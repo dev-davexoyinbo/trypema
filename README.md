@@ -1,4 +1,24 @@
-# rate_limiter
+# Trypema Rate Limiter
+
+The name is inspired by the Koine Greek word "τρυπήματος" (trypematos, "hole/opening") from the phrase "διὰ τρυπήματος ῥαφίδος" ("through the eye of a needle") in the Bible:
+
+- Matthew 19:24
+- Mark 10:25
+- Luke 18:25
+
+Koine Greek (one common form):
+
+"εὐκοπώτερόν ἐστιν κάμηλον διὰ τρυπήματος ῥαφίδος εἰσελθεῖν ἢ πλούσιον εἰς τὴν βασιλείαν τοῦ θεοῦ"
+
+Word breakdown:
+
+- κάμηλον (kamēlon) — camel
+- διὰ (dia) — through
+- τρυπήματος (trypēmatos) — hole/opening
+- ῥαφίδος (rhaphidos) — of a needle
+- εἰσελθεῖν (eiselthein) — to enter
+- πλούσιον (plousion) — a rich man
+- βασιλείαν τοῦ θεοῦ — kingdom of God
 
 High-performance rate limiting primitives in Rust, designed for concurrency safety, low overhead, and predictable latency.
 
