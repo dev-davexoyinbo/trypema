@@ -6,21 +6,25 @@ pub struct RedisRateLimiterOptions {}
 
 /// A rate limiter backed by Redis.
 pub struct RedisRateLimiterProvider {
-    options: RedisRateLimiterOptions,
+    absolute: AbsoluteRedisRateLimiter,
+    suppressed: SuppressedRedisRateLimiter,
 }
 
 impl RedisRateLimiterProvider {
     pub(crate) fn new(options: RedisRateLimiterOptions) -> Self {
-        Self { options }
+        Self {
+            absolute: AbsoluteRedisRateLimiter::new(options.clone()),
+            suppressed: SuppressedRedisRateLimiter::new(options),
+        }
     }
 
     /// Absolute Redis rate limiter implementation.
-    pub fn absolute(&self) -> AbsoluteRedisRateLimiter {
-        AbsoluteRedisRateLimiter::new(self.options.clone())
+    pub fn absolute(&self) -> &AbsoluteRedisRateLimiter {
+        &self.absolute
     }
 
     /// Suppressed Redis rate limiter implementation.
-    pub fn suppressed(&self) -> SuppressedRedisRateLimiter {
-        SuppressedRedisRateLimiter::new(self.options.clone())
+    pub fn suppressed(&self) -> &SuppressedRedisRateLimiter {
+        &self.suppressed
     }
 }
