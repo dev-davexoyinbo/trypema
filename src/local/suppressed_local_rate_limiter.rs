@@ -3,8 +3,8 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
     AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
+    common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
 };
 
 /// Local strategy that can probabilistically suppress work while tracking both
@@ -156,6 +156,12 @@ impl SuppressedLocalRateLimiter {
         };
 
         if series.series.is_empty() {
+            return self.persist_suppression_factor(key, 0f64);
+        }
+
+        let window_limit = *self.window_size_seconds as f64 * *series.limit;
+
+        if series.total.load(Ordering::Relaxed) < window_limit as u64 {
             return self.persist_suppression_factor(key, 0f64);
         }
 
