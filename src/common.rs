@@ -10,6 +10,8 @@ use std::{
     time::Instant,
 };
 
+use crate::TrypemaError;
+
 pub(crate) struct InstantRate {
     pub count: AtomicU64,
     pub timestamp: Instant,
@@ -100,11 +102,13 @@ impl Deref for RateLimit {
 }
 
 impl TryFrom<f64> for RateLimit {
-    type Error = String;
+    type Error = TrypemaError;
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
         if value <= 0f64 {
-            Err("Rate limit must be greater than 0".to_string())
+            Err(TrypemaError::InvalidRateLimit(
+                "rate limit must be greater than 0".to_string(),
+            ))
         } else {
             Ok(Self(value))
         }
@@ -138,11 +142,13 @@ impl DerefMut for WindowSizeSeconds {
 }
 
 impl TryFrom<u64> for WindowSizeSeconds {
-    type Error = String;
+    type Error = TrypemaError;
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
         if value < 1 {
-            Err("Window size must be at least 1".to_string())
+            Err(TrypemaError::InvalidWindowSizeSeconds(
+                "Window size must be at least 1".to_string(),
+            ))
         } else {
             Ok(Self(value))
         }
@@ -170,11 +176,13 @@ impl DerefMut for RateGroupSizeMs {
 }
 
 impl TryFrom<u64> for RateGroupSizeMs {
-    type Error = String;
+    type Error = TrypemaError;
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
         if value == 0 {
-            Err("Rate group size must be greater than 0".to_string())
+            Err(TrypemaError::InvalidRateGroupSizeMs(
+                "Rate group size must be greater than 0".to_string(),
+            ))
         } else {
             Ok(Self(value))
         }
@@ -202,11 +210,13 @@ impl Deref for HardLimitFactor {
 }
 
 impl TryFrom<f64> for HardLimitFactor {
-    type Error = String;
+    type Error = TrypemaError;
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
         if value <= 0f64 {
-            Err("Hard limit factor must be greater than 0".to_string())
+            Err(TrypemaError::InvalidHardLimitFactor(
+                "Hard limit factor must be greater than 0".to_string(),
+            ))
         } else {
             Ok(Self(value))
         }
