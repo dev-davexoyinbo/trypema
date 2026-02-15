@@ -11,6 +11,9 @@ pub use local::*;
 mod redis;
 pub use redis::*;
 
+mod error;
+pub use error::*;
+
 mod common;
 pub use common::{
     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, WindowSizeSeconds,

@@ -2,7 +2,10 @@ use crate::{AbsoluteRedisRateLimiter, SuppressedRedisRateLimiter};
 
 /// Configuration for Redis rate limiter implementations.
 #[derive(Clone, Debug)]
-pub struct RedisRateLimiterOptions {}
+pub struct RedisRateLimiterOptions {
+    /// The Redis client to use.
+    pub redis_client: redis::Client,
+}
 
 /// A rate limiter backed by Redis.
 pub struct RedisRateLimiterProvider {
