@@ -4,7 +4,7 @@ use dashmap::DashMap;
 
 use crate::{
     LocalRateLimiterOptions,
-    common::{InstantRate, RateLimit, RateLimitDecision},
+    common::{InstantRate, RateLimitDecision, RateLimitSeries},
 };
 
 /// Local, per-key rate limiter with a sliding time window.
@@ -15,7 +15,7 @@ use crate::{
 pub struct AbsoluteLocalRateLimiter {
     window_size_seconds: u64,
     rate_group_size_ms: u16,
-    series: DashMap<String, RateLimit>,
+    series: DashMap<String, RateLimitSeries>,
 }
 
 impl AbsoluteLocalRateLimiter {
@@ -27,7 +27,7 @@ impl AbsoluteLocalRateLimiter {
         }
     } // end constructor
 
-    pub(crate) fn series(&self) -> &DashMap<String, RateLimit> {
+    pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries> {
         &self.series
     }
 
@@ -52,7 +52,7 @@ impl AbsoluteLocalRateLimiter {
         if !self.series.contains_key(key) {
             self.series
                 .entry(key.to_string())
-                .or_insert_with(|| RateLimit::new(rate_limit));
+                .or_insert_with(|| RateLimitSeries::new(rate_limit));
         }
 
         let Some(rate_limit_series) = self.series.get(key) else {
@@ -70,7 +70,7 @@ impl AbsoluteLocalRateLimiter {
             let mut rate_limit_series = self
                 .series
                 .entry(key.to_string())
-                .or_insert_with(|| RateLimit::new(rate_limit));
+                .or_insert_with(|| RateLimitSeries::new(rate_limit));
 
             rate_limit_series.series.push_back(InstantRate {
                 count: count.into(),

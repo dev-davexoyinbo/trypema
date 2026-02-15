@@ -5,13 +5,13 @@ pub(crate) struct InstantRate {
     pub timestamp: Instant,
 }
 
-pub(crate) struct RateLimit {
+pub(crate) struct RateLimitSeries {
     pub limit: u64,
     pub series: VecDeque<InstantRate>,
     pub total: AtomicU64,
 }
 
-impl RateLimit {
+impl RateLimitSeries {
     pub fn new(limit: u64) -> Self {
         Self {
             limit,
