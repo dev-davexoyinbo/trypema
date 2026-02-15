@@ -1,3 +1,8 @@
+//! Local provider implementations.
+//!
+//! "Local" means the rate limiting state is maintained within the current process.
+//! Additional providers (e.g., shared/distributed backends) can be layered on top.
+
 mod absolute_local_rate_limiter;
 pub use absolute_local_rate_limiter::*;
 

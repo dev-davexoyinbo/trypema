@@ -7,6 +7,11 @@ use crate::{
     common::{InstantRate, RateLimit, RateLimitDecision},
 };
 
+/// Local, per-key rate limiter with a sliding time window.
+///
+/// This implementation is designed for multi-threaded use.
+/// Internally it uses a [`dashmap::DashMap`] for concurrent access and atomics
+/// for per-key counters.
 pub struct AbsoluteLocalRateLimiter {
     window_size_seconds: u64,
     rate_group_size_ms: u16,
@@ -22,6 +27,14 @@ impl AbsoluteLocalRateLimiter {
         }
     } // end constructor
 
+    /// Increment the observed count for `key`.
+    ///
+    /// - `rate_limit`: per-second limit for `key`. This is stored the first time
+    ///   the key is seen; subsequent calls for the same key do not update it.
+    /// - `count`: amount to add (typically `1`).
+    ///
+    /// Increments close together in time may be coalesced based on
+    /// `rate_group_size_ms`.
     pub fn inc(&self, key: &str, rate_limit: u64, count: u64) {
         if !self.series.contains_key(key) {
             self.series
@@ -55,6 +68,11 @@ impl AbsoluteLocalRateLimiter {
         }
     } // end method inc
 
+    /// Determine whether `key` is currently allowed.
+    ///
+    /// Returns [`RateLimitDecision::Allowed`] if the current sliding window total
+    /// is below the window limit, otherwise returns [`RateLimitDecision::Rejected`]
+    /// with a best-effort `retry_after_ms`.
     pub fn is_allowed(&self, key: &str) -> RateLimitDecision {
         let Some(rate_limit) = self.series.get(key) else {
             return RateLimitDecision::Allowed;
