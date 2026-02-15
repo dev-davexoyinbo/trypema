@@ -54,10 +54,14 @@ pub enum RateLimitDecision {
     },
 }
 
+/// Per-second rate limit for a key.
+///
+/// This is represented as a positive `f64` to allow non-integer limits.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct RateLimit(f64);
 
 impl RateLimit {
+    /// A practically-unbounded rate limit.
     pub fn max() -> Self {
         Self(f64::MAX)
     }
@@ -89,6 +93,7 @@ impl DerefMut for RateLimit {
     }
 }
 
+/// Sliding window size in seconds.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct WindowSizeSeconds(u64);
 
@@ -118,6 +123,7 @@ impl TryFrom<u64> for WindowSizeSeconds {
     }
 }
 
+/// Coalescing interval (in milliseconds) for grouping increments close in time.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct RateGroupSizeMs(u64);
 
@@ -147,6 +153,7 @@ impl TryFrom<u64> for RateGroupSizeMs {
     }
 }
 
+/// Multiplier used by strategies that apply a "hard" cutoff beyond the base rate limit.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct HardLimitFactor(f64);
 

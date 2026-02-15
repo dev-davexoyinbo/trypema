@@ -40,19 +40,24 @@ This repository accompanies a post that demonstrates one possible implementation
 ## Usage
 
 ```rust
-use trypema::{LocalRateLimiterOptions, RateLimitDecision, RateLimiter, RateLimiterOptions};
+use trypema::{
+    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
+    RateLimiter, RateLimiterOptions, WindowSizeSeconds,
+};
 
 let rl = RateLimiter::new(RateLimiterOptions {
     local: LocalRateLimiterOptions {
-        window_size_seconds: 60,
-        rate_group_size_ms: 10,
+        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+        rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+        hard_limit_factor: HardLimitFactor::default(),
     },
 });
 
 let key = "user:123";
+let rate_limit = RateLimit::try_from(5f64).unwrap();
 
 // check + record work
-match rl.local().absolute().inc(key, /*rate_limit=*/ 5, /*count=*/ 1) {
+match rl.local().absolute().inc(key, &rate_limit, /*count=*/ 1) {
     RateLimitDecision::Allowed => {
         // proceed
     }
@@ -63,6 +68,9 @@ match rl.local().absolute().inc(key, /*rate_limit=*/ 5, /*count=*/ 1) {
     } => {
         let _ = (window_size_seconds, retry_after_ms, remaining_after_waiting);
         // reject / retry later
+    }
+    RateLimitDecision::Suppressed { .. } => {
+        // only returned by strategies that support suppression
     }
 }
 ```

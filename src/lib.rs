@@ -9,7 +9,7 @@ mod local;
 pub use local::*;
 
 mod common;
-pub use common::RateLimitDecision;
+pub use common::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, WindowSizeSeconds};
 
 #[cfg(test)]
 mod tests;
