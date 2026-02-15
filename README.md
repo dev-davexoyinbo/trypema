@@ -40,7 +40,7 @@ This repository accompanies a post that demonstrates one possible implementation
 ## Usage
 
 ```rust
-use rate_limiter::{LocalRateLimiterOptions, RateLimiter, RateLimiterOptions};
+use trypema::{LocalRateLimiterOptions, RateLimitDecision, RateLimiter, RateLimiterOptions};
 
 let rl = RateLimiter::new(RateLimiterOptions {
     local: LocalRateLimiterOptions {
@@ -51,15 +51,12 @@ let rl = RateLimiter::new(RateLimiterOptions {
 
 let key = "user:123";
 
-// record work
-rl.local().absolute().inc(key, /*rate_limit=*/ 5, /*count=*/ 1);
-
-// check admission
-match rl.local().absolute().is_allowed(key) {
-    rate_limiter::RateLimitDecision::Allowed => {
+// check + record work
+match rl.local().absolute().inc(key, /*rate_limit=*/ 5, /*count=*/ 1) {
+    RateLimitDecision::Allowed => {
         // proceed
     }
-    rate_limiter::RateLimitDecision::Rejected {
+    RateLimitDecision::Rejected {
         window_size_seconds,
         retry_after_ms,
         remaining_after_waiting,

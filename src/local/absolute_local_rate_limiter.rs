@@ -27,11 +27,14 @@ impl AbsoluteLocalRateLimiter {
         }
     } // end constructor
 
-    /// Increment the observed count for `key`.
+    /// Check admission and, if allowed, increment the observed count for `key`.
     ///
     /// - `rate_limit`: per-second limit for `key`. This is stored the first time
     ///   the key is seen; subsequent calls for the same key do not update it.
     /// - `count`: amount to add (typically `1`).
+    ///
+    /// If the key is currently over limit, this returns [`RateLimitDecision::Rejected`]
+    /// and does not apply the increment.
     ///
     /// Increments close together in time may be coalesced based on
     /// `rate_group_size_ms`.
