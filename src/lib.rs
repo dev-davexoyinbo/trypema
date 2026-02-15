@@ -8,8 +8,13 @@ pub use rate_limiter::*;
 mod local;
 pub use local::*;
 
+mod redis;
+pub use redis::*;
+
 mod common;
-pub use common::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, WindowSizeSeconds};
+pub use common::{
+    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, WindowSizeSeconds,
+};
 
 #[cfg(test)]
 mod tests;

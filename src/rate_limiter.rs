@@ -4,13 +4,18 @@
 //! [`RateLimiter::local`]. Additional providers (e.g. shared/distributed state) can be
 //! added behind this facade.
 
-use crate::{LocalRateLimiterOptions, LocalRateLimiterProvider};
+use crate::{
+    LocalRateLimiterOptions, LocalRateLimiterProvider, RedisRateLimiterOptions,
+    RedisRateLimiterProvider,
+};
 
 /// Top-level configuration for [`RateLimiter`].
 #[derive(Clone, Debug)]
 pub struct RateLimiterOptions {
     /// Options for the local provider.
     pub local: LocalRateLimiterOptions,
+    /// Options for the Redis provider.
+    pub redis: RedisRateLimiterOptions,
 }
 
 /// Rate limiter entrypoint.
@@ -18,6 +23,7 @@ pub struct RateLimiterOptions {
 /// This type wires together one or more providers (currently `local`).
 pub struct RateLimiter {
     local: LocalRateLimiterProvider,
+    redis: RedisRateLimiterProvider,
 }
 
 impl RateLimiter {
@@ -25,7 +31,13 @@ impl RateLimiter {
     pub fn new(options: RateLimiterOptions) -> Self {
         Self {
             local: LocalRateLimiterProvider::new(options.local),
+            redis: RedisRateLimiterProvider::new(options.redis),
         }
+    }
+
+    /// Access the Redis provider.
+    pub fn redis(&self) -> &RedisRateLimiterProvider {
+        &self.redis
     }
 
     /// Access the local provider.
