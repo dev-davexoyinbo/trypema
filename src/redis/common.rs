@@ -10,6 +10,13 @@ use crate::TrypemaError;
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub struct RedisKey(String);
 
+impl RedisKey {
+    /// Create a new default prefix.
+    pub fn default_prefix() -> Self {
+        Self("trypema".to_string())
+    }
+}
+
 impl Deref for RedisKey {
     type Target = String;
 
@@ -31,6 +38,10 @@ impl TryFrom<String> for RedisKey {
         if value.is_empty() {
             Err(TrypemaError::InvalidRedisKey(
                 "Redis key must not be empty".to_string(),
+            ))
+        } else if value.len() > 255 {
+            Err(TrypemaError::InvalidRedisKey(
+                "Redis key must not be longer than 255 characters".to_string(),
             ))
         } else if value.contains(":") {
             Err(TrypemaError::InvalidRedisKey(

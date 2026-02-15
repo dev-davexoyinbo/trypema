@@ -6,7 +6,7 @@ pub struct RedisRateLimiterOptions {
     /// The Redis client to use.
     pub redis_client: redis::Client,
     /// The prefix to use for keys.
-    pub prefix: RedisKey,
+    pub prefix: Option<RedisKey>,
 }
 
 /// A rate limiter backed by Redis.
