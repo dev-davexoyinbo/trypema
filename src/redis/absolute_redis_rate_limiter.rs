@@ -3,6 +3,7 @@ use crate::{RateLimitDecision, RedisRateLimiterOptions, TrypemaError};
 /// A rate limiter backed by Redis.
 pub struct AbsoluteRedisRateLimiter {
     redis_client: redis::Client,
+    prefix: String,
 }
 
 impl AbsoluteRedisRateLimiter {

@@ -16,4 +16,7 @@ pub enum TrypemaError {
     /// Invalid hard limit factor.
     #[error("invalid hard limit factor: {0}")]
     InvalidHardLimitFactor(String),
+    /// Invalid Redis key.
+    #[error("invalid Redis key: {0}")]
+    InvalidRedisKey(String),
 }
