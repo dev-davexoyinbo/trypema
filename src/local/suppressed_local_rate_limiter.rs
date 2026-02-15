@@ -51,8 +51,8 @@ impl SuppressedLocalRateLimiter {
     ///
     /// Increments close together in time may be coalesced based on
     /// `rate_group_size_ms`.
-    pub fn inc(&self, key: &str, rate_limit: RateLimit, count: u64) -> RateLimitDecision {
-        self.observed_limiter.inc(key, RateLimit::max(), count);
+    pub fn inc(&self, key: &str, rate_limit: &RateLimit, count: u64) -> RateLimitDecision {
+        self.observed_limiter.inc(key, &RateLimit::max(), count);
 
         let mut suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
@@ -68,7 +68,7 @@ impl SuppressedLocalRateLimiter {
         if suppression_factor <= 0f64 {
             return self
                 .accepted_limiter
-                .inc(key, self.get_hard_limit(&rate_limit), count);
+                .inc(key, &self.get_hard_limit(rate_limit), count);
         }
 
         let should_allow = rand::random_bool((1f64 - suppression_factor) as f64);
@@ -82,7 +82,7 @@ impl SuppressedLocalRateLimiter {
 
         let decision = self
             .accepted_limiter
-            .inc(key, self.get_hard_limit(&rate_limit), count);
+            .inc(key, &self.get_hard_limit(rate_limit), count);
 
         match decision {
             RateLimitDecision::Allowed => RateLimitDecision::Suppressed {

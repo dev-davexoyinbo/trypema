@@ -42,7 +42,7 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// Increments close together in time may be coalesced based on
     /// `rate_group_size_ms`.
-    pub fn inc(&self, key: &str, rate_limit: RateLimit, count: u64) -> RateLimitDecision {
+    pub fn inc(&self, key: &str, rate_limit: &RateLimit, count: u64) -> RateLimitDecision {
         let is_allowed = self.is_allowed(key);
 
         if !matches!(is_allowed, RateLimitDecision::Allowed) {
@@ -52,7 +52,7 @@ impl AbsoluteLocalRateLimiter {
         if !self.series.contains_key(key) {
             self.series
                 .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(rate_limit));
+                .or_insert_with(|| RateLimitSeries::new(*rate_limit));
         }
 
         let Some(rate_limit_series) = self.series.get(key) else {
@@ -70,7 +70,7 @@ impl AbsoluteLocalRateLimiter {
             let mut rate_limit_series = self
                 .series
                 .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(rate_limit));
+                .or_insert_with(|| RateLimitSeries::new(*rate_limit));
 
             rate_limit_series.series.push_back(InstantRate {
                 count: count.into(),
