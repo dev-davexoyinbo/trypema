@@ -146,3 +146,32 @@ impl TryFrom<u64> for RateGroupSizeMs {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct HardLimitFactor(f64);
+
+impl Default for HardLimitFactor {
+    fn default() -> Self {
+        Self(1f64)
+    }
+}
+
+impl Deref for HardLimitFactor {
+    type Target = f64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl TryFrom<f64> for HardLimitFactor {
+    type Error = String;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        if value <= 0f64 {
+            Err("Rate limit must be greater than 0".to_string())
+        } else {
+            Ok(Self(value))
+        }
+    }
+}

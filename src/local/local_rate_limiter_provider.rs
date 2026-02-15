@@ -1,6 +1,6 @@
 use crate::{
     AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
-    common::{RateGroupSizeMs, WindowSizeSeconds},
+    common::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds},
 };
 
 /// Configuration for local rate limiter implementations.
@@ -15,6 +15,10 @@ pub struct LocalRateLimiterOptions {
     /// When multiple `inc` calls happen within this interval, they may be grouped
     /// into a single time bucket to reduce overhead.
     pub rate_group_size_ms: RateGroupSizeMs,
+
+    /// Hard limit factor would only be considered if we are using the suppressed local rate
+    /// limiter
+    pub hard_limit_factor: HardLimitFactor,
 }
 
 /// A collection of local rate limiter implementations.

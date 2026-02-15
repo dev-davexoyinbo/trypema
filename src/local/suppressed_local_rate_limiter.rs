@@ -4,7 +4,7 @@ use dashmap::DashMap;
 
 use crate::{
     AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
-    common::{RateGroupSizeMs, RateLimit, WindowSizeSeconds},
+    common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
 };
 
 /// Placeholder for an alternative local rate limiter strategy.
@@ -15,7 +15,7 @@ pub struct SuppressedLocalRateLimiter {
     accepted_limiter: AbsoluteLocalRateLimiter,
     observed_limiter: AbsoluteLocalRateLimiter,
     suppression_factors: DashMap<String, (Instant, f64)>,
-    hard_limit_factor: f64,
+    hard_limit_factor: HardLimitFactor,
     rate_group_size_ms: RateGroupSizeMs,
     window_size_seconds: WindowSizeSeconds,
 }
@@ -24,6 +24,7 @@ impl SuppressedLocalRateLimiter {
     pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
         let rate_group_size_ms = options.rate_group_size_ms;
         let window_size_seconds = options.window_size_seconds;
+        let hard_limit_factor = options.hard_limit_factor;
 
         let accepted_limiter = AbsoluteLocalRateLimiter::new(options.clone());
         let observed_limiter = AbsoluteLocalRateLimiter::new(options);
@@ -32,7 +33,7 @@ impl SuppressedLocalRateLimiter {
             accepted_limiter,
             observed_limiter,
             suppression_factors: DashMap::new(),
-            hard_limit_factor: 3f64,
+            hard_limit_factor,
             rate_group_size_ms,
             window_size_seconds,
         }
@@ -138,7 +139,7 @@ impl SuppressedLocalRateLimiter {
     #[inline]
     fn get_hard_limit(&self, rate_limit: &RateLimit) -> RateLimit {
         // if hard limit factor is always > 0 and rate limit is always > 0, this is safe
-        let Ok(val) = RateLimit::try_from(self.hard_limit_factor * **rate_limit) else {
+        let Ok(val) = RateLimit::try_from(*self.hard_limit_factor * **rate_limit) else {
             unreachable!(
                 "AbsoluteLocalRateLimiter::get_hard_limit: hard_limit_factor is always > 0"
             );
