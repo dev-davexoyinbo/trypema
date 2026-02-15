@@ -3,7 +3,8 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision, common::RateLimit,
+    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
+    common::{RateLimit, WindowSizeSeconds},
 };
 
 /// Placeholder for an alternative local rate limiter strategy.
@@ -16,7 +17,7 @@ pub struct SuppressedLocalRateLimiter {
     suppression_factors: DashMap<String, (Instant, f64)>,
     hard_limit_factor: f64,
     rate_group_size_ms: u16,
-    window_size_seconds: u64,
+    window_size_seconds: WindowSizeSeconds,
 }
 
 impl SuppressedLocalRateLimiter {
@@ -125,7 +126,7 @@ impl SuppressedLocalRateLimiter {
         }
 
         let average_rate_in_window: f64 =
-            series.total.load(Ordering::Relaxed) as f64 / self.window_size_seconds as f64;
+            series.total.load(Ordering::Relaxed) as f64 / *self.window_size_seconds as f64;
 
         let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
 

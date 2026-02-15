@@ -1,4 +1,4 @@
-use crate::{AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter};
+use crate::{AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter, common::WindowSizeSeconds};
 
 /// Configuration for local rate limiter implementations.
 ///
@@ -6,7 +6,7 @@ use crate::{AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter};
 #[derive(Clone, Debug)]
 pub struct LocalRateLimiterOptions {
     /// Sliding window size used when evaluating admission.
-    pub window_size_seconds: u64,
+    pub window_size_seconds: WindowSizeSeconds,
     /// Coalescing interval for increments close in time.
     ///
     /// When multiple `inc` calls happen within this interval, they may be grouped

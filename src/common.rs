@@ -88,3 +88,32 @@ impl DerefMut for RateLimit {
         &mut self.0
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct WindowSizeSeconds(u64);
+
+impl Deref for WindowSizeSeconds {
+    type Target = u64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for WindowSizeSeconds {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl TryFrom<u64> for WindowSizeSeconds {
+    type Error = String;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value < 1 {
+            Err("Window size must be at least 1".to_string())
+        } else {
+            Ok(Self(value))
+        }
+    }
+}

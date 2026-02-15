@@ -4,7 +4,7 @@ use dashmap::DashMap;
 
 use crate::{
     LocalRateLimiterOptions,
-    common::{InstantRate, RateLimit, RateLimitDecision, RateLimitSeries},
+    common::{InstantRate, RateLimit, RateLimitDecision, RateLimitSeries, WindowSizeSeconds},
 };
 
 /// Local, per-key rate limiter with a sliding time window.
@@ -13,7 +13,7 @@ use crate::{
 /// Internally it uses a [`dashmap::DashMap`] for concurrent access and atomics
 /// for per-key counters.
 pub struct AbsoluteLocalRateLimiter {
-    window_size_seconds: u64,
+    window_size_seconds: WindowSizeSeconds,
     rate_group_size_ms: u16,
     series: DashMap<String, RateLimitSeries>,
 }
@@ -96,7 +96,7 @@ impl AbsoluteLocalRateLimiter {
         let rate_limit = match rate_limit.series.front() {
             None => rate_limit,
             Some(instant_rate)
-                if instant_rate.timestamp.elapsed().as_secs() <= self.window_size_seconds =>
+                if instant_rate.timestamp.elapsed().as_secs() <= *self.window_size_seconds =>
             {
                 rate_limit
             }
@@ -108,7 +108,7 @@ impl AbsoluteLocalRateLimiter {
                 };
 
                 while let Some(instant_rate) = rate_limit.series.front()
-                    && instant_rate.timestamp.elapsed().as_secs() > self.window_size_seconds
+                    && instant_rate.timestamp.elapsed().as_secs() > *self.window_size_seconds
                 {
                     rate_limit.total.fetch_sub(
                         instant_rate.count.load(Ordering::Relaxed),
@@ -128,7 +128,7 @@ impl AbsoluteLocalRateLimiter {
             }
         };
 
-        let window_limit = self.window_size_seconds as f64 * *rate_limit.limit;
+        let window_limit = *self.window_size_seconds as f64 * *rate_limit.limit;
 
         if rate_limit.total.load(Ordering::Relaxed) < window_limit as u64 {
             return RateLimitDecision::Allowed;
@@ -151,7 +151,7 @@ impl AbsoluteLocalRateLimiter {
         };
 
         RateLimitDecision::Rejected {
-            window_size_seconds: self.window_size_seconds,
+            window_size_seconds: *self.window_size_seconds,
             retry_after_ms,
             remaining_after_waiting,
         }
