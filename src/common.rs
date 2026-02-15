@@ -117,3 +117,32 @@ impl TryFrom<u64> for WindowSizeSeconds {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct RateGroupSizeMs(u64);
+
+impl Deref for RateGroupSizeMs {
+    type Target = u64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for RateGroupSizeMs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl TryFrom<u64> for RateGroupSizeMs {
+    type Error = String;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value == 0 {
+            Err("Rate group size must be greater than 0".to_string())
+        } else {
+            Ok(Self(value))
+        }
+    }
+}

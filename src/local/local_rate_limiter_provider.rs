@@ -1,4 +1,7 @@
-use crate::{AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter, common::WindowSizeSeconds};
+use crate::{
+    AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
+    common::{RateGroupSizeMs, WindowSizeSeconds},
+};
 
 /// Configuration for local rate limiter implementations.
 ///
@@ -11,7 +14,7 @@ pub struct LocalRateLimiterOptions {
     ///
     /// When multiple `inc` calls happen within this interval, they may be grouped
     /// into a single time bucket to reduce overhead.
-    pub rate_group_size_ms: u16,
+    pub rate_group_size_ms: RateGroupSizeMs,
 }
 
 /// A collection of local rate limiter implementations.

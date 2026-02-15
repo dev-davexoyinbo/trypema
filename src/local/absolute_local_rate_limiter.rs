@@ -4,7 +4,10 @@ use dashmap::DashMap;
 
 use crate::{
     LocalRateLimiterOptions,
-    common::{InstantRate, RateLimit, RateLimitDecision, RateLimitSeries, WindowSizeSeconds},
+    common::{
+        InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimitSeries,
+        WindowSizeSeconds,
+    },
 };
 
 /// Local, per-key rate limiter with a sliding time window.
@@ -14,7 +17,7 @@ use crate::{
 /// for per-key counters.
 pub struct AbsoluteLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
-    rate_group_size_ms: u16,
+    rate_group_size_ms: RateGroupSizeMs,
     series: DashMap<String, RateLimitSeries>,
 }
 
@@ -60,7 +63,7 @@ impl AbsoluteLocalRateLimiter {
         };
 
         if let Some(last_entry) = rate_limit_series.series.back()
-            && last_entry.timestamp.elapsed().as_millis() <= self.rate_group_size_ms as u128
+            && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
         {
             last_entry.count.fetch_add(count, Ordering::Relaxed);
             rate_limit_series.total.fetch_add(count, Ordering::Relaxed);

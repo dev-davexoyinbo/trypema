@@ -4,7 +4,7 @@ use dashmap::DashMap;
 
 use crate::{
     AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
-    common::{RateLimit, WindowSizeSeconds},
+    common::{RateGroupSizeMs, RateLimit, WindowSizeSeconds},
 };
 
 /// Placeholder for an alternative local rate limiter strategy.
@@ -16,7 +16,7 @@ pub struct SuppressedLocalRateLimiter {
     observed_limiter: AbsoluteLocalRateLimiter,
     suppression_factors: DashMap<String, (Instant, f64)>,
     hard_limit_factor: f64,
-    rate_group_size_ms: u16,
+    rate_group_size_ms: RateGroupSizeMs,
     window_size_seconds: WindowSizeSeconds,
 }
 
@@ -56,7 +56,7 @@ impl SuppressedLocalRateLimiter {
 
         let mut suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
-            Some(val) if val.0.elapsed().as_millis() < self.rate_group_size_ms as u128 => val.1,
+            Some(val) if val.0.elapsed().as_millis() < *self.rate_group_size_ms as u128 => val.1,
             Some(val) => {
                 drop(val);
                 self.calculate_suppression_factor(key).1
