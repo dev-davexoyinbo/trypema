@@ -21,6 +21,10 @@ impl RateLimit {
     }
 }
 
+/// Result of a rate limit admission check.
+///
+/// Returned by rate limiter implementations to indicate whether work for a key
+/// should proceed, and (when rejected) to provide best-effort backoff hints.
 pub enum RateLimitDecision {
     /// The request/work is allowed.
     Allowed,
