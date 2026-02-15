@@ -1,0 +1,8 @@
+[package]
+name = "rate_limiter"
+version = "0.1.0-dev"
+edition = "2024"
+
+[dependencies]
+dashmap = "6.1.0"
+tracing = "0.1.44"

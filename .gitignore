@@ -1,0 +1,25 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Cargo.lock
+# Ignore for libraries; commit for binaries/apps.
+/Cargo.lock
+
+# Rustfmt
+/.rustfmt.toml.bk
+
+# IDEs / editors
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+
+# Env / secrets
+.env
+.env.*
+
+# Logs
+*.log
