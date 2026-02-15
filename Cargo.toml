@@ -20,4 +20,5 @@ documentation = "https://docs.rs/trypema"
 [dependencies]
 dashmap = "6.1.0"
 rand = "0.10.0"
+redis = "1.0.3"
 tracing = "0.1.44"
