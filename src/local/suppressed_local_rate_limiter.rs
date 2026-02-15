@@ -129,7 +129,7 @@ impl SuppressedLocalRateLimiter {
 
         let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
 
-        let suppression_factor = 1f64 - (perceived_rate_limit / *series.limit as f64);
+        let suppression_factor = 1f64 - (perceived_rate_limit / *series.limit);
 
         self.persist_suppression_factor(key, suppression_factor)
     } // end method calculate_suppression_factor
@@ -137,7 +137,7 @@ impl SuppressedLocalRateLimiter {
     #[inline]
     fn get_hard_limit(&self, rate_limit: &RateLimit) -> RateLimit {
         // if hard limit factor is always > 0 and rate limit is always > 0, this is safe
-        let Ok(val) = RateLimit::try_from((self.hard_limit_factor * **rate_limit) as f64) else {
+        let Ok(val) = RateLimit::try_from(self.hard_limit_factor * **rate_limit) else {
             unreachable!(
                 "AbsoluteLocalRateLimiter::get_hard_limit: hard_limit_factor is always > 0"
             );
