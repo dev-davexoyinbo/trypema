@@ -126,6 +126,11 @@ This strategy can return `RateLimitDecision::Suppressed` to expose suppression m
 - hard cutoff: `rate_limit * hard_limit_factor`
 - hitting the hard cutoff returns `Rejected` (a hard rejection, not suppressible)
 
+Suppression activation:
+
+- Suppression is only considered once accepted usage meets/exceeds the base window capacity (`window_size_seconds * rate_limit`).
+- Below that capacity, suppression is bypassed (calls return `Allowed`, subject to the hard cutoff).
+
 Inspiration:
 
 - The suppressed strategy is inspired by Ably's approach to distributed rate limiting, where they describe preferring suppression over a strict hard limit once the target rate is exceeded: <https://ably.com/blog/distributed-rate-limiting-scale-your-platform>

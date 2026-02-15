@@ -18,6 +18,11 @@ use crate::{
 /// suppression may occur. When `is_allowed` is `false`, the call is denied without
 /// incrementing the accepted series.
 ///
+/// Suppression activation:
+/// - Suppression is only considered once the accepted usage meets/exceeds the base
+///   window capacity (`window_size_seconds * rate_limit`).
+/// - When accepted usage is below that capacity, suppression is bypassed.
+///
 /// A hard cutoff is enforced using `hard_limit_factor`: if accepted usage would exceed
 /// `rate_limit * hard_limit_factor`, the decision is returned as
 /// [`RateLimitDecision::Rejected`] (a hard rejection that cannot be "suppressed").
