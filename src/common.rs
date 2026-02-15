@@ -43,7 +43,7 @@ pub enum RateLimitDecision {
     /// This is a hint for callers that want to communicate backoff.
     Suppressed {
         /// Calculated suppression factor.
-        suppression_factor: f32,
+        suppression_factor: f64,
         /// Is allowed
         is_allowed: bool,
     },

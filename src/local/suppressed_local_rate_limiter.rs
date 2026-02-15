@@ -1,4 +1,4 @@
-use std::{cmp, time::Instant};
+use std::{cmp, sync::atomic::Ordering, time::Instant};
 
 use dashmap::DashMap;
 
@@ -11,14 +11,17 @@ use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision
 pub struct SuppressedLocalRateLimiter {
     accepted_limiter: AbsoluteLocalRateLimiter,
     observed_limiter: AbsoluteLocalRateLimiter,
-    suppression_factors: DashMap<String, (Instant, f32)>,
-    hard_limit_factor: f32,
+    suppression_factors: DashMap<String, (Instant, f64)>,
+    hard_limit_factor: f64,
     rate_group_size_ms: u16,
+    window_size_seconds: u64,
 }
 
 impl SuppressedLocalRateLimiter {
     pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
         let rate_group_size_ms = options.rate_group_size_ms;
+        let window_size_seconds = options.window_size_seconds;
+
         let accepted_limiter = AbsoluteLocalRateLimiter::new(options.clone());
         let observed_limiter = AbsoluteLocalRateLimiter::new(options);
 
@@ -26,8 +29,9 @@ impl SuppressedLocalRateLimiter {
             accepted_limiter,
             observed_limiter,
             suppression_factors: DashMap::new(),
-            hard_limit_factor: 3f32,
+            hard_limit_factor: 3f64,
             rate_group_size_ms,
+            window_size_seconds,
         }
     } // end constructor
 
@@ -56,15 +60,15 @@ impl SuppressedLocalRateLimiter {
             }
         };
 
-        suppression_factor = suppression_factor.min(1f32);
+        suppression_factor = suppression_factor.min(1f64);
 
-        if suppression_factor <= 0f32 {
+        if suppression_factor <= 0f64 {
             return self
                 .accepted_limiter
                 .inc(key, self.get_hard_limit(rate_limit), count);
         }
 
-        let should_allow = rand::random_bool((1f32 - suppression_factor) as f64);
+        let should_allow = rand::random_bool((1f64 - suppression_factor) as f64);
 
         if !should_allow {
             return RateLimitDecision::Suppressed {
@@ -90,12 +94,46 @@ impl SuppressedLocalRateLimiter {
         }
     }
 
-    fn calculate_suppression_factor(&self, key: &str) -> (Instant, f32) {
-        todo!("SuppressedLocalRateLimiter::calculate_suppression_factor: implement");
+    #[inline(always)]
+    fn persist_suppression_factor(&self, key: &str, value: f64) -> (Instant, f64) {
+        let persist = (Instant::now(), value);
+        self.suppression_factors.insert(key.to_string(), persist);
+        persist
+    }
+
+    #[inline]
+    fn calculate_suppression_factor(&self, key: &str) -> (Instant, f64) {
+        let Some(series) = self.accepted_limiter.series().get(key) else {
+            return self.persist_suppression_factor(key, 0f64);
+        };
+
+        if series.series.is_empty() {
+            return self.persist_suppression_factor(key, 0f64);
+        }
+
+        let mut total_in_last_second = 0u64;
+
+        for instant_rate in series.series.iter().rev() {
+            if instant_rate.timestamp.elapsed().as_secs() > 1 {
+                break;
+            }
+
+            total_in_last_second =
+                total_in_last_second.saturating_add(instant_rate.count.load(Ordering::Relaxed));
+        }
+
+        let average_rate_in_window: f64 =
+            series.total.load(Ordering::Relaxed) as f64 / self.window_size_seconds as f64;
+
+        let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
+
+        let suppression_factor = 1f64 - (perceived_rate_limit / series.limit as f64);
+
+        self.persist_suppression_factor(key, suppression_factor)
     } // end method calculate_suppression_factor
 
     #[inline]
     fn get_hard_limit(&self, rate_limit: u64) -> u64 {
-        (self.hard_limit_factor * rate_limit as f32) as u64
-    }
+        (self.hard_limit_factor * rate_limit as f64) as u64
+    } // end method get_hard_limit
 } // end impl    

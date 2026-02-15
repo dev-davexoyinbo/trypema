@@ -27,6 +27,10 @@ impl AbsoluteLocalRateLimiter {
         }
     } // end constructor
 
+    pub(crate) fn series(&self) -> &DashMap<String, RateLimit> {
+        &self.series
+    }
+
     /// Check admission and, if allowed, increment the observed count for `key`.
     ///
     /// - `rate_limit`: per-second limit for `key`. This is stored the first time
