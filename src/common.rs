@@ -39,4 +39,12 @@ pub enum RateLimitDecision {
         /// Estimated remaining count after waiting `retry_after_ms`.
         remaining_after_waiting: u64,
     },
+    /// The request/work is rejected and should be retried later.
+    /// This is a hint for callers that want to communicate backoff.
+    Suppressed {
+        /// Calculated suppression factor.
+        suppression_factor: f32,
+        /// Is allowed
+        is_allowed: bool,
+    },
 }
