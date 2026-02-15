@@ -4,7 +4,7 @@ use dashmap::DashMap;
 
 use crate::{
     LocalRateLimiterOptions,
-    common::{InstantRate, RateLimitDecision, RateLimitSeries},
+    common::{InstantRate, RateLimit, RateLimitDecision, RateLimitSeries},
 };
 
 /// Local, per-key rate limiter with a sliding time window.
@@ -42,7 +42,7 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// Increments close together in time may be coalesced based on
     /// `rate_group_size_ms`.
-    pub fn inc(&self, key: &str, rate_limit: u64, count: u64) -> RateLimitDecision {
+    pub fn inc(&self, key: &str, rate_limit: RateLimit, count: u64) -> RateLimitDecision {
         let is_allowed = self.is_allowed(key);
 
         if !matches!(is_allowed, RateLimitDecision::Allowed) {
@@ -128,9 +128,9 @@ impl AbsoluteLocalRateLimiter {
             }
         };
 
-        let window_limit = self.window_size_seconds * rate_limit.limit;
+        let window_limit = self.window_size_seconds as f64 * *rate_limit.limit;
 
-        if rate_limit.total.load(Ordering::Relaxed) < window_limit {
+        if rate_limit.total.load(Ordering::Relaxed) < window_limit as u64 {
             return RateLimitDecision::Allowed;
         }
 

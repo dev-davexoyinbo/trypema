@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, sync::atomic::AtomicU64, time::Instant};
+use std::{
+    collections::VecDeque,
+    ops::{Deref, DerefMut},
+    sync::atomic::AtomicU64,
+    time::Instant,
+};
 
 pub(crate) struct InstantRate {
     pub count: AtomicU64,
@@ -6,13 +11,13 @@ pub(crate) struct InstantRate {
 }
 
 pub(crate) struct RateLimitSeries {
-    pub limit: u64,
+    pub limit: RateLimit,
     pub series: VecDeque<InstantRate>,
     pub total: AtomicU64,
 }
 
 impl RateLimitSeries {
-    pub fn new(limit: u64) -> Self {
+    pub fn new(limit: RateLimit) -> Self {
         Self {
             limit,
             series: VecDeque::new(),
@@ -47,4 +52,39 @@ pub enum RateLimitDecision {
         /// Is allowed
         is_allowed: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct RateLimit(f64);
+
+impl RateLimit {
+    pub fn max() -> Self {
+        Self(f64::MAX)
+    }
+}
+
+impl Deref for RateLimit {
+    type Target = f64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl TryFrom<f64> for RateLimit {
+    type Error = String;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        if value <= 0f64 {
+            Err("Rate limit must be greater than 0".to_string())
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+impl DerefMut for RateLimit {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }

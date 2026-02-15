@@ -1,8 +1,10 @@
-use std::{cmp, sync::atomic::Ordering, time::Instant};
+use std::{sync::atomic::Ordering, time::Instant};
 
 use dashmap::DashMap;
 
-use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision};
+use crate::{
+    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision, common::RateLimit,
+};
 
 /// Placeholder for an alternative local rate limiter strategy.
 ///
@@ -48,8 +50,8 @@ impl SuppressedLocalRateLimiter {
     ///
     /// Increments close together in time may be coalesced based on
     /// `rate_group_size_ms`.
-    pub fn inc(&self, key: &str, rate_limit: u64, count: u64) -> RateLimitDecision {
-        self.observed_limiter.inc(key, u64::MAX, count);
+    pub fn inc(&self, key: &str, rate_limit: RateLimit, count: u64) -> RateLimitDecision {
+        self.observed_limiter.inc(key, RateLimit::max(), count);
 
         let mut suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
@@ -65,7 +67,7 @@ impl SuppressedLocalRateLimiter {
         if suppression_factor <= 0f64 {
             return self
                 .accepted_limiter
-                .inc(key, self.get_hard_limit(rate_limit), count);
+                .inc(key, self.get_hard_limit(&rate_limit), count);
         }
 
         let should_allow = rand::random_bool((1f64 - suppression_factor) as f64);
@@ -79,7 +81,7 @@ impl SuppressedLocalRateLimiter {
 
         let decision = self
             .accepted_limiter
-            .inc(key, self.get_hard_limit(rate_limit), count);
+            .inc(key, self.get_hard_limit(&rate_limit), count);
 
         match decision {
             RateLimitDecision::Allowed => RateLimitDecision::Suppressed {
@@ -127,13 +129,20 @@ impl SuppressedLocalRateLimiter {
 
         let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
 
-        let suppression_factor = 1f64 - (perceived_rate_limit / series.limit as f64);
+        let suppression_factor = 1f64 - (perceived_rate_limit / *series.limit as f64);
 
         self.persist_suppression_factor(key, suppression_factor)
     } // end method calculate_suppression_factor
 
     #[inline]
-    fn get_hard_limit(&self, rate_limit: u64) -> u64 {
-        (self.hard_limit_factor * rate_limit as f64) as u64
+    fn get_hard_limit(&self, rate_limit: &RateLimit) -> RateLimit {
+        // if hard limit factor is always > 0 and rate limit is always > 0, this is safe
+        let Ok(val) = RateLimit::try_from((self.hard_limit_factor * **rate_limit) as f64) else {
+            unreachable!(
+                "AbsoluteLocalRateLimiter::get_hard_limit: hard_limit_factor is always > 0"
+            );
+        };
+
+        val
     } // end method get_hard_limit
 } // end impl    
