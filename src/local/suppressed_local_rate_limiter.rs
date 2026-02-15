@@ -56,9 +56,9 @@ impl SuppressedLocalRateLimiter {
             }
         };
 
-        suppression_factor = suppression_factor.max(0f32);
+        suppression_factor = suppression_factor.min(1f32);
 
-        if suppression_factor >= 1f32 {
+        if suppression_factor <= 0f32 {
             return self
                 .accepted_limiter
                 .inc(key, self.get_hard_limit(rate_limit), count);
