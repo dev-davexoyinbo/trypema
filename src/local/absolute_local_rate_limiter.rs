@@ -15,6 +15,21 @@ use crate::{
 /// This implementation is designed for multi-threaded use.
 /// Internally it uses a [`dashmap::DashMap`] for concurrent access and atomics
 /// for per-key counters.
+///
+/// Semantics:
+/// - The limit is expressed as a per-second [`RateLimit`]. For a window of `W` seconds,
+///   the capacity is approximately `W * rate_limit`.
+/// - Decisions are best-effort under concurrency: `inc` performs an admission check and
+///   then applies the increment. Concurrent callers may temporarily overshoot.
+/// - Per-key configuration is fixed on first use: the first call for a key stores the
+///   provided `rate_limit`; subsequent calls for the same key do not update it.
+///
+/// Performance/accuracy trade-offs:
+/// - Buckets are lazily evicted on calls to [`AbsoluteLocalRateLimiter::is_allowed`].
+/// - Window eviction uses `Instant::elapsed().as_secs()`, which truncates to whole seconds.
+///   This makes eviction slightly conservative (a 1s window may effectively require ~2s).
+/// - Keys are not automatically removed from the internal map; unbounded key cardinality
+///   will grow memory usage.
 pub struct AbsoluteLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
     rate_group_size_ms: RateGroupSizeMs,
@@ -42,6 +57,10 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// If the key is currently over limit, this returns [`RateLimitDecision::Rejected`]
     /// and does not apply the increment.
+    ///
+    /// Concurrency note: admission is checked before incrementing, so multiple threads
+    /// may all observe "allowed" and increment. Consumers requiring strict, linearizable
+    /// admission should treat this as an approximate limiter.
     ///
     /// Increments close together in time may be coalesced based on
     /// `rate_group_size_ms`.
@@ -91,6 +110,8 @@ impl AbsoluteLocalRateLimiter {
     /// Returns [`RateLimitDecision::Allowed`] if the current sliding window total
     /// is below the window limit, otherwise returns [`RateLimitDecision::Rejected`]
     /// with a best-effort `retry_after_ms`.
+    ///
+    /// This method performs lazy eviction of expired buckets for the key.
     pub fn is_allowed(&self, key: &str) -> RateLimitDecision {
         let Some(rate_limit) = self.series.get(key) else {
             return RateLimitDecision::Allowed;

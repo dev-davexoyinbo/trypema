@@ -1,3 +1,9 @@
+//! Top-level entrypoint that wires provider implementations.
+//!
+//! Today the crate ships a single provider (`local`), exposed via
+//! [`RateLimiter::local`]. Additional providers (e.g. shared/distributed state) can be
+//! added behind this facade.
+
 use crate::{LocalRateLimiterOptions, LocalRateLimiterProvider};
 
 /// Top-level configuration for [`RateLimiter`].

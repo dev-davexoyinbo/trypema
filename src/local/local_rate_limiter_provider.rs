@@ -1,6 +1,6 @@
 use crate::{
-    AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
     common::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds},
+    AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
 };
 
 /// Configuration for local rate limiter implementations.
@@ -16,8 +16,13 @@ pub struct LocalRateLimiterOptions {
     /// into a single time bucket to reduce overhead.
     pub rate_group_size_ms: RateGroupSizeMs,
 
-    /// Hard limit factor would only be considered if we are using the suppressed local rate
-    /// limiter
+    /// Multiplier used by [`SuppressedLocalRateLimiter`] as a hard cutoff.
+    ///
+    /// The suppressed strategy may probabilistically reject work to keep the accepted
+    /// rate near the base limit. This factor defines an absolute maximum rate
+    /// (`rate_limit * hard_limit_factor`) beyond which work is rejected unconditionally.
+    ///
+    /// A value of `1.0` means the hard cutoff equals the base limit.
     pub hard_limit_factor: HardLimitFactor,
 }
 
@@ -38,13 +43,15 @@ impl LocalRateLimiterProvider {
     }
 
     /// Absolute local limiter implementation.
+    ///
+    /// See [`AbsoluteLocalRateLimiter`] for semantics and trade-offs.
     pub fn absolute(&self) -> &AbsoluteLocalRateLimiter {
         &self.absolute
     }
 
     /// Suppressed local limiter implementation.
     ///
-    /// This is currently a stub while additional strategies are developed.
+    /// This strategy exposes suppression metadata via [`crate::RateLimitDecision::Suppressed`].
     pub fn suppressed(&self) -> &SuppressedLocalRateLimiter {
         &self.suppressed
     }

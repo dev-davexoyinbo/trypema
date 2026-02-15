@@ -49,10 +49,10 @@ fn hard_limit_factor_default_and_try_from_validate_positive() {
 
     assert_eq!(
         HardLimitFactor::try_from(0f64).unwrap_err(),
-        "Rate limit must be greater than 0"
+        "Hard limit factor must be greater than 0"
     );
     assert_eq!(
         HardLimitFactor::try_from(-1f64).unwrap_err(),
-        "Rate limit must be greater than 0"
+        "Hard limit factor must be greater than 0"
     );
 }

@@ -3,14 +3,24 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
     common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
+    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
 };
 
-/// Placeholder for an alternative local rate limiter strategy.
+/// Local strategy that can probabilistically suppress work while tracking both
+/// observed and accepted rates.
 ///
-/// This type exists to reserve the API surface while additional strategies and
-/// providers are implemented.
+/// This limiter maintains two internal limiters:
+/// - `observed_limiter`: tracks all calls (including suppressed ones)
+/// - `accepted_limiter`: tracks only calls admitted by this strategy
+///
+/// It returns [`RateLimitDecision::Suppressed`] when operating in a regime where
+/// suppression may occur. When `is_allowed` is `false`, the call is denied without
+/// incrementing the accepted series.
+///
+/// A hard cutoff is enforced using `hard_limit_factor`: if accepted usage would exceed
+/// `rate_limit * hard_limit_factor`, the decision is returned as
+/// [`RateLimitDecision::Rejected`] (a hard rejection that cannot be "suppressed").
 pub struct SuppressedLocalRateLimiter {
     accepted_limiter: AbsoluteLocalRateLimiter,
     observed_limiter: AbsoluteLocalRateLimiter,
@@ -41,14 +51,15 @@ impl SuppressedLocalRateLimiter {
 
     /// Check admission and, if allowed, increment the observed count for `key`.
     ///
-    /// This is a stub implementation that does not actually apply the increment.
-    ///
     /// - `rate_limit`: per-second limit for `key`. This is stored the first time
     ///   the key is seen; subsequent calls for the same key do not update it.
     /// - `count`: amount to add (typically `1`).
     ///
-    /// If the key is currently over limit, this returns [`RateLimitDecision::Rejected`]
-    /// and does not apply the increment.
+    /// Return values:
+    /// - [`RateLimitDecision::Allowed`]: suppression is bypassed and the increment is applied.
+    /// - [`RateLimitDecision::Suppressed`]: suppression is in effect; check `is_allowed`.
+    /// - [`RateLimitDecision::Rejected`]: hard cutoff was hit; the increment is not applied
+    ///   to the accepted series.
     ///
     /// Increments close together in time may be coalesced based on
     /// `rate_group_size_ms`.
@@ -64,6 +75,7 @@ impl SuppressedLocalRateLimiter {
         count: u64,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> RateLimitDecision {
+        // Always track observed usage; this limiter uses a max rate to avoid rejecting.
         self.observed_limiter.inc(key, &RateLimit::max(), count);
 
         let mut suppression_factor = match self.suppression_factors.get(key) {
@@ -173,10 +185,10 @@ impl SuppressedLocalRateLimiter {
         // if hard limit factor is always > 0 and rate limit is always > 0, this is safe
         let Ok(val) = RateLimit::try_from(*self.hard_limit_factor * **rate_limit) else {
             unreachable!(
-                "AbsoluteLocalRateLimiter::get_hard_limit: hard_limit_factor is always > 0"
+                "SuppressedLocalRateLimiter::get_hard_limit: hard_limit_factor is always > 0"
             );
         };
 
         val
     } // end method get_hard_limit
-} // end impl    
+} // end impl
