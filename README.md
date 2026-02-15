@@ -1,5 +1,7 @@
 # Trypema Rate Limiter
 
+Status: in development (pre-release).
+
 The name is inspired by the Koine Greek word "τρυπήματος" (trypematos, "hole/opening") from the phrase "διὰ τρυπήματος ῥαφίδος" ("through the eye of a needle") in the Bible:
 
 - Matthew 19:24
