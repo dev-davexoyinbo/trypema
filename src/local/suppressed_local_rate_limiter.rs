@@ -53,6 +53,17 @@ impl SuppressedLocalRateLimiter {
     /// Increments close together in time may be coalesced based on
     /// `rate_group_size_ms`.
     pub fn inc(&self, key: &str, rate_limit: &RateLimit, count: u64) -> RateLimitDecision {
+        let mut rng = |p: f64| rand::random_bool(p);
+        self.inc_with_rng(key, rate_limit, count, &mut rng)
+    }
+
+    pub(crate) fn inc_with_rng(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        count: u64,
+        random_bool: &mut impl FnMut(f64) -> bool,
+    ) -> RateLimitDecision {
         self.observed_limiter.inc(key, &RateLimit::max(), count);
 
         let mut suppression_factor = match self.suppression_factors.get(key) {
@@ -72,7 +83,7 @@ impl SuppressedLocalRateLimiter {
                 .inc(key, &self.get_hard_limit(rate_limit), count);
         }
 
-        let should_allow = rand::random_bool((1f64 - suppression_factor) as f64);
+        let should_allow = random_bool(1f64 - suppression_factor);
 
         if !should_allow {
             return RateLimitDecision::Suppressed {
@@ -96,6 +107,27 @@ impl SuppressedLocalRateLimiter {
                 unreachable!("AbsoluteLocalRateLimiter::inc: should not be suppressed")
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accepted_limiter(&self) -> &AbsoluteLocalRateLimiter {
+        &self.accepted_limiter
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observed_limiter(&self) -> &AbsoluteLocalRateLimiter {
+        &self.observed_limiter
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_suppression_factor(&self, key: &str, at: Instant, value: f64) {
+        self.suppression_factors
+            .insert(key.to_string(), (at, value));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_get_suppression_factor(&self, key: &str) -> Option<(Instant, f64)> {
+        self.suppression_factors.get(key).map(|v| *v)
     }
 
     #[inline(always)]
