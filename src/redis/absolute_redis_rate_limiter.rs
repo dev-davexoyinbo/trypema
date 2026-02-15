@@ -57,6 +57,14 @@ impl AbsoluteRedisRateLimiter {
             local time_array = redis.call("TIME")
             local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 
+            local latest_hash_field = redis.call("GET", latest_key)
+            if latest_hash_field then
+                local latest_hash_field_ttl = redis.call("PTTL", latest_hash_field)
+                if latest_hash_field_ttl > 0 and window_size_seconds * 1000 - latest_hash_field_ttl < rate_group_size_ms then
+                    timestamp_ms = tonumber(latest_hash_field)
+                end
+            end
+
             local hash_field = tostring(timestamp_ms)
             local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
 
