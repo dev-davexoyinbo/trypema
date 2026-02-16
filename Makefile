@@ -18,6 +18,6 @@ test-redis:
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
-	REDIS_URL="$(REDIS_URL)" cargo test
+	REDIS_URL="$(REDIS_URL)" cargo test --features redis-tokio
 
 test: test-redis

@@ -28,9 +28,13 @@ What this crate is not (currently):
 
 ## Quick Start
 
-Quick Start assumes default features (Redis enabled) and a Redis instance reachable at `redis://127.0.0.1:6379/`.
+Default build (Redis enabled):
 
-```rust,ignore
+```toml
+trypema = { version = "*", features = ["redis-tokio"] }
+```
+
+```rust,no_run
 use trypema::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
     RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
@@ -48,7 +52,6 @@ rt.block_on(async {
             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
         },
-        #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
         redis: RedisRateLimiterOptions {
             connection_manager,
             prefix: None,
@@ -60,47 +63,44 @@ rt.block_on(async {
     let key = "user:123";
     let rate_limit = RateLimit::try_from(5.0).unwrap();
 
-    // Local: check + record work (count is usually 1)
-    match rl.local().absolute().inc(key, &rate_limit, 1) {
-    RateLimitDecision::Allowed => {
-        // proceed
-    }
-    RateLimitDecision::Rejected {
-        window_size_seconds,
-        retry_after_ms,
-        remaining_after_waiting,
-    } => {
-        let _ = (window_size_seconds, retry_after_ms, remaining_after_waiting);
-        // reject / retry later
-    }
-    RateLimitDecision::Suppressed { is_allowed, .. } => {
-        // only returned by strategies that support suppression
-        if is_allowed {
-            // proceed
-        } else {
-            // suppressed / retry later
-        }
-    }
-    }
+    // Local: check + record work
+    let _ = rl.local().absolute().inc(key, &rate_limit, 1);
 
     // Redis: check + record work
     // Note: Redis keys are validated and must not contain ':'
     let redis_key = RedisKey::try_from("user_123".to_string()).unwrap();
-    let _ = rl
-        .redis()
-        .absolute()
-        .inc(&redis_key, &rate_limit, 1)
-        .await
-        .unwrap();
+    let _ = rl.redis().absolute().inc(&redis_key, &rate_limit, 1).await.unwrap();
 });
 ```
 
-Local-only usage:
-
-- disable default features in your `Cargo.toml`
+Local-only build (disable Redis features):
 
 ```toml
 trypema = { version = "*", default-features = false }
+```
+
+```rust,ignore
+use trypema::{
+    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
+    RateLimiter, RateLimiterOptions, WindowSizeSeconds,
+};
+
+let rl = RateLimiter::new(RateLimiterOptions {
+    local: LocalRateLimiterOptions {
+        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+        rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+        hard_limit_factor: HardLimitFactor::default(),
+    },
+});
+
+let key = "user:123";
+let rate_limit = RateLimit::try_from(5.0).unwrap();
+
+match rl.local().absolute().inc(key, &rate_limit, 1) {
+    RateLimitDecision::Allowed => {}
+    RateLimitDecision::Rejected { .. } => {}
+    RateLimitDecision::Suppressed { .. } => {}
+}
 ```
 
 ## Core Concepts
@@ -196,6 +196,7 @@ Inspiration:
 
 - Requires Redis >= 7.4 due to hash-field TTL commands used by the Lua scripts.
 - See `docs/redis.md` for key layout, semantics, and operational notes.
+- Default Redis URL example: `redis://127.0.0.1:6379/`
 
 ### Feature Flags
 
