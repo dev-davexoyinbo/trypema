@@ -8,36 +8,43 @@ The name is inspired by the Koine Greek word "τρυπήματος" (trypematos,
 
 ## Overview
 
-Trypema provides rate limiting primitives designed for multi-threaded, in-process use with low overhead and predictable latency characteristics.
+Trypema provides rate limiting primitives for both in-process use and Redis-backed (shared/distributed) enforcement, with a focus on predictable behavior and low overhead.
 
 What you get today:
 
 - A `RateLimiter` facade that exposes a `local` provider.
+- A Redis-backed provider (`redis`) for shared/distributed rate limiting (experimental).
 - A deterministic sliding-window strategy (`absolute`) and a suppression-capable strategy (`suppressed`).
 
 What this crate is not (currently):
 
-- A distributed/shared rate limiter (Redis, memcached, etc.).
+- A drop-in, strongly-consistent admission controller under high concurrency.
 - A strict/linearizable admission controller under high concurrency.
 
 ## Status
 
 - `local` provider: implemented
-- additional providers: planned/experimental
+- `redis` provider: experimental (absolute implemented; suppressed placeholder)
 
 ## Quick Start
 
 ```rust,no_run
 use trypema::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RateLimiter, RateLimiterOptions, RedisRateLimiterOptions, WindowSizeSeconds,
+    RateLimiter, RateLimiterOptions, WindowSizeSeconds,
 };
 
 let rt = tokio::runtime::Runtime::new().unwrap();
 
 rt.block_on(async {
-    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-    let connection_manager = client.get_connection_manager().await.unwrap();
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    use trypema::{RedisKey, RedisRateLimiterOptions};
+
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    let connection_manager = {
+        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        client.get_connection_manager().await.unwrap()
+    };
 
     let rl = RateLimiter::new(RateLimiterOptions {
         local: LocalRateLimiterOptions {
@@ -45,6 +52,7 @@ rt.block_on(async {
             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
         },
+        #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
         redis: RedisRateLimiterOptions {
             connection_manager,
             prefix: None,
@@ -53,11 +61,11 @@ rt.block_on(async {
         },
     });
 
-let key = "user:123";
-let rate_limit = RateLimit::try_from(5.0).unwrap();
+    let key = "user:123";
+    let rate_limit = RateLimit::try_from(5.0).unwrap();
 
-// check + record work (count is usually 1)
-match rl.local().absolute().inc(key, &rate_limit, 1) {
+    // Local: check + record work (count is usually 1)
+    match rl.local().absolute().inc(key, &rate_limit, 1) {
     RateLimitDecision::Allowed => {
         // proceed
     }
@@ -77,7 +85,20 @@ match rl.local().absolute().inc(key, &rate_limit, 1) {
             // suppressed / retry later
         }
     }
-}
+    }
+
+    // Redis: check + record work
+    // Note: Redis keys are validated and must not contain ':'
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    {
+        let redis_key = RedisKey::try_from("user_123".to_string()).unwrap();
+        let _ = rl
+            .redis()
+            .absolute()
+            .inc(&redis_key, &rate_limit, 1)
+            .await
+            .unwrap();
+    }
 });
 ```
 
@@ -166,7 +187,31 @@ Inspiration:
 - `src/rate_limiter.rs`: `RateLimiter` facade and options
 - `src/local/absolute_local_rate_limiter.rs`: absolute local implementation
 - `src/local/suppressed_local_rate_limiter.rs`: suppression-capable local implementation
+- `src/redis/absolute_redis_rate_limiter.rs`: absolute Redis implementation (Lua)
+- `src/redis/redis_rate_limiter_provider.rs`: Redis provider facade and options
 - `src/common.rs`: shared types (`RateLimitDecision`, newtypes, internal series)
+
+## Redis Provider (Experimental)
+
+- Requires Redis >= 7.4 due to hash-field TTL commands used by the Lua scripts.
+- See `docs/redis.md` for key layout, semantics, and operational notes.
+
+### Feature Flags
+
+- Default features enable Redis support via `redis-tokio`.
+- Redis support is gated behind one of:
+  - `redis-tokio` (Tokio runtime)
+  - `redis-smol` (Smol runtime)
+- Disable Redis support entirely with `--no-default-features`.
+
+## Testing
+
+- Local-only tests: `cargo test`
+- Redis integration tests: `make test-redis`
+  - Override port: `REDIS_PORT=16379 make test-redis`
+  - Or point at your own Redis: `REDIS_URL=redis://127.0.0.1:6379 cargo test`
+
+More details: `docs/testing.md`
 
 ## Roadmap
 

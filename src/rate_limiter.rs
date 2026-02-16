@@ -24,6 +24,7 @@ pub struct RateLimiterOptions {
 /// This type wires together one or more providers (currently `local`).
 pub struct RateLimiter {
     local: LocalRateLimiterProvider,
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     redis: RedisRateLimiterProvider,
 }
 
@@ -32,6 +33,7 @@ impl RateLimiter {
     pub fn new(options: RateLimiterOptions) -> Self {
         Self {
             local: LocalRateLimiterProvider::new(options.local),
+            #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
             redis: RedisRateLimiterProvider::new(options.redis),
         }
     }

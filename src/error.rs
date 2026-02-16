@@ -2,6 +2,7 @@
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum TrypemaError {
     /// Redis error.
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     #[error("redis error: {0}")]
     RedisError(#[from] redis::RedisError),
     /// Invalid rate limit.
