@@ -17,6 +17,9 @@ keywords = [
 authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
 documentation = "https://docs.rs/trypema"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 dashmap = "6.1.0"
 rand = "0.10.0"

@@ -28,23 +28,19 @@ What this crate is not (currently):
 
 ## Quick Start
 
-```rust,no_run
+Quick Start assumes default features (Redis enabled) and a Redis instance reachable at `redis://127.0.0.1:6379/`.
+
+```rust,ignore
 use trypema::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RateLimiter, RateLimiterOptions, WindowSizeSeconds,
+    RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
 };
 
 let rt = tokio::runtime::Runtime::new().unwrap();
 
 rt.block_on(async {
-    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    use trypema::{RedisKey, RedisRateLimiterOptions};
-
-    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    let connection_manager = {
-        let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
-        client.get_connection_manager().await.unwrap()
-    };
+    let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
+    let connection_manager = client.get_connection_manager().await.unwrap();
 
     let rl = RateLimiter::new(RateLimiterOptions {
         local: LocalRateLimiterOptions {
@@ -89,17 +85,22 @@ rt.block_on(async {
 
     // Redis: check + record work
     // Note: Redis keys are validated and must not contain ':'
-    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    {
-        let redis_key = RedisKey::try_from("user_123".to_string()).unwrap();
-        let _ = rl
-            .redis()
-            .absolute()
-            .inc(&redis_key, &rate_limit, 1)
-            .await
-            .unwrap();
-    }
+    let redis_key = RedisKey::try_from("user_123".to_string()).unwrap();
+    let _ = rl
+        .redis()
+        .absolute()
+        .inc(&redis_key, &rate_limit, 1)
+        .await
+        .unwrap();
 });
+```
+
+Local-only usage:
+
+- disable default features in your `Cargo.toml`
+
+```toml
+trypema = { version = "*", default-features = false }
 ```
 
 ## Core Concepts
