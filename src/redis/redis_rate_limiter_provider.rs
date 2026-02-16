@@ -1,3 +1,5 @@
+use redis::aio::ConnectionManager;
+
 use crate::{
     AbsoluteRedisRateLimiter, RateGroupSizeMs, RedisKey, SuppressedRedisRateLimiter,
     WindowSizeSeconds,
