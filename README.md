@@ -42,7 +42,7 @@ rt.block_on(async {
 
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     let connection_manager = {
-        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+        let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
         client.get_connection_manager().await.unwrap()
     };
 
