@@ -1,3 +1,4 @@
 mod test_absolute_local_rate_limiter;
+mod test_absolute_redis_rate_limiter;
 mod test_common_validation;
 mod test_suppressed_local_rate_limiter;
