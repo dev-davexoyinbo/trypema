@@ -28,6 +28,10 @@ fn active_keys_key(prefix: &RedisKey, key: &RedisKey) -> String {
     format!("{}:{}:absolute:a", **prefix, **key)
 }
 
+fn window_limit_key(prefix: &RedisKey, key: &RedisKey) -> String {
+    format!("{}:{}:absolute:w", **prefix, **key)
+}
+
 async fn build_limiter(
     url: &str,
     window_size_seconds: u64,
@@ -252,6 +256,151 @@ fn is_allowed_unknown_key_is_allowed() {
         let (limiter, _cm, _prefix) = build_limiter(&url, 1, 50).await;
 
         let k = key("missing");
+        let decision = limiter.is_allowed(&k).await.unwrap();
+        assert!(matches!(decision, RateLimitDecision::Allowed));
+    });
+}
+
+#[test]
+fn is_allowed_unknown_key_does_not_create_redis_state() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping redis integration tests (REDIS_URL not set)");
+        return;
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+
+        let k = key("missing");
+        let _ = limiter.is_allowed(&k).await;
+
+        let mut conn = cm.clone();
+        let h_exists: bool = conn.exists(hash_key(&prefix, &k)).await.unwrap();
+        let a_exists: bool = conn.exists(active_keys_key(&prefix, &k)).await.unwrap();
+        let w_exists: bool = conn.exists(window_limit_key(&prefix, &k)).await.unwrap();
+
+        assert!(!h_exists);
+        assert!(!a_exists);
+        assert!(!w_exists);
+    });
+}
+
+#[test]
+fn is_allowed_reflects_rejected_after_hitting_limit_then_allows_after_expiry() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping redis integration tests (REDIS_URL not set)");
+        return;
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, _cm, _prefix) = build_limiter(&url, 1, 1000).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(2f64).unwrap();
+
+        limiter.inc(&k, &rate_limit, 2).await.unwrap();
+        let d1 = limiter.is_allowed(&k).await.unwrap();
+        assert!(matches!(d1, RateLimitDecision::Rejected { .. }));
+
+        thread::sleep(Duration::from_millis(1100));
+        let d2 = limiter.is_allowed(&k).await.unwrap();
+        assert!(matches!(d2, RateLimitDecision::Allowed));
+    });
+}
+
+#[test]
+fn is_allowed_does_not_mutate_bucket_counts() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping redis integration tests (REDIS_URL not set)");
+        return;
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+
+        // Create two buckets.
+        limiter.inc(&k, &rate_limit, 1).await.unwrap();
+        thread::sleep(Duration::from_millis(250));
+        limiter.inc(&k, &rate_limit, 1).await.unwrap();
+
+        let mut conn = cm.clone();
+        let hlen_before: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
+        let zcard_before: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
+
+        let _ = limiter.is_allowed(&k).await;
+
+        let hlen_after: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
+        let zcard_after: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
+
+        assert_eq!(hlen_before, hlen_after);
+        assert_eq!(zcard_before, zcard_after);
+    });
+}
+
+#[test]
+fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping redis integration tests (REDIS_URL not set)");
+        return;
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, _cm, _prefix) = build_limiter(&url, 6, 200).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        limiter.inc(&k, &rate_limit, 2).await.unwrap();
+        thread::sleep(Duration::from_millis(250));
+        limiter.inc(&k, &rate_limit, 4).await.unwrap();
+
+        let decision = limiter.is_allowed(&k).await.unwrap();
+        let RateLimitDecision::Rejected {
+            window_size_seconds,
+            retry_after_ms,
+            remaining_after_waiting,
+        } = decision
+        else {
+            panic!("expected rejected decision");
+        };
+
+        assert_eq!(
+            window_size_seconds, 6,
+            "window size should be 6 instead got {window_size_seconds}"
+        );
+        assert!(
+            retry_after_ms <= 6000,
+            "retry after should be less than 6000, instead got {retry_after_ms}"
+        );
+        assert_eq!(
+            remaining_after_waiting, 2,
+            "remaining after waiting should be 2 instead got {remaining_after_waiting}"
+        );
+    });
+}
+
+#[test]
+fn is_allowed_returns_allowed_when_below_limit() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping redis integration tests (REDIS_URL not set)");
+        return;
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, _cm, _prefix) = build_limiter(&url, 6, 200).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        limiter.inc(&k, &rate_limit, 5).await.unwrap();
         let decision = limiter.is_allowed(&k).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
     });

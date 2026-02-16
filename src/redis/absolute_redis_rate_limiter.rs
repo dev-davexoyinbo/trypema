@@ -170,7 +170,7 @@ impl AbsoluteRedisRateLimiter {
                 end
 
                 local oldest_hash_field = oldest_hash_fields[1]
-                local oldest_hash_field_ttl = redis.call("PTTL", oldest_hash_field) or 0
+                local oldest_hash_field_ttl = redis.call("HPTTL", hash_key, "FIELDS", 1, oldest_hash_field)[1]
                 local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_field)) or 0
 
                 return {"rejected", oldest_hash_field_ttl, oldest_count}

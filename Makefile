@@ -1,4 +1,4 @@
-.PHONY: test-redis redis-up redis-down
+.PHONY: test-redis test redis-up redis-down
 
 REDIS_PORT ?= 16379
 REDIS_URL ?= redis://127.0.0.1:$(REDIS_PORT)
@@ -14,8 +14,10 @@ redis-up:
 redis-down:
 	@docker compose down -v --remove-orphans
 
-test:
+test-redis:
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo test
+
+test: test-redis
