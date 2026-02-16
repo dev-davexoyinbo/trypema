@@ -67,7 +67,7 @@ impl AbsoluteRedisRateLimiter {
                 end
 
                 local oldest_hash_field = oldest_hash_fields[1]
-                local oldest_hash_field_ttl = redis.call("PTTL", oldest_hash_field) or 0
+                local oldest_hash_field_ttl = redis.call("HPTTL", hash_key, "FIELDS", 1, oldest_hash_field)[1]
                 local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_field)) or 0
 
                 return {"rejected", oldest_hash_field_ttl, oldest_count}
@@ -86,7 +86,7 @@ impl AbsoluteRedisRateLimiter {
             local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
 
             if new_count == count then
-               redis.call("HEXPIRE", hash_key, window_size_seconds, "FIELDS", 1, hash_field)
+               redis.call("HPEXPIRE", hash_key, window_size_seconds * 1000, "FIELDS", 1, hash_field)
                redis.call("ZADD", active_keys, timestamp_ms, hash_field)
                redis.call("SET", window_limit_key, window_limit)
             end
