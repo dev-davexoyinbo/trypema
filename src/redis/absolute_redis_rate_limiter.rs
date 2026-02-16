@@ -122,8 +122,76 @@ impl AbsoluteRedisRateLimiter {
     /// with a best-effort `retry_after_ms`.
     ///
     /// This method performs lazy eviction of expired buckets for the key.
-    pub fn is_allowed(&self, _key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
-        todo!("AbsoluteRedisRateLimiter::is_allowed");
+    pub async fn is_allowed(&self, _key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
+        let mut connection = self.redis_client.get_connection()?;
+
+        // TODO: cleanup the active keys set
+
+        // At least a version of Redis that is 7.4.0 or higher is needed
+        let mut script = redis::Script::new(
+            r#"
+            local time_array = redis.call("TIME")
+            local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+
+
+            local hash_key = KEYS[1]
+            local active_keys = KEYS[2]
+
+            local window_size_seconds = tonumber(ARGV[1])
+            local window_limit = tonumber(ARGV[2])
+            local rate_group_size_ms = tonumber(ARGV[3])
+            local count = tonumber(ARGV[4])
+
+            redis.call("ZREMRANGEBYSCORE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000)
+
+            local values = redis.call("HVALS", hash_key)
+            local sum = 0
+            for i = 1, #values do
+                local value = values[i]
+                if value then
+                    sum = sum + tonumber(value)
+                end
+            end
+
+            if sum >= window_limit then
+                local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0)
+
+                if #oldest_hash_fields == 0 then
+                    return {"rejected", 0, 0}
+                end
+
+                local oldest_hash_field = oldest_hash_fields[1]
+                local oldest_hash_field_ttl = redis.call("PTTL", oldest_hash_field) or 0
+                local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_field)) or 0
+
+                return {"rejected", oldest_hash_field_ttl, oldest_count}
+            end
+
+            return {"allowed", 0, 0}
+        "#,
+        );
+
+        let window_limit = *self.window_size_seconds as f64 * **rate_limit;
+
+        let (result, retry_after_ms, remaining_after_waiting) = script
+            .key(self.get_hash_key(key))
+            .key(self.get_active_keys(key))
+            .arg(*self.window_size_seconds)
+            .arg(window_limit)
+            .arg(*self.rate_group_size_ms)
+            .arg(count)
+            .invoke_async(&mut connection)
+            .await?;
+
+        match result {
+            "allowed" => Ok(RateLimitDecision::Allowed),
+            "rejected" => Ok(RateLimitDecision::Rejected {
+                window_size_seconds: *self.window_size_seconds,
+                retry_after_ms,
+                remaining_after_waiting,
+            }),
+            _ => unreachable!("unexpected result from Redis script: {result}"),
+        }
     }
 
     /// Determine whether `key` is currently allowed.
