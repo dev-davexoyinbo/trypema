@@ -86,7 +86,7 @@ impl AbsoluteRedisRateLimiter {
             local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
 
             if new_count == count then
-               redis.call("HEXPIRE", hash_key, window_size_seconds, "FIELDS", hash_field)
+               redis.call("HEXPIRE", hash_key, window_size_seconds, "FIELDS", 1, hash_field)
                redis.call("ZADD", active_keys, timestamp_ms, hash_field)
                redis.call("SET", window_limit_key, window_limit)
             end
