@@ -1,3 +1,5 @@
+use redis::aio::ConnectionManager;
+
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError,
     WindowSizeSeconds,
@@ -31,7 +33,7 @@ impl AbsoluteRedisRateLimiter {
         // TODO: cleanup the active keys set
 
         // At least a version of Redis that is 7.4.0 or higher is needed
-        let mut script = redis::Script::new(
+        let script = redis::Script::new(
             r#"
             local time_array = redis.call("TIME")
             local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
@@ -130,7 +132,7 @@ impl AbsoluteRedisRateLimiter {
         // TODO: cleanup the active keys set
 
         // At least a version of Redis that is 7.4.0 or higher is needed
-        let mut script = redis::Script::new(
+        let script = redis::Script::new(
             r#"
             local time_array = redis.call("TIME")
             local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
