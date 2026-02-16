@@ -30,16 +30,24 @@ impl AbsoluteRedisRateLimiter {
     ) -> Result<RateLimitDecision, TrypemaError> {
         let mut connection = self.redis_client.get_connection()?;
 
+        // TODO: cleanup the active keys set
+
         // At least a version of Redis that is 7.4.0 or higher is needed
         let mut script = redis::Script::new(
             r#"
+            local time_array = redis.call("TIME")
+            local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+
+
             local hash_key = KEYS[1]
-            local latest_key = KEYS[2]
+            local active_keys = KEYS[2]
 
             local window_size_seconds = tonumber(ARGV[1])
             local window_limit = tonumber(ARGV[2])
             local rate_group_size_ms = tonumber(ARGV[3])
             local count = tonumber(ARGV[4])
+
+            redis.call("ZREMRANGEBYSCORE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000)
 
             local values = redis.call("HVALS", hash_key)
             local sum = 0
@@ -51,13 +59,20 @@ impl AbsoluteRedisRateLimiter {
             end
 
             if sum >= window_limit then
-                return {"rejected"}
+                local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0)
+
+                if #oldest_hash_fields == 0 then
+                    return {"rejected", 0, 0}
+                end
+
+                local oldest_hash_field = oldest_hash_fields[1]
+                local oldest_hash_field_ttl = redis.call("PTTL", oldest_hash_field) or 0
+                local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_field)) or 0
+
+                return {"rejected", oldest_hash_field_ttl, oldest_count}
             end
 
-            local time_array = redis.call("TIME")
-            local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-
-            local latest_hash_field = redis.call("GET", latest_key)
+            local latest_hash_field = redis.call("ZRANGE", active_keys, 0, 0, "REV")[1]
             if latest_hash_field then
                 local latest_hash_field_ttl = redis.call("PTTL", latest_hash_field)
                 if latest_hash_field_ttl > 0 and window_size_seconds * 1000 - latest_hash_field_ttl < rate_group_size_ms then
@@ -70,19 +85,18 @@ impl AbsoluteRedisRateLimiter {
 
             if new_count == count then
                redis.call("HEXPIRE", hash_key, window_size_seconds, "FIELDS", hash_field)
-               redis.call("SET", latest_key, hash_field)
-               redis.call("EXPIRE", latest_key, window_size_seconds)
+               redis.call("ZADD", active_keys, timestamp_ms, hash_field)
             end
 
-            return {"allowed"}
+            return {"allowed", 0, 0}
         "#,
         );
 
         let window_limit = *self.window_size_seconds as f64 * **rate_limit;
 
-        let [result] = script
+        let (result, retry_after_ms, remaining_after_waiting) = script
             .key(self.get_hash_key(key))
-            .key(self.get_latest_key(key))
+            .key(self.get_active_keys(key))
             .arg(*self.window_size_seconds)
             .arg(window_limit)
             .arg(*self.rate_group_size_ms)
@@ -94,8 +108,8 @@ impl AbsoluteRedisRateLimiter {
             "allowed" => Ok(RateLimitDecision::Allowed),
             "rejected" => Ok(RateLimitDecision::Rejected {
                 window_size_seconds: *self.window_size_seconds,
-                retry_after_ms: 0,
-                remaining_after_waiting: 0,
+                retry_after_ms,
+                remaining_after_waiting,
             }),
             _ => unreachable!("unexpected result from Redis script: {result}"),
         }
@@ -117,7 +131,7 @@ impl AbsoluteRedisRateLimiter {
         format!("{}:{}:absolute:h", *self.prefix, **key)
     } // end method get_hash_key
 
-    fn get_latest_key(&self, key: &RedisKey) -> String {
-        format!("{}:{}:absolute:l", *self.prefix, **key)
-    } // end method get_latest_key
+    fn get_active_keys(&self, key: &RedisKey) -> String {
+        format!("{}:{}:absolute:a", *self.prefix, **key)
+    } // end method get_active_keys
 }
