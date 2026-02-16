@@ -49,4 +49,4 @@ jobs:
       - name: Run tests
         env:
           REDIS_URL: redis://127.0.0.1:6379
-        run: cargo test
+        run: cargo test --features redis-tokio
