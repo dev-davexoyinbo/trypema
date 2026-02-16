@@ -76,6 +76,7 @@ impl AbsoluteRedisRateLimiter {
             local latest_hash_field = redis.call("ZRANGE", active_keys, 0, 0, "REV")[1]
             if latest_hash_field then
                 local latest_hash_field_ttl = redis.call("PTTL", latest_hash_field)
+
                 if latest_hash_field_ttl > 0 and window_size_seconds * 1000 - latest_hash_field_ttl < rate_group_size_ms then
                     timestamp_ms = tonumber(latest_hash_field)
                 end

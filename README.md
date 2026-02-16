@@ -27,19 +27,31 @@ What this crate is not (currently):
 
 ## Quick Start
 
-```rust
+```rust,no_run
 use trypema::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RateLimiter, RateLimiterOptions, WindowSizeSeconds,
+    RateLimiter, RateLimiterOptions, RedisRateLimiterOptions, WindowSizeSeconds,
 };
 
-let rl = RateLimiter::new(RateLimiterOptions {
-    local: LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-        rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-        hard_limit_factor: HardLimitFactor::default(),
-    },
-});
+let rt = tokio::runtime::Runtime::new().unwrap();
+
+rt.block_on(async {
+    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+    let connection_manager = client.get_connection_manager().await.unwrap();
+
+    let rl = RateLimiter::new(RateLimiterOptions {
+        local: LocalRateLimiterOptions {
+            window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+            rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+            hard_limit_factor: HardLimitFactor::default(),
+        },
+        redis: RedisRateLimiterOptions {
+            connection_manager,
+            prefix: None,
+            window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+            rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+        },
+    });
 
 let key = "user:123";
 let rate_limit = RateLimit::try_from(5.0).unwrap();
@@ -66,6 +78,7 @@ match rl.local().absolute().inc(key, &rate_limit, 1) {
         }
     }
 }
+});
 ```
 
 ## Core Concepts
