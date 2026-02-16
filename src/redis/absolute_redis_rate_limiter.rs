@@ -5,7 +5,7 @@ use crate::{
 
 /// A rate limiter backed by Redis.
 pub struct AbsoluteRedisRateLimiter {
-    redis_client: redis::Client,
+    connection_manager: ConnectionManager,
     prefix: RedisKey,
     window_size_seconds: WindowSizeSeconds,
     rate_group_size_ms: RateGroupSizeMs,
@@ -14,7 +14,7 @@ pub struct AbsoluteRedisRateLimiter {
 impl AbsoluteRedisRateLimiter {
     pub(crate) fn new(options: RedisRateLimiterOptions) -> Self {
         Self {
-            redis_client: options.redis_client,
+            connection_manager: options.connection_manager,
             prefix: options.prefix.unwrap_or_else(RedisKey::default_prefix),
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
@@ -28,8 +28,6 @@ impl AbsoluteRedisRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let mut connection = self.redis_client.get_connection()?;
-
         // TODO: cleanup the active keys set
 
         // At least a version of Redis that is 7.4.0 or higher is needed
@@ -41,6 +39,7 @@ impl AbsoluteRedisRateLimiter {
 
             local hash_key = KEYS[1]
             local active_keys = KEYS[2]
+            local window_limit_key = KEYS[3]
 
             local window_size_seconds = tonumber(ARGV[1])
             local window_limit = tonumber(ARGV[2])
@@ -86,25 +85,30 @@ impl AbsoluteRedisRateLimiter {
             if new_count == count then
                redis.call("HEXPIRE", hash_key, window_size_seconds, "FIELDS", hash_field)
                redis.call("ZADD", active_keys, timestamp_ms, hash_field)
+               redis.call("SET", window_limit_key, window_limit)
             end
+
+            redis.call("EXPIRE", window_limit_key, window_size_seconds)
 
             return {"allowed", 0, 0}
         "#,
         );
 
         let window_limit = *self.window_size_seconds as f64 * **rate_limit;
+        let mut connection_manager = self.connection_manager.clone();
 
-        let (result, retry_after_ms, remaining_after_waiting) = script
+        let (result, retry_after_ms, remaining_after_waiting): (String, u64, u64) = script
             .key(self.get_hash_key(key))
             .key(self.get_active_keys(key))
+            .key(self.get_window_limit_key(key))
             .arg(*self.window_size_seconds)
             .arg(window_limit)
             .arg(*self.rate_group_size_ms)
             .arg(count)
-            .invoke_async(&mut connection)
+            .invoke_async(&mut connection_manager)
             .await?;
 
-        match result {
+        match result.as_str() {
             "allowed" => Ok(RateLimitDecision::Allowed),
             "rejected" => Ok(RateLimitDecision::Rejected {
                 window_size_seconds: *self.window_size_seconds,
@@ -122,9 +126,7 @@ impl AbsoluteRedisRateLimiter {
     /// with a best-effort `retry_after_ms`.
     ///
     /// This method performs lazy eviction of expired buckets for the key.
-    pub async fn is_allowed(&self, _key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
-        let mut connection = self.redis_client.get_connection()?;
-
+    pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
         // TODO: cleanup the active keys set
 
         // At least a version of Redis that is 7.4.0 or higher is needed
@@ -136,13 +138,17 @@ impl AbsoluteRedisRateLimiter {
 
             local hash_key = KEYS[1]
             local active_keys = KEYS[2]
+            local window_limit_key = KEYS[3]
 
             local window_size_seconds = tonumber(ARGV[1])
-            local window_limit = tonumber(ARGV[2])
-            local rate_group_size_ms = tonumber(ARGV[3])
-            local count = tonumber(ARGV[4])
+            local rate_group_size_ms = tonumber(ARGV[2])
 
             redis.call("ZREMRANGEBYSCORE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000)
+
+            local window_limit = tonumber(redis.call("GET", window_limit_key))
+            if window_limit == nil then
+                return {"accepted", 0, 0}
+            end
 
             local values = redis.call("HVALS", hash_key)
             local sum = 0
@@ -171,19 +177,18 @@ impl AbsoluteRedisRateLimiter {
         "#,
         );
 
-        let window_limit = *self.window_size_seconds as f64 * **rate_limit;
+        let mut connection_manager = self.connection_manager.clone();
 
-        let (result, retry_after_ms, remaining_after_waiting) = script
+        let (result, retry_after_ms, remaining_after_waiting): (String, u64, u64) = script
             .key(self.get_hash_key(key))
             .key(self.get_active_keys(key))
+            .key(self.get_window_limit_key(key))
             .arg(*self.window_size_seconds)
-            .arg(window_limit)
             .arg(*self.rate_group_size_ms)
-            .arg(count)
-            .invoke_async(&mut connection)
+            .invoke_async(&mut connection_manager)
             .await?;
 
-        match result {
+        match result.as_str() {
             "allowed" => Ok(RateLimitDecision::Allowed),
             "rejected" => Ok(RateLimitDecision::Rejected {
                 window_size_seconds: *self.window_size_seconds,
@@ -198,6 +203,10 @@ impl AbsoluteRedisRateLimiter {
     fn get_hash_key(&self, key: &RedisKey) -> String {
         format!("{}:{}:absolute:h", *self.prefix, **key)
     } // end method get_hash_key
+
+    fn get_window_limit_key(&self, key: &RedisKey) -> String {
+        format!("{}:{}:absolute:w", *self.prefix, **key)
+    } // end method get_window_limit_key
 
     fn get_active_keys(&self, key: &RedisKey) -> String {
         format!("{}:{}:absolute:a", *self.prefix, **key)

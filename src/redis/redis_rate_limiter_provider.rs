@@ -7,7 +7,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct RedisRateLimiterOptions {
     /// The Redis client to use.
-    pub redis_client: redis::Client,
+    pub connection_manager: ConnectionManager,
     /// The prefix to use for keys.
     pub prefix: Option<RedisKey>,
     /// Sliding window size in seconds.
