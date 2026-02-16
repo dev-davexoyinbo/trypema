@@ -4,10 +4,10 @@
 //! [`RateLimiter::local`]. Additional providers (e.g. shared/distributed state) can be
 //! added behind this facade.
 
-use crate::{
-    LocalRateLimiterOptions, LocalRateLimiterProvider, RedisRateLimiterOptions,
-    RedisRateLimiterProvider,
-};
+use crate::{LocalRateLimiterOptions, LocalRateLimiterProvider};
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use crate::{RedisRateLimiterOptions, RedisRateLimiterProvider};
 
 /// Top-level configuration for [`RateLimiter`].
 #[derive(Clone, Debug)]
@@ -15,6 +15,7 @@ pub struct RateLimiterOptions {
     /// Options for the local provider.
     pub local: LocalRateLimiterOptions,
     /// Options for the Redis provider.
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     pub redis: RedisRateLimiterOptions,
 }
 
@@ -36,6 +37,7 @@ impl RateLimiter {
     }
 
     /// Access the Redis provider.
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     pub fn redis(&self) -> &RedisRateLimiterProvider {
         &self.redis
     }

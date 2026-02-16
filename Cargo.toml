@@ -20,9 +20,27 @@ documentation = "https://docs.rs/trypema"
 [dependencies]
 dashmap = "6.1.0"
 rand = "0.10.0"
-redis = { version = "1.0.3", features = ["aio", "tokio-comp", "connection-manager"] }
+redis = { version = "1.0.3", optional = true, default-features = false, features = [
+  "script",
+] }
 thiserror = "2.0.18"
 tracing = "0.1.44"
+
+[features]
+default = ["redis-tokio"]
+
+redis-tokio = [
+  "redis",
+  "redis/tokio-comp",
+  "redis/aio",
+  "redis/connection-manager",
+]
+redis-smol = [
+  "redis",
+  "redis/smol-comp",
+  "redis/aio",
+  "redis/connection-manager",
+]
 
 [dev-dependencies]
 tokio = { version = "1.49.0", features = ["rt-multi-thread"] }

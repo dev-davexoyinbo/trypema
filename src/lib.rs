@@ -8,7 +8,9 @@ pub use rate_limiter::*;
 mod local;
 pub use local::*;
 
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 mod redis;
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 pub use redis::*;
 
 mod error;

@@ -17,6 +17,7 @@ pub enum TrypemaError {
     #[error("invalid hard limit factor: {0}")]
     InvalidHardLimitFactor(String),
     /// Invalid Redis key.
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     #[error("invalid Redis key: {0}")]
     InvalidRedisKey(String),
 }
