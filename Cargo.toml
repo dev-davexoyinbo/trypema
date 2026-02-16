@@ -1,6 +1,6 @@
 [package]
 name = "trypema"
-version = "0.1.0-dev.5"
+version = "0.1.0-dev.6"
 edition = "2024"
 readme = "README.md"
 description = "High-performance rate limiting primitives in Rust, designed for concurrency safety, low overhead, and predictable latency."
