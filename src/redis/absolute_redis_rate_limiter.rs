@@ -150,7 +150,7 @@ impl AbsoluteRedisRateLimiter {
 
             local window_limit = tonumber(redis.call("GET", window_limit_key))
             if window_limit == nil then
-                return {"accepted", 0, 0}
+                return {"allowed", 0, 0}
             end
 
             local values = redis.call("HVALS", hash_key)
