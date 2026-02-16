@@ -7,6 +7,7 @@
 use crate::{LocalRateLimiterOptions, LocalRateLimiterProvider};
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
 use crate::{RedisRateLimiterOptions, RedisRateLimiterProvider};
 
 /// Top-level configuration for [`RateLimiter`].
@@ -25,6 +26,7 @@ pub struct RateLimiterOptions {
 pub struct RateLimiter {
     local: LocalRateLimiterProvider,
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     redis: RedisRateLimiterProvider,
 }
 
@@ -34,12 +36,14 @@ impl RateLimiter {
         Self {
             local: LocalRateLimiterProvider::new(options.local),
             #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+            #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
             redis: RedisRateLimiterProvider::new(options.redis),
         }
     }
 
     /// Access the Redis provider.
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     pub fn redis(&self) -> &RedisRateLimiterProvider {
         &self.redis
     }

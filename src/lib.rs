@@ -9,8 +9,10 @@ mod local;
 pub use local::*;
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
 mod redis;
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
 pub use redis::*;
 
 mod error;

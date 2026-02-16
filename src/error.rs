@@ -3,6 +3,7 @@
 pub enum TrypemaError {
     /// Redis error.
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     #[error("redis error: {0}")]
     RedisError(#[from] redis::RedisError),
     /// Invalid rate limit.
@@ -19,6 +20,7 @@ pub enum TrypemaError {
     InvalidHardLimitFactor(String),
     /// Invalid Redis key.
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     #[error("invalid Redis key: {0}")]
     InvalidRedisKey(String),
 }
