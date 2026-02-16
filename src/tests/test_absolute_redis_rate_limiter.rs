@@ -7,8 +7,9 @@ use crate::{
     RedisRateLimiterOptions, WindowSizeSeconds,
 };
 
-fn redis_url() -> Option<String> {
-    env::var("REDIS_URL").ok()
+fn redis_url() -> String {
+    env::var("REDIS_URL")
+        .expect("REDIS_URL must be set to run redis integration tests (try `make test-redis`)")
 }
 
 fn unique_prefix() -> RedisKey {
@@ -57,10 +58,7 @@ async fn build_limiter(
 
 #[test]
 fn rejects_at_exact_window_limit() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -87,10 +85,7 @@ fn rejects_at_exact_window_limit() {
 
 #[test]
 fn per_key_state_is_independent() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -113,10 +108,7 @@ fn per_key_state_is_independent() {
 
 #[test]
 fn rate_grouping_merges_within_group() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -141,11 +133,7 @@ fn rate_grouping_merges_within_group() {
 
 #[test]
 fn rate_grouping_separates_beyond_group() {
-    eprintln!(">>>>>> skipping redis integration tests (REDIS_URL not set)");
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -169,10 +157,7 @@ fn rate_grouping_separates_beyond_group() {
 
 #[test]
 fn unblocks_after_window_expires() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -202,10 +187,7 @@ fn unblocks_after_window_expires() {
 
 #[test]
 fn rejected_includes_retry_after_and_remaining_after_waiting() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -246,10 +228,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
 
 #[test]
 fn is_allowed_unknown_key_is_allowed() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -263,10 +242,7 @@ fn is_allowed_unknown_key_is_allowed() {
 
 #[test]
 fn is_allowed_unknown_key_does_not_create_redis_state() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -288,10 +264,7 @@ fn is_allowed_unknown_key_does_not_create_redis_state() {
 
 #[test]
 fn is_allowed_reflects_rejected_after_hitting_limit_then_allows_after_expiry() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -312,10 +285,7 @@ fn is_allowed_reflects_rejected_after_hitting_limit_then_allows_after_expiry() {
 
 #[test]
 fn is_allowed_does_not_mutate_bucket_counts() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -345,10 +315,7 @@ fn is_allowed_does_not_mutate_bucket_counts() {
 
 #[test]
 fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -388,10 +355,7 @@ fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
 
 #[test]
 fn is_allowed_returns_allowed_when_below_limit() {
-    let Some(url) = redis_url() else {
-        eprintln!("skipping redis integration tests (REDIS_URL not set)");
-        return;
-    };
+    let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
