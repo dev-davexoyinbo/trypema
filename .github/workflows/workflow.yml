@@ -1,0 +1,52 @@
+name: Redis Rate Limiter Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - staging
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7.4.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s
+          --health-timeout 1s
+          --health-retries 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Wait for Redis
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if docker exec "${{ job.services.redis.id }}" redis-cli ping >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+          echo "redis did not become ready in time" >&2
+          docker logs "${{ job.services.redis.id }}" || true
+          exit 1
+
+      - name: Run tests
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+        run: cargo test
