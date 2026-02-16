@@ -1,4 +1,7 @@
-use crate::{AbsoluteRedisRateLimiter, RedisKey, SuppressedRedisRateLimiter};
+use crate::{
+    AbsoluteRedisRateLimiter, RateGroupSizeMs, RedisKey, SuppressedRedisRateLimiter,
+    WindowSizeSeconds,
+};
 
 /// Configuration for Redis rate limiter implementations.
 #[derive(Clone, Debug)]
@@ -7,6 +10,10 @@ pub struct RedisRateLimiterOptions {
     pub redis_client: redis::Client,
     /// The prefix to use for keys.
     pub prefix: Option<RedisKey>,
+    /// Sliding window size in seconds.
+    pub window_size_seconds: WindowSizeSeconds,
+    /// Coalescing interval (in milliseconds) for grouping increments close in time.
+    pub rate_group_size_ms: RateGroupSizeMs,
 }
 
 /// A rate limiter backed by Redis.

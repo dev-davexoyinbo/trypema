@@ -1,9 +1,14 @@
-use crate::{RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError};
+use crate::{
+    RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError,
+    WindowSizeSeconds,
+};
 
 /// A rate limiter backed by Redis.
 pub struct AbsoluteRedisRateLimiter {
     redis_client: redis::Client,
     prefix: RedisKey,
+    window_size_seconds: WindowSizeSeconds,
+    rate_group_size_ms: RateGroupSizeMs,
 }
 
 impl AbsoluteRedisRateLimiter {
@@ -11,27 +16,22 @@ impl AbsoluteRedisRateLimiter {
         Self {
             redis_client: options.redis_client,
             prefix: options.prefix.unwrap_or_else(RedisKey::default_prefix),
+            window_size_seconds: options.window_size_seconds,
+            rate_group_size_ms: options.rate_group_size_ms,
         }
     }
 
     /// Check admission and, if allowed, increment the observed count for `key`.
-    pub fn inc(
+    pub async fn inc(
         &self,
         key: &RedisKey,
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        // let is_allowed = self.is_allowed(key)?;
-        //
-        // if !matches!(is_allowed, RateLimitDecision::Allowed) {
-        //     return Ok(is_allowed);
-        // }
-
-        let connection = self.redis_client.get_connection()?;
+        let mut connection = self.redis_client.get_connection()?;
 
         // At least a version of Redis that is 7.4.0 or higher is needed
-
-        let script = redis::Script::new(
+        let mut script = redis::Script::new(
             r#"
             local hash_key = KEYS[1]
             local latest_key = KEYS[2]
@@ -51,7 +51,7 @@ impl AbsoluteRedisRateLimiter {
             end
 
             if sum >= window_limit then
-                return "rejected"
+                return {"rejected"}
             end
 
             local time_array = redis.call("TIME")
@@ -74,11 +74,31 @@ impl AbsoluteRedisRateLimiter {
                redis.call("EXPIRE", latest_key, window_size_seconds)
             end
 
-            return "allowed"
+            return {"allowed"}
         "#,
         );
 
-        todo!("AbsoluteRedisRateLimiter::inc");
+        let window_limit = *self.window_size_seconds as f64 * **rate_limit;
+
+        let [result] = script
+            .key(self.get_hash_key(key))
+            .key(self.get_latest_key(key))
+            .arg(*self.window_size_seconds)
+            .arg(window_limit)
+            .arg(*self.rate_group_size_ms)
+            .arg(count)
+            .invoke_async(&mut connection)
+            .await?;
+
+        match result {
+            "allowed" => Ok(RateLimitDecision::Allowed),
+            "rejected" => Ok(RateLimitDecision::Rejected {
+                window_size_seconds: *self.window_size_seconds,
+                retry_after_ms: 0,
+                remaining_after_waiting: 0,
+            }),
+            _ => unreachable!("unexpected result from Redis script: {result}"),
+        }
     } // end method inc
 
     /// Determine whether `key` is currently allowed.
