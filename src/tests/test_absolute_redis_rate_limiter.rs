@@ -33,6 +33,21 @@ fn window_limit_key(prefix: &RedisKey, key: &RedisKey) -> String {
     format!("{}:{}:absolute:w", **prefix, **key)
 }
 
+fn total_count_key(prefix: &RedisKey, key: &RedisKey) -> String {
+    format!("{}:{}:absolute:t", **prefix, **key)
+}
+
+async fn sum_hash_counts(
+    conn: &mut redis::aio::ConnectionManager,
+    hash_key: String,
+) -> u64 {
+    let values: Vec<String> = conn.hvals(hash_key).await.unwrap();
+    values
+        .into_iter()
+        .map(|v| v.parse::<u64>().unwrap())
+        .sum::<u64>()
+}
+
 async fn build_limiter(
     url: &str,
     window_size_seconds: u64,
@@ -264,10 +279,142 @@ fn is_allowed_unknown_key_does_not_create_redis_state() {
         let h_exists: bool = conn.exists(hash_key(&prefix, &k)).await.unwrap();
         let a_exists: bool = conn.exists(active_keys_key(&prefix, &k)).await.unwrap();
         let w_exists: bool = conn.exists(window_limit_key(&prefix, &k)).await.unwrap();
+        let t_exists: bool = conn.exists(total_count_key(&prefix, &k)).await.unwrap();
 
         assert!(!h_exists);
         assert!(!a_exists);
         assert!(!w_exists);
+        assert!(!t_exists);
+    });
+}
+
+#[test]
+fn inc_rejects_when_count_would_push_over_limit() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 1, 1000).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(2f64).unwrap();
+
+        assert!(matches!(
+            limiter.inc(&k, &rate_limit, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+
+        // Capacity is 2 (1s * 2/s). current_total=1; count=2 would push to 3, so reject.
+        let decision = limiter.inc(&k, &rate_limit, 2).await.unwrap();
+        assert!(matches!(decision, RateLimitDecision::Rejected { .. }));
+
+        // Rejected increments must not mutate state.
+        let mut conn = cm.clone();
+        let total: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
+        assert_eq!(total, Some(1));
+
+        let sum = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
+        assert_eq!(sum, 1);
+    });
+}
+
+#[test]
+fn is_allowed_evicts_old_buckets_and_updates_total_count() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 2, 200).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+
+        // Two buckets (sleep > group size).
+        limiter.inc(&k, &rate_limit, 1).await.unwrap();
+        thread::sleep(Duration::from_millis(250));
+        limiter.inc(&k, &rate_limit, 1).await.unwrap();
+
+        // Wait until the first bucket is out of window (2s) but the second is still in-window.
+        thread::sleep(Duration::from_millis(1850));
+
+        let decision = limiter.is_allowed(&k).await.unwrap();
+        assert!(matches!(decision, RateLimitDecision::Allowed));
+
+        let mut conn = cm.clone();
+        let hlen: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
+        let zcard: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
+        let total: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
+
+        assert_eq!(hlen, 1, "expected oldest bucket to be evicted");
+        assert_eq!(zcard, 1, "expected oldest bucket to be evicted");
+        assert_eq!(total, Some(1));
+
+        let sum = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
+        assert_eq!(sum, 1);
+    });
+}
+
+#[test]
+fn is_allowed_does_not_change_total_count_when_no_eviction() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+
+        limiter.inc(&k, &rate_limit, 1).await.unwrap();
+        thread::sleep(Duration::from_millis(250));
+        limiter.inc(&k, &rate_limit, 1).await.unwrap();
+
+        let mut conn = cm.clone();
+        let total_before: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
+        let sum_before = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
+
+        let _ = limiter.is_allowed(&k).await.unwrap();
+
+        let total_after: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
+        let sum_after = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
+
+        assert_eq!(total_before, total_after);
+        assert_eq!(sum_before, sum_after);
+    });
+}
+
+#[test]
+fn inc_evicts_expired_buckets_and_total_matches_hash_sum() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 1, 200).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+
+        // Two buckets.
+        limiter.inc(&k, &rate_limit, 1).await.unwrap();
+        thread::sleep(Duration::from_millis(250));
+        limiter.inc(&k, &rate_limit, 1).await.unwrap();
+
+        // Wait past the window so both buckets are expired.
+        thread::sleep(Duration::from_millis(1200));
+        assert!(matches!(
+            limiter.inc(&k, &rate_limit, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+
+        let mut conn = cm.clone();
+        let sum = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
+        let total: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
+        assert_eq!(total, Some(sum));
+
+        let hlen: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
+        let zcard: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
+        assert_eq!(hlen, 1);
+        assert_eq!(zcard, 1);
     });
 }
 

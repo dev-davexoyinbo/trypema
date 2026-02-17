@@ -69,7 +69,7 @@ impl AbsoluteRedisRateLimiter {
 
             local total_count = tonumber(redis.call("GET", total_count_key)) or 0
 
-            if total_count >= window_limit then
+            if total_count + count > window_limit then
                 local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
 
                 if #oldest_hash_fields == 0 then
