@@ -23,4 +23,8 @@ pub enum TrypemaError {
     #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     #[error("invalid Redis key: {0}")]
     InvalidRedisKey(String),
+
+    /// Custom error.
+    #[error("custom error: {0}")]
+    CustomError(String),
 }
