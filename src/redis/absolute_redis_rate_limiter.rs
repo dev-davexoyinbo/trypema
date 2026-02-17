@@ -32,8 +32,6 @@ impl AbsoluteRedisRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        // TODO: cleanup the active keys set
-
         let script = redis::Script::new(
             r#"
             local time_array = redis.call("TIME")
@@ -275,6 +273,7 @@ impl AbsoluteRedisRateLimiter {
 
             if #remove_keys > 0 then
                 redis.call("DEL", unpack(remove_keys))
+                redis.call("ZREM", active_entities_key, unpack(active_entities))
             end
 
             return
