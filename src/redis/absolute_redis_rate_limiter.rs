@@ -32,7 +32,6 @@ impl AbsoluteRedisRateLimiter {
     ) -> Result<RateLimitDecision, TrypemaError> {
         // TODO: cleanup the active keys set
 
-        // At least a version of Redis that is 7.4.0 or higher is needed
         let script = redis::Script::new(
             r#"
             local time_array = redis.call("TIME")
@@ -52,7 +51,9 @@ impl AbsoluteRedisRateLimiter {
             local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
 
             if #to_remove_keys > 0 then
-                local to_remove = redis.call("HGETDEL", hash_key, "FIELDS", #to_remove_keys, unpack(to_remove_keys))
+                local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+                redis.call("HDEL", hash_key, unpack(to_remove_keys))
+
                 local remove_sum = 0
 
                 for i = 1, #to_remove do
@@ -95,6 +96,7 @@ impl AbsoluteRedisRateLimiter {
             end
 
             local hash_field = tostring(timestamp_ms)
+
             local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
             redis.call("INCRBY", total_count_key, count)
 

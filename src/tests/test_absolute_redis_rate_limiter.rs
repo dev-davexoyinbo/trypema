@@ -166,22 +166,31 @@ fn unblocks_after_window_expires() {
         let k = key("k");
         let rate_limit = RateLimit::try_from(3f64).unwrap();
 
-        assert!(matches!(
-            limiter.inc(&k, &rate_limit, 3).await.unwrap(),
-            RateLimitDecision::Allowed
-        ));
+        assert!(
+            matches!(
+                limiter.inc(&k, &rate_limit, 3).await.unwrap(),
+                RateLimitDecision::Allowed
+            ),
+            "first increment should be allowed"
+        );
 
-        assert!(matches!(
-            limiter.inc(&k, &rate_limit, 1).await.unwrap(),
-            RateLimitDecision::Rejected { .. }
-        ));
+        assert!(
+            matches!(
+                limiter.inc(&k, &rate_limit, 1).await.unwrap(),
+                RateLimitDecision::Rejected { .. }
+            ),
+            "second increment should be rejected"
+        );
 
         thread::sleep(Duration::from_millis(1100));
 
-        assert!(matches!(
-            limiter.inc(&k, &rate_limit, 1).await.unwrap(),
-            RateLimitDecision::Allowed
-        ));
+        assert!(
+            matches!(
+                limiter.inc(&k, &rate_limit, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ),
+            "third increment should be allowed"
+        );
     });
 }
 
