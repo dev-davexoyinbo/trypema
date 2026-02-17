@@ -42,51 +42,63 @@ impl AbsoluteRedisRateLimiter {
             local hash_key = KEYS[1]
             local active_keys = KEYS[2]
             local window_limit_key = KEYS[3]
+            local total_count_key = KEYS[4]
 
             local window_size_seconds = tonumber(ARGV[1])
             local window_limit = tonumber(ARGV[2])
             local rate_group_size_ms = tonumber(ARGV[3])
             local count = tonumber(ARGV[4])
 
-            redis.call("ZREMRANGEBYSCORE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000)
+            local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
 
-            local values = redis.call("HVALS", hash_key)
-            local sum = 0
-            for i = 1, #values do
-                local value = values[i]
-                if value then
-                    sum = sum + tonumber(value)
+            if #to_remove_keys > 0 then
+                local to_remove = redis.call("HGETDEL", hash_key, "FIELDS", #to_remove_keys, unpack(to_remove_keys))
+                local remove_sum = 0
+
+                for i = 1, #to_remove do
+                    local value = tonumber(to_remove[i])
+                    if value then
+                        remove_sum = remove_sum + value
+                    end
                 end
+
+                redis.call("DECRBY", total_count_key, remove_sum)
+                redis.call("ZREM", active_keys, unpack(to_remove_keys))
             end
 
-            if sum >= window_limit then
-                local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0)
+            local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+
+            if total_count >= window_limit then
+                local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
 
                 if #oldest_hash_fields == 0 then
                     return {"rejected", 0, 0}
                 end
 
                 local oldest_hash_field = oldest_hash_fields[1]
-                local oldest_hash_field_ttl = redis.call("HPTTL", hash_key, "FIELDS", 1, oldest_hash_field)[1]
+                local oldest_hash_field_group_timestamp = tonumber(oldest_hash_fields[2])
+                local oldest_hash_field_ttl = (window_size_seconds * 1000) - timestamp_ms + oldest_hash_field_group_timestamp
                 local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_field)) or 0
 
                 return {"rejected", oldest_hash_field_ttl, oldest_count}
             end
 
-            local latest_hash_field = redis.call("ZRANGE", active_keys, 0, 0, "REV")[1]
-            if latest_hash_field then
-                local latest_hash_field_ttl = redis.call("HPTTL", hash_key, "FIELDS", 1, latest_hash_field)[1]
+            local latest_hash_field_entry = redis.call("ZRANGE", active_keys, 0, 0, "REV", "WITHSCORES")
+            if #latest_hash_field_entry > 0 then
+                local latest_hash_field = latest_hash_field_entry[1]
+                local latest_hash_field_group_timestamp = tonumber(latest_hash_field_entry[2])
+                local latest_hash_field_age_ms = timestamp_ms - latest_hash_field_group_timestamp
 
-                if latest_hash_field_ttl > 0 and window_size_seconds * 1000 - latest_hash_field_ttl < rate_group_size_ms then
+                if latest_hash_field_age_ms > 0 and latest_hash_field_age_ms < rate_group_size_ms then
                     timestamp_ms = tonumber(latest_hash_field)
                 end
             end
 
             local hash_field = tostring(timestamp_ms)
             local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
+            redis.call("INCRBY", total_count_key, count)
 
             if new_count == count then
-               redis.call("HPEXPIRE", hash_key, window_size_seconds * 1000, "FIELDS", 1, hash_field)
                redis.call("ZADD", active_keys, timestamp_ms, hash_field)
                redis.call("SET", window_limit_key, window_limit)
             end
@@ -104,6 +116,7 @@ impl AbsoluteRedisRateLimiter {
             .key(self.get_hash_key(key))
             .key(self.get_active_keys(key))
             .key(self.get_window_limit_key(key))
+            .key(self.get_total_count_key(key))
             .arg(*self.window_size_seconds)
             .arg(window_limit)
             .arg(*self.rate_group_size_ms)
@@ -142,6 +155,7 @@ impl AbsoluteRedisRateLimiter {
             local hash_key = KEYS[1]
             local active_keys = KEYS[2]
             local window_limit_key = KEYS[3]
+            local total_count_key = KEYS[4]
 
             local window_size_seconds = tonumber(ARGV[1])
             local rate_group_size_ms = tonumber(ARGV[2])
@@ -186,6 +200,7 @@ impl AbsoluteRedisRateLimiter {
             .key(self.get_hash_key(key))
             .key(self.get_active_keys(key))
             .key(self.get_window_limit_key(key))
+            .key(self.get_total_count_key(key))
             .arg(*self.window_size_seconds)
             .arg(*self.rate_group_size_ms)
             .invoke_async(&mut connection_manager)
@@ -210,6 +225,10 @@ impl AbsoluteRedisRateLimiter {
     fn get_window_limit_key(&self, key: &RedisKey) -> String {
         format!("{}:{}:absolute:w", *self.prefix, **key)
     } // end method get_window_limit_key
+
+    fn get_total_count_key(&self, key: &RedisKey) -> String {
+        format!("{}:{}:absolute:t", *self.prefix, **key)
+    } // end method get_total_count_key
 
     fn get_active_keys(&self, key: &RedisKey) -> String {
         format!("{}:{}:absolute:a", *self.prefix, **key)
