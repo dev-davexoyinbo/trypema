@@ -162,31 +162,42 @@ impl AbsoluteRedisRateLimiter {
             local window_size_seconds = tonumber(ARGV[1])
             local rate_group_size_ms = tonumber(ARGV[2])
 
-            redis.call("ZREMRANGEBYSCORE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000)
-
             local window_limit = tonumber(redis.call("GET", window_limit_key))
             if window_limit == nil then
                 return {"allowed", 0, 0}
             end
 
-            local values = redis.call("HVALS", hash_key)
-            local sum = 0
-            for i = 1, #values do
-                local value = values[i]
-                if value then
-                    sum = sum + tonumber(value)
+            local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
+
+            if #to_remove_keys > 0 then
+                local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+                redis.call("HDEL", hash_key, unpack(to_remove_keys))
+
+                local remove_sum = 0
+
+                for i = 1, #to_remove do
+                    local value = tonumber(to_remove[i])
+                    if value then
+                        remove_sum = remove_sum + value
+                    end
                 end
+
+                redis.call("DECRBY", total_count_key, remove_sum)
+                redis.call("ZREM", active_keys, unpack(to_remove_keys))
             end
 
-            if sum >= window_limit then
-                local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0)
+            local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+
+            if total_count >= window_limit then
+                local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
 
                 if #oldest_hash_fields == 0 then
                     return {"rejected", 0, 0}
                 end
 
                 local oldest_hash_field = oldest_hash_fields[1]
-                local oldest_hash_field_ttl = redis.call("HPTTL", hash_key, "FIELDS", 1, oldest_hash_field)[1]
+                local oldest_hash_field_group_timestamp = tonumber(oldest_hash_fields[2])
+                local oldest_hash_field_ttl = (window_size_seconds * 1000) - timestamp_ms + oldest_hash_field_group_timestamp
                 local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_field)) or 0
 
                 return {"rejected", oldest_hash_field_ttl, oldest_count}

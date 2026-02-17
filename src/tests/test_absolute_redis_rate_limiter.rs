@@ -375,6 +375,9 @@ fn is_allowed_returns_allowed_when_below_limit() {
 
         limiter.inc(&k, &rate_limit, 5).await.unwrap();
         let decision = limiter.is_allowed(&k).await.unwrap();
-        assert!(matches!(decision, RateLimitDecision::Allowed));
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "should be allowed"
+        );
     });
 }
