@@ -245,7 +245,7 @@ impl AbsoluteRedisRateLimiter {
 
             local prefix = KEYS[1]
             local rate_type = KEYS[2]
-            local active_entities_key = KEYS[1]
+            local active_entities_key = KEYS[3]
 
             local stale_after_ms = tonumber(ARGV[1]) or 0
             local hash_suffix = ARGV[2]
@@ -267,7 +267,7 @@ impl AbsoluteRedisRateLimiter {
                 local entity = active_entities[i]
 
                 for i = 1, #suffixes do
-                    remove_keys.insert(prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
+                    table.insert(remove_keys, prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
                 end
             end
 

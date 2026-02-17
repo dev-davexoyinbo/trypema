@@ -37,6 +37,22 @@ fn total_count_key(prefix: &RedisKey, key: &RedisKey) -> String {
     format!("{}:{}:absolute:t", **prefix, **key)
 }
 
+fn active_entities_key(prefix: &RedisKey) -> String {
+    format!("{}:active_entities", **prefix)
+}
+
+async fn absolute_keys_exist(
+    conn: &mut redis::aio::ConnectionManager,
+    prefix: &RedisKey,
+    key: &RedisKey,
+) -> (bool, bool, bool, bool) {
+    let h_exists: bool = conn.exists(hash_key(prefix, key)).await.unwrap();
+    let a_exists: bool = conn.exists(active_keys_key(prefix, key)).await.unwrap();
+    let w_exists: bool = conn.exists(window_limit_key(prefix, key)).await.unwrap();
+    let t_exists: bool = conn.exists(total_count_key(prefix, key)).await.unwrap();
+    (h_exists, a_exists, w_exists, t_exists)
+}
+
 async fn sum_hash_counts(
     conn: &mut redis::aio::ConnectionManager,
     hash_key: String,
@@ -46,6 +62,35 @@ async fn sum_hash_counts(
         .into_iter()
         .map(|v| v.parse::<u64>().unwrap())
         .sum::<u64>()
+}
+
+async fn set_active_entity_score_ms_ago(
+    conn: &mut redis::aio::ConnectionManager,
+    active_entities_key: &str,
+    entity: &RedisKey,
+    score_ms_ago: u64,
+) {
+    let script = redis::Script::new(
+        r#"
+        local time_array = redis.call("TIME")
+        local now_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+
+        local member = ARGV[1]
+        local ms_ago = tonumber(ARGV[2])
+        local score = now_ms - ms_ago
+
+        redis.call("ZADD", KEYS[1], score, member)
+        return score
+    "#,
+    );
+
+    let _: u64 = script
+        .key(active_entities_key)
+        .arg(entity.to_string())
+        .arg(score_ms_ago)
+        .invoke_async(conn)
+        .await
+        .unwrap();
 }
 
 async fn build_limiter(
@@ -526,5 +571,165 @@ fn is_allowed_returns_allowed_when_below_limit() {
             matches!(decision, RateLimitDecision::Allowed),
             "should be allowed"
         );
+    });
+}
+
+#[test]
+fn cleanup_deletes_state_and_index_for_stale_entities() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+
+        let a = key("a");
+        let b = key("b");
+        let c = key("c");
+        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+
+        limiter.inc(&a, &rate_limit, 1).await.unwrap();
+        limiter.inc(&b, &rate_limit, 1).await.unwrap();
+        limiter.inc(&c, &rate_limit, 1).await.unwrap();
+
+        let mut conn = cm.clone();
+        let ae_key = active_entities_key(&prefix);
+
+        // Force staleness deterministically based on Redis server time.
+        set_active_entity_score_ms_ago(&mut conn, &ae_key, &a, 1050).await;
+        set_active_entity_score_ms_ago(&mut conn, &ae_key, &b, 1050).await;
+        set_active_entity_score_ms_ago(&mut conn, &ae_key, &c, 0).await;
+
+        limiter.cleanup(1000).await.unwrap();
+
+        let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &prefix, &a).await;
+        assert!(!a_h && !a_ak && !a_w && !a_t, "expected all keys for a deleted");
+
+        let (b_h, b_ak, b_w, b_t) = absolute_keys_exist(&mut conn, &prefix, &b).await;
+        assert!(!b_h && !b_ak && !b_w && !b_t, "expected all keys for b deleted");
+
+        let (c_h, c_ak, c_w, c_t) = absolute_keys_exist(&mut conn, &prefix, &c).await;
+        assert!(c_h && c_ak && c_w && c_t, "expected all keys for c retained");
+
+        let a_score: Option<f64> = conn.zscore(&ae_key, &*a).await.unwrap();
+        let b_score: Option<f64> = conn.zscore(&ae_key, &*b).await.unwrap();
+        let c_score: Option<f64> = conn.zscore(&ae_key, &*c).await.unwrap();
+
+        assert!(a_score.is_none(), "expected a removed from active_entities");
+        assert!(b_score.is_none(), "expected b removed from active_entities");
+        assert!(c_score.is_some(), "expected c retained in active_entities");
+    });
+}
+
+#[test]
+fn cleanup_removes_multiple_stale_entities() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+
+        let a = key("a");
+        let b = key("b");
+        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+
+        limiter.inc(&a, &rate_limit, 1).await.unwrap();
+        limiter.inc(&b, &rate_limit, 1).await.unwrap();
+
+        let mut conn = cm.clone();
+        let ae_key = active_entities_key(&prefix);
+        set_active_entity_score_ms_ago(&mut conn, &ae_key, &a, 1050).await;
+        set_active_entity_score_ms_ago(&mut conn, &ae_key, &b, 1050).await;
+
+        limiter.cleanup(1000).await.unwrap();
+
+        let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &prefix, &a).await;
+        let (b_h, b_ak, b_w, b_t) = absolute_keys_exist(&mut conn, &prefix, &b).await;
+        assert!(!a_h && !a_ak && !a_w && !a_t);
+        assert!(!b_h && !b_ak && !b_w && !b_t);
+
+        let a_score: Option<f64> = conn.zscore(&ae_key, &*a).await.unwrap();
+        let b_score: Option<f64> = conn.zscore(&ae_key, &*b).await.unwrap();
+        assert!(a_score.is_none());
+        assert!(b_score.is_none());
+    });
+}
+
+#[test]
+fn cleanup_noop_when_no_stale_entities() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+
+        let a = key("a");
+        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+        limiter.inc(&a, &rate_limit, 1).await.unwrap();
+
+        let mut conn = cm.clone();
+        let ae_key = active_entities_key(&prefix);
+        set_active_entity_score_ms_ago(&mut conn, &ae_key, &a, 0).await;
+
+        limiter.cleanup(1000).await.unwrap();
+
+        let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &prefix, &a).await;
+        assert!(a_h && a_ak && a_w && a_t, "expected all keys retained");
+
+        let a_score: Option<f64> = conn.zscore(&ae_key, &*a).await.unwrap();
+        assert!(a_score.is_some(), "expected active_entities retained");
+    });
+}
+
+#[test]
+fn cleanup_noop_on_empty_prefix() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+
+        limiter.cleanup(1000).await.unwrap();
+
+        let mut conn = cm.clone();
+        let exists: bool = conn.exists(active_entities_key(&prefix)).await.unwrap();
+        assert!(!exists, "cleanup should not create active_entities key");
+    });
+}
+
+#[test]
+fn cleanup_is_prefix_scoped() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter1, cm1, prefix1) = build_limiter(&url, 10, 200).await;
+        let (limiter2, cm2, prefix2) = build_limiter(&url, 10, 200).await;
+
+        let k1 = key("k");
+        let k2 = key("k");
+        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+
+        limiter1.inc(&k1, &rate_limit, 1).await.unwrap();
+        limiter2.inc(&k2, &rate_limit, 1).await.unwrap();
+
+        let mut conn1 = cm1.clone();
+        let ae1 = active_entities_key(&prefix1);
+        set_active_entity_score_ms_ago(&mut conn1, &ae1, &k1, 1050).await;
+
+        limiter1.cleanup(1000).await.unwrap();
+
+        let (k1_h, k1_ak, k1_w, k1_t) = absolute_keys_exist(&mut conn1, &prefix1, &k1).await;
+        assert!(!k1_h && !k1_ak && !k1_w && !k1_t, "expected prefix1 keys deleted");
+        let k1_score: Option<f64> = conn1.zscore(&ae1, &*k1).await.unwrap();
+        assert!(k1_score.is_none(), "expected prefix1 index entry removed");
+
+        let mut conn2 = cm2.clone();
+        let (k2_h, k2_ak, k2_w, k2_t) = absolute_keys_exist(&mut conn2, &prefix2, &k2).await;
+        assert!(k2_h && k2_ak && k2_w && k2_t, "expected prefix2 keys retained");
+        let k2_score: Option<f64> = conn2
+            .zscore(active_entities_key(&prefix2), &*k2)
+            .await
+            .unwrap();
+        assert!(k2_score.is_some(), "expected prefix2 index entry retained");
     });
 }
