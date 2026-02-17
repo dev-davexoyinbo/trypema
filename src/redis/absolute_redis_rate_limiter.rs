@@ -8,7 +8,6 @@ use crate::{
 /// A rate limiter backed by Redis.
 pub struct AbsoluteRedisRateLimiter {
     connection_manager: ConnectionManager,
-    prefix: RedisKey,
     window_size_seconds: WindowSizeSeconds,
     rate_group_size_ms: RateGroupSizeMs,
     key_generator: RedisKeyGenerator,
@@ -20,7 +19,6 @@ impl AbsoluteRedisRateLimiter {
 
         Self {
             connection_manager: options.connection_manager,
-            prefix: prefix.clone(),
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
             key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
@@ -241,37 +239,62 @@ impl AbsoluteRedisRateLimiter {
     }
 
     /// Evict expired buckets and update the total count.
-    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<bool, TrypemaError> {
+    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         let script = redis::Script::new(
             r#"
             local time_array = redis.call("TIME")
             local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 
+            local prefix = KEYS[1]
+            local rate_type = KEYS[2]
             local active_entities_key = KEYS[1]
+
             local stale_after_ms = tonumber(ARGV[1]) or 0
+            local hash_suffix = ARGV[2]
+            local window_limit_suffix = ARGV[3]
+            local total_count_suffix = ARGV[4]
+            local active_keys_suffix = ARGV[5]
 
-            local active_entities = redis.call("ZRANGEBYSCORE", active_entities_key, "-inf", timestamp_ms - stale_after_ms)
 
+            local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
+
+            if #active_entities == 0 then
+                return 
+            end
+
+            local remove_keys = {}
+
+            local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix}
             for i = 1, #active_entities do
                 local entity = active_entities[i]
 
-                redis.call("ZREM", active_entities_key, entity)
-                redis.call("HDEL", KEYS[2], entity)
+                for i = 1, #suffixes do
+                    remove_keys.insert(prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
+                end
             end
 
+            if #remove_keys > 0 then
+                redis.call("DEL", unpack(remove_keys))
+            end
 
-            return true
+            return
         "#,
         );
 
         let mut connection_manager = self.connection_manager.clone();
 
-        let ok: bool = script
+        let _: () = script
+            .key(self.key_generator.prefix.to_string())
+            .key(self.key_generator.rate_type.to_string())
             .key(self.key_generator.get_active_entities_key())
             .arg(stale_after_ms)
+            .arg(self.key_generator.hash_key_suffix.to_string())
+            .arg(self.key_generator.window_limit_key_suffix.to_string())
+            .arg(self.key_generator.total_count_key_suffix.to_string())
+            .arg(self.key_generator.active_keys_key_suffix.to_string())
             .invoke_async(&mut connection_manager)
             .await?;
 
-        Ok(ok)
+        Ok(())
     } // end method cleanup
 }

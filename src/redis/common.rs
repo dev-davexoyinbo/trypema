@@ -54,13 +54,13 @@ impl TryFrom<String> for RedisKey {
 }
 
 pub(crate) struct RedisKeyGenerator {
-    prefix: RedisKey,
-    rate_type: RateType,
-    active_entities_key_suffix: String,
-    hash_key_suffix: String,
-    window_limit_key_suffix: String,
-    total_count_key_suffix: String,
-    active_keys_key_suffix: String,
+    pub prefix: RedisKey,
+    pub rate_type: RateType,
+    pub active_entities_key_suffix: String,
+    pub hash_key_suffix: String,
+    pub window_limit_key_suffix: String,
+    pub total_count_key_suffix: String,
+    pub active_keys_key_suffix: String,
 }
 
 impl RedisKeyGenerator {
