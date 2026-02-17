@@ -1,8 +1,8 @@
 use redis::aio::ConnectionManager;
 
 use crate::{
-    RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError,
-    WindowSizeSeconds,
+    RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
+    RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds, common::RateType,
 };
 
 /// A rate limiter backed by Redis.
@@ -11,15 +11,19 @@ pub struct AbsoluteRedisRateLimiter {
     prefix: RedisKey,
     window_size_seconds: WindowSizeSeconds,
     rate_group_size_ms: RateGroupSizeMs,
+    key_generator: RedisKeyGenerator,
 }
 
 impl AbsoluteRedisRateLimiter {
     pub(crate) fn new(options: RedisRateLimiterOptions) -> Self {
+        let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
+
         Self {
             connection_manager: options.connection_manager,
-            prefix: options.prefix.unwrap_or_else(RedisKey::default_prefix),
+            prefix: prefix.clone(),
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
+            key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
         }
     }
 
@@ -42,11 +46,15 @@ impl AbsoluteRedisRateLimiter {
             local active_keys = KEYS[2]
             local window_limit_key = KEYS[3]
             local total_count_key = KEYS[4]
+            local get_active_entities_key = KEYS[5]
 
-            local window_size_seconds = tonumber(ARGV[1])
-            local window_limit = tonumber(ARGV[2])
-            local rate_group_size_ms = tonumber(ARGV[3])
-            local count = tonumber(ARGV[4])
+            local entity = ARGV[1]
+            local window_size_seconds = tonumber(ARGV[2])
+            local window_limit = tonumber(ARGV[3])
+            local rate_group_size_ms = tonumber(ARGV[4])
+            local count = tonumber(ARGV[5])
+
+            redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
             local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
 
@@ -115,10 +123,12 @@ impl AbsoluteRedisRateLimiter {
         let mut connection_manager = self.connection_manager.clone();
 
         let (result, retry_after_ms, remaining_after_waiting): (String, u64, u64) = script
-            .key(self.get_hash_key(key))
-            .key(self.get_active_keys(key))
-            .key(self.get_window_limit_key(key))
-            .key(self.get_total_count_key(key))
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .arg(key.to_string())
             .arg(*self.window_size_seconds)
             .arg(window_limit)
             .arg(*self.rate_group_size_ms)
@@ -210,10 +220,10 @@ impl AbsoluteRedisRateLimiter {
         let mut connection_manager = self.connection_manager.clone();
 
         let (result, retry_after_ms, remaining_after_waiting): (String, u64, u64) = script
-            .key(self.get_hash_key(key))
-            .key(self.get_active_keys(key))
-            .key(self.get_window_limit_key(key))
-            .key(self.get_total_count_key(key))
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
             .arg(*self.window_size_seconds)
             .arg(*self.rate_group_size_ms)
             .invoke_async(&mut connection_manager)
@@ -230,20 +240,38 @@ impl AbsoluteRedisRateLimiter {
         }
     }
 
-    /// Determine whether `key` is currently allowed.
-    fn get_hash_key(&self, key: &RedisKey) -> String {
-        format!("{}:{}:absolute:h", *self.prefix, **key)
-    } // end method get_hash_key
+    /// Evict expired buckets and update the total count.
+    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<bool, TrypemaError> {
+        let script = redis::Script::new(
+            r#"
+            local time_array = redis.call("TIME")
+            local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 
-    fn get_window_limit_key(&self, key: &RedisKey) -> String {
-        format!("{}:{}:absolute:w", *self.prefix, **key)
-    } // end method get_window_limit_key
+            local active_entities_key = KEYS[1]
+            local stale_after_ms = tonumber(ARGV[1]) or 0
 
-    fn get_total_count_key(&self, key: &RedisKey) -> String {
-        format!("{}:{}:absolute:t", *self.prefix, **key)
-    } // end method get_total_count_key
+            local active_entities = redis.call("ZRANGEBYSCORE", active_entities_key, "-inf", timestamp_ms - stale_after_ms)
 
-    fn get_active_keys(&self, key: &RedisKey) -> String {
-        format!("{}:{}:absolute:a", *self.prefix, **key)
-    } // end method get_active_keys
+            for i = 1, #active_entities do
+                local entity = active_entities[i]
+
+                redis.call("ZREM", active_entities_key, entity)
+                redis.call("HDEL", KEYS[2], entity)
+            end
+
+
+            return true
+        "#,
+        );
+
+        let mut connection_manager = self.connection_manager.clone();
+
+        let ok: bool = script
+            .key(self.key_generator.get_active_entities_key())
+            .arg(stale_after_ms)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(ok)
+    } // end method cleanup
 }
