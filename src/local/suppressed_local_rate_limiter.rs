@@ -205,7 +205,7 @@ impl SuppressedLocalRateLimiter {
 
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {
         self.suppression_factors
-            .retain(|_, (instant, _)| instant.elapsed().as_millis() > stale_after_ms as u128);
+            .retain(|_, (instant, _)| instant.elapsed().as_millis() < stale_after_ms as u128);
         self.accepted_limiter.cleanup(stale_after_ms);
         self.observed_limiter.cleanup(stale_after_ms);
     } // end method cleanup
