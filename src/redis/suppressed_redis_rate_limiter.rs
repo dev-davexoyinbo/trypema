@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use dashmap::DashMap;
-use redis::aio::ConnectionManager;
+use redis::{Script, aio::ConnectionManager};
 
 use crate::{
     AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
@@ -102,39 +102,59 @@ impl SuppressedRedisRateLimiter {
 
     #[inline]
     fn compute_or_calculate_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
-        // let Some(series) = self.accepted_limiter.series().get(key) else {
-        //     return self.persist_suppression_factor(key, 0f64);
-        // };
-        //
-        // if series.series.is_empty() {
-        //     return self.persist_suppression_factor(key, 0f64);
-        // }
-        //
-        // let window_limit = *self.window_size_seconds as f64 * *series.limit;
-        //
-        // if series.total.load(Ordering::Relaxed) < window_limit as u64 {
-        //     return self.persist_suppression_factor(key, 0f64);
-        // }
-        //
-        // let mut total_in_last_second = 0u64;
-        //
-        // for instant_rate in series.series.iter().rev() {
-        //     if instant_rate.timestamp.elapsed().as_secs() > 1 {
-        //         break;
-        //     }
-        //
-        //     total_in_last_second =
-        //         total_in_last_second.saturating_add(instant_rate.count.load(Ordering::Relaxed));
-        // }
-        //
-        // let average_rate_in_window: f64 =
-        //     series.total.load(Ordering::Relaxed) as f64 / *self.window_size_seconds as f64;
-        //
-        // let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
-        //
-        // let suppression_factor = 1f64 - (perceived_rate_limit / *series.limit);
-        //
-        // self.persist_suppression_factor(key, suppression_factor)
+        let script = Script::new(
+            r#"
+            local time_array = redis.call("TIME")
+            local now_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+
+            local accepted_total_count_key = KEYS[1]
+            local accepted_active_keys_key = KEYS[2]
+            local accepted_window_limit_key = KEYS[3]
+            local suppressed_factor_key = KEYS[4]
+
+            local window_size_seconds = tonumber(ARGV[1])
+            local rate_group_size_ms = tonumber(ARGV[4])
+
+            local suppression_factor = tonumber(redis.call("GET", suppressed_factor_key))
+            if suppression_factor ~= nil then
+                return suppression_factor
+            end
+
+            local window_limit = tonumber(redis.call("GET", accepted_window_limit_key)) or 0
+            local accepted_total_count = tonumber(redis.call("GET", accepted_total_count_key)) or 0
+            local active_keys_count = tonumber(redis.call("ZCARD", accepted_active_keys_key)) or 0
+
+            if window_limit == 0 or accepted_total_count < window_limit or active_keys_count == 0 then
+                redis.call("SET", suppressed_factor_key, 0, PX, rate_group_size_ms)
+                return 0
+            end
+
+            local accepted_active_keys_in_1s = redis.call("ZRANGE", accepted_active_keys_key, +inf, now_ms - 1000, "BYSCORE", "REV")
+            local total_in_last_second = 0
+
+            if #accepted_active_keys_in_1s > 0 then
+                local values = redis.call("HMGET", accepted_active_keys_key, unpack(accepted_active_keys_in_1s))
+                for i = 1, #values do
+                    local value = tonumber(values[i])
+                    if value then
+                        total_in_last_second = total_in_last_second + value
+                    end
+                end
+            end
+
+            local average_rate_in_window = accepted_total / window_size_seconds
+            local perceived_rate_limit = average_rate_in_window
+
+            if total_in_last_second > average_rate_in_window then
+                perceived_rate_limit = total_in_last_second
+            end
+
+            suppression_factor = 1 - (perceived_rate_limit / window_limit)
+            redis.call("SET", suppressed_factor_key, suppression_factor, PX, rate_group_size_ms)
+
+            return suppression_factor
+        "#,
+        );
 
         todo!()
     } // end method calculate_suppression_factor
