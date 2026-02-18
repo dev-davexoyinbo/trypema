@@ -16,9 +16,11 @@ keywords = [
 ]
 authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
 documentation = "https://docs.rs/trypema"
+exclude = [".github", "Makefile", "compose.yaml"]
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 dashmap = "6.1.0"
@@ -32,8 +34,6 @@ thiserror = "2.0.18"
 tracing = "0.1.44"
 
 [features]
-default = ["redis-tokio"]
-
 redis-tokio = [
   "redis",
   "redis/tokio-comp",
