@@ -3,7 +3,7 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    LocalRateLimiterOptions,
+    LocalRateLimiterOptions, TrypemaError,
     common::{
         InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimitSeries,
         WindowSizeSeconds,
@@ -180,4 +180,18 @@ impl AbsoluteLocalRateLimiter {
             remaining_after_waiting,
         }
     } // end method is_allowed
+
+    pub(crate) fn cleanup(&self, stale_after_ms: u64) {
+        self.series.retain(
+            |_, rate_limit_series| match rate_limit_series.series.back() {
+                None => false,
+                Some(instant_rate)
+                    if instant_rate.timestamp.elapsed().as_millis() > stale_after_ms as u128 =>
+                {
+                    false
+                }
+                Some(_) => true,
+            },
+        );
+    } // end method cleanup
 } // end of impl

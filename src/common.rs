@@ -222,3 +222,11 @@ impl TryFrom<f64> for HardLimitFactor {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, strum_macros::Display)]
+pub(crate) enum RateType {
+    #[strum(to_string = "absolute")]
+    Absolute,
+    #[strum(to_string = "suppressed")]
+    Suppressed,
+}

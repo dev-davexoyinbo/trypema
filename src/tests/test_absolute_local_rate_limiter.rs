@@ -1,7 +1,13 @@
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{atomic::AtomicU64, Arc},
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::common::{
-    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, WindowSizeSeconds,
+    HardLimitFactor, InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimitSeries,
+    WindowSizeSeconds,
 };
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};
 
@@ -11,6 +17,31 @@ fn limiter(window_size_seconds: u64, rate_group_size_ms: u64) -> AbsoluteLocalRa
         rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
         hard_limit_factor: HardLimitFactor::default(),
     })
+}
+
+fn insert_series(
+    limiter: &AbsoluteLocalRateLimiter,
+    key: &str,
+    limit: RateLimit,
+    buckets: &[(u64, u64)],
+) {
+    let total = buckets.iter().map(|(count, _)| *count).sum::<u64>();
+    let series = buckets
+        .iter()
+        .map(|(count, ms_ago)| InstantRate {
+            count: AtomicU64::new(*count),
+            timestamp: Instant::now() - Duration::from_millis(*ms_ago),
+        })
+        .collect::<VecDeque<_>>();
+
+    limiter.series().insert(
+        key.to_string(),
+        RateLimitSeries {
+            limit,
+            series,
+            total: AtomicU64::new(total),
+        },
+    );
 }
 
 #[test]
@@ -496,4 +527,120 @@ fn concurrent_inc_eventually_rejects_without_panicking() {
         limiter.is_allowed(key),
         RateLimitDecision::Rejected { .. }
     ));
+}
+
+#[test]
+fn cleanup_removes_stale_keys_by_last_activity() {
+    let limiter = limiter(60, 1000);
+    let limit = RateLimit::try_from(1f64).unwrap();
+
+    insert_series(&limiter, "stale", limit, &[(1, 5_000)]);
+    assert!(limiter.series().contains_key("stale"));
+
+    limiter.cleanup(1_000);
+    assert!(!limiter.series().contains_key("stale"));
+}
+
+#[test]
+fn cleanup_keeps_fresh_keys() {
+    let limiter = limiter(60, 1000);
+    let limit = RateLimit::try_from(1f64).unwrap();
+
+    insert_series(&limiter, "fresh", limit, &[(1, 10)]);
+    limiter.cleanup(10_000);
+    assert!(limiter.series().contains_key("fresh"));
+}
+
+#[test]
+fn cleanup_drops_empty_series_entries() {
+    let limiter = limiter(60, 1000);
+    let limit = RateLimit::try_from(1f64).unwrap();
+
+    limiter
+        .series()
+        .insert("empty".to_string(), RateLimitSeries::new(limit));
+    assert!(limiter.series().contains_key("empty"));
+
+    limiter.cleanup(10_000);
+    assert!(!limiter.series().contains_key("empty"));
+}
+
+#[test]
+fn cleanup_uses_most_recent_bucket_not_oldest() {
+    let limiter = limiter(60, 1000);
+    let limit = RateLimit::try_from(1f64).unwrap();
+
+    // Oldest is very old, but most recent bucket is fresh.
+    insert_series(&limiter, "mixed", limit, &[(1, 60_000), (1, 10)]);
+
+    limiter.cleanup(1_000);
+    assert!(limiter.series().contains_key("mixed"));
+}
+
+#[test]
+fn cleanup_removal_makes_key_unknown_and_allowed() {
+    let limiter = limiter(60, 1000);
+    let key = "k";
+    let limit = RateLimit::try_from(1f64).unwrap();
+
+    // window_limit = 60 * 1 = 60; total=61 => rejected.
+    insert_series(&limiter, key, limit, &[(61, 50)]);
+    assert!(matches!(
+        limiter.is_allowed(key),
+        RateLimitDecision::Rejected { .. }
+    ));
+
+    limiter.cleanup(10);
+    assert!(!limiter.series().contains_key(key));
+    assert!(matches!(
+        limiter.is_allowed(key),
+        RateLimitDecision::Allowed
+    ));
+}
+
+#[test]
+fn cleanup_is_millisecond_granularity() {
+    let limiter = limiter(60, 1000);
+    let limit = RateLimit::try_from(1f64).unwrap();
+
+    insert_series(&limiter, "ms", limit, &[(1, 150)]);
+    limiter.cleanup(100);
+    assert!(!limiter.series().contains_key("ms"));
+}
+
+#[test]
+fn cleanup_concurrent_is_allowed_smoke_does_not_panic() {
+    let limiter = Arc::new(limiter(60, 1));
+    let limit = RateLimit::try_from(1f64).unwrap();
+
+    // Seed some state.
+    insert_series(&limiter, "a", limit, &[(1, 0)]);
+    insert_series(&limiter, "b", limit, &[(1, 0)]);
+
+    let reader = {
+        let limiter = limiter.clone();
+        thread::spawn(move || {
+            for i in 0..50_000u64 {
+                let k = if i % 2 == 0 { "a" } else { "b" };
+                let _ = limiter.is_allowed(k);
+
+                // Occasionally re-seed a key to race with cleanup.
+                if i % 5000 == 0 {
+                    insert_series(&limiter, k, limit, &[(1, 0)]);
+                }
+            }
+        })
+    };
+
+    let cleaner = {
+        let limiter = limiter.clone();
+        thread::spawn(move || {
+            for _ in 0..5_000u64 {
+                limiter.cleanup(0);
+            }
+        })
+    };
+
+    reader.join().expect("reader thread panicked");
+    cleaner.join().expect("cleaner thread panicked");
 }
