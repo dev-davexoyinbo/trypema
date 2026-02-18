@@ -139,7 +139,11 @@ impl AbsoluteRedisRateLimiter {
                 retry_after_ms,
                 remaining_after_waiting,
             }),
-            _ => unreachable!("unexpected result from Redis script: {result}"),
+            _ => Err(TrypemaError::UnexpectedRedisScriptResult {
+                operation: "absolute.inc",
+                key: key.to_string(),
+                result,
+            }),
         }
     } // end method inc
 
@@ -232,7 +236,11 @@ impl AbsoluteRedisRateLimiter {
                 retry_after_ms,
                 remaining_after_waiting,
             }),
-            _ => unreachable!("unexpected result from Redis script: {result}"),
+            _ => Err(TrypemaError::UnexpectedRedisScriptResult {
+                operation: "absolute.is_allowed",
+                key: key.to_string(),
+                result,
+            }),
         }
     }
 

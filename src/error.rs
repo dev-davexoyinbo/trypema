@@ -24,6 +24,19 @@ pub enum TrypemaError {
     #[error("invalid Redis key: {0}")]
     InvalidRedisKey(String),
 
+    /// Redis script returned an unexpected status string.
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+    #[error("unexpected Redis script result for {operation} (key={key}): {result}")]
+    UnexpectedRedisScriptResult {
+        /// Operation name (e.g. "absolute.inc").
+        operation: &'static str,
+        /// Logical limiter key used for the operation.
+        key: String,
+        /// Raw status string returned by the script.
+        result: String,
+    },
+
     /// Custom error.
     #[error("custom error: {0}")]
     CustomError(String),
