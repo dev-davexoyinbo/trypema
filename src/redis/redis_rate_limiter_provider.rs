@@ -1,8 +1,8 @@
 use redis::aio::ConnectionManager;
 
 use crate::{
-    AbsoluteRedisRateLimiter, RateGroupSizeMs, RedisKey, SuppressedRedisRateLimiter,
-    WindowSizeSeconds,
+    AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RedisKey,
+    SuppressedRedisRateLimiter, WindowSizeSeconds,
 };
 
 /// Configuration for Redis rate limiter implementations.
@@ -16,6 +16,9 @@ pub struct RedisRateLimiterOptions {
     pub window_size_seconds: WindowSizeSeconds,
     /// Coalescing interval (in milliseconds) for grouping increments close in time.
     pub rate_group_size_ms: RateGroupSizeMs,
+
+    /// Multiplier used by [`SuppressedRedisRateLimiter`] as a hard cutoff.
+    pub hard_limit_factor: HardLimitFactor,
 }
 
 /// A rate limiter backed by Redis.
