@@ -4,7 +4,7 @@ use redis::AsyncCommands;
 
 use crate::{
     AbsoluteRedisRateLimiter, RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey,
-    RedisRateLimiterOptions, WindowSizeSeconds,
+    RedisKeyGenerator, RedisRateLimiterOptions, WindowSizeSeconds, common::RateType,
 };
 
 fn redis_url() -> String {
@@ -21,35 +21,19 @@ fn key(s: &str) -> RedisKey {
     RedisKey::try_from(s.to_string()).unwrap()
 }
 
-fn hash_key(prefix: &RedisKey, key: &RedisKey) -> String {
-    format!("{}:{}:absolute:h", **prefix, **key)
-}
-
-fn active_keys_key(prefix: &RedisKey, key: &RedisKey) -> String {
-    format!("{}:{}:absolute:a", **prefix, **key)
-}
-
-fn window_limit_key(prefix: &RedisKey, key: &RedisKey) -> String {
-    format!("{}:{}:absolute:w", **prefix, **key)
-}
-
-fn total_count_key(prefix: &RedisKey, key: &RedisKey) -> String {
-    format!("{}:{}:absolute:t", **prefix, **key)
-}
-
-fn active_entities_key(prefix: &RedisKey) -> String {
-    format!("{}:active_entities", **prefix)
+fn keygen(prefix: &RedisKey) -> RedisKeyGenerator {
+    RedisKeyGenerator::new(prefix.clone(), RateType::Absolute)
 }
 
 async fn absolute_keys_exist(
     conn: &mut redis::aio::ConnectionManager,
-    prefix: &RedisKey,
+    kg: &RedisKeyGenerator,
     key: &RedisKey,
 ) -> (bool, bool, bool, bool) {
-    let h_exists: bool = conn.exists(hash_key(prefix, key)).await.unwrap();
-    let a_exists: bool = conn.exists(active_keys_key(prefix, key)).await.unwrap();
-    let w_exists: bool = conn.exists(window_limit_key(prefix, key)).await.unwrap();
-    let t_exists: bool = conn.exists(total_count_key(prefix, key)).await.unwrap();
+    let h_exists: bool = conn.exists(kg.get_hash_key(key)).await.unwrap();
+    let a_exists: bool = conn.exists(kg.get_active_keys(key)).await.unwrap();
+    let w_exists: bool = conn.exists(kg.get_window_limit_key(key)).await.unwrap();
+    let t_exists: bool = conn.exists(kg.get_total_count_key(key)).await.unwrap();
     (h_exists, a_exists, w_exists, t_exists)
 }
 
@@ -173,6 +157,7 @@ fn rate_grouping_merges_within_group() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+        let kg = keygen(&prefix);
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(1000f64).unwrap();
@@ -182,8 +167,8 @@ fn rate_grouping_merges_within_group() {
         limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
         let mut conn = cm.clone();
-        let hlen: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
-        let zcard: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
+        let hlen: u64 = conn.hlen(kg.get_hash_key(&k)).await.unwrap();
+        let zcard: u64 = conn.zcard(kg.get_active_keys(&k)).await.unwrap();
 
         // Increments within the coalescing window should share a single bucket.
         assert_eq!(hlen, 1, "hlen should be 1");
@@ -198,6 +183,7 @@ fn rate_grouping_separates_beyond_group() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+        let kg = keygen(&prefix);
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(1000f64).unwrap();
@@ -207,8 +193,8 @@ fn rate_grouping_separates_beyond_group() {
         limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
         let mut conn = cm.clone();
-        let hlen: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
-        let zcard: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
+        let hlen: u64 = conn.hlen(kg.get_hash_key(&k)).await.unwrap();
+        let zcard: u64 = conn.zcard(kg.get_active_keys(&k)).await.unwrap();
 
         assert_eq!(hlen, 2);
         assert_eq!(zcard, 2);
@@ -316,15 +302,16 @@ fn is_allowed_unknown_key_does_not_create_redis_state() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+        let kg = keygen(&prefix);
 
         let k = key("missing");
         let _ = limiter.is_allowed(&k).await;
 
         let mut conn = cm.clone();
-        let h_exists: bool = conn.exists(hash_key(&prefix, &k)).await.unwrap();
-        let a_exists: bool = conn.exists(active_keys_key(&prefix, &k)).await.unwrap();
-        let w_exists: bool = conn.exists(window_limit_key(&prefix, &k)).await.unwrap();
-        let t_exists: bool = conn.exists(total_count_key(&prefix, &k)).await.unwrap();
+        let h_exists: bool = conn.exists(kg.get_hash_key(&k)).await.unwrap();
+        let a_exists: bool = conn.exists(kg.get_active_keys(&k)).await.unwrap();
+        let w_exists: bool = conn.exists(kg.get_window_limit_key(&k)).await.unwrap();
+        let t_exists: bool = conn.exists(kg.get_total_count_key(&k)).await.unwrap();
 
         assert!(!h_exists);
         assert!(!a_exists);
@@ -340,6 +327,7 @@ fn inc_rejects_when_count_would_push_over_limit() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 1, 1000).await;
+        let kg = keygen(&prefix);
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(2f64).unwrap();
@@ -355,10 +343,10 @@ fn inc_rejects_when_count_would_push_over_limit() {
 
         // Rejected increments must not mutate state.
         let mut conn = cm.clone();
-        let total: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
+        let total: Option<u64> = conn.get(kg.get_total_count_key(&k)).await.unwrap();
         assert_eq!(total, Some(1));
 
-        let sum = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
+        let sum = sum_hash_counts(&mut conn, kg.get_hash_key(&k)).await;
         assert_eq!(sum, 1);
     });
 }
@@ -370,6 +358,7 @@ fn is_allowed_evicts_old_buckets_and_updates_total_count() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 2, 200).await;
+        let kg = keygen(&prefix);
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(1000f64).unwrap();
@@ -386,15 +375,15 @@ fn is_allowed_evicts_old_buckets_and_updates_total_count() {
         assert!(matches!(decision, RateLimitDecision::Allowed));
 
         let mut conn = cm.clone();
-        let hlen: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
-        let zcard: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
-        let total: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
+        let hlen: u64 = conn.hlen(kg.get_hash_key(&k)).await.unwrap();
+        let zcard: u64 = conn.zcard(kg.get_active_keys(&k)).await.unwrap();
+        let total: Option<u64> = conn.get(kg.get_total_count_key(&k)).await.unwrap();
 
         assert_eq!(hlen, 1, "expected oldest bucket to be evicted");
         assert_eq!(zcard, 1, "expected oldest bucket to be evicted");
         assert_eq!(total, Some(1));
 
-        let sum = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
+        let sum = sum_hash_counts(&mut conn, kg.get_hash_key(&k)).await;
         assert_eq!(sum, 1);
     });
 }
@@ -406,6 +395,7 @@ fn is_allowed_does_not_change_total_count_when_no_eviction() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+        let kg = keygen(&prefix);
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(1000f64).unwrap();
@@ -415,13 +405,13 @@ fn is_allowed_does_not_change_total_count_when_no_eviction() {
         limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
         let mut conn = cm.clone();
-        let total_before: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
-        let sum_before = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
+        let total_before: Option<u64> = conn.get(kg.get_total_count_key(&k)).await.unwrap();
+        let sum_before = sum_hash_counts(&mut conn, kg.get_hash_key(&k)).await;
 
         let _ = limiter.is_allowed(&k).await.unwrap();
 
-        let total_after: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
-        let sum_after = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
+        let total_after: Option<u64> = conn.get(kg.get_total_count_key(&k)).await.unwrap();
+        let sum_after = sum_hash_counts(&mut conn, kg.get_hash_key(&k)).await;
 
         assert_eq!(total_before, total_after);
         assert_eq!(sum_before, sum_after);
@@ -435,6 +425,7 @@ fn inc_evicts_expired_buckets_and_total_matches_hash_sum() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 1, 200).await;
+        let kg = keygen(&prefix);
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(1000f64).unwrap();
@@ -452,12 +443,12 @@ fn inc_evicts_expired_buckets_and_total_matches_hash_sum() {
         ));
 
         let mut conn = cm.clone();
-        let sum = sum_hash_counts(&mut conn, hash_key(&prefix, &k)).await;
-        let total: Option<u64> = conn.get(total_count_key(&prefix, &k)).await.unwrap();
+        let sum = sum_hash_counts(&mut conn, kg.get_hash_key(&k)).await;
+        let total: Option<u64> = conn.get(kg.get_total_count_key(&k)).await.unwrap();
         assert_eq!(total, Some(sum));
 
-        let hlen: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
-        let zcard: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
+        let hlen: u64 = conn.hlen(kg.get_hash_key(&k)).await.unwrap();
+        let zcard: u64 = conn.zcard(kg.get_active_keys(&k)).await.unwrap();
         assert_eq!(hlen, 1);
         assert_eq!(zcard, 1);
     });
@@ -491,6 +482,7 @@ fn is_allowed_does_not_mutate_bucket_counts() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+        let kg = keygen(&prefix);
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(1000f64).unwrap();
@@ -501,13 +493,13 @@ fn is_allowed_does_not_mutate_bucket_counts() {
         limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
         let mut conn = cm.clone();
-        let hlen_before: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
-        let zcard_before: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
+        let hlen_before: u64 = conn.hlen(kg.get_hash_key(&k)).await.unwrap();
+        let zcard_before: u64 = conn.zcard(kg.get_active_keys(&k)).await.unwrap();
 
         let _ = limiter.is_allowed(&k).await;
 
-        let hlen_after: u64 = conn.hlen(hash_key(&prefix, &k)).await.unwrap();
-        let zcard_after: u64 = conn.zcard(active_keys_key(&prefix, &k)).await.unwrap();
+        let hlen_after: u64 = conn.hlen(kg.get_hash_key(&k)).await.unwrap();
+        let zcard_after: u64 = conn.zcard(kg.get_active_keys(&k)).await.unwrap();
 
         assert_eq!(hlen_before, hlen_after);
         assert_eq!(zcard_before, zcard_after);
@@ -581,6 +573,7 @@ fn cleanup_deletes_state_and_index_for_stale_entities() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+        let kg = keygen(&prefix);
 
         let a = key("a");
         let b = key("b");
@@ -592,7 +585,7 @@ fn cleanup_deletes_state_and_index_for_stale_entities() {
         limiter.inc(&c, &rate_limit, 1).await.unwrap();
 
         let mut conn = cm.clone();
-        let ae_key = active_entities_key(&prefix);
+        let ae_key = kg.get_active_entities_key();
 
         // Force staleness deterministically based on Redis server time.
         set_active_entity_score_ms_ago(&mut conn, &ae_key, &a, 1050).await;
@@ -601,13 +594,13 @@ fn cleanup_deletes_state_and_index_for_stale_entities() {
 
         limiter.cleanup(1000).await.unwrap();
 
-        let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &prefix, &a).await;
+        let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &kg, &a).await;
         assert!(!a_h && !a_ak && !a_w && !a_t, "expected all keys for a deleted");
 
-        let (b_h, b_ak, b_w, b_t) = absolute_keys_exist(&mut conn, &prefix, &b).await;
+        let (b_h, b_ak, b_w, b_t) = absolute_keys_exist(&mut conn, &kg, &b).await;
         assert!(!b_h && !b_ak && !b_w && !b_t, "expected all keys for b deleted");
 
-        let (c_h, c_ak, c_w, c_t) = absolute_keys_exist(&mut conn, &prefix, &c).await;
+        let (c_h, c_ak, c_w, c_t) = absolute_keys_exist(&mut conn, &kg, &c).await;
         assert!(c_h && c_ak && c_w && c_t, "expected all keys for c retained");
 
         let a_score: Option<f64> = conn.zscore(&ae_key, &*a).await.unwrap();
@@ -627,6 +620,7 @@ fn cleanup_removes_multiple_stale_entities() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+        let kg = keygen(&prefix);
 
         let a = key("a");
         let b = key("b");
@@ -636,14 +630,14 @@ fn cleanup_removes_multiple_stale_entities() {
         limiter.inc(&b, &rate_limit, 1).await.unwrap();
 
         let mut conn = cm.clone();
-        let ae_key = active_entities_key(&prefix);
+        let ae_key = kg.get_active_entities_key();
         set_active_entity_score_ms_ago(&mut conn, &ae_key, &a, 1050).await;
         set_active_entity_score_ms_ago(&mut conn, &ae_key, &b, 1050).await;
 
         limiter.cleanup(1000).await.unwrap();
 
-        let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &prefix, &a).await;
-        let (b_h, b_ak, b_w, b_t) = absolute_keys_exist(&mut conn, &prefix, &b).await;
+        let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &kg, &a).await;
+        let (b_h, b_ak, b_w, b_t) = absolute_keys_exist(&mut conn, &kg, &b).await;
         assert!(!a_h && !a_ak && !a_w && !a_t);
         assert!(!b_h && !b_ak && !b_w && !b_t);
 
@@ -661,18 +655,19 @@ fn cleanup_noop_when_no_stale_entities() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+        let kg = keygen(&prefix);
 
         let a = key("a");
         let rate_limit = RateLimit::try_from(1000f64).unwrap();
         limiter.inc(&a, &rate_limit, 1).await.unwrap();
 
         let mut conn = cm.clone();
-        let ae_key = active_entities_key(&prefix);
+        let ae_key = kg.get_active_entities_key();
         set_active_entity_score_ms_ago(&mut conn, &ae_key, &a, 0).await;
 
         limiter.cleanup(1000).await.unwrap();
 
-        let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &prefix, &a).await;
+        let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &kg, &a).await;
         assert!(a_h && a_ak && a_w && a_t, "expected all keys retained");
 
         let a_score: Option<f64> = conn.zscore(&ae_key, &*a).await.unwrap();
@@ -687,11 +682,12 @@ fn cleanup_noop_on_empty_prefix() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let (limiter, cm, prefix) = build_limiter(&url, 10, 200).await;
+        let kg = keygen(&prefix);
 
         limiter.cleanup(1000).await.unwrap();
 
         let mut conn = cm.clone();
-        let exists: bool = conn.exists(active_entities_key(&prefix)).await.unwrap();
+        let exists: bool = conn.exists(kg.get_active_entities_key()).await.unwrap();
         assert!(!exists, "cleanup should not create active_entities key");
     });
 }
@@ -705,6 +701,9 @@ fn cleanup_is_prefix_scoped() {
         let (limiter1, cm1, prefix1) = build_limiter(&url, 10, 200).await;
         let (limiter2, cm2, prefix2) = build_limiter(&url, 10, 200).await;
 
+        let kg1 = keygen(&prefix1);
+        let kg2 = keygen(&prefix2);
+
         let k1 = key("k");
         let k2 = key("k");
         let rate_limit = RateLimit::try_from(1000f64).unwrap();
@@ -713,23 +712,20 @@ fn cleanup_is_prefix_scoped() {
         limiter2.inc(&k2, &rate_limit, 1).await.unwrap();
 
         let mut conn1 = cm1.clone();
-        let ae1 = active_entities_key(&prefix1);
+        let ae1 = kg1.get_active_entities_key();
         set_active_entity_score_ms_ago(&mut conn1, &ae1, &k1, 1050).await;
 
         limiter1.cleanup(1000).await.unwrap();
 
-        let (k1_h, k1_ak, k1_w, k1_t) = absolute_keys_exist(&mut conn1, &prefix1, &k1).await;
+        let (k1_h, k1_ak, k1_w, k1_t) = absolute_keys_exist(&mut conn1, &kg1, &k1).await;
         assert!(!k1_h && !k1_ak && !k1_w && !k1_t, "expected prefix1 keys deleted");
         let k1_score: Option<f64> = conn1.zscore(&ae1, &*k1).await.unwrap();
         assert!(k1_score.is_none(), "expected prefix1 index entry removed");
 
         let mut conn2 = cm2.clone();
-        let (k2_h, k2_ak, k2_w, k2_t) = absolute_keys_exist(&mut conn2, &prefix2, &k2).await;
+        let (k2_h, k2_ak, k2_w, k2_t) = absolute_keys_exist(&mut conn2, &kg2, &k2).await;
         assert!(k2_h && k2_ak && k2_w && k2_t, "expected prefix2 keys retained");
-        let k2_score: Option<f64> = conn2
-            .zscore(active_entities_key(&prefix2), &*k2)
-            .await
-            .unwrap();
+        let k2_score: Option<f64> = conn2.zscore(kg2.get_active_entities_key(), &*k2).await.unwrap();
         assert!(k2_score.is_some(), "expected prefix2 index entry retained");
     });
 }
