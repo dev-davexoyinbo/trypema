@@ -3,7 +3,7 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    LocalRateLimiterOptions, TrypemaError,
+    LocalRateLimiterOptions,
     common::{
         InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimitSeries,
         WindowSizeSeconds,

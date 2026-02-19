@@ -224,6 +224,7 @@ impl TryFrom<f64> for HardLimitFactor {
     }
 }
 
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, strum_macros::Display)]
 pub(crate) enum RateType {
     #[strum(to_string = "absolute")]
