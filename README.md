@@ -588,7 +588,7 @@ trypema = { version = "1.0", default-features = false, features = ["redis-smol"]
 
 ### Data Model & Cleanup
 
-See [docs/redis.md](docs/redis.md) for detailed information on:
+See [docs/redis.md](https://github.com/dev-davexoyinbo/trypema/docs/redis.md) for detailed information on:
 
 - Redis key schema
 - Lua script implementation
@@ -618,7 +618,7 @@ REDIS_PORT=6379 make test-redis
 REDIS_URL=redis://127.0.0.1:6379 cargo test
 ```
 
-See [docs/testing.md](docs/testing.md) for detailed testing documentation.
+See [docs/testing.md](https://github.com/dev-davexoyinbo/trypema/docs/testing.md) for detailed testing documentation.
 
 ## Roadmap
 
