@@ -301,7 +301,7 @@ A probabilistic strategy that gracefully degrades under load by suppressing a po
 
 **Suppression calculation:**
 
-```
+```text
 suppression_factor = 1.0 - (perceived_rate / rate_limit)
 ```
 

@@ -82,15 +82,43 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```
-/// use trypema::{RateLimit, RateLimitDecision, SuppressedLocalRateLimiter, LocalRateLimiterOptions};
-/// use trypema::{WindowSizeSeconds, RateGroupSizeMs, HardLimitFactor};
+/// ```no_run
+/// use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+/// use trypema::local::LocalRateLimiterOptions;
+/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+/// # use trypema::redis::RedisRateLimiterOptions;
+/// #
+/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+/// # fn options() -> RateLimiterOptions {
+/// #     RateLimiterOptions {
+/// #         local: LocalRateLimiterOptions {
+/// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+/// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+/// #             hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
+/// #         },
+/// #         redis: RedisRateLimiterOptions {
+/// #             connection_manager: todo!(),
+/// #             prefix: None,
+/// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+/// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+/// #             hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
+/// #         },
+/// #     }
+/// # }
+/// #
+/// # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
+/// # fn options() -> RateLimiterOptions {
+/// #     RateLimiterOptions {
+/// #         local: LocalRateLimiterOptions {
+/// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+/// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+/// #             hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
+/// #         },
+/// #     }
+/// # }
 ///
-/// let limiter = SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
-///     window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-///     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-///     hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(), // 50% burst headroom
-/// });
+/// let rl = RateLimiter::new(options());
+/// let limiter = rl.local().suppressed();
 ///
 /// let rate = RateLimit::try_from(10.0).unwrap(); // 10 req/s target, 15 req/s hard limit
 ///
@@ -180,14 +208,43 @@ impl SuppressedLocalRateLimiter {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # use trypema::{RateLimit, RateLimitDecision, SuppressedLocalRateLimiter, LocalRateLimiterOptions};
-    /// # use trypema::{WindowSizeSeconds, RateGroupSizeMs, HardLimitFactor};
-    /// # let limiter = SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
-    /// #     window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-    /// #     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-    /// #     hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
-    /// # });
+    /// ```no_run
+    /// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+    /// # use trypema::local::LocalRateLimiterOptions;
+    /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    /// # use trypema::redis::RedisRateLimiterOptions;
+    /// #
+    /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    /// # fn options() -> RateLimiterOptions {
+    /// #     RateLimiterOptions {
+    /// #         local: LocalRateLimiterOptions {
+    /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+    /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+    /// #             hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
+    /// #         },
+    /// #         redis: RedisRateLimiterOptions {
+    /// #             connection_manager: todo!(),
+    /// #             prefix: None,
+    /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+    /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+    /// #             hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
+    /// #         },
+    /// #     }
+    /// # }
+    /// #
+    /// # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
+    /// # fn options() -> RateLimiterOptions {
+    /// #     RateLimiterOptions {
+    /// #         local: LocalRateLimiterOptions {
+    /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+    /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+    /// #             hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
+    /// #         },
+    /// #     }
+    /// # }
+    /// #
+    /// # let rl = RateLimiter::new(options());
+    /// # let limiter = rl.local().suppressed();
     /// let rate = RateLimit::try_from(10.0).unwrap();
     ///
     /// match limiter.inc("user_123", &rate, 1) {

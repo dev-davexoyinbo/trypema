@@ -30,17 +30,42 @@
 //!
 //! # Examples
 //!
-//! ```
-//! use trypema::{RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions};
-//! use trypema::{LocalRateLimiterOptions, WindowSizeSeconds, RateGroupSizeMs, HardLimitFactor};
+//! ```no_run
+//! use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+//! use trypema::local::LocalRateLimiterOptions;
+//! # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+//! # use trypema::redis::RedisRateLimiterOptions;
+//! #
+//! # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+//! # fn options() -> RateLimiterOptions {
+//! #     RateLimiterOptions {
+//! #         local: LocalRateLimiterOptions {
+//! #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+//! #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+//! #             hard_limit_factor: HardLimitFactor::default(),
+//! #         },
+//! #         redis: RedisRateLimiterOptions {
+//! #             connection_manager: todo!(),
+//! #             prefix: None,
+//! #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+//! #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+//! #             hard_limit_factor: HardLimitFactor::default(),
+//! #         },
+//! #     }
+//! # }
+//! #
+//! # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
+//! # fn options() -> RateLimiterOptions {
+//! #     RateLimiterOptions {
+//! #         local: LocalRateLimiterOptions {
+//! #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+//! #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+//! #             hard_limit_factor: HardLimitFactor::default(),
+//! #         },
+//! #     }
+//! # }
 //!
-//! let rl = RateLimiter::new(RateLimiterOptions {
-//!     local: LocalRateLimiterOptions {
-//!         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-//!         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-//!         hard_limit_factor: HardLimitFactor::default(),
-//!     },
-//! });
+//! let rl = RateLimiter::new(options());
 //!
 //! let rate = RateLimit::try_from(10.0).unwrap();
 //!
