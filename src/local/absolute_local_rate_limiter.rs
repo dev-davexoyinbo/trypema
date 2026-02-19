@@ -371,7 +371,8 @@ impl AbsoluteLocalRateLimiter {
         let rate_limit = match rate_limit.series.front() {
             None => rate_limit,
             Some(instant_rate)
-                if instant_rate.timestamp.elapsed().as_secs() <= *self.window_size_seconds =>
+                if instant_rate.timestamp.elapsed().as_millis()
+                    <= (*self.window_size_seconds * 1000) as u128 =>
             {
                 rate_limit
             }
@@ -383,7 +384,8 @@ impl AbsoluteLocalRateLimiter {
                 };
 
                 while let Some(instant_rate) = rate_limit.series.front()
-                    && instant_rate.timestamp.elapsed().as_secs() > *self.window_size_seconds
+                    && instant_rate.timestamp.elapsed().as_millis()
+                        > (*self.window_size_seconds * 1000) as u128
                 {
                     rate_limit.total.fetch_sub(
                         instant_rate.count.load(Ordering::Relaxed),

@@ -315,16 +315,6 @@ suppression_factor = 1.0 - (perceived_rate / rate_limit)
 
 ## Important Semantics & Limitations
 
-### Best-Effort Concurrency
-
-The `inc()` method performs an admission check **before** applying the increment. Under concurrent load:
-
-- Multiple threads/processes may observe `Allowed` simultaneously
-- All may proceed and increment, causing temporary overshoot
-- This is **expected behavior**, not a bug
-
-**Implication:** This limiter provides approximate rate limiting, not strict linearizability.
-
 ### Eviction Granularity
 
 **Local provider:** Uses `Instant::elapsed().as_secs()` for bucket expiration, which truncates to whole seconds.
