@@ -140,9 +140,11 @@ RUST_LOG=debug cargo test -- --nocapture
 
 Enable Redis command logging (with `redis-tokio` feature):
 
-```rust,ignore
+```rust
+use tracing_subscriber::EnvFilter;
+
 tracing_subscriber::fmt()
-    .with_env_filter("trypema=debug,redis=debug")
+    .with_env_filter(EnvFilter::new("trypema=debug,redis=debug"))
     .init();
 ```
 
@@ -290,40 +292,56 @@ docker run -d --name redis -p 6379:6379 redis:6.2-alpine
 
 ### Writing Tests
 
-1. **Use descriptive names:**
-   ```rust,ignore
-   #[tokio::test]
-   async fn test_absolute_rejects_when_over_limit() { ... }
-   ```
+   1. **Use descriptive names:**
+    ```rust
+    #[tokio::test]
+    async fn test_absolute_rejects_when_over_limit() {
+        // Arrange
+        // Act
+        // Assert
+        assert!(true);
+    }
+    ```
 
-2. **Clean up after tests:**
-   ```rust,ignore
-   #[tokio::test]
-   async fn test_redis_rate_limit() {
-       let key = RedisKey::try_from(format!("test_{}", uuid::Uuid::new_v4()))?;
-       // ... test logic ...
-       
-       // Cleanup
-       redis::cmd("DEL").arg(&format!("trypema:{}:*", key)).query_async(&mut conn).await?;
-   }
-   ```
+   2. **Clean up after tests:**
+    ```rust
+    #[tokio::test]
+    async fn test_redis_rate_limit() -> Result<(), trypema::TrypemaError> {
+        use trypema::redis::RedisKey;
 
-3. **Use unique keys:**
-   ```rust,ignore
-   use uuid::Uuid;
-   let key = format!("test_{}", Uuid::new_v4());
-   ```
+        let key = RedisKey::try_from(format!("test_{}", uuid::Uuid::new_v4()))?;
 
-4. **Test concurrency:**
-   ```rust,ignore
-   let handles: Vec<_> = (0..100)
-       .map(|_| tokio::spawn(limiter.inc(&key, &rate, 1)))
-       .collect();
-   
-   for handle in handles {
-       handle.await??;
-   }
-   ```
+        // ... test logic ...
+
+        // Cleanup (example)
+        // redis::cmd("DEL")
+        //     .arg(format!("trypema:{}:*", key))
+        //     .query_async(&mut conn)
+        //     .await?;
+        let _ = key;
+        Ok(())
+    }
+    ```
+
+   3. **Use unique keys:**
+    ```rust
+    use uuid::Uuid;
+
+    let key = format!("test_{}", Uuid::new_v4());
+    ```
+
+   4. **Test concurrency:**
+    ```rust
+    let handles: Vec<_> = (0..100)
+        .map(|_| tokio::spawn(async {
+            limiter.inc(&key, &rate, 1).await
+        }))
+        .collect();
+
+    for handle in handles {
+        handle.await??;
+    }
+    ```
 
 ### Performance Testing
 

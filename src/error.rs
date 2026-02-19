@@ -125,8 +125,9 @@ pub enum TrypemaError {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// use trypema::{RedisKey, TrypemaError};
+    /// ```rust
+    /// use trypema::{TrypemaError};
+    /// use trypema::redis::RedisKey;
     ///
     /// // Invalid: contains ':'
     /// assert!(matches!(

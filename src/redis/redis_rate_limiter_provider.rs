@@ -16,21 +16,21 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use redis::aio::ConnectionManager;
-/// use trypema::{RedisRateLimiterOptions, RedisKey, WindowSizeSeconds, RateGroupSizeMs, HardLimitFactor};
-///
-/// let client = redis::Client::open("redis://127.0.0.1:6379/")?;
-/// let connection_manager = client.get_connection_manager().await?;
-///
-/// let options = RedisRateLimiterOptions {
-///     connection_manager,
-///     prefix: Some(RedisKey::try_from("myapp".to_string())?), // Keys: myapp:<key>:...
-///     window_size_seconds: WindowSizeSeconds::try_from(60)?,
-///     rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
-///     hard_limit_factor: HardLimitFactor::try_from(1.5)?,
-/// };
-/// ```
+    /// ```rust,no_run
+    /// # async fn example() -> Result<(), trypema::TrypemaError> {
+    /// use trypema::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds};
+    /// use trypema::redis::{RedisKey, RedisRateLimiterOptions};
+    ///
+    /// let options = RedisRateLimiterOptions {
+    ///     connection_manager: todo!("create redis::aio::ConnectionManager"),
+    ///     prefix: Some(RedisKey::try_from("myapp".to_string())?),
+    ///     window_size_seconds: WindowSizeSeconds::try_from(60)?,
+    ///     rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
+    ///     hard_limit_factor: HardLimitFactor::try_from(1.5)?,
+    /// };
+    /// let _ = options;
+    /// # Ok(()) }
+    /// ```
 #[derive(Clone, Debug)]
 pub struct RedisRateLimiterOptions {
     /// Redis connection manager from the `redis` crate.
@@ -39,9 +39,11 @@ pub struct RedisRateLimiterOptions {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// let client = redis::Client::open("redis://127.0.0.1:6379/")?;
-    /// let connection_manager = client.get_connection_manager().await?;
+    /// ```rust,no_run
+    /// # async fn example() -> Result<(), trypema::TrypemaError> {
+    /// let _connection_manager: redis::aio::ConnectionManager =
+    ///     todo!("create redis::aio::ConnectionManager");
+    /// # Ok(()) }
     /// ```
     pub connection_manager: ConnectionManager,
     
@@ -59,12 +61,15 @@ pub struct RedisRateLimiterOptions {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```rust,no_run
+    /// use trypema::redis::RedisKey;
+    ///
     /// // With prefix: myapp:user_123:absolute:h
-    /// prefix: Some(RedisKey::try_from("myapp".to_string())?)
+    /// let _prefix = Some(RedisKey::try_from("myapp".to_string())?);
     ///
     /// // Default prefix: trypema:user_123:absolute:h
-    /// prefix: None
+    /// let _prefix: Option<RedisKey> = None;
+    /// # Ok::<(), trypema::TrypemaError>(())
     /// ```
     pub prefix: Option<RedisKey>,
     
@@ -112,40 +117,42 @@ pub struct RedisRateLimiterOptions {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use trypema::{RateLimit, RedisKey, RateLimiter, RateLimiterOptions};
-/// use trypema::{LocalRateLimiterOptions, RedisRateLimiterOptions};
-/// use trypema::{WindowSizeSeconds, RateGroupSizeMs, HardLimitFactor};
-///
-/// let client = redis::Client::open("redis://127.0.0.1:6379/")?;
-/// let connection_manager = client.get_connection_manager().await?;
-///
-/// let rl = RateLimiter::new(RateLimiterOptions {
-///     local: LocalRateLimiterOptions {
-///         window_size_seconds: WindowSizeSeconds::try_from(60)?,
-///         rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
-///         hard_limit_factor: HardLimitFactor::default(),
-///     },
-///     redis: RedisRateLimiterOptions {
-///         connection_manager,
-///         prefix: None,
-///         window_size_seconds: WindowSizeSeconds::try_from(60)?,
-///         rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
-///         hard_limit_factor: HardLimitFactor::default(),
-///     },
-/// });
-///
-/// let key = RedisKey::try_from("user_123".to_string())?;
-/// let rate = RateLimit::try_from(10.0)?;
-///
-/// match rl.redis().absolute().inc(&key, &rate, 1).await? {
-///     RateLimitDecision::Allowed => { /* proceed */ }
-///     RateLimitDecision::Rejected { retry_after_ms, .. } => {
-///         /* send 429, retry after retry_after_ms */
-///     }
-///     _ => unreachable!(),
-/// }
-/// ```
+    /// ```rust,no_run
+    /// # async fn example() -> Result<(), trypema::TrypemaError> {
+    /// use trypema::{
+    ///     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter,
+    ///     RateLimiterOptions, WindowSizeSeconds,
+    /// };
+    /// use trypema::local::LocalRateLimiterOptions;
+    /// use trypema::redis::{RedisKey, RedisRateLimiterOptions};
+    ///
+    /// let rl = RateLimiter::new(RateLimiterOptions {
+    ///     local: LocalRateLimiterOptions {
+    ///         window_size_seconds: WindowSizeSeconds::try_from(60)?,
+    ///         rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
+    ///         hard_limit_factor: HardLimitFactor::default(),
+    ///     },
+    ///     redis: RedisRateLimiterOptions {
+    ///         connection_manager: todo!("create redis::aio::ConnectionManager"),
+    ///         prefix: None,
+    ///         window_size_seconds: WindowSizeSeconds::try_from(60)?,
+    ///         rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
+    ///         hard_limit_factor: HardLimitFactor::default(),
+    ///     },
+    /// });
+    ///
+    /// let key = RedisKey::try_from("user_123".to_string())?;
+    /// let rate = RateLimit::try_from(10.0)?;
+    ///
+    /// match rl.redis().absolute().inc(&key, &rate, 1).await? {
+    ///     RateLimitDecision::Allowed => {}
+    ///     RateLimitDecision::Rejected { retry_after_ms, .. } => {
+    ///         let _ = retry_after_ms;
+    ///     }
+    ///     _ => unreachable!(),
+    /// }
+    /// # Ok(()) }
+    /// ```
 pub struct RedisRateLimiterProvider {
     absolute: AbsoluteRedisRateLimiter,
     suppressed: SuppressedRedisRateLimiter,
@@ -170,11 +177,10 @@ impl RedisRateLimiterProvider {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// let decision = rl.redis()
-    ///     .absolute()
-    ///     .inc(&key, &rate, 1)
-    ///     .await?;
+    /// ```rust,no_run
+    /// # async fn example(rl: &trypema::RateLimiter, key: &trypema::redis::RedisKey, rate: &trypema::RateLimit) -> Result<(), trypema::TrypemaError> {
+    /// let _decision = rl.redis().absolute().inc(key, rate, 1).await?;
+    /// # Ok(()) }
     /// ```
     pub fn absolute(&self) -> &AbsoluteRedisRateLimiter {
         &self.absolute

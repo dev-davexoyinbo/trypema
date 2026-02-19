@@ -57,23 +57,38 @@ Use the local provider for single-process rate limiting with no external depende
 trypema = "*"
 ```
 
-```rust,ignore
+```rust,no_run
 use std::sync::Arc;
+
 use trypema::{
-    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RateLimiter, RateLimiterOptions, WindowSizeSeconds,
+    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions,
+    WindowSizeSeconds,
 };
+use trypema::local::LocalRateLimiterOptions;
+# #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+# use trypema::redis::RedisRateLimiterOptions;
 
-// Create rate limiter with a 60-second sliding window
-let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
-    local: LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-        rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-        hard_limit_factor: HardLimitFactor::default(),
-    },
-}));
+# fn options() -> RateLimiterOptions {
+#     RateLimiterOptions {
+#         local: LocalRateLimiterOptions {
+#             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+#             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+#             hard_limit_factor: HardLimitFactor::default(),
+#         },
+#         #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#         redis: RedisRateLimiterOptions {
+#             connection_manager: todo!("create redis::aio::ConnectionManager"),
+#             prefix: None,
+#             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+#             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+#             hard_limit_factor: HardLimitFactor::default(),
+#         },
+#     }
+# }
 
-// Optional: Start background cleanup to remove stale keys
+let rl = Arc::new(RateLimiter::new(options()));
+
+// Optional: start background cleanup to remove stale keys
 rl.run_cleanup_loop();
 
 // Rate limit a key to 5 requests per second
@@ -85,7 +100,8 @@ match rl.local().absolute().inc(key, &rate_limit, 1) {
         // Request allowed, proceed
     }
     RateLimitDecision::Rejected { retry_after_ms, .. } => {
-        // Request rejected, backoff for retry_after_ms
+        // Request rejected, back off for retry_after_ms
+        let _ = retry_after_ms;
     }
     RateLimitDecision::Suppressed { .. } => {
         // Only returned by suppressed strategy
@@ -109,20 +125,18 @@ redis = { version = "0.27", features = ["aio", "tokio-comp"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
-```rust,ignore
-use std::sync::Arc;
-use trypema::{
-    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
-    RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
-};
+```rust,no_run
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+async fn example() -> Result<(), trypema::TrypemaError> {
+    use std::sync::Arc;
 
-#[tokio::main]
-async fn main() {
-    // Connect to Redis
-    let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
-    let connection_manager = client.get_connection_manager().await.unwrap();
+    use trypema::{
+        HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions,
+        WindowSizeSeconds,
+    };
+    use trypema::local::LocalRateLimiterOptions;
+    use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 
-    // Create rate limiter with both local and Redis providers
     let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
         local: LocalRateLimiterOptions {
             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
@@ -130,30 +144,21 @@ async fn main() {
             hard_limit_factor: HardLimitFactor::default(),
         },
         redis: RedisRateLimiterOptions {
-            connection_manager,
-            prefix: None, // Optional: prefix all Redis keys with "myapp"
+            connection_manager: todo!("create redis::aio::ConnectionManager"),
+            prefix: None,
             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
         },
     }));
 
-    // Optional: Start background cleanup
     rl.run_cleanup_loop();
 
     let rate_limit = RateLimit::try_from(5.0).unwrap();
-
-    // Redis keys must not contain ':' (used internally as separator)
     let key = RedisKey::try_from("user_123".to_string()).unwrap();
 
-    match rl.redis().absolute().inc(&key, &rate_limit, 1).await {
-        Ok(decision) => {
-            // Handle decision
-        }
-        Err(e) => {
-            // Handle Redis errors
-        }
-    }
+    let _decision = rl.redis().absolute().inc(&key, &rate_limit, 1).await?;
+    Ok(())
 }
 ```
 
@@ -214,20 +219,24 @@ All strategies return a `RateLimitDecision` enum:
 
 The request is allowed and the increment has been recorded.
 
-```rust,ignore
-RateLimitDecision::Allowed
+```rust
+use trypema::RateLimitDecision;
+
+let decision = RateLimitDecision::Allowed;
 ```
 
 ### `Rejected`
 
 The request exceeds the rate limit and should not proceed. The increment was **not** recorded.
 
-```rust,ignore
-RateLimitDecision::Rejected {
+```rust
+use trypema::RateLimitDecision;
+
+let decision = RateLimitDecision::Rejected {
     window_size_seconds: 60,
-    retry_after_ms: 2500,        // Backoff hint: retry in ~2.5 seconds
-    remaining_after_waiting: 45,  // Estimated remaining count after waiting
-}
+    retry_after_ms: 2500,
+    remaining_after_waiting: 45,
+};
 ```
 
 **Fields:**
@@ -242,11 +251,13 @@ RateLimitDecision::Rejected {
 
 Only returned by the suppressed strategy. Indicates probabilistic suppression is active.
 
-```rust,ignore
-RateLimitDecision::Suppressed {
-    suppression_factor: 0.3,  // 30% suppression rate
-    is_allowed: true,         // This specific call was allowed
-}
+```rust
+use trypema::RateLimitDecision;
+
+let decision = RateLimitDecision::Suppressed {
+    suppression_factor: 0.3,
+    is_allowed: true,
+};
 ```
 
 **Fields:**
@@ -336,9 +347,34 @@ Keys are **not automatically removed** from the internal map (local provider) or
 
 **Mitigation:** Use `run_cleanup_loop()` to periodically remove stale keys:
 
-```rust,ignore
-let rl = Arc::new(RateLimiter::new(options));
-rl.run_cleanup_loop(); // Default: removes keys inactive for 10 minutes, checks every 30 seconds
+```rust,no_run
+use std::sync::Arc;
+
+use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+use trypema::local::LocalRateLimiterOptions;
+# #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+# use trypema::redis::RedisRateLimiterOptions;
+
+# fn options() -> RateLimiterOptions {
+#     RateLimiterOptions {
+#         local: LocalRateLimiterOptions {
+#             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+#             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+#             hard_limit_factor: HardLimitFactor::default(),
+#         },
+#         #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#         redis: RedisRateLimiterOptions {
+#             connection_manager: todo!("create redis::aio::ConnectionManager"),
+#             prefix: None,
+#             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+#             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+#             hard_limit_factor: HardLimitFactor::default(),
+#         },
+#     }
+# }
+
+let rl = Arc::new(RateLimiter::new(options()));
+rl.run_cleanup_loop();
 ```
 
 **Memory safety:** The cleanup loop holds only a `Weak<RateLimiter>` reference, so dropping all `Arc` references automatically stops cleanup.
@@ -437,14 +473,19 @@ Redis keys use the `RedisKey` newtype with validation:
 - **Must be ≤ 255 bytes**
 - **Must not contain** `:` (used internally as a separator)
 
-```rust,ignore
-// ✅ Valid
-RedisKey::try_from("user_123".to_string()).unwrap();
-RedisKey::try_from("api_v2_endpoint".to_string()).unwrap();
+```rust,no_run
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+{
+    use trypema::redis::RedisKey;
 
-// ❌ Invalid
-RedisKey::try_from("user:123".to_string()); // Error: contains ':'
-RedisKey::try_from("".to_string());         // Error: empty
+    // Valid
+    let _ = RedisKey::try_from("user_123".to_string()).unwrap();
+    let _ = RedisKey::try_from("api_v2_endpoint".to_string()).unwrap();
+
+    // Invalid
+    let _ = RedisKey::try_from("user:123".to_string());
+    let _ = RedisKey::try_from("".to_string());
+}
 ```
 
 ### Feature Flags

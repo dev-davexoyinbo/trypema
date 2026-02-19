@@ -30,15 +30,15 @@ Requires an async runtime:
 
 User-provided keys use the `RedisKey` newtype with strict validation:
 
-```rust,ignore
-pub struct RedisKey(String);
+```rust,no_run
+use trypema::redis::RedisKey;
 
-impl TryFrom<String> for RedisKey {
-    // Validates:
-    // ✓ Not empty
-    // ✓ Length ≤ 255 bytes
-    // ✓ Does not contain ':'
-}
+// Construction validates:
+// - not empty
+// - <= 255 bytes
+// - does not contain ':'
+let key = RedisKey::try_from("user_123".to_string()).unwrap();
+let _ = key;
 ```
 
 **Why the `:` restriction?** The limiter uses `:` as an internal separator when constructing Redis keys. For example:
@@ -49,16 +49,18 @@ impl TryFrom<String> for RedisKey {
 
 **Examples:**
 
-```rust,ignore
-// ✅ Valid
-RedisKey::try_from("user_123".to_string()).unwrap();
-RedisKey::try_from("api-endpoint-v2".to_string()).unwrap();
+```rust,no_run
+use trypema::redis::RedisKey;
 
-// ❌ Invalid
-RedisKey::try_from("user:123".to_string());  // Contains ':'
-RedisKey::try_from("".to_string());          // Empty
+// Valid
+let _ = RedisKey::try_from("user_123".to_string()).unwrap();
+let _ = RedisKey::try_from("api-endpoint-v2".to_string()).unwrap();
+
+// Invalid
+let _ = RedisKey::try_from("user:123".to_string());
+let _ = RedisKey::try_from("".to_string());
 let long_key = "x".repeat(256);
-RedisKey::try_from(long_key);                // Too long
+let _ = RedisKey::try_from(long_key);
 ```
 
 ## Absolute Strategy Implementation
@@ -73,18 +75,43 @@ The absolute Redis strategy is a distributed sliding-window limiter with bucket 
 
 Checks admission and atomically records the increment if allowed.
 
-```rust,ignore
-let key = RedisKey::try_from("user_123".to_string())?;
-let rate = RateLimit::try_from(10.0)?;
+```rust,no_run
+use trypema::{
+    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions,
+    WindowSizeSeconds,
+};
+use trypema::local::LocalRateLimiterOptions;
+use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 
-match limiter.inc(&key, &rate, 1).await? {
-    RateLimitDecision::Allowed => {
-        // Increment recorded, proceed
+async fn example() -> Result<(), trypema::TrypemaError> {
+    let rl = RateLimiter::new(RateLimiterOptions {
+        local: LocalRateLimiterOptions {
+            window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+            rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+            hard_limit_factor: HardLimitFactor::default(),
+        },
+        redis: RedisRateLimiterOptions {
+            connection_manager: todo!("create redis::aio::ConnectionManager"),
+            prefix: None,
+            window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+            rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+            hard_limit_factor: HardLimitFactor::default(),
+        },
+    });
+
+    let limiter = rl.redis().absolute();
+    let key = RedisKey::try_from("user_123".to_string())?;
+    let rate = RateLimit::try_from(10.0)?;
+
+    match limiter.inc(&key, &rate, 1).await? {
+        RateLimitDecision::Allowed => {}
+        RateLimitDecision::Rejected { retry_after_ms, .. } => {
+            let _ = retry_after_ms;
+        }
+        _ => unreachable!(),
     }
-    RateLimitDecision::Rejected { retry_after_ms, .. } => {
-        // Over limit, not recorded
-    }
-    _ => unreachable!(),
+
+    Ok(())
 }
 ```
 
@@ -96,11 +123,16 @@ match limiter.inc(&key, &rate, 1).await? {
 
 Checks current window usage without recording an increment (read-only).
 
-```rust,ignore
-match limiter.is_allowed(&key).await? {
-    RateLimitDecision::Allowed => { /* Has capacity */ }
-    RateLimitDecision::Rejected { .. } => { /* Over limit */ }
-    _ => unreachable!(),
+```rust,no_run
+use trypema::RateLimitDecision;
+
+async fn check(limiter: &trypema::AbsoluteRedisRateLimiter, key: &trypema::RedisKey) -> Result<(), trypema::TrypemaError> {
+    match limiter.is_allowed(key).await? {
+        RateLimitDecision::Allowed => {}
+        RateLimitDecision::Rejected { .. } => {}
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 ```
 
@@ -277,9 +309,30 @@ end
 
 For proactive cleanup of completely inactive keys, use:
 
-```rust,ignore
-rl.run_cleanup_loop();  // Default: stale_after=10min, interval=30s
-rl.run_cleanup_loop_with_config(600_000, 30_000);  // Custom config
+```rust,no_run
+use std::sync::Arc;
+
+use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+use trypema::local::LocalRateLimiterOptions;
+use trypema::redis::RedisRateLimiterOptions;
+
+let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+    local: LocalRateLimiterOptions {
+        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+        rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+        hard_limit_factor: HardLimitFactor::default(),
+    },
+    redis: RedisRateLimiterOptions {
+        connection_manager: todo!("create redis::aio::ConnectionManager"),
+        prefix: None,
+        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+        rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+        hard_limit_factor: HardLimitFactor::default(),
+    },
+}));
+
+rl.run_cleanup_loop();
+rl.run_cleanup_loop_with_config(600_000, 30_000);
 ```
 
 **What it cleans:**
@@ -314,12 +367,14 @@ done
 
 When a request is rejected, the Lua script returns:
 
-```rust,ignore
-RateLimitDecision::Rejected {
+```rust
+use trypema::RateLimitDecision;
+
+let decision = RateLimitDecision::Rejected {
     window_size_seconds: 60,
     retry_after_ms: 2500,
     remaining_after_waiting: 45,
-}
+};
 ```
 
 ### Field Meanings
@@ -460,27 +515,43 @@ if matches!(decision, RateLimitDecision::Allowed) {
 
 ### HTTP Middleware Example
 
-```rust,ignore
+```rust,no_run
+use std::sync::Arc;
+
+use trypema::{AbsoluteRedisRateLimiter, RateLimit, RateLimitDecision};
+use trypema::redis::RedisKey;
+
+struct Request;
+struct Response;
+
+#[derive(Debug)]
+struct Error;
+
+fn extract_user_id(_req: &Request) -> Result<String, Error> {
+    Ok("user_123".to_string())
+}
+
+async fn handle_request(_req: Request) -> Result<Response, Error> {
+    Ok(Response)
+}
+
 async fn rate_limit_middleware(
     req: Request,
     limiter: Arc<AbsoluteRedisRateLimiter>,
 ) -> Result<Response, Error> {
     let user_id = extract_user_id(&req)?;
-    let key = RedisKey::try_from(format!("api_{}", user_id))?;
-    let rate = RateLimit::try_from(100.0)?; // 100 req/s per user
-    
-    match limiter.inc(&key, &rate, 1).await? {
-        RateLimitDecision::Allowed => {
-            // Process request normally
-            Ok(handle_request(req).await)
-        }
-        RateLimitDecision::Rejected { retry_after_ms, remaining_after_waiting, .. } => {
-            // Return 429 with headers
-            Ok(Response::builder()
-                .status(429)
-                .header("Retry-After", (retry_after_ms / 1000).to_string())
-                .header("X-RateLimit-Remaining", remaining_after_waiting.to_string())
-                .body("Too Many Requests")?)
+    let key = RedisKey::try_from(format!("api_{}", user_id)).map_err(|_| Error)?;
+    let rate = RateLimit::try_from(100.0).map_err(|_| Error)?;
+
+    match limiter.inc(&key, &rate, 1).await.map_err(|_| Error)? {
+        RateLimitDecision::Allowed => handle_request(req).await,
+        RateLimitDecision::Rejected {
+            retry_after_ms,
+            remaining_after_waiting,
+            ..
+        } => {
+            let _ = (retry_after_ms, remaining_after_waiting);
+            Err(Error)
         }
         _ => unreachable!(),
     }
@@ -489,21 +560,29 @@ async fn rate_limit_middleware(
 
 ### Multi-Tier Rate Limiting
 
-```rust,ignore
-// Different limits for different tiers
+```rust,no_run
+use trypema::{AbsoluteRedisRateLimiter, RateLimit, RateLimitDecision, TrypemaError};
+use trypema::redis::RedisKey;
+
+enum UserTier {
+    Free,
+    Pro,
+    Enterprise,
+}
+
 async fn check_user_rate_limit(
     user_id: &str,
     user_tier: UserTier,
     limiter: &AbsoluteRedisRateLimiter,
 ) -> Result<RateLimitDecision, TrypemaError> {
     let key = RedisKey::try_from(format!("user_{}", user_id))?;
-    
+
     let rate = match user_tier {
-        UserTier::Free => RateLimit::try_from(10.0)?,      // 10 req/s
-        UserTier::Pro => RateLimit::try_from(100.0)?,      // 100 req/s
-        UserTier::Enterprise => RateLimit::try_from(1000.0)?, // 1000 req/s
+        UserTier::Free => RateLimit::try_from(10.0)?,
+        UserTier::Pro => RateLimit::try_from(100.0)?,
+        UserTier::Enterprise => RateLimit::try_from(1000.0)?,
     };
-    
+
     limiter.inc(&key, &rate, 1).await
 }
 ```
@@ -514,7 +593,7 @@ async fn check_user_rate_limit(
 
 Enable Redis command logging with `tracing`:
 
-```rust,ignore
+```rust
 use tracing_subscriber;
 
 tracing_subscriber::fmt()
@@ -532,7 +611,9 @@ WARN Redis cleanup failed, will retry: <error details>
 Recommended metrics for production:
 
 1. **Rate limit hit rate:**
-   ```rust,ignore
+   ```rust
+   use trypema::RateLimitDecision;
+
    match decision {
        RateLimitDecision::Rejected { .. } => {
            metrics.increment("rate_limit.rejected", tags);
@@ -545,14 +626,19 @@ Recommended metrics for production:
    ```
 
 2. **Redis operation latency:**
-   ```rust,ignore
+   ```rust,no_run
+   use std::time::Instant;
+
    let start = Instant::now();
    let decision = limiter.inc(&key, &rate, 1).await?;
    metrics.histogram("rate_limit.redis.latency_ms", start.elapsed().as_millis());
+   let _ = decision;
    ```
 
 3. **Redis connection errors:**
-   ```rust,ignore
+   ```rust,no_run
+   use trypema::TrypemaError;
+
    match limiter.inc(&key, &rate, 1).await {
        Err(TrypemaError::RedisError(_)) => {
            metrics.increment("rate_limit.redis.errors");
