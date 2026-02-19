@@ -3,10 +3,8 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    common::{
-        HardLimitFactor, RateGroupSizeMs, RateLimit, SuppressionFactorCacheMs, WindowSizeSeconds,
-    },
     AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
+    common::{HardLimitFactor, RateLimit, SuppressionFactorCacheMs, WindowSizeSeconds},
 };
 
 /// Probabilistic rate limiter with dual tracking for graceful degradation.
@@ -153,14 +151,12 @@ pub struct SuppressedLocalRateLimiter {
     observed_limiter: AbsoluteLocalRateLimiter,
     suppression_factors: DashMap<String, (Instant, f64)>,
     hard_limit_factor: HardLimitFactor,
-    rate_group_size_ms: RateGroupSizeMs,
     window_size_seconds: WindowSizeSeconds,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
 }
 
 impl SuppressedLocalRateLimiter {
     pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
-        let rate_group_size_ms = options.rate_group_size_ms;
         let window_size_seconds = options.window_size_seconds;
         let hard_limit_factor = options.hard_limit_factor;
         let suppression_factor_cache_ms = options.suppression_factor_cache_ms;
@@ -173,7 +169,6 @@ impl SuppressedLocalRateLimiter {
             observed_limiter,
             suppression_factors: DashMap::new(),
             hard_limit_factor,
-            rate_group_size_ms,
             window_size_seconds,
             suppression_factor_cache_ms,
         }
@@ -299,18 +294,7 @@ impl SuppressedLocalRateLimiter {
         // Always track observed usage; this limiter uses a max rate to avoid rejecting.
         self.observed_limiter.inc(key, &RateLimit::max(), count);
 
-        let mut suppression_factor = match self.suppression_factors.get(key) {
-            None => self.calculate_suppression_factor(key).1,
-            Some(val)
-                if val.0.elapsed().as_millis() < *self.suppression_factor_cache_ms as u128 =>
-            {
-                val.1
-            }
-            Some(val) => {
-                drop(val);
-                self.calculate_suppression_factor(key).1
-            }
-        };
+        let mut suppression_factor = self.get_suppression_factor(key);
 
         suppression_factor = suppression_factor.min(1f64);
 
@@ -342,6 +326,22 @@ impl SuppressedLocalRateLimiter {
             RateLimitDecision::Rejected { .. } => decision,
             RateLimitDecision::Suppressed { .. } => {
                 unreachable!("AbsoluteLocalRateLimiter::inc: should not be suppressed")
+            }
+        }
+    }
+
+    /// Get the current suppression factor for `key`.
+    pub fn get_suppression_factor(&self, key: &str) -> f64 {
+        match self.suppression_factors.get(key) {
+            None => self.calculate_suppression_factor(key).1,
+            Some(val)
+                if val.0.elapsed().as_millis() < *self.suppression_factor_cache_ms as u128 =>
+            {
+                val.1
+            }
+            Some(val) => {
+                drop(val);
+                self.calculate_suppression_factor(key).1
             }
         }
     }

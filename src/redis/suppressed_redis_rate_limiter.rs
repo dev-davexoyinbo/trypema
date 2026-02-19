@@ -60,10 +60,7 @@ impl SuppressedRedisRateLimiter {
             .inc(key, &RateLimit::max(), count)
             .await?;
 
-        let suppression_factor = self
-            .compute_or_calculate_suppression_factor(key)
-            .await?
-            .min(1f64);
+        let suppression_factor = self.get_suppression_factor(key).await?.min(1f64);
 
         if suppression_factor <= 0f64 {
             return self
@@ -101,10 +98,8 @@ impl SuppressedRedisRateLimiter {
         Ok(decision)
     }
 
-    async fn compute_or_calculate_suppression_factor(
-        &self,
-        key: &RedisKey,
-    ) -> Result<f64, TrypemaError> {
+    /// Get the current suppression factor for `key`.
+    pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         let script = Script::new(
             r#"
             local time_array = redis.call("TIME")
