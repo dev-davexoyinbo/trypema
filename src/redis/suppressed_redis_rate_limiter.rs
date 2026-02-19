@@ -1,12 +1,8 @@
-use std::time::Instant;
-
-use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
     AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RedisKey, RedisKeyGenerator, RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
-    common::RateType,
+    RedisKey, RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds, common::RateType,
 };
 
 /// A rate limiter backed by Redis.
@@ -60,9 +56,10 @@ impl SuppressedRedisRateLimiter {
             .inc(key, &RateLimit::max(), count)
             .await?;
 
-        // TODO: get suppression factor from redis
-
-        let suppression_factor = self.compute_or_calculate_suppression_factor(key)?.min(1f64);
+        let suppression_factor = self
+            .compute_or_calculate_suppression_factor(key)
+            .await?
+            .min(1f64);
 
         if suppression_factor <= 0f64 {
             return self
@@ -100,8 +97,10 @@ impl SuppressedRedisRateLimiter {
         Ok(decision)
     }
 
-    #[inline]
-    fn compute_or_calculate_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
+    async fn compute_or_calculate_suppression_factor(
+        &self,
+        key: &RedisKey,
+    ) -> Result<f64, TrypemaError> {
         let script = Script::new(
             r#"
             local time_array = redis.call("TIME")
@@ -113,7 +112,7 @@ impl SuppressedRedisRateLimiter {
             local suppressed_factor_key = KEYS[4]
 
             local window_size_seconds = tonumber(ARGV[1])
-            local rate_group_size_ms = tonumber(ARGV[4])
+            local rate_group_size_ms = tonumber(ARGV[2])
 
             local suppression_factor = tonumber(redis.call("GET", suppressed_factor_key))
             if suppression_factor ~= nil then
@@ -142,6 +141,8 @@ impl SuppressedRedisRateLimiter {
                 end
             end
 
+            local oldest_hash_field_timestamp = tonumber(accepted_active_keys_in_1s[1])
+
             local average_rate_in_window = accepted_total / window_size_seconds
             local perceived_rate_limit = average_rate_in_window
 
@@ -150,13 +151,43 @@ impl SuppressedRedisRateLimiter {
             end
 
             suppression_factor = 1 - (perceived_rate_limit / window_limit)
-            redis.call("SET", suppressed_factor_key, suppression_factor, PX, rate_group_size_ms)
+            suppression_factor_exp = rate_group_size_ms - now_ms + oldest_hash_field_timestamp
+
+            if suppression_factor_exp <= 0 then
+                suppression_factor_exp = 1000
+            end
+
+            redis.call("SET", suppressed_factor_key, suppression_factor, PX, suppression_factor_exp)
 
             return suppression_factor
         "#,
         );
 
-        todo!()
+        let mut connection_manager = self.connection_manager.clone();
+
+        let suppression_factor: f64 = script
+            .key(
+                self.accepted_limiter
+                    .key_generator()
+                    .get_total_count_key(key),
+            )
+            .key(self.accepted_limiter.key_generator().get_active_keys(key))
+            .key(
+                self.accepted_limiter
+                    .key_generator()
+                    .get_window_limit_key(key),
+            )
+            .key(
+                self.observed_limiter
+                    .key_generator()
+                    .get_suppression_factor_key(key),
+            )
+            .arg(*self.window_size_seconds)
+            .arg(*self.rate_group_size_ms)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(suppression_factor)
     } // end method calculate_suppression_factor
 
     #[inline]
