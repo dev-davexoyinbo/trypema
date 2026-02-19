@@ -8,6 +8,8 @@ The name is inspired by the Koine Greek word "τρυπήματος" (trypematos,
 
 Trypema is a Rust rate limiting library supporting both in-process and Redis-backed distributed enforcement. It emphasizes predictable behavior, low overhead, and flexible rate limiting strategies.
 
+Documentation: https://dev-davexoyinbo.github.io/trypema-docs/
+
 ### Features
 
 **Providers:**
