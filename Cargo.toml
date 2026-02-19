@@ -12,7 +12,6 @@ keywords = [
   "rate-limiter",
   "throttling",
   "concurrency",
-  "atomic",
 ]
 authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
 documentation = "https://docs.rs/trypema"

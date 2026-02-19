@@ -62,6 +62,8 @@ impl SuppressedRedisRateLimiter {
             .await?
             .min(1f64);
 
+        eprintln!("suppression_factor>>>>>: {suppression_factor}");
+
         if suppression_factor <= 0f64 {
             return self
                 .accepted_limiter
@@ -112,9 +114,11 @@ impl SuppressedRedisRateLimiter {
             local observed_total_count_key = KEYS[3]
             local observed_active_keys_key = KEYS[4]
             local suppressed_factor_key = KEYS[5]
+            local observed_hash_key = KEYS[6]
 
             local window_size_seconds = tonumber(ARGV[1])
             local rate_group_size_ms = tonumber(ARGV[2])
+            local hard_limit_factor = tonumber(ARGV[3])
 
             local suppression_factor = tonumber(redis.call("GET", suppressed_factor_key))
             if suppression_factor ~= nil then
@@ -122,6 +126,8 @@ impl SuppressedRedisRateLimiter {
             end
 
             local window_limit = tonumber(redis.call("GET", accepted_window_limit_key)) or 0
+            window_limit = window_limit / hard_limit_factor
+
             local accepted_total_count = tonumber(redis.call("GET", accepted_total_count_key)) or 0
             local observed_total_count = tonumber(redis.call("GET", observed_total_count_key)) or 0
             local active_keys_count = tonumber(redis.call("ZCARD", observed_active_keys_key)) or 0
@@ -135,8 +141,8 @@ impl SuppressedRedisRateLimiter {
             local observed_active_keys_in_1s = redis.call("ZRANGE", observed_active_keys_key, "+inf", now_ms - 1000, "BYSCORE", "REV")
             local total_in_last_second = 0
 
-            if #accepted_active_keys_in_1s > 0 then
-                local values = redis.call("HMGET", observed_active_keys_key, unpack(observed_active_keys_in_1s))
+            if #observed_active_keys_in_1s > 0 then
+                local values = redis.call("HMGET", observed_hash_key, unpack(observed_active_keys_in_1s))
                 for i = 1, #values do
                     local value = tonumber(values[i])
                     if value then
@@ -145,7 +151,6 @@ impl SuppressedRedisRateLimiter {
                 end
             end
 
-
             local average_rate_in_window = observed_total_count / window_size_seconds
             local perceived_rate_limit = average_rate_in_window
 
@@ -153,7 +158,7 @@ impl SuppressedRedisRateLimiter {
                 perceived_rate_limit = total_in_last_second
             end
 
-            suppression_factor = 1 - (perceived_rate_limit / window_limit)
+            suppression_factor = 1 - (window_limit / window_size_seconds / perceived_rate_limit)
 
 
             local oldest_hash_field_timestamp = tonumber(observed_active_keys_in_1s[1]) or now_ms
@@ -193,8 +198,10 @@ impl SuppressedRedisRateLimiter {
                     .key_generator()
                     .get_suppression_factor_key(key),
             )
+            .key(self.observed_limiter.key_generator().get_hash_key(key))
             .arg(*self.window_size_seconds)
             .arg(*self.rate_group_size_ms)
+            .arg(*self.hard_limit_factor)
             .invoke_async(&mut connection_manager)
             .await?;
 
