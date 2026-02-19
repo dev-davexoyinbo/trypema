@@ -71,9 +71,38 @@ fn verify_suppression_factor_calculation_spread() {
     // wait for 1.5 seconds
     std::thread::sleep(Duration::from_millis(1200));
 
-    let expected_suppression_factor = 1f64 - (10f64 / 21f64);
+    let expected_suppression_factor = 1f64 - (1f64 / 2.1f64);
 
     let decision = limiter.inc(key, &rate_limit, 1);
+    assert!(
+        matches!(
+            decision,
+            RateLimitDecision::Suppressed {
+                suppression_factor,
+                ..
+            } if suppression_factor - expected_suppression_factor < 1e-12
+        ),
+        "decision: {:?}",
+        decision
+    );
+}
+
+#[test]
+fn verify_suppression_factor_calculation_last_second() {
+    let limiter = limiter(10, 100, 10f64);
+    let key = "k";
+    let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+    let _ = limiter.inc(key, &rate_limit, 10);
+    // wait for 1s to pass
+    std::thread::sleep(Duration::from_millis(1001));
+
+    let _ = limiter.inc(key, &rate_limit, 20);
+
+    let expected_suppression_factor = 1f64 - (1f64 / 21f64);
+
+    let decision = limiter.inc(key, &rate_limit, 1);
+
     assert!(
         matches!(
             decision,
