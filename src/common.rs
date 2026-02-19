@@ -461,3 +461,35 @@ pub(crate) enum RateType {
     #[strum(to_string = "suppressed_observed")]
     SuppressedObserved,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct SuppressionFactorCacheMs(u64);
+
+impl Default for SuppressionFactorCacheMs {
+    /// Returns a suppression factor cache duration of 10 minutes (600_000 ms).
+    fn default() -> Self {
+        Self(10)
+    }
+}
+
+impl Deref for SuppressionFactorCacheMs {
+    type Target = u64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl TryFrom<u64> for SuppressionFactorCacheMs {
+    type Error = TrypemaError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value == 0 {
+            Err(TrypemaError::InvalidSuppressionFactorCacheMs(
+                "Suppression factor cache must be greater than 0".to_string(),
+            ))
+        } else {
+            Ok(Self(value))
+        }
+    }
+}

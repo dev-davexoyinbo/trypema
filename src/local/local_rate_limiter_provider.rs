@@ -1,6 +1,6 @@
 use crate::{
-    common::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds},
     AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
+    common::{HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds},
 };
 
 /// Configuration for local (in-process) rate limiters.
@@ -70,6 +70,14 @@ pub struct LocalRateLimiterOptions {
     /// **Recommended:** 1.5 (50% burst headroom)  
     /// **Note:** Ignored by [`AbsoluteLocalRateLimiter`]
     pub hard_limit_factor: HardLimitFactor,
+
+    /// Sliding window duration for caching suppression factors.
+    ///
+    /// Determines how long the cache of suppression factors is valid.
+    ///
+    /// **Typical values:** 10-300 seconds  
+    /// **Recommended:** 60 seconds
+    pub suppression_factor_cache_ms: SuppressionFactorCacheMs,
 }
 
 /// Provider for in-process rate limiting strategies.

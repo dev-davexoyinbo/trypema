@@ -4,7 +4,9 @@ use dashmap::DashMap;
 
 use crate::{
     AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
-    common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
+    common::{
+        HardLimitFactor, RateGroupSizeMs, RateLimit, SuppressionFactorCacheMs, WindowSizeSeconds,
+    },
 };
 
 /// Probabilistic rate limiter with dual tracking for graceful degradation.
@@ -150,6 +152,7 @@ pub struct SuppressedLocalRateLimiter {
     hard_limit_factor: HardLimitFactor,
     rate_group_size_ms: RateGroupSizeMs,
     window_size_seconds: WindowSizeSeconds,
+    suppression_factor_cache_ms: SuppressionFactorCacheMs,
 }
 
 impl SuppressedLocalRateLimiter {
@@ -157,6 +160,7 @@ impl SuppressedLocalRateLimiter {
         let rate_group_size_ms = options.rate_group_size_ms;
         let window_size_seconds = options.window_size_seconds;
         let hard_limit_factor = options.hard_limit_factor;
+        let suppression_factor_cache_ms = options.suppression_factor_cache_ms;
 
         let accepted_limiter = AbsoluteLocalRateLimiter::new(options.clone());
         let observed_limiter = AbsoluteLocalRateLimiter::new(options);
@@ -168,6 +172,7 @@ impl SuppressedLocalRateLimiter {
             hard_limit_factor,
             rate_group_size_ms,
             window_size_seconds,
+            suppression_factor_cache_ms,
         }
     } // end constructor
 
@@ -290,7 +295,11 @@ impl SuppressedLocalRateLimiter {
 
         let mut suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
-            Some(val) if val.0.elapsed().as_millis() < *self.rate_group_size_ms as u128 => val.1,
+            Some(val)
+                if val.0.elapsed().as_millis() < *self.suppression_factor_cache_ms as u128 =>
+            {
+                val.1
+            }
             Some(val) => {
                 drop(val);
                 self.calculate_suppression_factor(key).1

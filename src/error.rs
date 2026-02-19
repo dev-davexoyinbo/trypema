@@ -169,4 +169,10 @@ pub enum TrypemaError {
     /// Not typically encountered by end users.
     #[error("custom error: {0}")]
     CustomError(String),
+
+    /// Invalid suppression factor cache duration.
+    ///
+    /// The duration must be greater than 0.
+    #[error("invalid suppression factor cache duration: {0}")]
+    InvalidSuppressionFactorCacheMs(String),
 }
