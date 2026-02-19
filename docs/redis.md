@@ -140,6 +140,33 @@ async fn check(limiter: &trypema::AbsoluteRedisRateLimiter, key: &trypema::Redis
 
 **Use case:** Preview admission decision without affecting state (e.g., for middleware that needs to check before doing expensive work).
 
+## Suppressed Strategy Implementation
+
+**Source:** `src/redis/suppressed_redis_rate_limiter.rs`
+
+The suppressed Redis strategy provides probabilistic suppression under load. It also exposes the
+current suppression factor per key.
+
+### API Methods
+
+#### `get_suppression_factor(key) -> Result<f64, TrypemaError>`
+
+Returns the current suppression factor for the key. If a cached value exists in Redis, it is
+returned; otherwise the value is recomputed and cached with a TTL.
+
+```rust,no_run
+use trypema::{RateLimit, RedisKey};
+
+async fn example(limiter: &trypema::SuppressedRedisRateLimiter) -> Result<(), trypema::TrypemaError> {
+    let key = RedisKey::try_from("user_123".to_string())?;
+    let _rate = RateLimit::try_from(10.0)?;
+
+    let sf = limiter.get_suppression_factor(&key).await?;
+    let _ = sf;
+    Ok(())
+}
+```
+
 ### Implementation
 
 Both methods are implemented as **atomic Lua scripts** executed on Redis via `EVALSHA`.

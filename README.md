@@ -103,6 +103,9 @@ match rl.local().absolute().inc(key, &rate_limit, 1) {
 }
 
 // Suppressed strategy (probabilistic suppression near/over the target rate)
+// You can also query the current suppression factor (useful for metrics/debugging).
+let sf = rl.local().suppressed().get_suppression_factor(key);
+let _ = sf;
 match rl.local().suppressed().inc(key, &rate_limit, 1) {
     RateLimitDecision::Allowed => {
         // Below capacity: request allowed, proceed
@@ -206,6 +209,9 @@ match decision {
 }
 
 // Suppressed strategy (probabilistic suppression near/over the target rate)
+// You can also query the current suppression factor (useful for metrics/debugging).
+let sf = rl.redis().suppressed().get_suppression_factor(&key).await?;
+let _ = sf;
 let decision = match rl.redis().suppressed().inc(&key, &rate_limit, 1).await {
     Ok(decision) => decision,
     Err(e) => {

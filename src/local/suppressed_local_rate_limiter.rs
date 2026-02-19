@@ -3,8 +3,8 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
     common::{HardLimitFactor, RateLimit, SuppressionFactorCacheMs, WindowSizeSeconds},
+    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
 };
 
 /// Probabilistic rate limiter with dual tracking for graceful degradation.
@@ -331,6 +331,11 @@ impl SuppressedLocalRateLimiter {
     }
 
     /// Get the current suppression factor for `key`.
+    ///
+    /// This is useful for exporting metrics or debugging why calls are being suppressed.
+    ///
+    /// Returns the cached value if it is still fresh, otherwise recomputes and refreshes
+    /// the cache.
     pub fn get_suppression_factor(&self, key: &str) -> f64 {
         match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,

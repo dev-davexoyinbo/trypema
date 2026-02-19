@@ -99,6 +99,11 @@ impl SuppressedRedisRateLimiter {
     }
 
     /// Get the current suppression factor for `key`.
+    ///
+    /// This is useful for exporting metrics or debugging why calls are being suppressed.
+    ///
+    /// If a cached value exists in Redis, it is returned. Otherwise, this recomputes the
+    /// suppression factor and writes it back to Redis with a TTL.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         let script = Script::new(
             r#"
