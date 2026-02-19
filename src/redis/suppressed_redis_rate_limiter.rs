@@ -141,9 +141,8 @@ impl SuppressedRedisRateLimiter {
                 end
             end
 
-            local oldest_hash_field_timestamp = tonumber(accepted_active_keys_in_1s[1])
 
-            local average_rate_in_window = accepted_total / window_size_seconds
+            local average_rate_in_window = accepted_total_count / window_size_seconds
             local perceived_rate_limit = average_rate_in_window
 
             if total_in_last_second > average_rate_in_window then
@@ -151,7 +150,10 @@ impl SuppressedRedisRateLimiter {
             end
 
             suppression_factor = 1 - (perceived_rate_limit / window_limit)
-            suppression_factor_exp = rate_group_size_ms - now_ms + oldest_hash_field_timestamp
+
+
+            local oldest_hash_field_timestamp = tonumber(accepted_active_keys_in_1s[1]) or now_ms
+            local suppression_factor_exp = rate_group_size_ms - now_ms + oldest_hash_field_timestamp
 
             if suppression_factor_exp <= 0 then
                 suppression_factor_exp = 1000

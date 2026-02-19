@@ -381,7 +381,7 @@ fn suppression_factor_recompute_does_not_error_when_no_recent_activity_in_last_1
 
         let mut rng = |_p: f64| true;
         let res = limiter.inc_with_rng(&k, &rate_limit, 1, &mut rng).await;
-        assert!(res.is_ok(), "expected recompute to not error");
+        assert!(res.is_ok(), "expected recompute to not error, instead got {res:?}");
     });
 }
 
