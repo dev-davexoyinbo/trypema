@@ -377,6 +377,12 @@ impl SuppressedLocalRateLimiter {
 
         let window_limit = *self.window_size_seconds as f64 * *rate_limit;
 
+        if observed_series.total.load(Ordering::Relaxed)
+            >= (window_limit * *self.hard_limit_factor) as u64
+        {
+            return self.persist_suppression_factor(key, 1f64);
+        }
+
         if series.total.load(Ordering::Relaxed) < window_limit as u64 {
             return self.persist_suppression_factor(key, 0f64);
         }
