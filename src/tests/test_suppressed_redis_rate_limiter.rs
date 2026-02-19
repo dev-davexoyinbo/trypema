@@ -508,3 +508,31 @@ fn verify_suppression_factor_calculation_last_second_redis() {
         );
     });
 }
+
+#[test]
+fn verify_hard_limit_rejects() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, _cm, _prefix) = build_limiter(&url, 10, 100, 10f64).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        let _ = limiter.inc(&k, &rate_limit, 100).await.unwrap();
+        // wait for 1s to pass
+        tokio::time::sleep(Duration::from_millis(1001)).await;
+
+        let _ = limiter.inc(&k, &rate_limit, 20).await.unwrap();
+
+        let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
+
+        assert!(
+            matches!(decision, RateLimitDecision::Rejected { .. } )
+            ||
+            matches!(decision, RateLimitDecision::Suppressed { suppression_factor, .. } if suppression_factor == 1.0f64),
+            "decision: {:?}",
+            decision
+        );
+    });
+}

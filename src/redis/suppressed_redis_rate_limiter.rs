@@ -135,6 +135,11 @@ impl SuppressedRedisRateLimiter {
                 return 0
             end
 
+            if observed_total_count >= window_limit * hard_limit_factor then
+                redis.call("SET", suppressed_factor_key, 1, "PX", rate_group_size_ms)
+                return 1
+            end
+
 
             local observed_active_keys_in_1s = redis.call("ZRANGE", observed_active_keys_key, "+inf", now_ms - 1000, "BYSCORE", "REV")
             local total_in_last_second = 0
