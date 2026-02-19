@@ -54,7 +54,7 @@ Use the local provider for single-process rate limiting with no external depende
 
 ```toml
 [dependencies]
-trypema = "*"
+trypema = "1.0"
 ```
 
 ```rust,no_run
@@ -146,7 +146,7 @@ Use the Redis provider for distributed rate limiting across multiple processes/s
 
 ```toml
 [dependencies]
-trypema = { version = "*", features = ["redis-tokio"] }
+trypema = { version = "1.0", features = ["redis-tokio"] }
 redis = { version = "0.27", features = ["aio", "tokio-comp"] }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -579,13 +579,13 @@ Control Redis support at compile time:
 
 ```toml
 # Default: Redis enabled with Tokio
-trypema = { version = "*" }
+trypema = { version = "1.0" }
 
 # Disable Redis entirely
-trypema = { version = "*", default-features = false }
+trypema = { version = "1.0", default-features = false }
 
 # Use Smol runtime instead
-trypema = { version = "*", default-features = false, features = ["redis-smol"] }
+trypema = { version = "1.0", default-features = false, features = ["redis-smol"] }
 ```
 
 ### Data Model & Cleanup
