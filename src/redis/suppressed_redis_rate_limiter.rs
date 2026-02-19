@@ -2,7 +2,8 @@ use redis::{Script, aio::ConnectionManager};
 
 use crate::{
     AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RedisKey, RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds, common::RateType,
+    RedisKey, RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
+    common::{RateType, SuppressionFactorCacheMs},
 };
 
 /// A rate limiter backed by Redis.
@@ -15,6 +16,7 @@ pub struct SuppressedRedisRateLimiter {
     hard_limit_factor: HardLimitFactor,
     rate_group_size_ms: RateGroupSizeMs,
     window_size_seconds: WindowSizeSeconds,
+    suppression_factor_cache_ms: SuppressionFactorCacheMs,
 }
 
 impl SuppressedRedisRateLimiter {
@@ -31,6 +33,7 @@ impl SuppressedRedisRateLimiter {
             accepted_limiter,
             observed_limiter,
             hard_limit_factor: options.hard_limit_factor,
+            suppression_factor_cache_ms: options.suppression_factor_cache_ms,
         }
     }
 
@@ -117,6 +120,7 @@ impl SuppressedRedisRateLimiter {
             local window_size_seconds = tonumber(ARGV[1])
             local rate_group_size_ms = tonumber(ARGV[2])
             local hard_limit_factor = tonumber(ARGV[3])
+            local suppression_factor_cache_ms = tonumber(ARGV[4])
 
             local suppression_factor = tonumber(redis.call("GET", suppressed_factor_key))
             if suppression_factor ~= nil then
@@ -163,15 +167,7 @@ impl SuppressedRedisRateLimiter {
 
             suppression_factor = 1 - (window_limit / window_size_seconds / perceived_rate_limit)
 
-
-            local oldest_hash_field_timestamp = tonumber(observed_active_keys_in_1s[1]) or now_ms
-            local suppression_factor_exp = rate_group_size_ms - now_ms + oldest_hash_field_timestamp
-
-            if suppression_factor_exp <= 0 then
-                suppression_factor_exp = 1000
-            end
-
-            redis.call("SET", suppressed_factor_key, suppression_factor, "PX", suppression_factor_exp)
+            redis.call("SET", suppressed_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
 
             return tostring(suppression_factor)
         "#,
@@ -205,6 +201,7 @@ impl SuppressedRedisRateLimiter {
             .arg(*self.window_size_seconds)
             .arg(*self.rate_group_size_ms)
             .arg(*self.hard_limit_factor)
+            .arg(*self.suppression_factor_cache_ms)
             .invoke_async(&mut connection_manager)
             .await?;
 
