@@ -19,7 +19,7 @@ documentation = "https://docs.rs/trypema"
 exclude = [".github", "Makefile", "compose.yaml"]
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["redis-tokio"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]

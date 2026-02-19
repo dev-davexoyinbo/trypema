@@ -28,55 +28,13 @@ What this crate is not (currently):
 
 ## Quick Start
 
-Default build (Redis enabled):
+### Local-only (no Redis)
+
+When using only local (in-process) rate limiting:
 
 ```toml
-trypema = { version = "*", features = ["redis-tokio"] }
-```
-
-```rust,no_run
-use trypema::{
-    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
-};
-
-let rt = tokio::runtime::Runtime::new().unwrap();
-
-rt.block_on(async {
-    let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
-    let connection_manager = client.get_connection_manager().await.unwrap();
-
-    let rl = RateLimiter::new(RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager,
-            prefix: None,
-            window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-        },
-    });
-
-    let key = "user:123";
-    let rate_limit = RateLimit::try_from(5.0).unwrap();
-
-    // Local: check + record work
-    let _ = rl.local().absolute().inc(key, &rate_limit, 1);
-
-    // Redis: check + record work
-    // Note: Redis keys are validated and must not contain ':'
-    let redis_key = RedisKey::try_from("user_123".to_string()).unwrap();
-    let _ = rl.redis().absolute().inc(&redis_key, &rate_limit, 1).await.unwrap();
-});
-```
-
-Local-only build (disable Redis features):
-
-```toml
-trypema = { version = "*", default-features = false }
+[dependencies]
+trypema = "*"
 ```
 
 ```rust,ignore
@@ -101,6 +59,66 @@ match rl.local().absolute().inc(key, &rate_limit, 1) {
     RateLimitDecision::Rejected { .. } => {}
     RateLimitDecision::Suppressed { .. } => {}
 }
+```
+
+### With Redis (distributed)
+
+For distributed rate limiting with Redis:
+
+```toml
+[dependencies]
+trypema = { version = "*", features = ["redis-tokio"] }
+redis = "1.0"
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust,ignore
+# use trypema::{
+#     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
+#     RateLimiter, RateLimiterOptions, WindowSizeSeconds,
+# };
+# let rl = RateLimiter::new(RateLimiterOptions {
+#     local: LocalRateLimiterOptions {
+#         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+#         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+#         hard_limit_factor: HardLimitFactor::default(),
+#     },
+# });
+// With redis-tokio feature enabled:
+//
+// use trypema::{RedisKey, RedisRateLimiterOptions};
+//
+// let rt = tokio::runtime::Runtime::new().unwrap();
+// rt.block_on(async {
+//     let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
+//     let connection_manager = client.get_connection_manager().await.unwrap();
+//
+//     let rl = RateLimiter::new(RateLimiterOptions {
+//         local: LocalRateLimiterOptions {
+//             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+//             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+//             hard_limit_factor: HardLimitFactor::default(),
+//         },
+//         redis: RedisRateLimiterOptions {
+//             connection_manager,
+//             prefix: None,
+//             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+//             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+//             hard_limit_factor: HardLimitFactor::default(),
+//         },
+//     });
+//
+//     let key = "user:123";
+//     let rate_limit = RateLimit::try_from(5.0).unwrap();
+//
+//     // Local: check + record work
+//     let _ = rl.local().absolute().inc(key, &rate_limit, 1);
+//
+//     // Redis: check + record work
+//     // Note: Redis keys are validated and must not contain ':'
+//     let redis_key = RedisKey::try_from("user_123".to_string()).unwrap();
+//     let _ = rl.redis().absolute().inc(&redis_key, &rate_limit, 1).await.unwrap();
+// });
 ```
 
 ## Core Concepts
