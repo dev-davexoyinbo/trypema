@@ -1,8 +1,33 @@
-//! Top-level entrypoint that wires provider implementations.
+//! Top-level rate limiter facade.
 //!
-//! Today the crate ships a single provider (`local`), exposed via
-//! [`RateLimiter::local`]. Additional providers (e.g. shared/distributed state) can be
-//! added behind this facade.
+//! This module provides [`RateLimiter`], the main entry point for rate limiting.
+//! It coordinates multiple providers:
+//! - [`LocalRateLimiterProvider`]: In-process rate limiting
+//! - [`RedisRateLimiterProvider`]: Distributed rate limiting (requires Redis 7.4+)
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use trypema::{
+//!     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
+//!     RateLimiter, RateLimiterOptions, WindowSizeSeconds,
+//! };
+//!
+//! let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+//!     local: LocalRateLimiterOptions {
+//!         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+//!         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+//!         hard_limit_factor: HardLimitFactor::default(),
+//!     },
+//! }));
+//!
+//! // Start background cleanup (optional but recommended)
+//! rl.run_cleanup_loop();
+//!
+//! let rate = RateLimit::try_from(10.0).unwrap();
+//! let decision = rl.local().absolute().inc("user_123", &rate, 1);
+//! ```
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,19 +37,74 @@ use crate::{LocalRateLimiterOptions, LocalRateLimiterProvider};
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
 use crate::redis::{RedisRateLimiterOptions, RedisRateLimiterProvider};
 
-/// Top-level configuration for [`RateLimiter`].
+/// Configuration for [`RateLimiter`].
+///
+/// Configures both local and Redis providers. If Redis features are disabled,
+/// only `local` is required.
+///
+/// # Examples
+///
+/// Local-only configuration:
+/// ```
+/// use trypema::{
+///     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs,
+///     RateLimiterOptions, WindowSizeSeconds,
+/// };
+///
+/// let options = RateLimiterOptions {
+///     local: LocalRateLimiterOptions {
+///         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+///         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+///         hard_limit_factor: HardLimitFactor::default(),
+///     },
+/// };
+/// ```
 #[derive(Clone, Debug)]
 pub struct RateLimiterOptions {
-    /// Options for the local provider.
+    /// Configuration for the local (in-process) provider.
     pub local: LocalRateLimiterOptions,
-    /// Options for the Redis provider.
+    
+    /// Configuration for the Redis (distributed) provider.
+    ///
+    /// Only available with `redis-tokio` or `redis-smol` features.
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     pub redis: RedisRateLimiterOptions,
 }
 
-/// Rate limiter entrypoint.
+/// Primary rate limiter facade.
 ///
-/// This type wires together one or more providers (currently `local`).
+/// Provides access to multiple rate limiting providers and strategies:
+/// - **Local provider:** In-process rate limiting with per-key state
+/// - **Redis provider:** Distributed rate limiting across processes/servers
+///
+/// Each provider supports multiple strategies (absolute, suppressed).
+///
+/// # Thread Safety
+///
+/// `RateLimiter` is thread-safe and designed for use in `Arc<RateLimiter>`.
+/// The cleanup loop holds only a `Weak` reference, so dropping all `Arc` references
+/// automatically stops background tasks.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use trypema::{RateLimiter, RateLimiterOptions, RateLimit, LocalRateLimiterOptions};
+/// # use trypema::{WindowSizeSeconds, RateGroupSizeMs, HardLimitFactor};
+/// # let options = RateLimiterOptions {
+/// #     local: LocalRateLimiterOptions {
+/// #         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+/// #         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+/// #         hard_limit_factor: HardLimitFactor::default(),
+/// #     },
+/// # };
+///
+/// let rl = Arc::new(RateLimiter::new(options));
+/// rl.run_cleanup_loop();
+///
+/// let rate = RateLimit::try_from(5.0).unwrap();
+/// let decision = rl.local().absolute().inc("user_123", &rate, 1);
+/// ```
 pub struct RateLimiter {
     local: LocalRateLimiterProvider,
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -33,7 +113,24 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Create a new [`RateLimiter`].
+    /// Create a new rate limiter with the given configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trypema::{
+    ///     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs,
+    ///     RateLimiter, RateLimiterOptions, WindowSizeSeconds,
+    /// };
+    ///
+    /// let rl = RateLimiter::new(RateLimiterOptions {
+    ///     local: LocalRateLimiterOptions {
+    ///         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+    ///         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+    ///         hard_limit_factor: HardLimitFactor::default(),
+    ///     },
+    /// });
+    /// ```
     pub fn new(options: RateLimiterOptions) -> Self {
         Self {
             local: LocalRateLimiterProvider::new(options.local),
@@ -159,14 +256,41 @@ impl RateLimiter {
         }
     } // end method run_cleanup_loop_with_config
 
-    /// Access the Redis provider.
+    /// Access the Redis provider for distributed rate limiting.
+    ///
+    /// Requires Redis 7.4+ and one of the Redis features (`redis-tokio` or `redis-smol`).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let decision = rl.redis()
+    ///     .absolute()
+    ///     .inc(&key, &rate, 1)
+    ///     .await?;
+    /// ```
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     pub fn redis(&self) -> &RedisRateLimiterProvider {
         &self.redis
     }
 
-    /// Access the local provider.
+    /// Access the local provider for in-process rate limiting.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use trypema::{RateLimiter, RateLimiterOptions, RateLimit, LocalRateLimiterOptions};
+    /// # use trypema::{WindowSizeSeconds, RateGroupSizeMs, HardLimitFactor};
+    /// # let rl = RateLimiter::new(RateLimiterOptions {
+    /// #     local: LocalRateLimiterOptions {
+    /// #         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+    /// #         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+    /// #         hard_limit_factor: HardLimitFactor::default(),
+    /// #     },
+    /// # });
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let decision = rl.local().absolute().inc("user_123", &rate, 1);
+    /// ```
     pub fn local(&self) -> &LocalRateLimiterProvider {
         &self.local
     }

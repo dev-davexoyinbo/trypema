@@ -3,29 +3,114 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
     common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
+    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
 };
 
-/// Local strategy that can probabilistically suppress work while tracking both
-/// observed and accepted rates.
+/// Probabilistic rate limiter with dual tracking for graceful degradation.
 ///
-/// This limiter maintains two internal limiters:
-/// - `observed_limiter`: tracks all calls (including suppressed ones)
-/// - `accepted_limiter`: tracks only calls admitted by this strategy
+/// The suppressed strategy tracks two separate rate series:
+/// - **Observed limiter:** Tracks all calls (including suppressed ones)
+/// - **Accepted limiter:** Tracks only calls admitted by the strategy
 ///
-/// It returns [`RateLimitDecision::Suppressed`] when operating in a regime where
-/// suppression may occur. When `is_allowed` is `false`, the call is denied without
-/// incrementing the accepted series.
+/// This enables probabilistic suppression: when the observed rate exceeds the target,
+/// the strategy probabilistically denies some requests to keep the accepted rate near
+/// the configured limit.
 ///
-/// Suppression activation:
-/// - Suppression is only considered once the accepted usage meets/exceeds the base
-///   window capacity (`window_size_seconds * rate_limit`).
-/// - When accepted usage is below that capacity, suppression is bypassed.
+/// # Algorithm
 ///
-/// A hard cutoff is enforced using `hard_limit_factor`: if accepted usage would exceed
-/// `rate_limit * hard_limit_factor`, the decision is returned as
-/// [`RateLimitDecision::Rejected`] (a hard rejection that cannot be "suppressed").
+/// 1. **Record observed:** Every call increments the observed limiter (unbounded)
+/// 2. **Check capacity:** If `accepted_usage < window_capacity`, bypass suppression → `Allowed`
+/// 3. **Calculate suppression:** `suppression_factor = 1.0 - (perceived_rate / rate_limit)`
+/// 4. **Probabilistic decision:** Random choice based on `1.0 - suppression_factor`
+/// 5. **Hard cutoff:** If `accepted_usage >= hard_limit`, unconditionally reject → `Rejected`
+///
+/// # Suppression Factor
+///
+/// ```text
+/// suppression_factor = 1.0 - (perceived_rate / rate_limit)
+///
+/// - 0.0: No suppression (below target rate)
+/// - 0.3: Suppress 30% of requests
+/// - 0.7: Suppress 70% of requests
+/// - 1.0: Suppress all requests (full suppression)
+/// ```
+///
+/// **Perceived rate** is `max(average_window_rate, last_second_rate)`.
+///
+/// # Three Operating Regimes
+///
+/// ## 1. Below Capacity (No Suppression)
+///
+/// `accepted_usage < window_capacity`
+///
+/// - Returns: [`RateLimitDecision::Allowed`]
+/// - Behavior: All requests admitted (subject to hard cutoff)
+///
+/// ## 2. At Capacity (Probabilistic Suppression)
+///
+/// `window_capacity ≤ accepted_usage < hard_limit`
+///
+/// - Returns: [`RateLimitDecision::Suppressed { is_allowed, suppression_factor }`]
+/// - Behavior: Probabilistically deny requests to maintain target rate
+///
+/// ## 3. Over Hard Limit (Hard Rejection)
+///
+/// `accepted_usage ≥ hard_limit`
+///
+/// - Returns: [`RateLimitDecision::Rejected`]
+/// - Behavior: All requests unconditionally rejected (cannot be suppressed)
+///
+/// # Hard Limit
+///
+/// `hard_limit = rate_limit × hard_limit_factor`
+///
+/// - Acts as an absolute ceiling beyond which no requests are admitted
+/// - Prevents runaway acceptance if suppression calculation fails
+/// - Recommended: `hard_limit_factor = 1.5-2.0` for burst headroom
+///
+/// # Thread Safety
+///
+/// - Uses two independent [`AbsoluteLocalRateLimiter`] instances
+/// - Uses [`DashMap`](dashmap::DashMap) for suppression factor cache
+/// - Safe for concurrent use without external synchronization
+///
+/// # Inspiration
+///
+/// Based on [Ably's distributed rate limiting approach](https://ably.com/blog/distributed-rate-limiting-scale-your-platform),
+/// which favors probabilistic suppression over hard cutoffs for better system behavior under load.
+///
+/// # Examples
+///
+/// ```
+/// use trypema::{RateLimit, RateLimitDecision, SuppressedLocalRateLimiter, LocalRateLimiterOptions};
+/// use trypema::{WindowSizeSeconds, RateGroupSizeMs, HardLimitFactor};
+///
+/// let limiter = SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
+///     window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+///     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+///     hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(), // 50% burst headroom
+/// });
+///
+/// let rate = RateLimit::try_from(10.0).unwrap(); // 10 req/s target, 15 req/s hard limit
+///
+/// match limiter.inc("user_123", &rate, 1) {
+///     RateLimitDecision::Allowed => {
+///         // Below capacity, proceed normally
+///     }
+///     RateLimitDecision::Suppressed { is_allowed: true, suppression_factor } => {
+///         // At capacity, this request allowed (but suppression active)
+///         println!("Allowed with {}% suppression", suppression_factor * 100.0);
+///     }
+///     RateLimitDecision::Suppressed { is_allowed: false, suppression_factor } => {
+///         // At capacity, this request suppressed
+///         println!("Suppressed ({}% rate)", suppression_factor * 100.0);
+///     }
+///     RateLimitDecision::Rejected { .. } => {
+///         // Over hard limit, unconditionally rejected
+///     }
+/// }
+/// ```
 pub struct SuppressedLocalRateLimiter {
     accepted_limiter: AbsoluteLocalRateLimiter,
     observed_limiter: AbsoluteLocalRateLimiter,
@@ -54,20 +139,79 @@ impl SuppressedLocalRateLimiter {
         }
     } // end constructor
 
-    /// Check admission and, if allowed, increment the observed count for `key`.
+    /// Check admission with probabilistic suppression and record the increment.
     ///
-    /// - `rate_limit`: per-second limit for `key`. This is stored the first time
-    ///   the key is seen; subsequent calls for the same key do not update it.
-    /// - `count`: amount to add (typically `1`).
+    /// This is the primary method for the suppressed strategy. It always records the
+    /// increment in the observed limiter, and conditionally records it in the accepted
+    /// limiter based on suppression logic.
     ///
-    /// Return values:
-    /// - [`RateLimitDecision::Allowed`]: suppression is bypassed and the increment is applied.
-    /// - [`RateLimitDecision::Suppressed`]: suppression is in effect; check `is_allowed`.
-    /// - [`RateLimitDecision::Rejected`]: hard cutoff was hit; the increment is not applied
-    ///   to the accepted series.
+    /// # Arguments
     ///
-    /// Increments close together in time may be coalesced based on
-    /// `rate_group_size_ms`.
+    /// - `key`: Unique identifier for the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit. **Sticky:** stored on first call, ignored on subsequent calls
+    /// - `count`: Amount to increment (typically `1` for single requests, or batch size)
+    ///
+    /// # Returns
+    ///
+    /// - [`RateLimitDecision::Allowed`]: Below capacity, no suppression active
+    /// - [`RateLimitDecision::Suppressed`]: At capacity, probabilistic suppression active
+    ///   - Check `is_allowed` field to determine if this specific call was admitted
+    /// - [`RateLimitDecision::Rejected`]: Over hard limit, unconditionally rejected
+    ///
+    /// # Behavior
+    ///
+    /// 1. **Always record observed:** Increment observed limiter (unbounded)
+    /// 2. **Calculate suppression factor** (cached per `rate_group_size_ms`)
+    /// 3. **Decide:**
+    ///    - If `suppression_factor ≤ 0.0`: Bypass suppression → try `accepted_limiter.inc()`
+    ///    - Else: Probabilistic decision based on `1.0 - suppression_factor`
+    /// 4. **If probabilistically denied:**
+    ///    - Return `Suppressed { is_allowed: false }`
+    ///    - Do **not** increment accepted limiter
+    /// 5. **If probabilistically allowed:**
+    ///    - Try `accepted_limiter.inc()` with hard limit
+    ///    - If over hard limit → `Rejected`
+    ///    - If under hard limit → `Suppressed { is_allowed: true }`
+    ///
+    /// # Concurrency
+    ///
+    /// Same as [`AbsoluteLocalRateLimiter::inc`]: not atomic across calls, temporary
+    /// overshoot possible under high concurrency.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use trypema::{RateLimit, RateLimitDecision, SuppressedLocalRateLimiter, LocalRateLimiterOptions};
+    /// # use trypema::{WindowSizeSeconds, RateGroupSizeMs, HardLimitFactor};
+    /// # let limiter = SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
+    /// #     window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+    /// #     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+    /// #     hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
+    /// # });
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    ///
+    /// match limiter.inc("user_123", &rate, 1) {
+    ///     RateLimitDecision::Allowed => {
+    ///         // Below capacity, proceed
+    ///         println!("Request allowed");
+    ///     }
+    ///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
+    ///         if is_allowed {
+    ///             // At capacity but this request admitted
+    ///             println!("Allowed with {}% suppression", suppression_factor * 100.0);
+    ///             // Proceed, maybe with reduced priority
+    ///         } else {
+    ///             // At capacity and this request suppressed
+    ///             println!("Suppressed ({}%)", suppression_factor * 100.0);
+    ///             // Deny request, send 429
+    ///         }
+    ///     }
+    ///     RateLimitDecision::Rejected { retry_after_ms, .. } => {
+    ///         // Over hard limit, unconditionally rejected
+    ///         println!("Hard limit exceeded, retry in {}ms", retry_after_ms);
+    ///     }
+    /// }
+    /// ```
     pub fn inc(&self, key: &str, rate_limit: &RateLimit, count: u64) -> RateLimitDecision {
         let mut rng = |p: f64| rand::random_bool(p);
         self.inc_with_rng(key, rate_limit, count, &mut rng)

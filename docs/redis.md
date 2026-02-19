@@ -1,160 +1,583 @@
-# Redis Provider (Experimental)
+# Redis Provider Documentation
 
-This crate includes a Redis-backed provider exposed via `RateLimiter::redis()`.
+The Redis provider enables distributed rate limiting across multiple processes or servers using Redis as a shared backend.
 
-Status notes:
+**Status:**
+- ✅ **Absolute strategy:** Implemented and tested
+- ✅ **Suppressed strategy:** Implemented and tested
 
-- `absolute`: implemented
-- `suppressed`: placeholder (not yet implemented)
+## Requirements
 
-## Redis Version Requirement
+### Redis Version
 
-The Redis scripts use hash field TTL commands (`HPEXPIRE`, `HPTTL ... FIELDS`), which require Redis >= 7.4.
+**Minimum:** Redis >= 7.4.0
 
-The test harness and CI workflow pin Redis to `redis:7.4.2-alpine`.
+**Why:** The implementation uses hash field expiration commands introduced in Redis 7.4:
+- `HPEXPIRE` - Set TTL on hash fields
+- `HPTTL ... FIELDS` - Get remaining TTL for hash fields
+
+**Tested version:** `redis:7.4.2-alpine` (used in CI and test harness)
+
+### Runtime
+
+Requires an async runtime:
+- **Tokio** (feature: `redis-tokio`, enabled by default)
+- **Smol** (feature: `redis-smol`)
 
 ## Key Validation
 
-Redis keys passed into the limiter use the `RedisKey` newtype:
+User-provided keys use the `RedisKey` newtype with strict validation:
 
-- must not be empty
-- must be <= 255 bytes
-- must not contain `:`
+```rust,ignore
+pub struct RedisKey(String);
 
-The limiter itself composes Redis keys using `:` as a separator, so user keys cannot contain `:`.
+impl TryFrom<String> for RedisKey {
+    // Validates:
+    // ✓ Not empty
+    // ✓ Length ≤ 255 bytes
+    // ✓ Does not contain ':'
+}
+```
 
-## AbsoluteRedisRateLimiter
+**Why the `:` restriction?** The limiter uses `:` as an internal separator when constructing Redis keys. For example:
 
-Path: `src/redis/absolute_redis_rate_limiter.rs`
+```
+<prefix>:<user_key>:<strategy>:<data_type>
+```
 
-This implementation is a sliding-window limiter with bucket coalescing.
+**Examples:**
 
-### Public API
+```rust,ignore
+// ✅ Valid
+RedisKey::try_from("user_123".to_string()).unwrap();
+RedisKey::try_from("api-endpoint-v2".to_string()).unwrap();
 
-- `inc(key, rate_limit, count) -> RateLimitDecision`
-  - If allowed, the increment is recorded and `Allowed` is returned.
-  - If over limit, the increment is not applied and `Rejected { retry_after_ms, remaining_after_waiting, .. }` is returned.
-- `is_allowed(key) -> RateLimitDecision`
-  - Reads the current window total and returns `Allowed` / `Rejected`.
-  - Does not record an increment.
+// ❌ Invalid
+RedisKey::try_from("user:123".to_string());  // Contains ':'
+RedisKey::try_from("".to_string());          // Empty
+let long_key = "x".repeat(256);
+RedisKey::try_from(long_key);                // Too long
+```
 
-Both methods are implemented as Lua scripts invoked via `redis::Script`.
+## Absolute Strategy Implementation
 
-### Window Limit
+**Source:** `src/redis/absolute_redis_rate_limiter.rs`
 
-The limiter computes a per-window capacity from the configured options:
+The absolute Redis strategy is a distributed sliding-window limiter with bucket coalescing.
 
-- `window_limit = window_size_seconds * rate_limit`
+### API Methods
 
-Notes:
+#### `inc(key, rate_limit, count) -> Result<RateLimitDecision, TrypemaError>`
 
-- `RateLimit` is an `f64` to allow non-integer per-second limits.
-- Internally, counters are integer (`u64`). The Lua scripts compare the integer sum of counts to `window_limit`.
+Checks admission and atomically records the increment if allowed.
 
-### Bucket Coalescing (`rate_group_size_ms`)
+```rust,ignore
+let key = RedisKey::try_from("user_123".to_string())?;
+let rate = RateLimit::try_from(10.0)?;
 
-To reduce write amplification, increments that happen close together can be merged into one bucket.
+match limiter.inc(&key, &rate, 1).await? {
+    RateLimitDecision::Allowed => {
+        // Increment recorded, proceed
+    }
+    RateLimitDecision::Rejected { retry_after_ms, .. } => {
+        // Over limit, not recorded
+    }
+    _ => unreachable!(),
+}
+```
 
-Mechanism (implemented in the `inc` script):
+**Behavior:**
+- If allowed: increment recorded, returns `Allowed`
+- If over limit: increment **not** recorded, returns `Rejected` with backoff hints
 
-- Each bucket is keyed by a millisecond timestamp (`timestamp_ms`).
-- Before writing a new bucket, the script checks the most recent active bucket.
-- If that bucket is still alive and the "age since its creation" is less than `rate_group_size_ms`, the new increment is added to the most recent bucket instead of creating a new one.
+#### `is_allowed(key) -> Result<RateLimitDecision, TrypemaError>`
 
-This improves performance but makes per-bucket timing coarser, which also affects rejection metadata.
+Checks current window usage without recording an increment (read-only).
 
-### Redis Data Model
+```rust,ignore
+match limiter.is_allowed(&key).await? {
+    RateLimitDecision::Allowed => { /* Has capacity */ }
+    RateLimitDecision::Rejected { .. } => { /* Over limit */ }
+    _ => unreachable!(),
+}
+```
 
-For each logical user key `key`, the limiter uses three Redis keys under a configurable prefix.
+**Use case:** Preview admission decision without affecting state (e.g., for middleware that needs to check before doing expensive work).
+
+### Implementation
+
+Both methods are implemented as **atomic Lua scripts** executed on Redis via `EVALSHA`.
+
+### Window Capacity
+
+Computed per key as:
+
+```
+window_capacity = window_size_seconds × rate_limit
+```
+
+**Example:** 60-second window with 10 req/s limit = 600 total requests allowed in window
+
+**Implementation notes:**
+- `RateLimit` is `f64` (supports non-integer rates like `5.5` req/s)
+- Internal counters are `u64` (integer operations in Lua)
+- Lua scripts compare integer sum against `window_capacity`
+
+### Bucket Coalescing
+
+To reduce write amplification and memory usage, nearby increments are merged into the same bucket.
+
+**Algorithm** (in `inc` Lua script):
+
+1. Each bucket is identified by a millisecond timestamp
+2. Before creating a new bucket:
+   - Check the most recent active bucket
+   - If bucket age < `rate_group_size_ms`, add to existing bucket
+   - Otherwise, create a new bucket
+
+**Benefits:**
+- ✅ Fewer Redis writes
+- ✅ Lower memory usage
+- ✅ Better performance under high throughput
+
+**Trade-offs:**
+- ❌ Coarser timing granularity
+- ❌ Less precise rejection metadata (`retry_after_ms`)
+
+**Example:**
+
+With `rate_group_size_ms = 10`:
+- Request at t=100ms → creates bucket at 100
+- Request at t=105ms → adds to bucket at 100 (within 10ms window)
+- Request at t=115ms → creates new bucket at 115 (> 10ms since bucket creation)
+
+## Redis Data Model
+
+For each user key, the limiter stores data in **three Redis keys** under a configurable prefix.
+
+### Key Schema
 
 Given:
+- `prefix` = `"trypema"` (default) or custom `RedisKey`
+- `key` = user's `RedisKey`
 
-- `prefix`: `RedisKey` (defaults to `trypema`)
-- `key`: `RedisKey`
+The following Redis keys are created:
 
-Key schema:
+#### 1. Bucket Hash: `<prefix>:<key>:absolute:h`
 
-- Hash of buckets:
-  - `<prefix>:<key>:absolute:h`
-  - fields: bucket timestamp in ms (string)
-  - values: integer count (string/int)
-- Sorted set of active buckets:
-  - `<prefix>:<key>:absolute:a`
-  - members: bucket timestamp in ms (string)
-  - score: bucket timestamp in ms (number)
-- Window-limit cache:
-  - `<prefix>:<key>:absolute:w`
-  - value: computed window limit (`window_size_seconds * rate_limit`)
+**Type:** Hash
 
-How these are used:
+**Purpose:** Stores count for each time bucket
 
-- The sorted set is used to find and evict expired bucket timestamps (`ZREMRANGEBYSCORE`), and to locate the oldest bucket when generating rejection metadata (`ZRANGE ... 0 0`).
-- The hash stores counts per bucket timestamp.
-- The window-limit key allows `is_allowed` to work without the caller supplying `rate_limit` (the limit is cached on first bucket creation).
+**Structure:**
+```
+Field: "1234567890123" (bucket timestamp in milliseconds)
+Value: "42" (count as string)
+```
 
-### Expiration / Cleanup
+**Operations:**
+- `HINCRBY` - Increment bucket count
+- `HPEXPIRE` - Set per-field TTL
+- `HGETALL` - Read all buckets
+- `HPTTL` - Get field TTL for rejection metadata
 
-Bucket expiration:
+#### 2. Active Bucket Index: `<prefix>:<key>:absolute:a`
 
-- Each bucket field in the hash gets a per-field TTL of `window_size_seconds * 1000` using `HPEXPIRE ... FIELDS`.
+**Type:** Sorted Set
 
-Window-limit expiration:
+**Purpose:** Track which buckets are active (for efficient range queries)
 
-- `<prefix>:<key>:absolute:w` is set when a bucket is created and is refreshed via `EXPIRE` on each `inc` call.
+**Structure:**
+```
+Member: "1234567890123" (bucket timestamp)
+Score: 1234567890123.0 (same timestamp as float)
+```
 
-Active bucket eviction:
+**Operations:**
+- `ZADD` - Add new bucket timestamp
+- `ZREMRANGEBYSCORE` - Remove expired buckets by time range
+- `ZRANGE ... 0 0` - Find oldest bucket (for `retry_after_ms`)
 
-- Both `inc` and `is_allowed` remove old timestamps from the sorted set with:
-  - `ZREMRANGEBYSCORE active_keys -inf (now_ms - window_ms)`
+#### 3. Window Limit Cache: `<prefix>:<key>:absolute:w`
 
-Important caveat:
+**Type:** String
 
-- The code includes a TODO to clean up "active keys" sets globally. Per-key sorted sets are cleaned by score, but there is no global index to delete per-key data when it becomes completely inactive.
-- The scripts do not delete the hash key or active set key when they become empty.
+**Purpose:** Cache the computed window limit so `is_allowed()` doesn't need the rate limit parameter
 
-### Rejection Metadata
+**Structure:**
+```
+Value: "300.0" (window_size_seconds × rate_limit)
+```
 
-When rejecting, the scripts return:
+**Operations:**
+- `SET` - Store on first increment
+- `EXPIRE` - Refresh TTL on each increment
+- `GET` - Read cached limit
 
-- `retry_after_ms`: the remaining TTL (ms) of the oldest active hash field
-- `remaining_after_waiting`: the count stored in the oldest bucket
+### Example
 
-These are surfaced as:
+For user key `"user_123"` with default prefix:
 
-- `RateLimitDecision::Rejected { retry_after_ms, remaining_after_waiting, window_size_seconds }`
+```
+trypema:user_123:absolute:h     → Hash of bucket counts
+trypema:user_123:absolute:a     → Sorted set of active bucket timestamps
+trypema:user_123:absolute:w     → Cached window limit
+```
 
-Interpretation:
+## Expiration & Cleanup
 
-- `retry_after_ms` is a best-effort backoff hint for "when to try again".
-- `remaining_after_waiting` is the number of tokens that will be freed when that oldest bucket expires.
+### Automatic Expiration
 
-Because of coalescing and concurrency, these hints can be imprecise.
+#### Bucket Fields (Hash)
 
-### Concurrency / Consistency
+Each bucket field gets a **per-field TTL** = `window_size_seconds × 1000` milliseconds
 
-Within a single Redis instance, each script invocation is atomic.
+```lua
+redis.call('HPEXPIRE', hash_key, window_ms, 'FIELDS', 1, bucket_timestamp)
+```
 
-However, the limiter is still best-effort in the sense that:
+**Effect:** Old buckets automatically expire from the hash after the window duration.
 
-- multiple clients can be allowed concurrently up to the window limit; the scripts enforce the limit at evaluation time, but timing and coalescing can cause behavior that looks "bursty" around the boundary
-- rejection metadata is advisory
+#### Window Limit Cache
 
-## Usage Example
+The `<prefix>:<key>:absolute:w` key is refreshed on each `inc()`:
+
+```lua
+redis.call('EXPIRE', window_limit_key, window_size_seconds)
+```
+
+**Effect:** Inactive keys expire after `window_size_seconds` of no activity.
+
+### Lazy Cleanup
+
+Both `inc()` and `is_allowed()` perform **lazy cleanup** of the active bucket index:
+
+```lua
+redis.call('ZREMRANGEBYSCORE', active_key, '-inf', cutoff_timestamp)
+```
+
+**What it does:** Removes bucket timestamps older than the window from the sorted set.
+
+### Cleanup Loop
+
+For proactive cleanup of completely inactive keys, use:
+
+```rust,ignore
+rl.run_cleanup_loop();  // Default: stale_after=10min, interval=30s
+rl.run_cleanup_loop_with_config(600_000, 30_000);  // Custom config
+```
+
+**What it cleans:**
+- **Local provider:** Removes keys from in-memory maps
+- **Redis provider:** Currently no-op (see Known Limitations)
+
+### Known Limitations
+
+⚠️ **Memory leak potential:** The Redis scripts do **not** delete the hash or sorted set keys when they become empty.
+
+**Symptom:** If you have high key cardinality (many unique keys), Redis memory usage grows over time even as keys become inactive.
+
+**Workaround:** Implement periodic cleanup using Redis `SCAN` + `TTL` checks:
+
+```bash
+# Find keys with no recent activity
+redis-cli --scan --pattern "trypema:*:absolute:w" | while read key; do
+  ttl=$(redis-cli TTL "$key")
+  if [ "$ttl" -eq -1 ] || [ "$ttl" -eq -2 ]; then
+    # Key expired or doesn't exist, clean up related keys
+    user_key=$(echo "$key" | cut -d: -f2)
+    redis-cli DEL "trypema:$user_key:absolute:h"
+    redis-cli DEL "trypema:$user_key:absolute:a"
+    redis-cli DEL "trypema:$user_key:absolute:w"
+  fi
+done
+```
+
+**Future work:** Global key index for automatic cleanup (tracked internally).
+
+## Rejection Metadata
+
+When a request is rejected, the Lua script returns:
+
+```rust,ignore
+RateLimitDecision::Rejected {
+    window_size_seconds: 60,
+    retry_after_ms: 2500,
+    remaining_after_waiting: 45,
+}
+```
+
+### Field Meanings
+
+#### `retry_after_ms`
+
+**Computation:** Remaining TTL of the oldest active bucket
+
+```lua
+local ttl_ms = redis.call('HPTTL', hash_key, oldest_bucket_timestamp)
+```
+
+**Interpretation:** **Best-effort** hint for "how long to wait before capacity becomes available"
+
+**Caveats:**
+- Assumes the oldest bucket will expire without new increments
+- Coalescing can make this less accurate
+- Concurrent requests can change the actual wait time
+
+#### `remaining_after_waiting`
+
+**Computation:** Count stored in the oldest bucket
+
+```lua
+local oldest_count = redis.call('HGET', hash_key, oldest_bucket_timestamp)
+```
+
+**Interpretation:** **Estimate** of window usage after waiting `retry_after_ms`
+
+**Caveats:**
+- If heavily coalesced, may be `0` even when far over limit
+- Concurrent activity changes the actual remaining count
+- Use for rough backoff, not precise capacity planning
+
+### Best Practices
+
+✅ **Do:**
+- Use as a backoff hint for retry logic
+- Expose to clients for rate limit feedback
+- Log for monitoring rate limit hits
+
+❌ **Don't:**
+- Rely on exact timing for strict guarantees
+- Use for precise capacity calculations
+- Expect deterministic behavior under high concurrency
+
+## Concurrency & Consistency
+
+### Atomicity
+
+✅ **Each Lua script execution is atomic** within a single Redis instance.
+
+**Guarantees:**
+- No partial updates
+- Consistent view of buckets during script execution
+- No race conditions within a single script
+
+### Best-Effort Limiting
+
+❌ **Overall rate limiting is best-effort**, not strictly linearizable.
+
+**Why:**
+
+1. **Multiple clients** can check the limit concurrently
+2. **All see "allowed"** if under limit at check time
+3. **All proceed** and increment, causing temporary overshoot
+4. **Bucket coalescing** can merge concurrent requests into same bucket
+
+**Example:**
+
+```
+Window limit: 100 requests
+Current usage: 95 requests
+
+Time T:
+  Client A: checks → 95 < 100 → allowed
+  Client B: checks → 95 < 100 → allowed
+  Client C: checks → 95 < 100 → allowed
+
+Time T+1:
+  All three increment → total = 98
+  
+Temporary overshoot possible if timing is tight.
+```
+
+**Implication:** This is **expected behavior**. The limiter provides approximate distributed rate limiting, not strict enforcement.
+
+### Redis Cluster
+
+⚠️ **Not tested with Redis Cluster**
+
+**Potential issues:**
+- Lua scripts with multiple keys require all keys to be on the same shard
+- Current implementation may not use hash tags correctly for cluster mode
+- Cross-slot operations will fail
+
+**If you need cluster support:** File an issue with your use case.
+
+## Usage Examples
+
+### Basic Rate Limiting
 
 ```rust,no_run
 use trypema::{RateLimit, RateLimitDecision, RedisKey};
 
-let key = RedisKey::try_from("user_123".to_string()).unwrap();
-let rate = RateLimit::try_from(5.0).unwrap();
+let key = RedisKey::try_from("user_123".to_string())?;
+let rate = RateLimit::try_from(10.0)?; // 10 requests per second
 
-// limiter: &AbsoluteRedisRateLimiter
-let decision = limiter.inc(&key, &rate, 1).await.unwrap();
+let decision = limiter.inc(&key, &rate, 1).await?;
 
 match decision {
-    RateLimitDecision::Allowed => {}
-    RateLimitDecision::Rejected { retry_after_ms, .. } => {
-        let _ = retry_after_ms;
+    RateLimitDecision::Allowed => {
+        // Process request
     }
-    RateLimitDecision::Suppressed { .. } => {}
+    RateLimitDecision::Rejected { retry_after_ms, remaining_after_waiting, .. } => {
+        // Send 429 Too Many Requests with Retry-After header
+        log::warn!("Rate limit exceeded for {key}, retry in {retry_after_ms}ms");
+    }
+    _ => unreachable!("absolute strategy never returns Suppressed"),
 }
 ```
+
+### Read-Only Check
+
+```rust,no_run
+// Check if request would be allowed without recording it
+let decision = limiter.is_allowed(&key).await?;
+
+if matches!(decision, RateLimitDecision::Allowed) {
+    // Do expensive work, then record
+    let result = expensive_operation().await;
+    limiter.inc(&key, &rate, 1).await?;
+    return result;
+}
+```
+
+### HTTP Middleware Example
+
+```rust,ignore
+async fn rate_limit_middleware(
+    req: Request,
+    limiter: Arc<AbsoluteRedisRateLimiter>,
+) -> Result<Response, Error> {
+    let user_id = extract_user_id(&req)?;
+    let key = RedisKey::try_from(format!("api_{}", user_id))?;
+    let rate = RateLimit::try_from(100.0)?; // 100 req/s per user
+    
+    match limiter.inc(&key, &rate, 1).await? {
+        RateLimitDecision::Allowed => {
+            // Process request normally
+            Ok(handle_request(req).await)
+        }
+        RateLimitDecision::Rejected { retry_after_ms, remaining_after_waiting, .. } => {
+            // Return 429 with headers
+            Ok(Response::builder()
+                .status(429)
+                .header("Retry-After", (retry_after_ms / 1000).to_string())
+                .header("X-RateLimit-Remaining", remaining_after_waiting.to_string())
+                .body("Too Many Requests")?)
+        }
+        _ => unreachable!(),
+    }
+}
+```
+
+### Multi-Tier Rate Limiting
+
+```rust,ignore
+// Different limits for different tiers
+async fn check_user_rate_limit(
+    user_id: &str,
+    user_tier: UserTier,
+    limiter: &AbsoluteRedisRateLimiter,
+) -> Result<RateLimitDecision, TrypemaError> {
+    let key = RedisKey::try_from(format!("user_{}", user_id))?;
+    
+    let rate = match user_tier {
+        UserTier::Free => RateLimit::try_from(10.0)?,      // 10 req/s
+        UserTier::Pro => RateLimit::try_from(100.0)?,      // 100 req/s
+        UserTier::Enterprise => RateLimit::try_from(1000.0)?, // 1000 req/s
+    };
+    
+    limiter.inc(&key, &rate, 1).await
+}
+```
+
+## Monitoring & Observability
+
+### Logging Redis Operations
+
+Enable Redis command logging with `tracing`:
+
+```rust,ignore
+use tracing_subscriber;
+
+tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::DEBUG)
+    .init();
+```
+
+Look for:
+```
+WARN Redis cleanup failed, will retry: <error details>
+```
+
+### Metrics to Track
+
+Recommended metrics for production:
+
+1. **Rate limit hit rate:**
+   ```rust,ignore
+   match decision {
+       RateLimitDecision::Rejected { .. } => {
+           metrics.increment("rate_limit.rejected", tags);
+       }
+       RateLimitDecision::Allowed => {
+           metrics.increment("rate_limit.allowed", tags);
+       }
+       _ => {}
+   }
+   ```
+
+2. **Redis operation latency:**
+   ```rust,ignore
+   let start = Instant::now();
+   let decision = limiter.inc(&key, &rate, 1).await?;
+   metrics.histogram("rate_limit.redis.latency_ms", start.elapsed().as_millis());
+   ```
+
+3. **Redis connection errors:**
+   ```rust,ignore
+   match limiter.inc(&key, &rate, 1).await {
+       Err(TrypemaError::RedisError(_)) => {
+           metrics.increment("rate_limit.redis.errors");
+       }
+       _ => {}
+   }
+   ```
+
+4. **Key cardinality:** Periodically scan Redis to track unique keys
+   ```bash
+   redis-cli --scan --pattern "trypema:*:absolute:w" | wc -l
+   ```
+
+## Troubleshooting
+
+### Problem: Rate limits not working (always allowed)
+
+**Check:**
+1. Verify Redis version: `redis-cli INFO server | grep redis_version`
+2. Test hash field TTL support: `redis-cli HPEXPIRE testkey 5000 FIELDS 1 field1`
+3. Check connection: `redis-cli PING`
+4. Verify key prefix in logs
+
+### Problem: Memory usage growing unbounded
+
+**Cause:** Keys not expiring (see Known Limitations)
+
+**Solution:** Implement periodic cleanup (see Expiration & Cleanup section)
+
+### Problem: High latency on rate limit checks
+
+**Check:**
+1. Redis network latency: `redis-cli --latency`
+2. Redis CPU usage: `redis-cli INFO stats`
+3. Script caching: Ensure `EVALSHA` is used (not `EVAL`)
+4. Consider connection pooling if using many connections
+
+### Problem: Inconsistent rate limiting behavior
+
+**Likely causes:**
+1. Multiple processes with different `window_size_seconds` or `rate_group_size_ms` configs
+2. Clock skew between application servers
+3. Redis replication lag (if using replica reads)
+
+**Solution:** Ensure all application instances use identical configuration.
