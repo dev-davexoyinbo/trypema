@@ -163,9 +163,6 @@ impl AbsoluteRedisRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
-        // TODO: cleanup the active keys set
-
-        // At least a version of Redis that is 7.4.0 or higher is needed
         let script = redis::Script::new(
             r#"
             local time_array = redis.call("TIME")

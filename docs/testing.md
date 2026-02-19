@@ -78,7 +78,7 @@ make stop-redis
 
 ### Using Existing Redis
 
-If you already have Redis 7.4+ running:
+If you already have Redis 6.2+ running:
 
 ```bash
 # Standard Redis
@@ -273,21 +273,16 @@ REDIS_PORT=16380 make test-redis
 lsof -ti:16379 | xargs kill
 ```
 
-### Problem: Hash field TTL not supported
+### Problem: Redis version too old
 
-**Error:**
-```
-RedisError: ERR unknown command 'HPEXPIRE'
-```
-
-**Cause:** Redis version < 7.4
+**Cause:** Redis version < 6.2.0
 
 **Solution:**
 ```bash
 # Check version
 redis-cli INFO server | grep redis_version
 
-# Upgrade Redis
+# Upgrade Redis (using latest for best compatibility)
 docker run -d --name redis -p 6379:6379 redis:7.4.2-alpine
 ```
 

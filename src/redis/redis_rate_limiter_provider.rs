@@ -11,7 +11,7 @@ use crate::{
 ///
 /// # Requirements
 ///
-/// - **Redis version:** >= 7.4.0 (required for hash field TTL commands)
+/// - **Redis version:** >= 6.2.0
 /// - **Runtime:** Tokio or Smol (via `redis-tokio` or `redis-smol` features)
 ///
 /// # Examples
@@ -93,7 +93,7 @@ pub struct RedisRateLimiterOptions {
 ///
 /// # Requirements
 ///
-/// - **Redis:** >= 7.4.0 (for `HPEXPIRE` hash field TTL support)
+/// - **Redis:** >= 6.2.0
 /// - **Runtime:** Tokio or Smol
 ///
 /// # Strategies

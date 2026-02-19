@@ -13,7 +13,7 @@ Trypema is a Rust rate limiting library supporting both in-process and Redis-bac
 **Providers:**
 
 - **Local provider** (`local`): In-process rate limiting with per-key state
-- **Redis provider** (`redis`): Distributed rate limiting backed by Redis 7.4+
+- **Redis provider** (`redis`): Distributed rate limiting backed by Redis 6.2+
 
 **Strategies:**
 
@@ -99,7 +99,7 @@ Use the Redis provider for distributed rate limiting across multiple processes/s
 
 **Requirements:**
 
-- Redis >= 7.4 (required for hash field TTL commands)
+- Redis >= 6.2
 - Tokio or Smol async runtime
 
 ```toml
@@ -331,7 +331,7 @@ The `inc()` method performs an admission check **before** applying the increment
 
 **Effect:** Conservative eviction. A 1-second window may effectively require ~2 seconds before a bucket is considered fully expired.
 
-**Redis provider:** Uses millisecond-precision TTLs via `HPEXPIRE`.
+**Redis provider:** Uses standard Redis expiration commands (`EXPIRE`, `SET` with `PX` option).
 
 ### Memory Growth
 
@@ -431,7 +431,7 @@ docs/
 
 ### Requirements
 
-- **Redis version:** >= 7.4.0 (required for `HPEXPIRE` and `HPTTL` hash field TTL commands)
+- **Redis version:** >= 6.2.0
 - **Async runtime:** Tokio or Smol
 
 ### Key Constraints

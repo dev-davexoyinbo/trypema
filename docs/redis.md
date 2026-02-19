@@ -10,11 +10,13 @@ The Redis provider enables distributed rate limiting across multiple processes o
 
 ### Redis Version
 
-**Minimum:** Redis >= 7.4.0
+**Minimum:** Redis >= 6.2.0
 
-**Why:** The implementation uses hash field expiration commands introduced in Redis 7.4:
-- `HPEXPIRE` - Set TTL on hash fields
-- `HPTTL ... FIELDS` - Get remaining TTL for hash fields
+**Why:** The implementation uses standard Redis commands:
+- String commands: `GET`, `SET`, `INCRBY`, `DECRBY`, `DEL`, `EXPIRE`
+- Hash commands: `HGET`, `HDEL`, `HINCRBY`, `HMGET`
+- Sorted Set commands: `ZADD`, `ZREM`, `ZRANGE` (with `REV` option from 6.2.0), `ZCARD`
+- Server commands: `TIME`
 
 **Tested version:** `redis:7.4.2-alpine` (used in CI and test harness)
 
@@ -177,9 +179,8 @@ Value: "42" (count as string)
 
 **Operations:**
 - `HINCRBY` - Increment bucket count
-- `HPEXPIRE` - Set per-field TTL
-- `HGETALL` - Read all buckets
-- `HPTTL` - Get field TTL for rejection metadata
+- `HMGET` - Get multiple bucket values
+- `HDEL` - Delete expired buckets
 
 #### 2. Active Bucket Index: `<prefix>:<key>:absolute:a`
 
@@ -230,13 +231,20 @@ trypema:user_123:absolute:w     → Cached window limit
 
 #### Bucket Fields (Hash)
 
-Each bucket field gets a **per-field TTL** = `window_size_seconds × 1000` milliseconds
+Expired buckets are **lazily removed** during `inc()` and `is_allowed()` operations:
 
 ```lua
-redis.call('HPEXPIRE', hash_key, window_ms, 'FIELDS', 1, bucket_timestamp)
+-- Find expired bucket timestamps
+local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
+
+-- Remove from hash
+if #to_remove_keys > 0 then
+    redis.call("HDEL", hash_key, unpack(to_remove_keys))
+    redis.call("ZREM", active_keys, unpack(to_remove_keys))
+end
 ```
 
-**Effect:** Old buckets automatically expire from the hash after the window duration.
+**Effect:** Old buckets are removed from the hash during the next operation after they expire.
 
 #### Window Limit Cache
 
@@ -250,13 +258,20 @@ redis.call('EXPIRE', window_limit_key, window_size_seconds)
 
 ### Lazy Cleanup
 
-Both `inc()` and `is_allowed()` perform **lazy cleanup** of the active bucket index:
+Both `inc()` and `is_allowed()` perform **lazy cleanup** of expired buckets:
 
 ```lua
-redis.call('ZREMRANGEBYSCORE', active_key, '-inf', cutoff_timestamp)
+-- Find expired buckets
+local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
+
+-- Remove from hash and sorted set
+if #to_remove_keys > 0 then
+    redis.call("HDEL", hash_key, unpack(to_remove_keys))
+    redis.call("ZREM", active_keys, unpack(to_remove_keys))
+end
 ```
 
-**What it does:** Removes bucket timestamps older than the window from the sorted set.
+**What it does:** Removes bucket timestamps and hash fields older than the window from both the hash and sorted set.
 
 ### Cleanup Loop
 
@@ -311,10 +326,12 @@ RateLimitDecision::Rejected {
 
 #### `retry_after_ms`
 
-**Computation:** Remaining TTL of the oldest active bucket
+**Computation:** Time until the oldest active bucket expires
 
 ```lua
-local ttl_ms = redis.call('HPTTL', hash_key, oldest_bucket_timestamp)
+-- Calculate remaining time for oldest bucket
+local oldest_hash_field_group_timestamp = tonumber(oldest_hash_fields[2])
+local oldest_hash_field_ttl = (window_size_seconds * 1000) - timestamp_ms + oldest_hash_field_group_timestamp
 ```
 
 **Interpretation:** **Best-effort** hint for "how long to wait before capacity becomes available"
@@ -555,9 +572,9 @@ Recommended metrics for production:
 
 **Check:**
 1. Verify Redis version: `redis-cli INFO server | grep redis_version`
-2. Test hash field TTL support: `redis-cli HPEXPIRE testkey 5000 FIELDS 1 field1`
-3. Check connection: `redis-cli PING`
-4. Verify key prefix in logs
+2. Check connection: `redis-cli PING`
+3. Verify key prefix in logs
+4. Check that keys are being created: `redis-cli KEYS "trypema:*"`
 
 ### Problem: Memory usage growing unbounded
 
