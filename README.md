@@ -53,7 +53,7 @@ use std::sync::Arc;
 
 use trypema::{
     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions,
-    WindowSizeSeconds,
+    SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 use trypema::local::LocalRateLimiterOptions;
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -65,6 +65,7 @@ use trypema::local::LocalRateLimiterOptions;
 #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 #             hard_limit_factor: HardLimitFactor::default(),
+#             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 #         },
 #         #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #         redis: RedisRateLimiterOptions {
@@ -73,6 +74,7 @@ use trypema::local::LocalRateLimiterOptions;
 #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 #             hard_limit_factor: HardLimitFactor::default(),
+#             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 #         },
 #     }
 # }
@@ -150,7 +152,7 @@ use std::sync::Arc;
 
 use trypema::{
     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions,
-    WindowSizeSeconds,
+    SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 use trypema::local::LocalRateLimiterOptions;
 use trypema::redis::{RedisKey, RedisRateLimiterOptions};
@@ -164,6 +166,7 @@ let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
         hard_limit_factor: HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     },
     redis: RedisRateLimiterOptions {
         connection_manager,
@@ -171,6 +174,7 @@ let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
         hard_limit_factor: HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     },
 }));
 
@@ -424,7 +428,7 @@ Keys are **not automatically removed** from the internal map (local provider) or
 ```rust,no_run
 use std::sync::Arc;
 
-use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
 use trypema::local::LocalRateLimiterOptions;
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 # use trypema::redis::RedisRateLimiterOptions;
@@ -435,6 +439,7 @@ use trypema::local::LocalRateLimiterOptions;
 #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 #             hard_limit_factor: HardLimitFactor::default(),
+#             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 #         },
 #         #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #         redis: RedisRateLimiterOptions {
@@ -443,6 +448,7 @@ use trypema::local::LocalRateLimiterOptions;
 #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 #             hard_limit_factor: HardLimitFactor::default(),
+#             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 #         },
 #     }
 # }

@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimiter,
-    RateLimiterOptions, WindowSizeSeconds,
+    RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
@@ -14,6 +14,7 @@ fn test_local_cleanup_loop_runs() {
             window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
             rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
+            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
         },
     };
 
@@ -46,6 +47,7 @@ fn test_cleanup_loop_keeps_active_entries() {
             window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
             rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
+            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
         },
     };
 
@@ -87,6 +89,7 @@ fn test_redis_cleanup_loop_with_tokio() {
                 window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
             },
             redis: crate::RedisRateLimiterOptions {
                 connection_manager,
@@ -94,6 +97,7 @@ fn test_redis_cleanup_loop_with_tokio() {
                 window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
             },
         };
 

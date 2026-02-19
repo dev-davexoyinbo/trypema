@@ -22,7 +22,8 @@ pub use error::*;
 
 mod common;
 pub use common::{
-    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, WindowSizeSeconds,
+    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, SuppressionFactorCacheMs,
+    WindowSizeSeconds,
 };
 
 #[cfg(test)]

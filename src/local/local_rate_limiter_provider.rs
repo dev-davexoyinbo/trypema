@@ -1,6 +1,6 @@
 use crate::{
-    AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
     common::{HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds},
+    AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
 };
 
 /// Configuration for local (in-process) rate limiters.
@@ -15,7 +15,7 @@ use crate::{
 /// # Examples
 ///
 /// ```
-/// use trypema::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds};
+/// use trypema::{HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds};
 /// use trypema::local::LocalRateLimiterOptions;
 ///
 /// // Recommended defaults for most use cases
@@ -23,6 +23,7 @@ use crate::{
 ///     window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),   // 60s sliding window
 ///     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),      // 10ms coalescing
 ///     hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),      // 50% burst headroom
+///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// };
 ///
 /// // High-precision, low-coalescing
@@ -30,6 +31,7 @@ use crate::{
 ///     window_size_seconds: WindowSizeSeconds::try_from(10).unwrap(),
 ///     rate_group_size_ms: RateGroupSizeMs::try_from(1).unwrap(),
 ///     hard_limit_factor: HardLimitFactor::default(),
+///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// };
 ///
 /// // High-performance, aggressive coalescing
@@ -37,6 +39,7 @@ use crate::{
 ///     window_size_seconds: WindowSizeSeconds::try_from(120).unwrap(),
 ///     rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
 ///     hard_limit_factor: HardLimitFactor::try_from(2.0).unwrap(),
+///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// };
 /// ```
 #[derive(Clone, Debug)]
@@ -71,12 +74,13 @@ pub struct LocalRateLimiterOptions {
     /// **Note:** Ignored by [`AbsoluteLocalRateLimiter`]
     pub hard_limit_factor: HardLimitFactor,
 
-    /// Sliding window duration for caching suppression factors.
+    /// Cache duration (milliseconds) for suppression factor recomputation.
     ///
-    /// Determines how long the cache of suppression factors is valid.
+    /// The suppressed strategy caches the computed suppression factor per key to avoid
+    /// recomputing it on every request.
     ///
-    /// **Typical values:** 10-300 seconds  
-    /// **Recommended:** 60 seconds
+    /// **Typical values:** 10-1000 ms
+    /// **Recommended:** 10-200 ms
     pub suppression_factor_cache_ms: SuppressionFactorCacheMs,
 }
 
@@ -97,7 +101,7 @@ pub struct LocalRateLimiterOptions {
 /// # Examples
 ///
 /// ```no_run
-/// use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+/// use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
 /// use trypema::local::LocalRateLimiterOptions;
 /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 /// # use trypema::redis::RedisRateLimiterOptions;
@@ -109,6 +113,7 @@ pub struct LocalRateLimiterOptions {
 /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 /// #             hard_limit_factor: HardLimitFactor::default(),
+/// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// #         },
 /// #         redis: RedisRateLimiterOptions {
 /// #             connection_manager: todo!(),
@@ -116,6 +121,7 @@ pub struct LocalRateLimiterOptions {
 /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 /// #             hard_limit_factor: HardLimitFactor::default(),
+/// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// #         },
 /// #     }
 /// # }
@@ -127,6 +133,7 @@ pub struct LocalRateLimiterOptions {
 /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 /// #             hard_limit_factor: HardLimitFactor::default(),
+/// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// #         },
 /// #     }
 /// # }
@@ -163,7 +170,7 @@ impl LocalRateLimiterProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+    /// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
     /// # use trypema::local::LocalRateLimiterOptions;
     /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     /// # use trypema::redis::RedisRateLimiterOptions;
@@ -175,6 +182,7 @@ impl LocalRateLimiterProvider {
     /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
     /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
     /// #             hard_limit_factor: HardLimitFactor::default(),
+    /// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     /// #         },
     /// #         redis: RedisRateLimiterOptions {
     /// #             connection_manager: todo!(),
@@ -182,6 +190,7 @@ impl LocalRateLimiterProvider {
     /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
     /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
     /// #             hard_limit_factor: HardLimitFactor::default(),
+    /// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     /// #         },
     /// #     }
     /// # }
@@ -193,6 +202,7 @@ impl LocalRateLimiterProvider {
     /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
     /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
     /// #             hard_limit_factor: HardLimitFactor::default(),
+    /// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     /// #         },
     /// #     }
     /// # }
@@ -217,7 +227,7 @@ impl LocalRateLimiterProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+    /// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
     /// # use trypema::local::LocalRateLimiterOptions;
     /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     /// # use trypema::redis::RedisRateLimiterOptions;
@@ -229,6 +239,7 @@ impl LocalRateLimiterProvider {
     /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
     /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
     /// #             hard_limit_factor: HardLimitFactor::default(),
+    /// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     /// #         },
     /// #         redis: RedisRateLimiterOptions {
     /// #             connection_manager: todo!(),
@@ -236,6 +247,7 @@ impl LocalRateLimiterProvider {
     /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
     /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
     /// #             hard_limit_factor: HardLimitFactor::default(),
+    /// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     /// #         },
     /// #     }
     /// # }
@@ -247,6 +259,7 @@ impl LocalRateLimiterProvider {
     /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
     /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
     /// #             hard_limit_factor: HardLimitFactor::default(),
+    /// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     /// #         },
     /// #     }
     /// # }

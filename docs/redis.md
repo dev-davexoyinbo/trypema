@@ -78,7 +78,7 @@ Checks admission and atomically records the increment if allowed.
 ```rust,no_run
 use trypema::{
     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions,
-    WindowSizeSeconds,
+    SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 use trypema::local::LocalRateLimiterOptions;
 use trypema::redis::{RedisKey, RedisRateLimiterOptions};
@@ -89,6 +89,7 @@ async fn example() -> Result<(), trypema::TrypemaError> {
             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
+            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
         },
         redis: RedisRateLimiterOptions {
             connection_manager: todo!("create redis::aio::ConnectionManager"),
@@ -96,6 +97,7 @@ async fn example() -> Result<(), trypema::TrypemaError> {
             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
+            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
         },
     });
 
@@ -312,7 +314,7 @@ For proactive cleanup of completely inactive keys, use:
 ```rust,no_run
 use std::sync::Arc;
 
-use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
 use trypema::local::LocalRateLimiterOptions;
 use trypema::redis::RedisRateLimiterOptions;
 
@@ -321,6 +323,7 @@ let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
         hard_limit_factor: HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     },
     redis: RedisRateLimiterOptions {
         connection_manager: todo!("create redis::aio::ConnectionManager"),
@@ -328,6 +331,7 @@ let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
         hard_limit_factor: HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     },
 }));
 

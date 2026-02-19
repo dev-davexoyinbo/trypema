@@ -90,7 +90,9 @@ pub struct RedisRateLimiterOptions {
     /// **Note:** Currently only used by absolute strategy in Redis (suppressed is placeholder).
     pub hard_limit_factor: HardLimitFactor,
 
-    /// d
+    /// Cache duration (milliseconds) for suppression factor recomputation.
+    ///
+    /// Same semantics as local provider.
     pub suppression_factor_cache_ms: SuppressionFactorCacheMs,
 }
 

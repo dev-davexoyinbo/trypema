@@ -61,7 +61,7 @@ impl RateLimitSeries {
 ///
 /// ```no_run
 /// use trypema::{RateLimitDecision, RateLimit};
-/// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, WindowSizeSeconds};
+/// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
 /// # use trypema::local::LocalRateLimiterOptions;
 /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 /// # use trypema::redis::RedisRateLimiterOptions;
@@ -73,6 +73,7 @@ impl RateLimitSeries {
 /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 /// #             hard_limit_factor: HardLimitFactor::default(),
+/// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// #         },
 /// #         redis: RedisRateLimiterOptions {
 /// #             connection_manager: todo!(),
@@ -80,6 +81,7 @@ impl RateLimitSeries {
 /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 /// #             hard_limit_factor: HardLimitFactor::default(),
+/// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// #         },
 /// #     }
 /// # }
@@ -91,6 +93,7 @@ impl RateLimitSeries {
 /// #             window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
 /// #             rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
 /// #             hard_limit_factor: HardLimitFactor::default(),
+/// #             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// #         },
 /// #     }
 /// # }
@@ -463,12 +466,15 @@ pub(crate) enum RateType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+/// Cache duration (milliseconds) for suppression factor recomputation.
+///
+/// Used by the suppressed strategy to avoid recomputing the suppression factor on every request.
 pub struct SuppressionFactorCacheMs(u64);
 
 impl Default for SuppressionFactorCacheMs {
-    /// Returns a suppression factor cache duration of 10 minutes (600_000 ms).
+    /// Returns a suppression factor cache duration of 100 ms.
     fn default() -> Self {
-        Self(10)
+        Self(100)
     }
 }
 

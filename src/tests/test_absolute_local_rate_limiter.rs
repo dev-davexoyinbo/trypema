@@ -7,7 +7,7 @@ use std::{
 
 use crate::common::{
     HardLimitFactor, InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimitSeries,
-    WindowSizeSeconds,
+    SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};
 
@@ -16,6 +16,7 @@ fn limiter(window_size_seconds: u64, rate_group_size_ms: u64) -> AbsoluteLocalRa
         window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
         hard_limit_factor: HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     })
 }
 

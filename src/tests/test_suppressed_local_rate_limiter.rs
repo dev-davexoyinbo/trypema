@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    SuppressedLocalRateLimiter, WindowSizeSeconds,
+    SuppressedLocalRateLimiter, SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 
 use crate::common::{InstantRate, RateLimitSeries};
@@ -20,6 +20,7 @@ fn limiter(
         window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
         hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     })
 }
 
@@ -275,12 +276,13 @@ fn nonpositive_suppression_factor_bypasses_suppression() {
 }
 
 #[test]
-fn suppression_factor_cache_is_recomputed_after_group_window() {
+fn suppression_factor_cache_is_recomputed_after_cache_window() {
     let limiter = limiter(1, 50, 10f64);
     let key = "k";
     let rate_limit = RateLimit::try_from(5f64).unwrap();
 
-    let old_ts = Instant::now() - Duration::from_millis(51);
+    // Default suppression_factor_cache_ms is 100ms; make the cached value stale.
+    let old_ts = Instant::now() - Duration::from_millis(101);
     limiter.test_set_suppression_factor(key, old_ts, 0.9);
 
     // With no accepted series, calculate_suppression_factor() persists 0.
