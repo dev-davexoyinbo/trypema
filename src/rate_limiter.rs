@@ -3,7 +3,7 @@
 //! This module provides [`RateLimiter`], the main entry point for rate limiting.
 //! It coordinates multiple providers:
 //! - [`LocalRateLimiterProvider`]: In-process rate limiting
-//! - [`RedisRateLimiterProvider`]: Distributed rate limiting (requires Redis 7.4+)
+//! - [`RedisRateLimiterProvider`]: Distributed rate limiting (requires Redis 6.2+)
 //!
 //! # Examples
 //!
@@ -352,7 +352,7 @@ impl RateLimiter {
 
     /// Access the Redis provider for distributed rate limiting.
     ///
-    /// Requires Redis 7.4+ and one of the Redis features (`redis-tokio` or `redis-smol`).
+    /// Requires Redis 6.2+ and one of the Redis features (`redis-tokio` or `redis-smol`).
     ///
     /// # Examples
     ///

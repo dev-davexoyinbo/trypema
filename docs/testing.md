@@ -52,7 +52,7 @@ Redis support is controlled by feature flags:
 ### Using Docker (Recommended)
 
 The repository includes a test harness (`compose.yaml` + `Makefile`) that:
-1. Starts Redis 7.4.2-alpine in a container
+1. Starts Redis 6.2+ in a container
 2. Waits for Redis to be ready
 3. Runs all tests
 4. Cleans up the container
@@ -154,7 +154,7 @@ tracing_subscriber::fmt()
 
 **What it does:**
 
-1. Starts `redis:7.4.2-alpine` as a service container
+1. Starts `redis:6.2-alpine` as a service container
 2. Waits for Redis readiness (`redis-cli ping`)
 3. Runs `cargo test` with `REDIS_URL=redis://127.0.0.1:6379`
 4. Runs tests on multiple Rust versions (stable, beta, nightly)
@@ -220,7 +220,7 @@ Error: RedisError(Io(Os { code: 111, kind: ConnectionRefused, message: "Connecti
 **Solution:**
 ```bash
 # Start Redis with Docker
-docker run -d --name redis -p 6379:6379 redis:7.4.2-alpine
+docker run -d --name redis -p 6379:6379 redis:6.2-alpine
 
 # Or use make
 make start-redis
@@ -282,8 +282,8 @@ lsof -ti:16379 | xargs kill
 # Check version
 redis-cli INFO server | grep redis_version
 
-# Upgrade Redis (using latest for best compatibility)
-docker run -d --name redis -p 6379:6379 redis:7.4.2-alpine
+# Upgrade Redis (6.2+ required)
+docker run -d --name redis -p 6379:6379 redis:6.2-alpine
 ```
 
 ## Best Practices

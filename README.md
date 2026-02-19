@@ -489,7 +489,7 @@ cargo test --no-default-features
 Requires Docker and Docker Compose:
 
 ```bash
-# Start Redis 7.4.2 and run all tests
+# Start Redis (6.2+) and run all tests
 make test-redis
 
 # Use custom Redis port

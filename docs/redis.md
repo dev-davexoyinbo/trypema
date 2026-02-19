@@ -18,7 +18,7 @@ The Redis provider enables distributed rate limiting across multiple processes o
 - Sorted Set commands: `ZADD`, `ZREM`, `ZRANGE` (with `REV` option from 6.2.0), `ZCARD`
 - Server commands: `TIME`
 
-**Tested version:** `redis:7.4.2-alpine` (used in CI and test harness)
+**Tested version:** `redis:6.2-alpine` (used in CI and test harness)
 
 ### Runtime
 
