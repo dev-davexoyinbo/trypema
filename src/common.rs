@@ -33,6 +33,7 @@ impl RateLimitSeries {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, strum_macros::Display)]
 /// Result of a rate limit admission check.
 ///
 /// Returned by rate limiter implementations to indicate whether work for a key

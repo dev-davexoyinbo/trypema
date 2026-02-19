@@ -268,7 +268,7 @@ impl AbsoluteRedisRateLimiter {
             local window_limit_suffix = ARGV[3]
             local total_count_suffix = ARGV[4]
             local active_keys_suffix = ARGV[5]
-            local suppression_factor_suffix = ARGV[6]
+            local suppression_factor_key_suffix = ARGV[6]
 
 
             local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")

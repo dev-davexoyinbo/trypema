@@ -116,7 +116,7 @@ impl SuppressedRedisRateLimiter {
 
             local suppression_factor = tonumber(redis.call("GET", suppressed_factor_key))
             if suppression_factor ~= nil then
-                return suppression_factor
+                return tostring(suppression_factor)
             end
 
             local window_limit = tonumber(redis.call("GET", accepted_window_limit_key)) or 0
@@ -128,7 +128,7 @@ impl SuppressedRedisRateLimiter {
                 return 0
             end
 
-            local accepted_active_keys_in_1s = redis.call("ZRANGE", accepted_active_keys_key, +inf, now_ms - 1000, "BYSCORE", "REV")
+            local accepted_active_keys_in_1s = redis.call("ZRANGE", accepted_active_keys_key, "+inf", now_ms - 1000, "BYSCORE", "REV")
             local total_in_last_second = 0
 
             if #accepted_active_keys_in_1s > 0 then
@@ -159,7 +159,7 @@ impl SuppressedRedisRateLimiter {
 
             redis.call("SET", suppressed_factor_key, suppression_factor, PX, suppression_factor_exp)
 
-            return suppression_factor
+            return tostring(suppression_factor)
         "#,
         );
 
