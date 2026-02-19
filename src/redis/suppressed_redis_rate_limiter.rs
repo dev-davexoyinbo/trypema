@@ -62,8 +62,6 @@ impl SuppressedRedisRateLimiter {
             .await?
             .min(1f64);
 
-        eprintln!("suppression_factor>>>>>: {suppression_factor}");
-
         if suppression_factor <= 0f64 {
             return self
                 .accepted_limiter

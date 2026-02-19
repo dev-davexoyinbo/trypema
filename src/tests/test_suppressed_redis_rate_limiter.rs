@@ -442,7 +442,7 @@ fn verify_suppression_factor_calculation_spread_redis() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let (limiter, cm, prefix) = build_limiter(&url, 10, 100, 10f64).await;
+        let (limiter, _cm, _prefix) = build_limiter(&url, 10, 100, 10f64).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
 
@@ -475,31 +475,36 @@ fn verify_suppression_factor_calculation_spread_redis() {
     });
 }
 
-// #[test]
-// fn verify_suppression_factor_calculation_last_second() {
-//     let limiter = limiter(10, 100, 10f64);
-//     let key = "k";
-//     let rate_limit = RateLimit::try_from(1f64).unwrap();
-//
-//     let _ = limiter.inc(key, &rate_limit, 10);
-//     // wait for 1s to pass
-//     std::thread::sleep(Duration::from_millis(1001));
-//
-//     let _ = limiter.inc(key, &rate_limit, 20);
-//
-//     let expected_suppression_factor = 1f64 - (1f64 / 21f64);
-//
-//     let decision = limiter.inc(key, &rate_limit, 1);
-//
-//     assert!(
-//         matches!(
-//             decision,
-//             RateLimitDecision::Suppressed {
-//                 suppression_factor,
-//                 ..
-//             } if suppression_factor - expected_suppression_factor < 1e-12
-//         ),
-//         "decision: {:?}",
-//         decision
-//     );
-// }
+#[test]
+fn verify_suppression_factor_calculation_last_second_redis() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, _cm, _prefix) = build_limiter(&url, 10, 100, 10f64).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        let _ = limiter.inc(&k, &rate_limit, 10).await.unwrap();
+        // wait for 1s to pass
+        tokio::time::sleep(Duration::from_millis(1001)).await;
+
+        let _ = limiter.inc(&k, &rate_limit, 20).await.unwrap();
+
+        let expected_suppression_factor = 1f64 - (1f64 / 21f64);
+
+        let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
+
+        assert!(
+            matches!(
+                decision,
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    ..
+                } if suppression_factor - expected_suppression_factor < 1e-12
+            ),
+            "decision: {:?}",
+            decision
+        );
+    });
+}
