@@ -108,9 +108,10 @@ impl SuppressedRedisRateLimiter {
             local now_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 
             local accepted_total_count_key = KEYS[1]
-            local accepted_active_keys_key = KEYS[2]
-            local accepted_window_limit_key = KEYS[3]
-            local suppressed_factor_key = KEYS[4]
+            local accepted_window_limit_key = KEYS[2]
+            local observed_total_count_key = KEYS[3]
+            local observed_active_keys_key = KEYS[4]
+            local suppressed_factor_key = KEYS[5]
 
             local window_size_seconds = tonumber(ARGV[1])
             local rate_group_size_ms = tonumber(ARGV[2])
@@ -122,18 +123,20 @@ impl SuppressedRedisRateLimiter {
 
             local window_limit = tonumber(redis.call("GET", accepted_window_limit_key)) or 0
             local accepted_total_count = tonumber(redis.call("GET", accepted_total_count_key)) or 0
-            local active_keys_count = tonumber(redis.call("ZCARD", accepted_active_keys_key)) or 0
+            local observed_total_count = tonumber(redis.call("GET", observed_total_count_key)) or 0
+            local active_keys_count = tonumber(redis.call("ZCARD", observed_active_keys_key)) or 0
 
-            if window_limit == 0 or accepted_total_count < window_limit or active_keys_count == 0 then
+            if window_limit == 0 or observed_total_count == 0 or accepted_total_count < window_limit or active_keys_count == 0 then
                 redis.call("SET", suppressed_factor_key, 0, "PX", rate_group_size_ms)
                 return 0
             end
 
-            local accepted_active_keys_in_1s = redis.call("ZRANGE", accepted_active_keys_key, "+inf", now_ms - 1000, "BYSCORE", "REV")
+
+            local observed_active_keys_in_1s = redis.call("ZRANGE", observed_active_keys_key, "+inf", now_ms - 1000, "BYSCORE", "REV")
             local total_in_last_second = 0
 
             if #accepted_active_keys_in_1s > 0 then
-                local values = redis.call("HMGET", accepted_active_keys_key, unpack(accepted_active_keys_in_1s))
+                local values = redis.call("HMGET", observed_active_keys_key, unpack(observed_active_keys_in_1s))
                 for i = 1, #values do
                     local value = tonumber(values[i])
                     if value then
@@ -143,7 +146,7 @@ impl SuppressedRedisRateLimiter {
             end
 
 
-            local average_rate_in_window = accepted_total_count / window_size_seconds
+            local average_rate_in_window = observed_total_count / window_size_seconds
             local perceived_rate_limit = average_rate_in_window
 
             if total_in_last_second > average_rate_in_window then
@@ -153,7 +156,7 @@ impl SuppressedRedisRateLimiter {
             suppression_factor = 1 - (perceived_rate_limit / window_limit)
 
 
-            local oldest_hash_field_timestamp = tonumber(accepted_active_keys_in_1s[1]) or now_ms
+            local oldest_hash_field_timestamp = tonumber(observed_active_keys_in_1s[1]) or now_ms
             local suppression_factor_exp = rate_group_size_ms - now_ms + oldest_hash_field_timestamp
 
             if suppression_factor_exp <= 0 then
@@ -174,12 +177,17 @@ impl SuppressedRedisRateLimiter {
                     .key_generator()
                     .get_total_count_key(key),
             )
-            .key(self.accepted_limiter.key_generator().get_active_keys(key))
             .key(
                 self.accepted_limiter
                     .key_generator()
                     .get_window_limit_key(key),
             )
+            .key(
+                self.observed_limiter
+                    .key_generator()
+                    .get_total_count_key(key),
+            )
+            .key(self.observed_limiter.key_generator().get_active_keys(key))
             .key(
                 self.observed_limiter
                     .key_generator()

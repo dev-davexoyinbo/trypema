@@ -3,8 +3,8 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
     AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
+    common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
 };
 
 /// Probabilistic rate limiter with dual tracking for graceful degradation.
@@ -365,6 +365,10 @@ impl SuppressedLocalRateLimiter {
             return self.persist_suppression_factor(key, 0f64);
         };
 
+        let Some(observed_series) = self.observed_limiter.series().get(key) else {
+            return self.persist_suppression_factor(key, 0f64);
+        };
+
         if series.series.is_empty() {
             return self.persist_suppression_factor(key, 0f64);
         }
@@ -377,7 +381,7 @@ impl SuppressedLocalRateLimiter {
 
         let mut total_in_last_second = 0u64;
 
-        for instant_rate in series.series.iter().rev() {
+        for instant_rate in observed_series.series.iter().rev() {
             if instant_rate.timestamp.elapsed().as_millis() > 1000 {
                 break;
             }
@@ -387,7 +391,7 @@ impl SuppressedLocalRateLimiter {
         }
 
         let average_rate_in_window: f64 =
-            series.total.load(Ordering::Relaxed) as f64 / *self.window_size_seconds as f64;
+            observed_series.total.load(Ordering::Relaxed) as f64 / *self.window_size_seconds as f64;
 
         let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
 
