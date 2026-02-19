@@ -36,7 +36,10 @@ use crate::{
 /// - 1.0: Suppress all requests (full suppression)
 /// ```
 ///
-/// **Perceived rate** is `max(average_window_rate, last_second_rate)`.
+/// **Perceived rate** is `max(average_window_rate, rate_in_last_1000ms)`.
+///
+/// `rate_in_last_1000ms` is computed using `Instant::elapsed().as_millis()` (whole-millisecond
+/// truncation), so suppression reacts at ~1ms granularity.
 ///
 /// # Three Operating Regimes
 ///

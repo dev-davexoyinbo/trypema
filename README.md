@@ -305,6 +305,11 @@ A probabilistic strategy that gracefully degrades under load by suppressing a po
 suppression_factor = 1.0 - (perceived_rate / rate_limit)
 ```
 
+Where `perceived_rate = max(average_rate_in_window, rate_in_last_1000ms)`.
+
+`rate_in_last_1000ms` is computed at millisecond granularity (not whole seconds), so suppression
+responds more precisely to short spikes.
+
 **Use cases:**
 
 - Graceful degradation under load spikes

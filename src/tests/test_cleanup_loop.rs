@@ -1,4 +1,4 @@
-use std::{sync::Arc, thread, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimiter,
@@ -32,7 +32,7 @@ fn test_local_cleanup_loop_runs() {
     rl.run_cleanup_loop_with_config(100, 50);
 
     // Wait for entries to become stale and be cleaned up
-    thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(200));
 
     // Entries should be cleaned up now
     assert_eq!(rl.local().absolute().series().len(), 0);
@@ -60,7 +60,7 @@ fn test_cleanup_loop_keeps_active_entries() {
 
     // Keep the key active by updating it periodically
     for _ in 0..5 {
-        thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
         rl.local().absolute().inc("key1", &rate_limit, 1);
     }
 
