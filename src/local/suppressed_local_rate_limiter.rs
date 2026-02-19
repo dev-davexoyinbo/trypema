@@ -366,14 +366,16 @@ impl SuppressedLocalRateLimiter {
         };
 
         let Some(observed_series) = self.observed_limiter.series().get(key) else {
-            return self.persist_suppression_factor(key, 0f64);
+            unreachable!("expected observed series to exist if accepted series exists");
         };
 
         if series.series.is_empty() {
             return self.persist_suppression_factor(key, 0f64);
         }
 
-        let window_limit = *self.window_size_seconds as f64 * *series.limit;
+        let rate_limit = self.get_rate_limit_from_hard_limit(&series.limit);
+
+        let window_limit = *self.window_size_seconds as f64 * *rate_limit;
 
         if series.total.load(Ordering::Relaxed) < window_limit as u64 {
             return self.persist_suppression_factor(key, 0f64);
@@ -395,7 +397,7 @@ impl SuppressedLocalRateLimiter {
 
         let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
 
-        let suppression_factor = 1f64 - (perceived_rate_limit / *series.limit);
+        let suppression_factor = 1f64 - (*rate_limit / perceived_rate_limit);
 
         self.persist_suppression_factor(key, suppression_factor)
     } // end method calculate_suppression_factor
@@ -411,6 +413,17 @@ impl SuppressedLocalRateLimiter {
 
         val
     } // end method get_hard_limit
+
+    #[inline]
+    fn get_rate_limit_from_hard_limit(&self, hard_limit: &RateLimit) -> RateLimit {
+        let Ok(val) = RateLimit::try_from(**hard_limit / *self.hard_limit_factor) else {
+            unreachable!(
+                "SuppressedLocalRateLimiter::get_rate_limit_from_hard_limit: hard_limit_factor is always > 0"
+            );
+        };
+
+        val
+    }
 
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {
         self.suppression_factors
