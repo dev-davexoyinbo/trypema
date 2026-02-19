@@ -268,6 +268,7 @@ impl AbsoluteRedisRateLimiter {
             local window_limit_suffix = ARGV[3]
             local total_count_suffix = ARGV[4]
             local active_keys_suffix = ARGV[5]
+            local suppression_factor_suffix = ARGV[6]
 
 
             local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
@@ -278,7 +279,7 @@ impl AbsoluteRedisRateLimiter {
 
             local remove_keys = {}
 
-            local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix}
+            local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
             for i = 1, #active_entities do
                 local entity = active_entities[i]
 
@@ -307,6 +308,7 @@ impl AbsoluteRedisRateLimiter {
             .arg(self.key_generator.window_limit_key_suffix.to_string())
             .arg(self.key_generator.total_count_key_suffix.to_string())
             .arg(self.key_generator.active_keys_key_suffix.to_string())
+            .arg(self.key_generator.suppression_factor_key_suffix.to_string())
             .invoke_async(&mut connection_manager)
             .await?;
 

@@ -203,7 +203,6 @@ impl SuppressedRedisRateLimiter {
     } // end method get_hard_limit
 
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        // TODO: cleanup suppression factors
         self.accepted_limiter.cleanup(stale_after_ms).await?;
         self.observed_limiter.cleanup(stale_after_ms).await
     } // end method cleanup
