@@ -6,6 +6,7 @@ use crate::{
 };
 
 /// A rate limiter backed by Redis.
+#[derive(Clone, Debug)]
 pub struct AbsoluteRedisRateLimiter {
     connection_manager: ConnectionManager,
     window_size_seconds: WindowSizeSeconds,

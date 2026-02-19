@@ -144,15 +144,16 @@ pub struct RedisRateLimiterOptions {
     /// let key = RedisKey::try_from("user_123".to_string())?;
     /// let rate = RateLimit::try_from(10.0)?;
     ///
-    /// match rl.redis().absolute().inc(&key, &rate, 1).await? {
-    ///     RateLimitDecision::Allowed => {}
-    ///     RateLimitDecision::Rejected { retry_after_ms, .. } => {
-    ///         let _ = retry_after_ms;
-    ///     }
-    ///     _ => unreachable!(),
-    /// }
-    /// # Ok(()) }
-    /// ```
+/// match rl.redis().absolute().inc(&key, &rate, 1).await? {
+///     RateLimitDecision::Allowed => {}
+///     RateLimitDecision::Rejected { retry_after_ms, .. } => {
+///         let _ = retry_after_ms;
+///     }
+///     _ => unreachable!(),
+/// }
+/// # Ok(()) }
+/// ```
+#[derive(Clone, Debug)]
 pub struct RedisRateLimiterProvider {
     absolute: AbsoluteRedisRateLimiter,
     suppressed: SuppressedRedisRateLimiter,

@@ -1,6 +1,6 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::{TrypemaError, common::RateType};
+use crate::{common::RateType, TrypemaError};
 
 /// A validated newtype for Redis keys.
 ///
@@ -53,6 +53,7 @@ impl TryFrom<String> for RedisKey {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct RedisKeyGenerator {
     pub prefix: RedisKey,
     pub rate_type: RateType,

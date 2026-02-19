@@ -131,6 +131,7 @@ pub struct LocalRateLimiterOptions {
 /// let abs_decision = rl.local().absolute().inc("user_123", &rate, 1);
 /// let sup_decision = rl.local().suppressed().inc("user_456", &rate, 1);
 /// ```
+#[derive(Debug)]
 pub struct LocalRateLimiterProvider {
     absolute: AbsoluteLocalRateLimiter,
     suppressed: SuppressedLocalRateLimiter,

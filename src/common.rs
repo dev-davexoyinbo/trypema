@@ -18,11 +18,13 @@ use std::{
 
 use crate::TrypemaError;
 
+#[derive(Debug)]
 pub(crate) struct InstantRate {
     pub count: AtomicU64,
     pub timestamp: Instant,
 }
 
+#[derive(Debug)]
 pub(crate) struct RateLimitSeries {
     pub limit: RateLimit,
     pub series: VecDeque<InstantRate>,

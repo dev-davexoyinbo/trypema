@@ -3,8 +3,8 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
     common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
+    AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
 };
 
 /// Probabilistic rate limiter with dual tracking for graceful degradation.
@@ -142,6 +142,7 @@ use crate::{
 ///     }
 /// }
 /// ```
+#[derive(Debug)]
 pub struct SuppressedLocalRateLimiter {
     accepted_limiter: AbsoluteLocalRateLimiter,
     observed_limiter: AbsoluteLocalRateLimiter,

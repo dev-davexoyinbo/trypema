@@ -114,6 +114,7 @@ use crate::{
 ///     RateLimitDecision::Allowed
 /// ));
 /// ```
+#[derive(Debug)]
 pub struct AbsoluteLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
     rate_group_size_ms: RateGroupSizeMs,
