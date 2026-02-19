@@ -53,6 +53,15 @@ impl RateLimiter {
     /// - `stale_after_ms`: keys inactive for this duration are removed (default: 10 minutes)
     /// - `cleanup_interval_ms`: how often to run cleanup (default: 30 seconds)
     ///
+    /// # Memory management
+    ///
+    /// The cleanup loop holds only a `Weak` reference to the `RateLimiter`, not a strong
+    /// `Arc` reference. This means:
+    /// - The cleanup loop will not prevent the `RateLimiter` from being dropped
+    /// - When all `Arc<RateLimiter>` references are dropped, the cleanup loop automatically exits
+    /// - You can safely drop your `Arc<RateLimiter>` references without worrying about
+    ///   background tasks keeping the limiter alive indefinitely
+    ///
     /// # Runtime requirements
     ///
     /// With `redis-tokio` feature:
@@ -72,7 +81,10 @@ impl RateLimiter {
 
     /// Run a cleanup loop with custom timing configuration.
     ///
-    /// See [`RateLimiter::run_cleanup_loop`] for details.
+    /// See [`RateLimiter::run_cleanup_loop`] for details on runtime requirements and memory management.
+    ///
+    /// Like `run_cleanup_loop`, this method uses `Weak` references internally, so dropping all
+    /// `Arc<RateLimiter>` references will cause the cleanup loop to exit gracefully.
     ///
     /// # Arguments
     ///
