@@ -273,8 +273,6 @@ Unlike fixed windows, sliding windows provide smoother rate limiting without bou
 
 To reduce memory and computational overhead, increments that occur within `rate_group_size_ms` of each other are merged into the same time bucket.
 
-**Trade-off:** Larger coalescing intervals improve performance but make rejection metadata (like `retry_after_ms`) less precise.
-
 ## Configuration
 
 ### LocalRateLimiterOptions
