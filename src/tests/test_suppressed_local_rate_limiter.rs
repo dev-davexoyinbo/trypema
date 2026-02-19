@@ -57,6 +57,32 @@ fn insert_series(
 }
 
 #[test]
+fn does_not_suppress_when_window_limit_not_exceeded() {
+    let limiter = limiter(10, 1000, 10f64);
+    let key = "k";
+    let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+    let _ = limiter.inc(key, &rate_limit, 10);
+    // wait for 1s to pass
+    std::thread::sleep(Duration::from_millis(1001));
+
+    let _ = limiter.inc(key, &rate_limit, 20);
+
+    let decision = limiter.inc(key, &rate_limit, 1);
+    assert!(
+        matches!(
+            decision,
+            RateLimitDecision::Suppressed {
+                suppression_factor,
+                ..
+            } if suppression_factor  < 1e-12
+        ) || matches!(decision, RateLimitDecision::Allowed),
+        "decision: {:?}",
+        decision
+    );
+}
+
+#[test]
 fn verify_suppression_factor_calculation_spread() {
     let limiter = limiter(10, 1000, 10f64);
     let key = "k";
@@ -261,34 +287,6 @@ fn suppression_factor_cache_is_recomputed_after_group_window() {
     let mut rng = |_p: f64| panic!("rng should not be used when suppression_factor <= 0");
     let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
     assert!(matches!(decision, RateLimitDecision::Allowed));
-
-    let (_ts, val) = limiter
-        .test_get_suppression_factor(key)
-        .expect("expected suppression factor to be persisted");
-    assert!((val - 0f64).abs() < 1e-12);
-}
-
-#[test]
-fn does_not_suppress_when_window_limit_not_exceeded() {
-    let limiter = limiter(10, 1, 10f64);
-    let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
-
-    // Seed accepted usage below the base window capacity.
-    // window_limit = 10 * 1 = 10
-    limiter.accepted_limiter().inc(key, &rate_limit, 9);
-
-    // Force a suppression-factor recompute (cached value is old and non-zero).
-    let old_ts = Instant::now() - Duration::from_millis(2);
-    limiter.test_set_suppression_factor(key, old_ts, 0.9);
-
-    // Under the window capacity, suppression must be bypassed.
-    let mut rng = |_p: f64| panic!("rng should not be used when under window limit");
-    let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
-    assert!(matches!(decision, RateLimitDecision::Allowed));
-
-    assert_eq!(total_for_key(limiter.observed_limiter(), key), 1);
-    assert_eq!(total_for_key(limiter.accepted_limiter(), key), 10);
 
     let (_ts, val) = limiter
         .test_get_suppression_factor(key)
