@@ -19,6 +19,7 @@ use crate::{
 /// ```rust,no_run
 /// # async fn example() -> Result<(), trypema::TrypemaError> {
 /// use trypema::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds};
+/// use trypema::SuppressionFactorCacheMs;
 /// use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 ///
 /// let options = RedisRateLimiterOptions {
@@ -27,6 +28,7 @@ use crate::{
 ///     window_size_seconds: WindowSizeSeconds::try_from(60)?,
 ///     rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
 ///     hard_limit_factor: HardLimitFactor::try_from(1.5)?,
+///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// };
 /// let _ = options;
 /// # Ok(()) }
@@ -126,7 +128,7 @@ pub struct RedisRateLimiterOptions {
 /// # async fn example() -> Result<(), trypema::TrypemaError> {
 /// use trypema::{
 ///     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter,
-///     RateLimiterOptions, WindowSizeSeconds,
+///     RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
 /// };
 /// use trypema::local::LocalRateLimiterOptions;
 /// use trypema::redis::{RedisKey, RedisRateLimiterOptions};
@@ -136,6 +138,7 @@ pub struct RedisRateLimiterOptions {
 ///         window_size_seconds: WindowSizeSeconds::try_from(60)?,
 ///         rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
 ///         hard_limit_factor: HardLimitFactor::default(),
+///         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 ///     },
 ///     redis: RedisRateLimiterOptions {
 ///         connection_manager: todo!("create redis::aio::ConnectionManager"),
@@ -143,6 +146,7 @@ pub struct RedisRateLimiterOptions {
 ///         window_size_seconds: WindowSizeSeconds::try_from(60)?,
 ///         rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
 ///         hard_limit_factor: HardLimitFactor::default(),
+///         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 ///     },
 /// });
 ///

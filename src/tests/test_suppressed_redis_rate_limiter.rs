@@ -7,6 +7,7 @@ use crate::{
     RedisKey, RedisKeyGenerator, RedisRateLimiterOptions, SuppressedRedisRateLimiter,
     WindowSizeSeconds, common::RateType,
 };
+use crate::common::SuppressionFactorCacheMs;
 
 fn redis_url() -> String {
     env::var("REDIS_URL")
@@ -99,6 +100,7 @@ async fn build_limiter(
         window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
         hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     });
 
     (limiter, cm, prefix)
@@ -343,6 +345,7 @@ fn suppression_factor_recompute_does_not_error_when_no_recent_activity_in_last_1
                 window_size_seconds: WindowSizeSeconds::try_from(10).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(50).unwrap(),
                 hard_limit_factor: HardLimitFactor::try_from(10f64).unwrap(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
             },
         );
         accepted.inc(&k, &rate_limit, 10).await.unwrap();

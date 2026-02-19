@@ -6,6 +6,7 @@ use crate::{
     AbsoluteRedisRateLimiter, RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey,
     RedisKeyGenerator, RedisRateLimiterOptions, WindowSizeSeconds, common::RateType,
 };
+use crate::common::SuppressionFactorCacheMs;
 
 fn redis_url() -> String {
     env::var("REDIS_URL")
@@ -97,6 +98,7 @@ async fn build_limiter(
         rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
         // Unused by absolute limiter, but required by the options type.
         hard_limit_factor: crate::HardLimitFactor::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
     });
 
     (limiter, cm, prefix)
