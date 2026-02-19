@@ -37,15 +37,6 @@ This crate is **not** designed for:
 
 Rate limiting is best-effort: concurrent requests may temporarily overshoot limits.
 
-## Implementation Status
-
-| Provider | Strategy   | Status         |
-| -------- | ---------- | -------------- |
-| Local    | Absolute   | ✅ Implemented |
-| Local    | Suppressed | ✅ Implemented |
-| Redis    | Absolute   | ✅ Implemented |
-| Redis    | Suppressed | ✅ Implemented |
-
 ## Quick Start
 
 ### Local Provider (In-Process)

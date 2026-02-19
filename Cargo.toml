@@ -1,13 +1,13 @@
 [package]
 name = "trypema"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 edition = "2024"
 readme = "README.md"
 description = "High-performance rate limiting primitives in Rust, designed for concurrency safety, low overhead, and predictable latency."
 license = "MIT"
-repository = "https://github.com/dev-davexoyinbo/trypema"
 categories = ["algorithms", "concurrency", "data-structures"]
 keywords = [
+  "distributed-rate-limiting",
   "rate-limiting",
   "rate-limiter",
   "throttling",
@@ -16,6 +16,8 @@ keywords = [
 ]
 authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
 documentation = "https://docs.rs/trypema"
+repository = "https://github.com/dev-davexoyinbo/trypema"
+homepage = "https://dev-davexoyinbo.github.io/trypema-docs"
 exclude = [".github", "Makefile", "compose.yaml"]
 
 [package.metadata.docs.rs]
