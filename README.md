@@ -95,6 +95,7 @@ rl.run_cleanup_loop();
 let key = "user:123";
 let rate_limit = RateLimit::try_from(5.0).unwrap();
 
+// Absolute strategy (deterministic sliding-window enforcement)
 match rl.local().absolute().inc(key, &rate_limit, 1) {
     RateLimitDecision::Allowed => {
         // Request allowed, proceed
@@ -104,7 +105,32 @@ match rl.local().absolute().inc(key, &rate_limit, 1) {
         let _ = retry_after_ms;
     }
     RateLimitDecision::Suppressed { .. } => {
-        // Only returned by suppressed strategy
+        unreachable!("absolute strategy never returns Suppressed");
+    }
+}
+
+// Suppressed strategy (probabilistic suppression near/over the target rate)
+match rl.local().suppressed().inc(key, &rate_limit, 1) {
+    RateLimitDecision::Allowed => {
+        // Below capacity: request allowed, proceed
+    }
+    RateLimitDecision::Suppressed {
+        is_allowed: true,
+        suppression_factor,
+    } => {
+        // At capacity: suppression active, but this request was allowed
+        let _ = suppression_factor;
+    }
+    RateLimitDecision::Suppressed {
+        is_allowed: false,
+        suppression_factor,
+    } => {
+        // At capacity: this request was suppressed (do not proceed)
+        let _ = suppression_factor;
+    }
+    RateLimitDecision::Rejected { retry_after_ms, .. } => {
+        // Over hard limit: request rejected
+        let _ = retry_after_ms;
     }
 }
 ```
@@ -126,40 +152,99 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust,no_run
-#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-async fn example() -> Result<(), trypema::TrypemaError> {
-    use std::sync::Arc;
+# async fn example() -> Result<(), trypema::TrypemaError> {
+# #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+# {
+use std::sync::Arc;
 
-    use trypema::{
-        HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions,
-        WindowSizeSeconds,
-    };
-    use trypema::local::LocalRateLimiterOptions;
-    use trypema::redis::{RedisKey, RedisRateLimiterOptions};
+use trypema::{
+    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions,
+    WindowSizeSeconds,
+};
+use trypema::local::LocalRateLimiterOptions;
+use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 
-    let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager: todo!("create redis::aio::ConnectionManager"),
-            prefix: None,
-            window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-        },
-    }));
+// Create Redis connection manager
+let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
+let connection_manager = client.get_connection_manager().await.unwrap();
 
-    rl.run_cleanup_loop();
+let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+    local: LocalRateLimiterOptions {
+        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+        rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+        hard_limit_factor: HardLimitFactor::default(),
+    },
+    redis: RedisRateLimiterOptions {
+        connection_manager,
+        prefix: None,
+        window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
+        rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+        hard_limit_factor: HardLimitFactor::default(),
+    },
+}));
 
-    let rate_limit = RateLimit::try_from(5.0).unwrap();
-    let key = RedisKey::try_from("user_123".to_string()).unwrap();
+rl.run_cleanup_loop();
 
-    let _decision = rl.redis().absolute().inc(&key, &rate_limit, 1).await?;
-    Ok(())
+let rate_limit = RateLimit::try_from(5.0).unwrap();
+let key = RedisKey::try_from("user_123".to_string()).unwrap();
+
+// Absolute strategy (deterministic sliding-window enforcement)
+let decision = match rl.redis().absolute().inc(&key, &rate_limit, 1).await {
+    Ok(decision) => decision,
+    Err(e) => {
+        // Handle Redis errors (connectivity, script failures, etc.)
+        return Err(e);
+    }
+};
+
+match decision {
+    RateLimitDecision::Allowed => {
+        // Request allowed, proceed
+    }
+    RateLimitDecision::Rejected { retry_after_ms, .. } => {
+        // Request rejected, back off for retry_after_ms
+        let _ = retry_after_ms;
+    }
+    RateLimitDecision::Suppressed { .. } => {
+        unreachable!("absolute strategy never returns Suppressed");
+    }
 }
+
+// Suppressed strategy (probabilistic suppression near/over the target rate)
+let decision = match rl.redis().suppressed().inc(&key, &rate_limit, 1).await {
+    Ok(decision) => decision,
+    Err(e) => {
+        // Handle Redis errors (connectivity, script failures, etc.)
+        return Err(e);
+    }
+};
+
+match decision {
+    RateLimitDecision::Allowed => {
+        // Below capacity: request allowed, proceed
+    }
+    RateLimitDecision::Suppressed {
+        is_allowed: true,
+        suppression_factor,
+    } => {
+        // At capacity: suppression active, but this request was allowed
+        let _ = suppression_factor;
+    }
+    RateLimitDecision::Suppressed {
+        is_allowed: false,
+        suppression_factor,
+    } => {
+        // At capacity: this request was suppressed (do not proceed)
+        let _ = suppression_factor;
+    }
+    RateLimitDecision::Rejected { retry_after_ms, .. } => {
+        // Over hard limit: request rejected
+        let _ = retry_after_ms;
+    }
+}
+# }
+# Ok(())
+# }
 ```
 
 ## Core Concepts
