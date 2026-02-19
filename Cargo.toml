@@ -7,11 +7,11 @@ description = "High-performance rate limiting primitives in Rust, designed for c
 license = "MIT"
 categories = ["algorithms", "concurrency", "data-structures"]
 keywords = [
-  "distributed-rate-limiting",
   "rate-limiting",
   "rate-limiter",
   "throttling",
   "concurrency",
+  "atomic",
 ]
 authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
 documentation = "https://docs.rs/trypema"
