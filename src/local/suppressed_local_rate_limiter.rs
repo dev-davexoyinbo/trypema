@@ -3,8 +3,8 @@ use std::{sync::atomic::Ordering, time::Instant};
 use dashmap::DashMap;
 
 use crate::{
-    common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
     AbsoluteLocalRateLimiter, LocalRateLimiterOptions, RateLimitDecision,
+    common::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds},
 };
 
 /// Probabilistic rate limiter with dual tracking for graceful degradation.
@@ -374,7 +374,7 @@ impl SuppressedLocalRateLimiter {
         let mut total_in_last_second = 0u64;
 
         for instant_rate in series.series.iter().rev() {
-            if instant_rate.timestamp.elapsed().as_secs() > 1 {
+            if instant_rate.timestamp.elapsed().as_millis() > 1000 {
                 break;
             }
 
