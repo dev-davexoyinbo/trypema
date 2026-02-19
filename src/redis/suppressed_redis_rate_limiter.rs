@@ -124,7 +124,7 @@ impl SuppressedRedisRateLimiter {
             local active_keys_count = tonumber(redis.call("ZCARD", accepted_active_keys_key)) or 0
 
             if window_limit == 0 or accepted_total_count < window_limit or active_keys_count == 0 then
-                redis.call("SET", suppressed_factor_key, 0, PX, rate_group_size_ms)
+                redis.call("SET", suppressed_factor_key, 0, "PX", rate_group_size_ms)
                 return 0
             end
 
@@ -157,7 +157,7 @@ impl SuppressedRedisRateLimiter {
                 suppression_factor_exp = 1000
             end
 
-            redis.call("SET", suppressed_factor_key, suppression_factor, PX, suppression_factor_exp)
+            redis.call("SET", suppressed_factor_key, suppression_factor, "PX", suppression_factor_exp)
 
             return tostring(suppression_factor)
         "#,
@@ -203,7 +203,9 @@ impl SuppressedRedisRateLimiter {
     } // end method get_hard_limit
 
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        self.accepted_limiter.cleanup(stale_after_ms).await?;
+        self.accepted_limiter
+            .cleanup_with_active_entities_cleanup(stale_after_ms, false)
+            .await?;
         self.observed_limiter.cleanup(stale_after_ms).await
     } // end method cleanup
 }
