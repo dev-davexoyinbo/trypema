@@ -317,11 +317,11 @@ suppression_factor = 1.0 - (perceived_rate / rate_limit)
 
 ### Eviction Granularity
 
-**Local provider:** Uses `Instant::elapsed().as_secs()` for bucket expiration, which truncates to whole seconds.
+**Local provider:** Uses `Instant::elapsed().as_millis()` for bucket expiration (millisecond granularity).
 
-**Effect:** Conservative eviction. A 1-second window may effectively require ~2 seconds before a bucket is considered fully expired.
+**Effect:** Buckets expire close to `window_size_seconds` (subject to ~1ms truncation and lazy eviction timing).
 
-**Redis provider:** Uses standard Redis expiration commands (`EXPIRE`, `SET` with `PX` option).
+**Redis provider:** Bucket eviction uses Redis server time in milliseconds inside Lua scripts; additionally uses standard Redis TTL commands (`EXPIRE`, `SET` with `PX` option) for auxiliary keys.
 
 ### Memory Growth
 

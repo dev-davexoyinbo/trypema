@@ -41,10 +41,9 @@ use crate::{
 /// - All may proceed, causing temporary overshoot
 /// - This is **expected behavior**, not a bug
 ///
-/// **Conservative eviction:**
-/// - Uses `Instant::elapsed().as_secs()` (whole-second truncation)
-/// - A 1-second window may effectively require ~2 seconds for full expiration
-/// - Trades precision for performance
+/// **Eviction granularity:**
+/// - Uses `Instant::elapsed().as_millis()` (whole-millisecond truncation)
+/// - Buckets expire close to `window_size_seconds` (lazy eviction may delay removal until next call)
 ///
 /// **Memory growth:**
 /// - Keys are not automatically removed

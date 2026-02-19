@@ -343,9 +343,9 @@ fn unblocks_after_window_expires() {
         RateLimitDecision::Rejected { .. }
     ));
 
-    // is_allowed eviction uses `elapsed().as_secs()`; for a 1s window that effectively
-    // means waiting until elapsed is >= 2s.
-    thread::sleep(Duration::from_millis(2200));
+    // is_allowed eviction uses `elapsed().as_millis()`; for a 1s window it should
+    // unblock shortly after ~1000ms.
+    thread::sleep(Duration::from_millis(1100));
 
     assert!(matches!(
         limiter.is_allowed(key),
@@ -366,9 +366,9 @@ fn unblocks_after_window_expires_window_2_with_nonzero_grouping() {
         RateLimitDecision::Rejected { .. }
     ));
 
-    // Eviction uses `elapsed().as_secs()`; for a 2s window that effectively
-    // means waiting until elapsed is >= 3s.
-    thread::sleep(Duration::from_millis(3200));
+    // Eviction uses `elapsed().as_millis()`; for a 2s window it should unblock
+    // shortly after ~2000ms.
+    thread::sleep(Duration::from_millis(2100));
 
     assert!(matches!(
         limiter.is_allowed(key),
@@ -394,9 +394,9 @@ fn evicts_oldest_bucket_but_keeps_newer_bucket_window_2_with_grouping() {
     ));
 
     // Wait long enough that:
-    // - the oldest bucket is evicted (elapsed >= 3s)
-    // - the newer bucket is still in-window (elapsed < 3s, i.e. as_secs() == 2)
-    thread::sleep(Duration::from_millis(2750));
+    // - the oldest bucket is evicted (elapsed > 2000ms)
+    // - the newer bucket is still in-window (elapsed <= 2000ms)
+    thread::sleep(Duration::from_millis(2050));
 
     assert!(matches!(
         limiter.is_allowed(key),
@@ -438,10 +438,9 @@ fn rate_grouping_separates_beyond_group() {
     // Keep the first bucket below the limit so the second increment is applied.
     limiter.inc(key, &rate_limit, 1);
 
-    // Ensure the second increment is beyond the grouping threshold.
-    // Use a large enough gap that there is a window where the first bucket is evictable
-    // (as_secs() > window) while the second is still in-window.
-    thread::sleep(Duration::from_millis(1100));
+    // Ensure the second increment is beyond the grouping threshold but still within the
+    // 1s window, so we end up with two buckets.
+    thread::sleep(Duration::from_millis(150));
 
     // Put the second bucket at the exact limit.
     limiter.inc(key, &rate_limit, 3);
@@ -465,29 +464,29 @@ fn rate_grouping_separates_beyond_group() {
             .get(key)
             .expect("expected key to exist in limiter");
 
-        let first_elapsed_s = series
+        let first_elapsed_ms = series
             .series
             .front()
             .expect("expected first bucket")
             .timestamp
             .elapsed()
-            .as_secs();
-        let second_elapsed_s = series
+            .as_millis();
+        let second_elapsed_ms = series
             .series
             .back()
             .expect("expected second bucket")
             .timestamp
             .elapsed()
-            .as_secs();
+            .as_millis();
         drop(series);
 
-        if first_elapsed_s > 1 && second_elapsed_s <= 1 {
+        if first_elapsed_ms > 1000 && second_elapsed_ms <= 1000 {
             break;
         }
 
         if start.elapsed() > Duration::from_secs(5) {
             panic!(
-                "timed out waiting for bucket ages; first_elapsed_s={first_elapsed_s} second_elapsed_s={second_elapsed_s}"
+                "timed out waiting for bucket ages; first_elapsed_ms={first_elapsed_ms} second_elapsed_ms={second_elapsed_ms}"
             );
         }
 
