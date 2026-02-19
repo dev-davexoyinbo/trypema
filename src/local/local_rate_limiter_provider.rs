@@ -1,6 +1,6 @@
 use crate::{
-    common::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds},
     AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
+    common::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds},
 };
 
 /// Configuration for local rate limiter implementations.
@@ -54,5 +54,10 @@ impl LocalRateLimiterProvider {
     /// This strategy exposes suppression metadata via [`crate::RateLimitDecision::Suppressed`].
     pub fn suppressed(&self) -> &SuppressedLocalRateLimiter {
         &self.suppressed
+    }
+
+    pub(crate) fn cleanup(&self, stale_after_ms: u64) {
+        self.absolute.cleanup(stale_after_ms);
+        self.suppressed.cleanup(stale_after_ms);
     }
 }

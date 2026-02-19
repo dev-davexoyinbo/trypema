@@ -2,7 +2,7 @@ use redis::aio::ConnectionManager;
 
 use crate::{
     AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RedisKey,
-    SuppressedRedisRateLimiter, WindowSizeSeconds,
+    SuppressedRedisRateLimiter, TrypemaError, WindowSizeSeconds,
 };
 
 /// Configuration for Redis rate limiter implementations.
@@ -43,5 +43,10 @@ impl RedisRateLimiterProvider {
     /// Suppressed Redis rate limiter implementation.
     pub fn suppressed(&self) -> &SuppressedRedisRateLimiter {
         &self.suppressed
+    }
+
+    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+        self.absolute.cleanup(stale_after_ms).await?;
+        self.suppressed.cleanup(stale_after_ms).await
     }
 }
