@@ -7,7 +7,7 @@ use crate::{TrypemaError, common::RateType};
 /// This is a string with the following constraints:
 /// - Must not be empty
 /// - Must not contain colons
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, PartialOrd, Hash, Eq)]
 pub struct RedisKey(String);
 
 impl RedisKey {
@@ -61,6 +61,7 @@ pub(crate) struct RedisKeyGenerator {
     pub window_limit_key_suffix: String,
     pub total_count_key_suffix: String,
     pub active_keys_key_suffix: String,
+    pub suppression_factor_key_suffix: String,
 }
 
 impl RedisKeyGenerator {
@@ -73,6 +74,7 @@ impl RedisKeyGenerator {
             window_limit_key_suffix: "w".to_string(),
             total_count_key_suffix: "t".to_string(),
             active_keys_key_suffix: "a".to_string(),
+            suppression_factor_key_suffix: "sf".to_string(),
         }
     }
 
@@ -98,5 +100,9 @@ impl RedisKeyGenerator {
 
     pub(crate) fn get_active_entities_key(&self) -> String {
         format!("{}:{}", *self.prefix, self.active_entities_key_suffix)
+    }
+
+    pub(crate) fn get_suppression_factor_key(&self, key: &RedisKey) -> String {
+        self.get_key_with_suffix(key, &self.suppression_factor_key_suffix)
     }
 }

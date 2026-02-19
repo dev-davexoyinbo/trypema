@@ -95,6 +95,8 @@ async fn build_limiter(
         prefix: Some(prefix.clone()),
         window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+        // Unused by absolute limiter, but required by the options type.
+        hard_limit_factor: crate::HardLimitFactor::default(),
     });
 
     (limiter, cm, prefix)
@@ -587,6 +589,14 @@ fn cleanup_deletes_state_and_index_for_stale_entities() {
         let mut conn = cm.clone();
         let ae_key = kg.get_active_entities_key();
 
+        // Seed suppression-factor keys to verify cleanup deletes them too.
+        let sf_a = kg.get_suppression_factor_key(&a);
+        let sf_b = kg.get_suppression_factor_key(&b);
+        let sf_c = kg.get_suppression_factor_key(&c);
+        let _: () = conn.set(&sf_a, 0.5_f64).await.unwrap();
+        let _: () = conn.set(&sf_b, 0.5_f64).await.unwrap();
+        let _: () = conn.set(&sf_c, 0.5_f64).await.unwrap();
+
         // Force staleness deterministically based on Redis server time.
         set_active_entity_score_ms_ago(&mut conn, &ae_key, &a, 1050).await;
         set_active_entity_score_ms_ago(&mut conn, &ae_key, &b, 1050).await;
@@ -597,11 +607,20 @@ fn cleanup_deletes_state_and_index_for_stale_entities() {
         let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &kg, &a).await;
         assert!(!a_h && !a_ak && !a_w && !a_t, "expected all keys for a deleted");
 
+        let a_sf: bool = conn.exists(&sf_a).await.unwrap();
+        assert!(!a_sf, "expected suppression-factor key for a deleted");
+
         let (b_h, b_ak, b_w, b_t) = absolute_keys_exist(&mut conn, &kg, &b).await;
         assert!(!b_h && !b_ak && !b_w && !b_t, "expected all keys for b deleted");
 
+        let b_sf: bool = conn.exists(&sf_b).await.unwrap();
+        assert!(!b_sf, "expected suppression-factor key for b deleted");
+
         let (c_h, c_ak, c_w, c_t) = absolute_keys_exist(&mut conn, &kg, &c).await;
         assert!(c_h && c_ak && c_w && c_t, "expected all keys for c retained");
+
+        let c_sf: bool = conn.exists(&sf_c).await.unwrap();
+        assert!(c_sf, "expected suppression-factor key for c retained");
 
         let a_score: Option<f64> = conn.zscore(&ae_key, &*a).await.unwrap();
         let b_score: Option<f64> = conn.zscore(&ae_key, &*b).await.unwrap();

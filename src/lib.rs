@@ -6,15 +6,16 @@
 mod rate_limiter;
 pub use rate_limiter::*;
 
-mod local;
-pub use local::*;
+pub mod local;
+use local::*;
 
+/// Redis-specific rate limiter implementations.
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
-mod redis;
+pub mod redis;
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
-pub use redis::*;
+use redis::*;
 
 mod error;
 pub use error::*;

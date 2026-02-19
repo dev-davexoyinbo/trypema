@@ -1,6 +1,6 @@
 [package]
 name = "trypema"
-version = "0.1.0-dev.7"
+version = "0.1.0-rc.1"
 edition = "2024"
 readme = "README.md"
 description = "High-performance rate limiting primitives in Rust, designed for concurrency safety, low overhead, and predictable latency."
@@ -19,7 +19,7 @@ documentation = "https://docs.rs/trypema"
 exclude = [".github", "Makefile", "compose.yaml"]
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["redis-tokio"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -32,6 +32,8 @@ strum = "0.27.2"
 strum_macros = "0.27.2"
 thiserror = "2.0.18"
 tracing = "0.1.44"
+tokio = { version = "1.49.0", optional = true, features = ["rt", "time"] }
+smol = { version = "2.0.2", optional = true }
 
 [features]
 redis-tokio = [
@@ -39,12 +41,14 @@ redis-tokio = [
   "redis/tokio-comp",
   "redis/aio",
   "redis/connection-manager",
+  "dep:tokio",
 ]
 redis-smol = [
   "redis",
   "redis/smol-comp",
   "redis/aio",
   "redis/connection-manager",
+  "dep:smol",
 ]
 
 [dev-dependencies]

@@ -15,15 +15,23 @@ pub struct AbsoluteRedisRateLimiter {
 
 impl AbsoluteRedisRateLimiter {
     pub(crate) fn new(options: RedisRateLimiterOptions) -> Self {
+        Self::with_rate_type(RateType::Absolute, options)
+    }
+
+    pub(crate) fn with_rate_type(rate_type: RateType, options: RedisRateLimiterOptions) -> Self {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
         Self {
             connection_manager: options.connection_manager,
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
-            key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
+            key_generator: RedisKeyGenerator::new(prefix, rate_type),
         }
-    }
+    } // end method with_rate_type
+
+    pub(crate) fn key_generator(&self) -> &RedisKeyGenerator {
+        &self.key_generator
+    } // end method key_generator
 
     /// Check admission and, if allowed, increment the observed count for `key`.
     pub async fn inc(
@@ -155,9 +163,6 @@ impl AbsoluteRedisRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
-        // TODO: cleanup the active keys set
-
-        // At least a version of Redis that is 7.4.0 or higher is needed
         let script = redis::Script::new(
             r#"
             local time_array = redis.call("TIME")
@@ -246,6 +251,15 @@ impl AbsoluteRedisRateLimiter {
 
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+        self.cleanup_with_active_entities_cleanup(stale_after_ms, true)
+            .await
+    } // end method cleanup
+
+    pub(crate) async fn cleanup_with_active_entities_cleanup(
+        &self,
+        stale_after_ms: u64,
+        should_cleanup_active_entities: bool,
+    ) -> Result<(), TrypemaError> {
         let script = redis::Script::new(
             r#"
             local time_array = redis.call("TIME")
@@ -260,6 +274,8 @@ impl AbsoluteRedisRateLimiter {
             local window_limit_suffix = ARGV[3]
             local total_count_suffix = ARGV[4]
             local active_keys_suffix = ARGV[5]
+            local suppression_factor_key_suffix = ARGV[6]
+            local should_cleanup_active_entities = ARGV[7] == "1"
 
 
             local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
@@ -270,7 +286,7 @@ impl AbsoluteRedisRateLimiter {
 
             local remove_keys = {}
 
-            local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix}
+            local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
             for i = 1, #active_entities do
                 local entity = active_entities[i]
 
@@ -281,7 +297,9 @@ impl AbsoluteRedisRateLimiter {
 
             if #remove_keys > 0 then
                 redis.call("DEL", unpack(remove_keys))
-                redis.call("ZREM", active_entities_key, unpack(active_entities))
+                if should_cleanup_active_entities then
+                    redis.call("ZREM", active_entities_key, unpack(active_entities))
+                end
             end
 
             return
@@ -299,9 +317,15 @@ impl AbsoluteRedisRateLimiter {
             .arg(self.key_generator.window_limit_key_suffix.to_string())
             .arg(self.key_generator.total_count_key_suffix.to_string())
             .arg(self.key_generator.active_keys_key_suffix.to_string())
+            .arg(self.key_generator.suppression_factor_key_suffix.to_string())
+            .arg(if should_cleanup_active_entities {
+                "1"
+            } else {
+                "0"
+            })
             .invoke_async(&mut connection_manager)
             .await?;
 
         Ok(())
-    } // end method cleanup
+    }
 }
