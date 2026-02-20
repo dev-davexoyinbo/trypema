@@ -311,6 +311,10 @@ impl SuppressedLocalRateLimiter {
             );
         }
 
+        if suppression_factor > 1f64 {
+            panic!("SuppressedLocalRateLimiter::get_suppression_factor: suppression factor > 1");
+        }
+
         suppression_factor
     }
 
