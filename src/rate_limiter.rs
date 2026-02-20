@@ -389,6 +389,13 @@ impl RateLimiter {
         }
     } // end method run_cleanup_loop_with_config
 
+    /// Stop the cleanup loop.
+    ///
+    /// This method is idempotent and safe to call multiple times.
+    pub fn stop_cleanup_loop(self: &Arc<Self>) {
+        self.is_loop_running.store(false, Ordering::SeqCst);
+    } // end method stop_cleanup_loop
+
     /// Access the Redis provider for distributed rate limiting.
     ///
     /// Requires Redis 6.2+ and one of the Redis features (`redis-tokio` or `redis-smol`).
