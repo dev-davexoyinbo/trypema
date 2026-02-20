@@ -136,6 +136,7 @@ impl AbsoluteLocalRateLimiter {
         }
     } // end constructor
 
+    #[cfg(test)]
     pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries> {
         &self.series
     }

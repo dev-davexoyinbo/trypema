@@ -198,7 +198,11 @@ impl SuppressedLocalRateLimiter {
             unreachable!("SuppressedLocalRateLimiter::inc: key should be in map");
         };
 
-        let suppression_factor = self.get_suppression_factor(key).min(1f64);
+        let suppression_factor = self.get_suppression_factor(key);
+
+        if suppression_factor < 0f64 {
+            unreachable!("SuppressedLocalRateLimiter::inc: suppression_factor < 0");
+        }
 
         let should_allow = if suppression_factor == 1f64 {
             true
