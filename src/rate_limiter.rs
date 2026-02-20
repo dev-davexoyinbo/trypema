@@ -55,7 +55,13 @@
 //! let decision = rl.local().absolute().inc("user_123", &rate, 1);
 //! ```
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::{LocalRateLimiterOptions, LocalRateLimiterProvider};
 
@@ -115,7 +121,7 @@ use crate::redis::{RedisRateLimiterOptions, RedisRateLimiterProvider};
 pub struct RateLimiterOptions {
     /// Configuration for the local (in-process) provider.
     pub local: LocalRateLimiterOptions,
-    
+
     /// Configuration for the Redis (distributed) provider.
     ///
     /// Only available with `redis-tokio` or `redis-smol` features.
@@ -190,6 +196,7 @@ pub struct RateLimiter {
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     redis: RedisRateLimiterProvider,
+    is_loop_running: AtomicBool,
 }
 
 impl RateLimiter {
@@ -243,6 +250,7 @@ impl RateLimiter {
             #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
             #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
             redis: RedisRateLimiterProvider::new(options.redis),
+            is_loop_running: AtomicBool::new(false),
         }
     }
 
@@ -298,6 +306,10 @@ impl RateLimiter {
         stale_after_ms: u64,
         cleanup_interval_ms: u64,
     ) {
+        if self.is_loop_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         // Always spawn local cleanup (sync, no runtime needed)
         {
             let rl = Arc::downgrade(self);
