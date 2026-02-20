@@ -260,6 +260,9 @@ impl RateLimiter {
     /// - Local provider: always spawns a thread for synchronous cleanup
     /// - Redis provider: spawns an async task if the appropriate runtime is available
     ///
+    /// This method is idempotent: calling it multiple times while the loop is already running
+    /// is a no-op.
+    ///
     /// Configuration:
     /// - `stale_after_ms`: keys inactive for this duration are removed (default: 10 minutes)
     /// - `cleanup_interval_ms`: how often to run cleanup (default: 30 seconds)
@@ -296,6 +299,9 @@ impl RateLimiter {
     ///
     /// Like `run_cleanup_loop`, this method uses `Weak` references internally, so dropping all
     /// `Arc<RateLimiter>` references will cause the cleanup loop to exit gracefully.
+    ///
+    /// This method is idempotent: calling it multiple times while the loop is already running
+    /// is a no-op.
     ///
     /// # Arguments
     ///
@@ -392,6 +398,8 @@ impl RateLimiter {
     /// Stop the cleanup loop.
     ///
     /// This method is idempotent and safe to call multiple times.
+    ///
+    /// Stopping is best-effort and asynchronous: background tasks will exit on their next check/tick.
     pub fn stop_cleanup_loop(self: &Arc<Self>) {
         self.is_loop_running.store(false, Ordering::SeqCst);
     } // end method stop_cleanup_loop

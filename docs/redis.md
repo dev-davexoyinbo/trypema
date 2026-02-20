@@ -368,31 +368,15 @@ rl.run_cleanup_loop_with_config(600_000, 30_000);
 
 **What it cleans:**
 - **Local provider:** Removes keys from in-memory maps
-- **Redis provider:** Currently no-op (see Known Limitations)
+- **Redis provider:** Removes stale keys tracked in Redis (best-effort)
+
+**Idempotency:** Starting the cleanup loop multiple times is a no-op once running, and
+`stop_cleanup_loop()` is safe to call multiple times.
 
 ### Known Limitations
 
-⚠️ **Memory leak potential:** The Redis scripts do **not** delete the hash or sorted set keys when they become empty.
-
-**Symptom:** If you have high key cardinality (many unique keys), Redis memory usage grows over time even as keys become inactive.
-
-**Workaround:** Implement periodic cleanup using Redis `SCAN` + `TTL` checks:
-
-```bash
-# Find keys with no recent activity
-redis-cli --scan --pattern "trypema:*:absolute:w" | while read key; do
-  ttl=$(redis-cli TTL "$key")
-  if [ "$ttl" -eq -1 ] || [ "$ttl" -eq -2 ]; then
-    # Key expired or doesn't exist, clean up related keys
-    user_key=$(echo "$key" | cut -d: -f2)
-    redis-cli DEL "trypema:$user_key:absolute:h"
-    redis-cli DEL "trypema:$user_key:absolute:a"
-    redis-cli DEL "trypema:$user_key:absolute:w"
-  fi
-done
-```
-
-**Future work:** Global key index for automatic cleanup (tracked internally).
+Redis cleanup requires a running async executor (Tokio or Smol). If no compatible runtime is
+available when the loop is started, Redis cleanup is skipped.
 
 ## Rejection Metadata
 

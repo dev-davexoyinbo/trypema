@@ -84,6 +84,7 @@ use trypema::local::LocalRateLimiterOptions;
 let rl = Arc::new(RateLimiter::new(options()));
 
 // Optional: start background cleanup to remove stale keys
+// Idempotent: calling this multiple times is a no-op once running.
 rl.run_cleanup_loop();
 
 // Rate limit a key to 5 requests per second
@@ -462,7 +463,12 @@ use trypema::local::LocalRateLimiterOptions;
 # }
 
 let rl = Arc::new(RateLimiter::new(options()));
+// Idempotent: calling this multiple times is a no-op once running.
 rl.run_cleanup_loop();
+
+// Optional: stop background cleanup
+// Idempotent: safe to call multiple times.
+rl.stop_cleanup_loop();
 ```
 
 **Memory safety:** The cleanup loop holds only a `Weak<RateLimiter>` reference, so dropping all `Arc` references automatically stops cleanup.
