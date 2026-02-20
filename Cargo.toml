@@ -1,6 +1,6 @@
 [package]
 name = "trypema"
-version = "0.1.0-rc.5"
+version = "0.1.0-rc.6"
 edition = "2024"
 readme = "README.md"
 description = "High-performance rate limiting primitives in Rust, designed for concurrency safety, low overhead, and predictable latency."
@@ -16,7 +16,7 @@ keywords = [
 authors = ["Oyinbo David Bayode <dev.davexoyinbo@gmail.com>"]
 documentation = "https://docs.rs/trypema"
 repository = "https://github.com/dev-davexoyinbo/trypema"
-homepage = "https://dev-davexoyinbo.github.io/trypema-docs"
+homepage = "https://trypema.davidoyinbo.com/"
 exclude = [".github", "Makefile", "compose.yaml"]
 
 [package.metadata.docs.rs]
