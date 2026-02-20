@@ -200,10 +200,6 @@ impl SuppressedLocalRateLimiter {
 
         let suppression_factor = self.get_suppression_factor(key);
 
-        if suppression_factor < 0f64 {
-            unreachable!("SuppressedLocalRateLimiter::inc: suppression_factor < 0");
-        }
-
         let should_allow = if suppression_factor == 1f64 {
             true
         } else {
@@ -296,7 +292,7 @@ impl SuppressedLocalRateLimiter {
     /// Returns the cached value if it is still fresh, otherwise recomputes and refreshes
     /// the cache.
     pub fn get_suppression_factor(&self, key: &str) -> f64 {
-        match self.suppression_factors.get(key) {
+        let suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
             Some(val)
                 if val.0.elapsed().as_millis() < *self.suppression_factor_cache_ms as u128 =>
@@ -307,7 +303,15 @@ impl SuppressedLocalRateLimiter {
                 drop(val);
                 self.calculate_suppression_factor(key).1
             }
+        };
+
+        if suppression_factor < 0f64 {
+            panic!(
+                "SuppressedLocalRateLimiter::get_suppression_factor: negative suppression factor"
+            );
         }
+
+        suppression_factor
     }
 
     #[cfg(test)]
