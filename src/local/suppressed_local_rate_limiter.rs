@@ -200,7 +200,7 @@ impl SuppressedLocalRateLimiter {
 
         let suppression_factor = self.get_suppression_factor(key);
 
-        let should_allow = if suppression_factor == 1f64 {
+        let should_allow = if suppression_factor == 0f64 {
             true
         } else {
             random_bool(1f64 - suppression_factor)
@@ -241,7 +241,7 @@ impl SuppressedLocalRateLimiter {
         }
 
         match suppression_factor {
-            1f64 => RateLimitDecision::Allowed,
+            0f64 => RateLimitDecision::Allowed,
             _ => RateLimitDecision::Suppressed {
                 suppression_factor,
                 is_allowed: should_allow,
