@@ -8,7 +8,7 @@ The name is inspired by the Koine Greek word "τρυπήματος" (trypematos,
 
 Trypema is a Rust rate limiting library supporting both in-process and Redis-backed distributed enforcement. It emphasizes predictable behavior, low overhead, and flexible rate limiting strategies.
 
-Documentation: https://dev-davexoyinbo.github.io/trypema-docs/
+Documentation: <https://trypema.davidoyinbo.com>
 
 ### Features
 
@@ -24,7 +24,7 @@ Documentation: https://dev-davexoyinbo.github.io/trypema-docs/
 
 **Key capabilities:**
 
-- Non-integer rate limits (e.g., `5.5` requests per second)
+- Non-integer rate limits (e.g., `0.5` requests per second)
 - Sliding time windows for smooth burst handling
 - Bucket coalescing to reduce overhead
 - Automatic cleanup of stale keys
@@ -591,52 +591,12 @@ trypema = { version = "1.0", default-features = false }
 trypema = { version = "1.0", default-features = false, features = ["redis-smol"] }
 ```
 
-### Data Model & Cleanup
-
-See [docs/redis.md](https://github.com/dev-davexoyinbo/trypema/docs/redis.md) for detailed information on:
-
-- Redis key schema
-- Lua script implementation
-- Expiration and cleanup behavior
-- Concurrency semantics
-
-## Testing
-
-### Local Tests Only
-
-```bash
-cargo test --no-default-features
-```
-
-### With Redis Integration Tests
-
-Requires Docker and Docker Compose:
-
-```bash
-# Start Redis (6.2+) and run all tests
-make test-redis
-
-# Use custom Redis port
-REDIS_PORT=6379 make test-redis
-
-# Point to existing Redis instance
-REDIS_URL=redis://127.0.0.1:6379 cargo test
-```
-
-See [docs/testing.md](https://github.com/dev-davexoyinbo/trypema/docs/testing.md) for detailed testing documentation.
-
 ## Roadmap
 
 **Planned:**
 
 - [ ] Comprehensive benchmarking suite
 - [ ] Metrics and observability hooks
-
-**Future considerations:**
-
-- [ ] Additional backends (e.g., in-memory distributed cache)
-- [ ] Token bucket strategy
-- [ ] Async local provider (currently sync only)
 
 **Non-goals:**
 
