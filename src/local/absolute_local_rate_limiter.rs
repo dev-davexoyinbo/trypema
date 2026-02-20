@@ -1,4 +1,7 @@
-use std::{sync::atomic::Ordering, time::Instant};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 use dashmap::DashMap;
 
@@ -270,6 +273,7 @@ impl AbsoluteLocalRateLimiter {
             rate_limit_series.series.push_back(InstantRate {
                 count: count.into(),
                 timestamp: Instant::now(),
+                declined: AtomicU64::new(0),
             });
 
             rate_limit_series.total.fetch_add(count, Ordering::Relaxed);
