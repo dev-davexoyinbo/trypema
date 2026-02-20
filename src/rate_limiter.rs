@@ -317,6 +317,11 @@ impl RateLimiter {
                 let interval = Duration::from_millis(cleanup_interval_ms);
                 loop {
                     let Some(rl) = rl.upgrade() else { break };
+
+                    if !rl.is_loop_running.load(Ordering::SeqCst) {
+                        break;
+                    }
+
                     rl.local.cleanup(stale_after_ms);
                     std::thread::sleep(interval);
                 }
@@ -339,6 +344,11 @@ impl RateLimiter {
                 loop {
                     interval.tick().await;
                     let Some(rl) = rl.upgrade() else { break };
+
+                    if !rl.is_loop_running.load(Ordering::SeqCst) {
+                        break;
+                    }
+
                     if let Err(e) = rl.redis.cleanup(stale_after_ms).await {
                         tracing::warn!(
                             error = ?e,
@@ -362,6 +372,11 @@ impl RateLimiter {
                     interval.next().await;
 
                     let Some(rl) = rl.upgrade() else { break };
+
+                    if !rl.is_loop_running.load(Ordering::SeqCst) {
+                        break;
+                    }
+
                     if let Err(e) = rl.redis.cleanup(stale_after_ms).await {
                         tracing::warn!(
                             error = ?e,
