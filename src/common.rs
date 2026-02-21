@@ -169,7 +169,7 @@ pub enum RateLimitDecision {
     Suppressed {
         /// Current suppression rate (0.0 = no suppression, 1.0 = full suppression).
         ///
-        /// Computed as: `1.0 - (perceived_rate / rate_limit)`
+        /// Computed as: `1.0 - (rate_limit / perceived_rate)`
         suppression_factor: f64,
 
         /// Whether this specific call was admitted.

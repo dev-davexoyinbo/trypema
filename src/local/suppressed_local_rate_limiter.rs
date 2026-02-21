@@ -13,28 +13,27 @@ use crate::{
     },
 };
 
-/// Probabilistic rate limiter with dual tracking for graceful degradation.
+/// Probabilistic in-process rate limiter for graceful degradation.
 ///
-/// The suppressed strategy tracks two separate rate series:
-/// - **Observed limiter:** Tracks all calls (including suppressed ones)
-/// - **Accepted limiter:** Tracks only calls admitted by the strategy
+/// This local suppressed limiter maintains a per-key sliding window of counters:
 ///
-/// This enables probabilistic suppression: when the observed rate exceeds the target,
-/// the strategy probabilistically denies some requests to keep the accepted rate near
-/// the configured limit.
+/// - `total`: the total number of calls observed for the key
+/// - `declined`: the number of calls that were denied by suppression (`is_allowed: false`)
+///
+/// From these, you can derive "accepted" usage as `total - declined`.
 ///
 /// # Algorithm
 ///
-/// 1. **Record observed:** Every call increments the observed limiter (unbounded)
-/// 2. **Check capacity:** If `accepted_usage < window_capacity`, bypass suppression → `Allowed`
-/// 3. **Calculate suppression:** `suppression_factor = 1.0 - (perceived_rate / rate_limit)`
-/// 4. **Probabilistic decision:** Random choice based on `1.0 - suppression_factor`
-/// 5. **Hard cutoff:** If `accepted_usage >= hard_limit`, unconditionally reject → `Rejected`
+/// 1. **Compute suppression factor (cached):** see "Suppression Factor" below
+/// 2. **Probabilistic decision:** if `0.0 < suppression_factor < 1.0`, allow with probability
+///    `p = 1.0 - suppression_factor`
+/// 3. **Record totals:** increments are tracked in the per-key sliding window; denied calls also
+///    increment the declined counters
 ///
 /// # Suppression Factor
 ///
 /// ```text
-/// suppression_factor = 1.0 - (perceived_rate / rate_limit)
+/// suppression_factor = 1.0 - (rate_limit / perceived_rate)
 ///
 /// - 0.0: No suppression (below target rate)
 /// - 0.3: Suppress 30% of requests
@@ -51,24 +50,25 @@ use crate::{
 ///
 /// ## 1. Below Capacity (No Suppression)
 ///
-/// `accepted_usage < window_capacity`
+/// If the observed window usage is below the window capacity, the suppression factor is `0.0`.
 ///
 /// - Returns: [`RateLimitDecision::Allowed`]
-/// - Behavior: All requests admitted (subject to hard cutoff)
+/// - Behavior: All requests admitted
 ///
 /// ## 2. At Capacity (Probabilistic Suppression)
 ///
-/// `window_capacity ≤ accepted_usage < hard_limit`
+/// When the observed usage is at/above capacity but below the hard cutoff, the limiter returns
+/// [`RateLimitDecision::Suppressed`]. Callers must check `is_allowed`.
 ///
 /// - Returns: [`RateLimitDecision::Suppressed { is_allowed, suppression_factor }`]
 /// - Behavior: Probabilistically deny requests to maintain target rate
 ///
-/// ## 3. Over Hard Limit (Hard Rejection)
+/// ## 3. Over Hard Limit (Full Suppression)
 ///
-/// `accepted_usage ≥ hard_limit`
+/// When the observed usage reaches the hard cutoff, the suppression factor becomes `1.0`.
 ///
-/// - Returns: [`RateLimitDecision::Rejected`]
-/// - Behavior: All requests unconditionally rejected (cannot be suppressed)
+/// - Returns: [`RateLimitDecision::Suppressed { is_allowed: false, suppression_factor: 1.0 }`]
+/// - Behavior: All requests denied
 ///
 /// # Hard Limit
 ///
@@ -80,8 +80,7 @@ use crate::{
 ///
 /// # Thread Safety
 ///
-/// - Uses two independent [`AbsoluteLocalRateLimiter`] instances
-/// - Uses [`DashMap`](dashmap::DashMap) for suppression factor cache
+/// - Uses [`DashMap`](dashmap::DashMap) and atomics; safe for concurrent use
 /// - Safe for concurrent use without external synchronization
 ///
 /// # Inspiration
@@ -146,9 +145,7 @@ use crate::{
 ///         // At capacity, this request suppressed
 ///         println!("Suppressed ({}% rate)", suppression_factor * 100.0);
 ///     }
-///     RateLimitDecision::Rejected { .. } => {
-///         // Over hard limit, unconditionally rejected
-///     }
+///     RateLimitDecision::Rejected { .. } => unreachable!("local suppressed limiter never rejects"),
 /// }
 /// ```
 #[derive(Debug)]
@@ -192,12 +189,6 @@ impl SuppressedLocalRateLimiter {
                 .or_insert_with(|| RateLimitSeries::new(self.get_hard_limit(rate_limit)));
         }
 
-        self.remove_expired_buckets(key);
-
-        let Some(rate_limit_series) = self.series.get(key) else {
-            unreachable!("SuppressedLocalRateLimiter::inc: key should be in map");
-        };
-
         let suppression_factor = self.get_suppression_factor(key);
 
         let should_allow = if suppression_factor == 0f64 {
@@ -206,6 +197,10 @@ impl SuppressedLocalRateLimiter {
             false
         } else {
             random_bool(1f64 - suppression_factor)
+        };
+
+        let Some(rate_limit_series) = self.series.get(key) else {
+            unreachable!("SuppressedLocalRateLimiter::inc: key should be in map");
         };
 
         if let Some(last_entry) = rate_limit_series.series.back()
@@ -339,6 +334,8 @@ impl SuppressedLocalRateLimiter {
     }
 
     fn calculate_suppression_factor(&self, key: &str) -> (Instant, f64) {
+        self.remove_expired_buckets(key);
+
         let Some(series) = self.series.get(key) else {
             return self.persist_suppression_factor(key, 0f64);
         };
