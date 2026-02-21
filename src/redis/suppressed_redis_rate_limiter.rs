@@ -78,8 +78,8 @@ impl SuppressedRedisRateLimiter {
 
                 for i = 1, #to_remove do
                     local value = cjson.decode(to_remove[i])
-                    sum_count = tonumber(value.count)
-                    sum_declined = tonumber(value.declined)
+                    local sum_count = tonumber(value.count)
+                    local sum_declined = tonumber(value.declined)
 
                     if sum_count then
                         remove_sum = remove_sum + sum_count
@@ -91,8 +91,11 @@ impl SuppressedRedisRateLimiter {
                 end
 
 
-                redis.call("HINCRBY", total_count_key, "count", -1 * remove_sum)
-                redis.call("HINCRBY", total_count_key, "declined", -1 * decline_sum)
+                local count_delta = math.floor(remove_sum) == 0 and 0 or -1 * math.floor(remove_sum)
+                local declined_delta = math.floor(decline_sum) == 0 and 0 or -1 * math.floor(decline_sum)
+
+                redis.call("HINCRBY", total_count_key, "count", count_delta)
+                redis.call("HINCRBY", total_count_key, "declined", declined_delta)
                 redis.call("ZREM", active_keys, unpack(to_remove_keys))
             end
 
@@ -266,8 +269,9 @@ impl SuppressedRedisRateLimiter {
 
                 for i = 1, #to_remove do
                     local value = cjson.decode(to_remove[i])
-                    sum_count = tonumber(value.count)
-                    sum_declined = tonumber(value.declined)
+                    local sum_count = tonumber(value.count)
+                    local sum_declined = tonumber(value.declined)
+
 
                     if sum_count then
                         remove_sum = remove_sum + sum_count
@@ -278,9 +282,11 @@ impl SuppressedRedisRateLimiter {
                     end
                 end
 
+                local count_delta = math.floor(remove_sum) == 0 and 0 or -1 * math.floor(remove_sum)
+                local declined_delta = math.floor(decline_sum) == 0 and 0 or -1 * math.floor(decline_sum)
 
-                redis.call("HINCRBY", total_count_key, "count", -1 * remove_sum)
-                redis.call("HINCRBY", total_count_key, "declined", -1 * decline_sum)
+                redis.call("HINCRBY", total_count_key, "count", count_delta)
+                redis.call("HINCRBY", total_count_key, "declined", declined_delta)
                 redis.call("ZREM", active_keys, unpack(to_remove_keys))
             end
 

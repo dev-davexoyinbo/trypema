@@ -103,6 +103,27 @@ async fn build_limiter(
     redis::aio::ConnectionManager,
     RedisKey,
 ) {
+    build_limiter_with_cache_ms(
+        url,
+        window_size_seconds,
+        rate_group_size_ms,
+        hard_limit_factor,
+        *SuppressionFactorCacheMs::default(),
+    )
+    .await
+}
+
+async fn build_limiter_with_cache_ms(
+    url: &str,
+    window_size_seconds: u64,
+    rate_group_size_ms: u64,
+    hard_limit_factor: f64,
+    suppression_factor_cache_ms: u64,
+) -> (
+    SuppressedRedisRateLimiter,
+    redis::aio::ConnectionManager,
+    RedisKey,
+) {
     let client = redis::Client::open(url).unwrap();
     let cm = client.get_connection_manager().await.unwrap();
     let prefix = unique_prefix();
@@ -113,10 +134,278 @@ async fn build_limiter(
         window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
         hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
+            suppression_factor_cache_ms,
+        )
+        .unwrap(),
     });
 
     (limiter, cm, prefix)
+}
+
+#[test]
+fn get_suppression_factor_fresh_key_returns_zero_and_sets_cache_ttl() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cache_ms = 500_u64;
+        let (limiter, cm, prefix) =
+            build_limiter_with_cache_ms(&url, 10, 100, 2f64, cache_ms).await;
+        let k = key("k");
+        let kg = keygen(&prefix, RateType::Suppressed);
+
+        let mut conn = cm.clone();
+        let sf_key = kg.get_suppression_factor_key(&k);
+        let _: u64 = conn.del(&sf_key).await.unwrap();
+
+        // With no window_limit key set yet, suppression factor resolves to 0.
+        let sf = limiter.get_suppression_factor(&k).await.unwrap();
+        assert!((sf - 0.0).abs() < 1e-12, "sf: {sf}");
+
+        let pttl: i64 = conn.pttl(&sf_key).await.unwrap();
+        assert!(pttl > 0, "expected sf key to have positive TTL");
+        assert!(
+            pttl <= cache_ms as i64 + 200,
+            "expected sf TTL <= cache_ms (+slack), got {pttl}"
+        );
+    });
+}
+
+#[test]
+fn get_suppression_factor_returns_cached_when_in_range_and_does_not_overwrite_ttl() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 100, 2f64).await;
+        let k = key("k");
+        let kg = keygen(&prefix, RateType::Suppressed);
+
+        let mut conn = cm.clone();
+        let sf_key = kg.get_suppression_factor_key(&k);
+
+        // Even if the underlying state would imply a different suppression factor, a valid
+        // cached value must be returned as-is.
+        let cached_val = 0.123_f64;
+        let _: () = conn.set_ex(&sf_key, cached_val, 60).await.unwrap();
+
+        // Seed state that would otherwise drive suppression_factor to 1.0.
+        let w_key = kg.get_window_limit_key(&k);
+        let t_key = kg.get_total_count_key(&k);
+        let _: () = conn.set(&w_key, 10_u64).await.unwrap();
+        let _: () = conn.hset(&t_key, "count", 10_u64).await.unwrap();
+
+        let sf = limiter.get_suppression_factor(&k).await.unwrap();
+        assert!((sf - cached_val).abs() < 1e-12, "sf: {sf}");
+
+        // TTL should remain ~60s (not overwritten to suppression_factor_cache_ms).
+        let pttl: i64 = conn.pttl(&sf_key).await.unwrap();
+        assert!(
+            pttl > 50_000,
+            "expected cached TTL to remain large, got {pttl}"
+        );
+    });
+}
+
+#[test]
+fn get_suppression_factor_invalid_cached_negative_is_recomputed_and_overwritten() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cache_ms = 500_u64;
+        let (limiter, cm, prefix) =
+            build_limiter_with_cache_ms(&url, 10, 100, 2f64, cache_ms).await;
+        let k = key("k");
+        let kg = keygen(&prefix, RateType::Suppressed);
+
+        let mut conn = cm.clone();
+        let sf_key = kg.get_suppression_factor_key(&k);
+        let w_key = kg.get_window_limit_key(&k);
+        let t_key = kg.get_total_count_key(&k);
+
+        // Create state that forces suppression_factor to 1.0.
+        let _: () = conn.set(&w_key, 10_u64).await.unwrap();
+        let _: () = conn.hset(&t_key, "count", 10_u64).await.unwrap();
+
+        // Write invalid cached value.
+        let _: () = conn.set_ex(&sf_key, -0.5_f64, 60).await.unwrap();
+
+        let sf = limiter.get_suppression_factor(&k).await.unwrap();
+        assert!((sf - 1.0).abs() < 1e-12, "sf: {sf}");
+
+        let cached: Option<f64> = conn.get(&sf_key).await.unwrap();
+        let cached = cached.expect("expected sf to be cached");
+        assert!((cached - 1.0).abs() < 1e-12, "cached: {cached}");
+
+        let pttl: i64 = conn.pttl(&sf_key).await.unwrap();
+        assert!(pttl > 0, "expected overwritten sf key to have TTL");
+        assert!(
+            pttl <= cache_ms as i64 + 200,
+            "expected overwritten TTL <= cache_ms (+slack), got {pttl}"
+        );
+    });
+}
+
+#[test]
+fn get_suppression_factor_invalid_cached_gt_one_is_recomputed_and_overwritten() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cache_ms = 500_u64;
+        let (limiter, cm, prefix) =
+            build_limiter_with_cache_ms(&url, 10, 100, 2f64, cache_ms).await;
+        let k = key("k");
+        let kg = keygen(&prefix, RateType::Suppressed);
+
+        let mut conn = cm.clone();
+        let sf_key = kg.get_suppression_factor_key(&k);
+        let w_key = kg.get_window_limit_key(&k);
+        let t_key = kg.get_total_count_key(&k);
+
+        // Create state that forces suppression_factor to 1.0.
+        let _: () = conn.set(&w_key, 10_u64).await.unwrap();
+        let _: () = conn.hset(&t_key, "count", 10_u64).await.unwrap();
+
+        // Write invalid cached value.
+        let _: () = conn.set_ex(&sf_key, 2.0_f64, 60).await.unwrap();
+
+        let sf = limiter.get_suppression_factor(&k).await.unwrap();
+        assert!((sf - 1.0).abs() < 1e-12, "sf: {sf}");
+
+        let cached: Option<f64> = conn.get(&sf_key).await.unwrap();
+        let cached = cached.expect("expected sf to be cached");
+        assert!((cached - 1.0).abs() < 1e-12, "cached: {cached}");
+
+        let pttl: i64 = conn.pttl(&sf_key).await.unwrap();
+        assert!(pttl > 0, "expected overwritten sf key to have TTL");
+        assert!(
+            pttl <= cache_ms as i64 + 200,
+            "expected overwritten TTL <= cache_ms (+slack), got {pttl}"
+        );
+    });
+}
+
+#[test]
+fn get_suppression_factor_returns_zero_when_window_limit_missing_even_if_totals_exist() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 100, 2f64).await;
+        let k = key("k");
+        let kg = keygen(&prefix, RateType::Suppressed);
+
+        let mut conn = cm.clone();
+        let w_key = kg.get_window_limit_key(&k);
+        let t_key = kg.get_total_count_key(&k);
+        let sf_key = kg.get_suppression_factor_key(&k);
+
+        // Simulate partial state: totals present, but no window_limit stored.
+        let _: () = conn.hset(&t_key, "count", 999_u64).await.unwrap();
+        let _: u64 = conn.del(&w_key).await.unwrap();
+        let _: u64 = conn.del(&sf_key).await.unwrap();
+
+        let sf = limiter.get_suppression_factor(&k).await.unwrap();
+        assert!((sf - 0.0).abs() < 1e-12, "sf: {sf}");
+    });
+}
+
+#[test]
+fn get_suppression_factor_missing_total_count_field_is_treated_as_zero() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (limiter, cm, prefix) = build_limiter(&url, 10, 100, 2f64).await;
+        let k = key("k");
+        let kg = keygen(&prefix, RateType::Suppressed);
+
+        let mut conn = cm.clone();
+        let w_key = kg.get_window_limit_key(&k);
+        let t_key = kg.get_total_count_key(&k);
+        let sf_key = kg.get_suppression_factor_key(&k);
+
+        // Hard window limit (window_size * rate * hard_limit_factor).
+        let _: () = conn.set(&w_key, 20_u64).await.unwrap();
+
+        // Write only declined; omit the "count" field.
+        let _: () = conn.hset(&t_key, "declined", 5_u64).await.unwrap();
+        let _: u64 = conn.del(&sf_key).await.unwrap();
+
+        let sf = limiter.get_suppression_factor(&k).await.unwrap();
+        assert!((sf - 0.0).abs() < 1e-12, "sf: {sf}");
+    });
+}
+
+#[test]
+fn get_suppression_factor_computed_uses_last_second_peak_rate_at_threshold_boundary() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // window_size=10s, hard_limit_factor=2 => window_limit=20 and threshold is 10.
+        // We drive total_count to exactly 10 with a burst in < 1s so perceived_rate uses
+        // last-second peak (10 req/s) instead of average (1 req/s).
+        let cache_ms = 50_u64;
+        let (limiter, _cm, _prefix) =
+            build_limiter_with_cache_ms(&url, 10, 100, 2f64, cache_ms).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        for _ in 0..10 {
+            let _ = limiter.inc(&k, &rate_limit, 1).await.unwrap();
+        }
+
+        // Ensure any cached suppression_factor from the burst expires so we recompute.
+        tokio::time::sleep(Duration::from_millis(cache_ms + 25)).await;
+
+        let sf = limiter.get_suppression_factor(&k).await.unwrap();
+
+        // rate_limit = 1 req/s; perceived_rate = 10 req/s => sf = 1 - 1/10 = 0.9
+        let expected = 1.0_f64 - (1.0_f64 / 10.0_f64);
+        assert!(
+            (sf - expected).abs() < 1e-12,
+            "sf: {sf}, expected: {expected}"
+        );
+    });
+}
+
+#[test]
+fn get_suppression_factor_evicts_out_of_window_usage_and_resets_admission() {
+    let url = redis_url();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let window_size_seconds = 1_u64;
+        let cache_ms = 50_u64;
+        let (limiter, _cm, _prefix) =
+            build_limiter_with_cache_ms(&url, window_size_seconds, 1000, 2f64, cache_ms).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        // window_limit = window_size * rate_limit * hard_limit_factor = 1 * 1 * 2 = 2.
+        // We record 2 calls in the window, then wait for the full window to pass. If eviction
+        // does not occur, the next increment would see total_count >= window_limit and go to full
+        // suppression (sf=1.0). If eviction occurs, the next increment is Allowed.
+        let d1 = limiter.inc(&k, &rate_limit, 2).await.unwrap();
+
+        assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {:?}", d1);
+
+        tokio::time::sleep(Duration::from_millis(window_size_seconds * 1000 + 50)).await;
+        tokio::time::sleep(Duration::from_millis(cache_ms + 25)).await;
+
+        eprintln!(">>>>>>>>>>>>>");
+        let sf = limiter.get_suppression_factor(&k).await.unwrap();
+        eprintln!("sf: {sf}");
+        assert!((sf - 0.0).abs() < 1e-12, "sf: {sf}");
+
+        let d2 = limiter.inc(&k, &rate_limit, 1).await.unwrap();
+        assert!(matches!(d2, RateLimitDecision::Allowed), "d2: {:?}", d2);
+    });
 }
 
 #[test]
