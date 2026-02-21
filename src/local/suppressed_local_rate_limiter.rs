@@ -224,7 +224,7 @@ impl SuppressedLocalRateLimiter {
 
             rate_limit_series.series.push_back(InstantRate {
                 count: count.into(),
-                declined: AtomicU64::new(if should_allow { 0 } else { 1 }),
+                declined: AtomicU64::new(if should_allow { 0 } else { count }),
                 timestamp: Instant::now(),
             });
 
