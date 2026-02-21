@@ -97,7 +97,7 @@ impl SuppressedRedisRateLimiter {
 
             local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
-            if suppression_factor == nil then
+            if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
                 if total_count >= window_limit then
                     suppression_factor = 1
                 elseif total_count < window_limit / hard_limit_factor then
@@ -281,7 +281,7 @@ impl SuppressedRedisRateLimiter {
 
             local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
-            if suppression_factor == nil then
+            if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
                 local window_limit = tonumber(redis.call("GET", window_limit_key)) 
                 if window_limit == nil then
                     suppression_factor = 0
