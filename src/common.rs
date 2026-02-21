@@ -21,6 +21,7 @@ use crate::TrypemaError;
 #[derive(Debug)]
 pub(crate) struct InstantRate {
     pub count: AtomicU64,
+    pub declined: AtomicU64,
     pub timestamp: Instant,
 }
 
@@ -29,6 +30,7 @@ pub(crate) struct RateLimitSeries {
     pub limit: RateLimit,
     pub series: VecDeque<InstantRate>,
     pub total: AtomicU64,
+    pub total_declined: AtomicU64,
 }
 
 impl RateLimitSeries {
@@ -37,11 +39,13 @@ impl RateLimitSeries {
             limit,
             series: VecDeque::new(),
             total: AtomicU64::new(0),
+            total_declined: AtomicU64::new(0),
         }
     }
 }
 
 /// Result of a rate limit admission check.
+///
 ///
 /// Returned by all rate limiting strategies to indicate whether a request should proceed.
 ///
@@ -165,7 +169,7 @@ pub enum RateLimitDecision {
     Suppressed {
         /// Current suppression rate (0.0 = no suppression, 1.0 = full suppression).
         ///
-        /// Computed as: `1.0 - (perceived_rate / rate_limit)`
+        /// Computed as: `1.0 - (rate_limit / perceived_rate)`
         suppression_factor: f64,
 
         /// Whether this specific call was admitted.

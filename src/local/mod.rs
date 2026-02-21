@@ -13,7 +13,7 @@
 //! # Strategies
 //!
 //! - [`AbsoluteLocalRateLimiter`]: Strict sliding-window enforcement
-//! - [`SuppressedLocalRateLimiter`]: Probabilistic suppression with dual tracking
+//! - [`SuppressedLocalRateLimiter`]: Probabilistic suppression for graceful degradation
 //!
 //! # When to Use
 //!

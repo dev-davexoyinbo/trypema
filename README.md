@@ -286,6 +286,7 @@ To reduce memory and computational overhead, increments that occur within `rate_
 | `window_size_seconds` | `WindowSizeSeconds` | Length of the sliding window for admission decisions                  | 10-300 seconds      |
 | `rate_group_size_ms`  | `RateGroupSizeMs`   | Coalescing interval for grouping nearby increments                    | 10-100 milliseconds |
 | `hard_limit_factor`   | `HardLimitFactor`   | Multiplier for hard cutoff in suppressed strategy (1.0 = no headroom) | 1.0-2.0             |
+| `suppression_factor_cache_ms` | `SuppressionFactorCacheMs` | Cache duration for per-key suppression factor recomputation           | 10-1000 milliseconds |
 
 ### RedisRateLimiterOptions
 
@@ -382,10 +383,10 @@ A deterministic sliding-window limiter that strictly enforces rate limits.
 
 A probabilistic strategy that gracefully degrades under load by suppressing a portion of requests.
 
-**Dual tracking:**
+**Semantics:**
 
-- **Observed limiter:** Tracks all calls (including suppressed ones)
-- **Accepted limiter:** Tracks only admitted calls
+- A call returning `RateLimitDecision::Suppressed { is_allowed, .. }` always means "suppressed strategy active".
+- Use `is_allowed` as the admission signal.
 
 **Behavior:**
 
@@ -394,13 +395,14 @@ A probabilistic strategy that gracefully degrades under load by suppressing a po
 2. **At or above capacity:**
    - Suppression activates probabilistically based on current rate
    - Returns `Suppressed { is_allowed: true/false }` to indicate suppression state
-3. **Above hard limit** (`accepted_usage >= rate_limit × hard_limit_factor`):
-   - Returns `Rejected` (hard rejection, cannot be suppressed)
+3. **Above hard limit** (`rate >= rate_limit × hard_limit_factor`):
+   - Local provider: returns `Suppressed { is_allowed: false, suppression_factor: 1.0 }`
+   - Redis provider: returns `Rejected` (hard rejection)
 
 **Suppression calculation:**
 
 ```text
-suppression_factor = 1.0 - (perceived_rate / rate_limit)
+suppression_factor = 1.0 - (rate_limit / perceived_rate)
 ```
 
 Where `perceived_rate = max(average_rate_in_window, rate_in_last_1000ms)`.
@@ -547,9 +549,7 @@ src/
     ├── suppressed_redis_rate_limiter.rs # Redis suppressed strategy (Lua scripts)
     └── common.rs                        # Redis-specific utilities
 
-docs/
-├── redis.md                     # Redis provider details
-└── testing.md                   # Testing guide
+ # (Docs are currently in rustdoc and this README; there is no `docs/` directory in this repo.)
 ```
 
 ## Redis Provider Details

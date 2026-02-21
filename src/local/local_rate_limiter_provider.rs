@@ -66,8 +66,8 @@ pub struct LocalRateLimiterOptions {
     ///
     /// Defines the absolute maximum rate: `rate_limit × hard_limit_factor`
     ///
-    /// Beyond this limit, requests are unconditionally rejected (not probabilistically
-    /// suppressed). Only relevant for [`SuppressedLocalRateLimiter`].
+    /// Beyond this limit, the suppressed strategy transitions to full suppression
+    /// (`suppression_factor = 1.0`). Only relevant for [`SuppressedLocalRateLimiter`].
     ///
     /// **Typical values:** 1.0-2.0  
     /// **Recommended:** 1.5 (50% burst headroom)  
@@ -92,7 +92,7 @@ pub struct LocalRateLimiterOptions {
 /// # Strategies
 ///
 /// - **Absolute:** Strict sliding-window enforcement
-/// - **Suppressed:** Probabilistic suppression with dual tracking
+/// - **Suppressed:** Probabilistic suppression for graceful degradation
 ///
 /// # Thread Safety
 ///

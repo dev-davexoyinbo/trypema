@@ -31,6 +31,7 @@ fn insert_series(
         .iter()
         .map(|(count, ms_ago)| InstantRate {
             count: AtomicU64::new(*count),
+            declined: AtomicU64::new(0),
             timestamp: Instant::now() - Duration::from_millis(*ms_ago),
         })
         .collect::<VecDeque<_>>();
@@ -41,6 +42,7 @@ fn insert_series(
             limit,
             series,
             total: AtomicU64::new(total),
+            total_declined: AtomicU64::new(0),
         },
     );
 }
