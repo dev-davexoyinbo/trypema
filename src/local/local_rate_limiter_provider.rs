@@ -1,6 +1,6 @@
 use crate::{
-    common::{HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds},
     AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
+    common::{HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds},
 };
 
 /// Configuration for local (in-process) rate limiters.

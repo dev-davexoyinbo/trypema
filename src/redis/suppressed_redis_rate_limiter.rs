@@ -7,6 +7,86 @@ use crate::{
     redis::RedisKeyGenerator,
 };
 
+const LUA_HELPERS: &str = r#"
+local function now_ms()
+    local time_array = redis.call("TIME")
+    return tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+end
+
+local function cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
+    local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
+
+    if #to_remove_keys == 0 then
+        return
+    end
+
+    local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+    redis.call("HDEL", hash_key, unpack(to_remove_keys))
+
+    local remove_sum = 0
+    local decline_sum = 0
+
+    for i = 1, #to_remove do
+        local value = cjson.decode(to_remove[i])
+
+        if value ~= nil then
+            local sum_count = tonumber(value.count)
+            local sum_declined = tonumber(value.declined)
+
+            if sum_count then
+                remove_sum = remove_sum + sum_count
+            end
+
+            if sum_declined then
+                decline_sum = decline_sum + sum_declined
+            end
+        end
+    end
+
+    local count_delta = math.floor(remove_sum) == 0 and 0 or -1 * math.floor(remove_sum)
+    local declined_delta = math.floor(decline_sum) == 0 and 0 or -1 * math.floor(decline_sum)
+
+    redis.call("HINCRBY", total_count_key, "count", count_delta)
+    redis.call("HINCRBY", total_count_key, "declined", declined_delta)
+    redis.call("ZREM", active_keys, unpack(to_remove_keys))
+end
+
+local function calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+    if total_count >= window_limit then
+        return 1
+    elseif total_count < window_limit / hard_limit_factor then
+        return 0
+    end
+
+    local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
+    local total_in_last_second = 0
+
+    if #active_keys_in_1s > 0 then
+        local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
+        for i = 1, #values do
+            local value = cjson.decode(values[i])
+            if value ~= nil then
+                local count_inc = tonumber(value.count)
+                if count_inc then
+                    total_in_last_second = total_in_last_second + count_inc
+                end
+            end
+        end
+    end
+
+    local average_rate_in_window = total_count / window_size_seconds
+    local perceived_rate_limit = average_rate_in_window
+
+    if total_in_last_second > average_rate_in_window then
+        perceived_rate_limit = total_in_last_second
+    end
+
+    local rate_limit = window_limit / window_size_seconds / hard_limit_factor
+
+    return 1 - (rate_limit / perceived_rate_limit)
+end
+"#;
+
 /// A rate limiter backed by Redis.
 #[derive(Clone, Debug)]
 pub struct SuppressedRedisRateLimiter {
@@ -43,10 +123,11 @@ impl SuppressedRedisRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let script = redis::Script::new(
+        let script_src = format!(
+            "{}\n{}",
+            LUA_HELPERS,
             r#"
-            local time_array = redis.call("TIME")
-            local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+            local timestamp_ms = now_ms()
 
             local hash_key = KEYS[1]
             local active_keys = KEYS[2]
@@ -67,80 +148,14 @@ impl SuppressedRedisRateLimiter {
 
             redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
-            local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
-
-            if #to_remove_keys > 0 then
-                local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
-                redis.call("HDEL", hash_key, unpack(to_remove_keys))
-
-                local remove_sum = 0
-                local decline_sum = 0
-
-
-                for i = 1, #to_remove do
-                    local value = cjson.decode(to_remove[i])
-
-                    if value ~= nil then
-                        local sum_count = tonumber(value.count)
-                        local sum_declined = tonumber(value.declined)
-
-
-                        if sum_count then
-                            remove_sum = remove_sum + sum_count
-                        end
-
-                        if sum_declined then
-                            decline_sum = decline_sum + sum_declined
-                        end
-                    end
-                end
-
-                local count_delta = math.floor(remove_sum) == 0 and 0 or -1 * math.floor(remove_sum)
-                local declined_delta = math.floor(decline_sum) == 0 and 0 or -1 * math.floor(decline_sum)
-
-                redis.call("HINCRBY", total_count_key, "count", count_delta)
-                redis.call("HINCRBY", total_count_key, "declined", declined_delta)
-                redis.call("ZREM", active_keys, unpack(to_remove_keys))
-            end
+            cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
 
             local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
 
             local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
             if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
-                if total_count >= window_limit then
-                    suppression_factor = 1
-                elseif total_count < window_limit / hard_limit_factor then
-                    suppression_factor = 0
-                else
-                    local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
-                    local total_in_last_second = 0
-
-
-                    if #active_keys_in_1s > 0 then
-                        local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
-                        for i = 1, #values do
-                            local value = cjson.decode(values[i])
-                            if value ~= nil then
-                                local count_inc = tonumber(value.count)
-                                if count_inc then
-                                    total_in_last_second = total_in_last_second + count_inc
-                                end
-                            end
-                        end
-                    end
-
-                    local average_rate_in_window = total_count / window_size_seconds
-                    local perceived_rate_limit = average_rate_in_window
-
-                    if total_in_last_second > average_rate_in_window then
-                        perceived_rate_limit = total_in_last_second
-                    end
-
-                    local rate_limit = window_limit / window_size_seconds / hard_limit_factor
-
-                    suppression_factor = 1 - (rate_limit / perceived_rate_limit)
-                end
+                suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
 
                 redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
             end
@@ -200,6 +215,8 @@ impl SuppressedRedisRateLimiter {
         "#,
         );
 
+        let script = redis::Script::new(&script_src);
+
         let window_limit =
             *self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor;
         let mut connection_manager = self.connection_manager.clone();
@@ -244,10 +261,11 @@ impl SuppressedRedisRateLimiter {
     ///
     /// If the cached value is outside `[0.0, 1.0]`, this recomputes and overwrites it.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
-        let script = Script::new(
+        let script_src = format!(
+            "{}\n{}",
+            LUA_HELPERS,
             r#"
-            local time_array = redis.call("TIME")
-            local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+            local timestamp_ms = now_ms()
 
             local hash_key = KEYS[1]
             local active_keys = KEYS[2]
@@ -264,40 +282,7 @@ impl SuppressedRedisRateLimiter {
 
             redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
-            local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
-
-            if #to_remove_keys > 0 then
-                local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
-                redis.call("HDEL", hash_key, unpack(to_remove_keys))
-
-                local remove_sum = 0
-                local decline_sum = 0
-
-                for i = 1, #to_remove do
-                    local value = cjson.decode(to_remove[i])
-
-                    if value ~= nil then
-                        local sum_count = tonumber(value.count)
-                        local sum_declined = tonumber(value.declined)
-
-
-                        if sum_count then
-                            remove_sum = remove_sum + sum_count
-                        end
-
-                        if sum_declined then
-                            decline_sum = decline_sum + sum_declined
-                        end
-                    end
-                end
-
-                local count_delta = math.floor(remove_sum) == 0 and 0 or -1 * math.floor(remove_sum)
-                local declined_delta = math.floor(decline_sum) == 0 and 0 or -1 * math.floor(decline_sum)
-
-                redis.call("HINCRBY", total_count_key, "count", count_delta)
-                redis.call("HINCRBY", total_count_key, "declined", declined_delta)
-                redis.call("ZREM", active_keys, unpack(to_remove_keys))
-            end
+            cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
 
             local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
 
@@ -307,37 +292,8 @@ impl SuppressedRedisRateLimiter {
                 local window_limit = tonumber(redis.call("GET", window_limit_key)) 
                 if window_limit == nil then
                     suppression_factor = 0
-                elseif total_count >= window_limit then
-                    suppression_factor = 1
-                elseif total_count < window_limit / hard_limit_factor then
-                    suppression_factor = 0
                 else
-                    local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
-                    local total_in_last_second = 0
-
-                    if #active_keys_in_1s > 0 then
-                        local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
-                        for i = 1, #values do
-                            local value = cjson.decode(values[i])
-                            if value ~= nil then
-                                local count_inc = tonumber(value.count)
-                                if count_inc then
-                                    total_in_last_second = total_in_last_second + count_inc
-                                end
-                            end
-                        end
-                    end
-
-                    local average_rate_in_window = total_count / window_size_seconds
-                    local perceived_rate_limit = average_rate_in_window
-
-                    if total_in_last_second > average_rate_in_window then
-                        perceived_rate_limit = total_in_last_second
-                    end
-
-                    local rate_limit = window_limit / window_size_seconds / hard_limit_factor
-
-                    suppression_factor = 1 - (rate_limit / perceived_rate_limit)
+                    suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
                 end
 
                 redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
@@ -346,6 +302,8 @@ impl SuppressedRedisRateLimiter {
             return tostring(suppression_factor)
         "#,
         );
+
+        let script = Script::new(&script_src);
 
         let mut connection_manager = self.connection_manager.clone();
 
