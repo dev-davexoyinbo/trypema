@@ -106,10 +106,12 @@ impl SuppressedRedisRateLimiter {
                     local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
                     local total_in_last_second = 0
 
+
                     if #active_keys_in_1s > 0 then
-                        local values = redis.call("HMGET", active_keys, unpack(active_keys_in_1s))
+                        local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
                         for i = 1, #values do
-                            local value = tonumber(values[i])
+                            local value = tonumber(cjson.decode(values[i]).count)
+
                             if value then
                                 total_in_last_second = total_in_last_second + value
                             end
@@ -122,6 +124,8 @@ impl SuppressedRedisRateLimiter {
                     if total_in_last_second > average_rate_in_window then
                         perceived_rate_limit = total_in_last_second
                     end
+
+                    redis.log(redis.LOG_WARNING, "total_in_last_second is: " .. total_in_last_second)
 
                     local rate_limit = window_limit / window_size_seconds / hard_limit_factor
 
@@ -158,14 +162,14 @@ impl SuppressedRedisRateLimiter {
             local raw_prev = redis.call("HGET", hash_key, hash_field)
             local prev_value = raw_prev and cjson.decode(raw_prev) or {count = 0, declined = 0}
 
-            local new_count = tonumber(prev_value.count) + count
-            local new_declined = tonumber(prev_value.declined)
+            local new_count = (tonumber(prev_value.count) or 0) + count
+            local new_declined = tonumber(prev_value.declined) or 0
 
             if not should_allow then
                 new_declined = new_declined + count
             end
 
-            local new_count = redis.call("HSET", hash_key, hash_field, cjson.encode({count = new_count, declined = new_declined}))
+            redis.call("HSET", hash_key, hash_field, cjson.encode({count = new_count, declined = new_declined}))
             redis.call("HINCRBY", total_count_key, "count", count)
             if not should_allow then
                 redis.call("HINCRBY", total_count_key, "declined", count)
@@ -296,7 +300,7 @@ impl SuppressedRedisRateLimiter {
                     if #active_keys_in_1s > 0 then
                         local values = redis.call("HMGET", active_keys, unpack(active_keys_in_1s))
                         for i = 1, #values do
-                            local value = tonumber(values[i])
+                            local value = tonumber(cjson.decode(values[i]).count)
                             if value then
                                 total_in_last_second = total_in_last_second + value
                             end

@@ -46,20 +46,22 @@ async fn get_total(
     conn: &mut redis::aio::ConnectionManager,
     kg: &RedisKeyGenerator,
     key: &RedisKey,
-) -> Option<u64> {
-    conn.hget(kg.get_total_count_key(key), "count")
+) -> u64 {
+    conn.hget::<_, _, Option<u64>>(kg.get_total_count_key(key), "count")
         .await
         .unwrap()
+        .unwrap_or(0)
 }
 
 async fn get_declined(
     conn: &mut redis::aio::ConnectionManager,
     kg: &RedisKeyGenerator,
     key: &RedisKey,
-) -> Option<u64> {
-    conn.hget(kg.get_total_count_key(key), "declined")
+) -> u64 {
+    conn.hget::<_, _, Option<u64>>(kg.get_total_count_key(key), "declined")
         .await
         .unwrap()
+        .unwrap_or(0)
 }
 
 async fn set_zset_score_ms_ago(
@@ -145,8 +147,8 @@ fn suppression_factor_one_returns_suppressed_denied_and_increments_declined() {
         ));
 
         let mut conn = cm.clone();
-        assert_eq!(get_total(&mut conn, &kg, &k).await, Some(1));
-        assert_eq!(get_declined(&mut conn, &kg, &k).await, Some(1));
+        assert_eq!(get_total(&mut conn, &kg, &k).await, 1);
+        assert_eq!(get_declined(&mut conn, &kg, &k).await, 1);
     });
 }
 
@@ -175,8 +177,8 @@ fn suppression_factor_zero_bypasses_suppression_and_declined_not_incremented() {
         );
 
         let mut conn = cm.clone();
-        assert_eq!(get_total(&mut conn, &kg, &k).await, Some(1));
-        assert_eq!(get_declined(&mut conn, &kg, &k).await.unwrap_or(0), 0);
+        assert_eq!(get_total(&mut conn, &kg, &k).await, 1);
+        assert_eq!(get_declined(&mut conn, &kg, &k).await, 0);
     });
 }
 
@@ -217,8 +219,8 @@ fn hard_limit_factor_one_never_allows_when_suppression_factor_is_forced_to_one()
         ));
 
         let mut conn = cm.clone();
-        assert_eq!(get_total(&mut conn, &kg, &k).await, Some(2));
-        assert_eq!(get_declined(&mut conn, &kg, &k).await, Some(2));
+        assert_eq!(get_total(&mut conn, &kg, &k).await, 2);
+        assert_eq!(get_declined(&mut conn, &kg, &k).await, 2);
     });
 }
 
@@ -281,16 +283,12 @@ fn suppression_factor_negative_is_invalid_and_is_recomputed() {
 
         let mut conn = cm.clone();
         let total = get_total(&mut conn, &kg, &k).await;
-        assert_eq!(
-            total,
-            Some(1),
-            "expected total to be 1, instead got {total:?}"
-        );
+        assert_eq!(total, 1, "expected total to be 1, instead got {total}");
 
-        let declined = get_declined(&mut conn, &kg, &k).await.unwrap_or(0);
+        let declined = get_declined(&mut conn, &kg, &k).await;
         assert_eq!(
             declined, 0,
-            "expected declined to be 0, instead got {declined:?}"
+            "expected declined to be 0, instead got {declined}"
         );
     });
 }
@@ -461,8 +459,10 @@ fn verify_suppression_factor_calculation_last_second_redis() {
         tokio::time::sleep(Duration::from_millis(1001)).await;
 
         let _ = limiter.inc(&k, &rate_limit, 20).await.unwrap();
+        // Allow time for the suppression_factor to expire
+        tokio::time::sleep(Duration::from_millis(101)).await;
 
-        let expected_suppression_factor = 1f64 - (1f64 / 21f64);
+        let expected_suppression_factor = 1f64 - (1f64 / 20f64);
 
         let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
@@ -474,7 +474,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
                     ..
                 } if (suppression_factor - expected_suppression_factor).abs() < 1e-12
             ),
-            "decision: {:?}",
+            "decision: {:?}, expected sf: {expected_suppression_factor}",
             decision
         );
     });
