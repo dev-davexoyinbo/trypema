@@ -11,7 +11,6 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct SuppressedRedisRateLimiter {
     connection_manager: ConnectionManager,
-
     key_generator: RedisKeyGenerator,
     hard_limit_factor: HardLimitFactor,
     rate_group_size_ms: RateGroupSizeMs,
@@ -59,9 +58,9 @@ impl SuppressedRedisRateLimiter {
             local rate_group_size_ms = tonumber(ARGV[4])
             local suppression_factor_cache_ms = tonumber(ARGV[5])
             local hard_limit_factor = tonumber(ARGV[6])
-            local count = tonumber(ARGV[5])
+            local count = tonumber(ARGV[7])
 
-            local window_limit = redis.call("GET", window_limit_key, window_size_seconds) or window_limit_to_consider
+            local window_limit = tonumber(redis.call("GET", window_limit_key)) or window_limit_to_consider
 
             redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
@@ -179,33 +178,40 @@ impl SuppressedRedisRateLimiter {
 
             redis.call("EXPIRE", window_limit_key, window_size_seconds)
 
-            return {"suppressed", tostring(suppression_factor), should_allow and "1" or "0"}
+            if suppression_factor == 0 then
+                return {"allowed", 0, 0}
+            else
+                return {"suppressed", tostring(suppression_factor), should_allow and "1" or "0"}
+            end
         "#,
         );
 
-        let window_limit = *self.window_size_seconds as f64 * **rate_limit;
+        let window_limit =
+            *self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor;
         let mut connection_manager = self.connection_manager.clone();
 
-        let (result, retry_after_ms, remaining_after_waiting): (String, u64, u64) = script
+        let (result, suppression_factor, should_allow): (String, f64, u8) = script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))
             .key(self.key_generator.get_total_count_key(key))
             .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_suppression_factor_key(key))
             .arg(key.to_string())
             .arg(*self.window_size_seconds)
             .arg(window_limit)
             .arg(*self.rate_group_size_ms)
+            .arg(*self.suppression_factor_cache_ms)
+            .arg(*self.hard_limit_factor)
             .arg(count)
             .invoke_async(&mut connection_manager)
             .await?;
 
         match result.as_str() {
             "allowed" => Ok(RateLimitDecision::Allowed),
-            "rejected" => Ok(RateLimitDecision::Rejected {
-                window_size_seconds: *self.window_size_seconds,
-                retry_after_ms,
-                remaining_after_waiting,
+            "suppressed" => Ok(RateLimitDecision::Suppressed {
+                suppression_factor,
+                is_allowed: should_allow == 1,
             }),
             _ => Err(TrypemaError::UnexpectedRedisScriptResult {
                 operation: "absolute.inc",
@@ -225,66 +231,92 @@ impl SuppressedRedisRateLimiter {
         let script = Script::new(
             r#"
             local time_array = redis.call("TIME")
-            local now_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+            local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 
-            local accepted_total_count_key = KEYS[1]
-            local accepted_window_limit_key = KEYS[2]
-            local observed_total_count_key = KEYS[3]
-            local observed_active_keys_key = KEYS[4]
-            local suppressed_factor_key = KEYS[5]
-            local observed_hash_key = KEYS[6]
+            local hash_key = KEYS[1]
+            local active_keys = KEYS[2]
+            local window_limit_key = KEYS[3]
+            local total_count_key = KEYS[4]
+            local get_active_entities_key = KEYS[5]
+            local suppression_factor_key = KEYS[6]
 
-            local window_size_seconds = tonumber(ARGV[1])
-            local rate_group_size_ms = tonumber(ARGV[2])
-            local hard_limit_factor = tonumber(ARGV[3])
+            local entity = ARGV[1]
+            local window_size_seconds = tonumber(ARGV[2])
+            local rate_group_size_ms = tonumber(ARGV[3])
             local suppression_factor_cache_ms = tonumber(ARGV[4])
+            local hard_limit_factor = tonumber(ARGV[5])
 
-            local suppression_factor = tonumber(redis.call("GET", suppressed_factor_key))
-            if suppression_factor ~= nil then
-                return tostring(suppression_factor)
-            end
+            redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
-            local window_limit = tonumber(redis.call("GET", accepted_window_limit_key)) or 0
-            window_limit = window_limit / hard_limit_factor
+            local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
 
-            local accepted_total_count = tonumber(redis.call("GET", accepted_total_count_key)) or 0
-            local observed_total_count = tonumber(redis.call("GET", observed_total_count_key)) or 0
-            local active_keys_count = tonumber(redis.call("ZCARD", observed_active_keys_key)) or 0
+            if #to_remove_keys > 0 then
+                local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+                redis.call("HDEL", hash_key, unpack(to_remove_keys))
 
-            if window_limit == 0 or observed_total_count == 0 or accepted_total_count < window_limit or active_keys_count == 0 then
-                redis.call("SET", suppressed_factor_key, 0, "PX", rate_group_size_ms)
-                return 0
-            end
+                local remove_sum = 0
+                local decline_sum = 0
 
-            if observed_total_count >= window_limit * hard_limit_factor then
-                redis.call("SET", suppressed_factor_key, 1, "PX", rate_group_size_ms)
-                return 1
-            end
+                for i = 1, #to_remove do
+                    local value = cjson.decode(to_remove[i])
+                    sum_count = tonumber(value.count)
+                    sum_declined = tonumber(value.declined)
 
+                    if sum_count then
+                        remove_sum = remove_sum + sum_count
+                    end
 
-            local observed_active_keys_in_1s = redis.call("ZRANGE", observed_active_keys_key, "+inf", now_ms - 1000, "BYSCORE", "REV")
-            local total_in_last_second = 0
-
-            if #observed_active_keys_in_1s > 0 then
-                local values = redis.call("HMGET", observed_hash_key, unpack(observed_active_keys_in_1s))
-                for i = 1, #values do
-                    local value = tonumber(values[i])
-                    if value then
-                        total_in_last_second = total_in_last_second + value
+                    if sum_declined then
+                        decline_sum = decline_sum + sum_declined
                     end
                 end
+
+
+                redis.call("HINCRBY", total_count_key, "count", -1 * remove_sum)
+                redis.call("HINCRBY", total_count_key, "declined", -1 * decline_sum)
+                redis.call("ZREM", active_keys, unpack(to_remove_keys))
             end
 
-            local average_rate_in_window = observed_total_count / window_size_seconds
-            local perceived_rate_limit = average_rate_in_window
+            local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
 
-            if total_in_last_second > average_rate_in_window then
-                perceived_rate_limit = total_in_last_second
+            local suppression_factor = tonumber(redis.call("GET", suppressed_factor_key))
+
+            if suppression_factor == nil then
+                local window_limit = tonumber(redis.call("GET", window_limit_key)) 
+                if window_limit == nil then
+                    suppression_factor = 0
+                elseif total_count >= window_limit then
+                    suppression_factor = 1
+                elseif total_count < window_limit / hard_limit_factor then
+                    suppression_factor = 0
+                else
+                    local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", now_ms - 1000, "BYSCORE", "REV")
+                    local total_in_last_second = 0
+
+                    if #active_keys_in_1s > 0 then
+                        local values = redis.call("HMGET", active_keys, unpack(active_keys_in_1s))
+                        for i = 1, #values do
+                            local value = tonumber(values[i])
+                            if value then
+                                total_in_last_second = total_in_last_second + value
+                            end
+                        end
+                    end
+
+                    local average_rate_in_window = total_count / window_size_seconds
+                    local perceived_rate_limit = average_rate_in_window
+
+                    if total_in_last_second > average_rate_in_window then
+                        perceived_rate_limit = total_in_last_second
+                    end
+
+                    local rate_limit = window_limit / window_size_seconds / hard_limit_factor
+
+                    suppression_factor = 1 - (rate_limit / perceived_rate_limit)
+                end
+
+                redis.call("SET", suppressed_factor_key, 1, "PX", suppression_factor_cache_ms)
             end
-
-            suppression_factor = 1 - (window_limit / window_size_seconds / perceived_rate_limit)
-
-            redis.call("SET", suppressed_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
 
             return tostring(suppression_factor)
         "#,
@@ -293,54 +325,83 @@ impl SuppressedRedisRateLimiter {
         let mut connection_manager = self.connection_manager.clone();
 
         let suppression_factor: f64 = script
-            .key(
-                self.accepted_limiter
-                    .key_generator()
-                    .get_total_count_key(key),
-            )
-            .key(
-                self.accepted_limiter
-                    .key_generator()
-                    .get_window_limit_key(key),
-            )
-            .key(
-                self.observed_limiter
-                    .key_generator()
-                    .get_total_count_key(key),
-            )
-            .key(self.observed_limiter.key_generator().get_active_keys(key))
-            .key(
-                self.observed_limiter
-                    .key_generator()
-                    .get_suppression_factor_key(key),
-            )
-            .key(self.observed_limiter.key_generator().get_hash_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_suppression_factor_key(key))
+            .arg(key.to_string())
             .arg(*self.window_size_seconds)
             .arg(*self.rate_group_size_ms)
-            .arg(*self.hard_limit_factor)
             .arg(*self.suppression_factor_cache_ms)
+            .arg(*self.hard_limit_factor)
             .invoke_async(&mut connection_manager)
             .await?;
 
         Ok(suppression_factor)
     } // end method calculate_suppression_factor
 
-    #[inline]
-    fn get_hard_limit(&self, rate_limit: &RateLimit) -> RateLimit {
-        // if hard limit factor is always > 0 and rate limit is always > 0, this is safe
-        let Ok(val) = RateLimit::try_from(*self.hard_limit_factor * **rate_limit) else {
-            unreachable!(
-                "SuppressedLocalRateLimiter::get_hard_limit: hard_limit_factor is always > 0"
-            );
-        };
-
-        val
-    } // end method get_hard_limit
-
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        self.accepted_limiter
-            .cleanup_with_active_entities_cleanup(stale_after_ms, false)
+        let script = redis::Script::new(
+            r#"
+            local time_array = redis.call("TIME")
+            local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+
+            local prefix = KEYS[1]
+            local rate_type = KEYS[2]
+            local active_entities_key = KEYS[3]
+
+            local stale_after_ms = tonumber(ARGV[1]) or 0
+            local hash_suffix = ARGV[2]
+            local window_limit_suffix = ARGV[3]
+            local total_count_suffix = ARGV[4]
+            local active_keys_suffix = ARGV[5]
+            local suppression_factor_key_suffix = ARGV[6]
+
+
+            local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
+
+            if #active_entities == 0 then
+                return 
+            end
+
+            local remove_keys = {}
+
+            local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
+            for i = 1, #active_entities do
+                local entity = active_entities[i]
+
+                for i = 1, #suffixes do
+                    table.insert(remove_keys, prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
+                end
+            end
+
+            if #remove_keys > 0 then
+                redis.call("DEL", unpack(remove_keys))
+                redis.call("ZREM", active_entities_key, unpack(active_entities))
+            end
+
+            return
+        "#,
+        );
+
+        let mut connection_manager = self.connection_manager.clone();
+
+        let _: () = script
+            .key(self.key_generator.prefix.to_string())
+            .key(self.key_generator.rate_type.to_string())
+            .key(self.key_generator.get_active_entities_key())
+            .arg(stale_after_ms)
+            .arg(self.key_generator.hash_key_suffix.to_string())
+            .arg(self.key_generator.window_limit_key_suffix.to_string())
+            .arg(self.key_generator.total_count_key_suffix.to_string())
+            .arg(self.key_generator.active_keys_key_suffix.to_string())
+            .arg(self.key_generator.suppression_factor_key_suffix.to_string())
+            .invoke_async(&mut connection_manager)
             .await?;
-        self.observed_limiter.cleanup(stale_after_ms).await
-    } // end method cleanup
+
+        Ok(())
+    }
 }
