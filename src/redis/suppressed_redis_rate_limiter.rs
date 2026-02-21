@@ -103,7 +103,7 @@ impl SuppressedRedisRateLimiter {
                 elseif total_count < window_limit / hard_limit_factor then
                     suppression_factor = 0
                 else
-                    local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", now_ms - 1000, "BYSCORE", "REV")
+                    local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
                     local total_in_last_second = 0
 
                     if #active_keys_in_1s > 0 then
@@ -290,7 +290,7 @@ impl SuppressedRedisRateLimiter {
                 elseif total_count < window_limit / hard_limit_factor then
                     suppression_factor = 0
                 else
-                    local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", now_ms - 1000, "BYSCORE", "REV")
+                    local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
                     local total_in_last_second = 0
 
                     if #active_keys_in_1s > 0 then

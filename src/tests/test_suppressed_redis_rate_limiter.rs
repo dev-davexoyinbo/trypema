@@ -168,11 +168,15 @@ fn suppression_factor_zero_bypasses_suppression_and_declined_not_incremented() {
 
         let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
-        assert!(matches!(decision, RateLimitDecision::Allowed));
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "decision: {:?}",
+            decision
+        );
 
         let mut conn = cm.clone();
         assert_eq!(get_total(&mut conn, &kg, &k).await, Some(1));
-        assert_eq!(get_declined(&mut conn, &kg, &k).await, Some(0));
+        assert_eq!(get_declined(&mut conn, &kg, &k).await.unwrap_or(0), 0);
     });
 }
 
@@ -276,8 +280,18 @@ fn suppression_factor_negative_is_invalid_and_is_recomputed() {
         assert!((cached - 0.0).abs() < 1e-12, "cached sf: {cached}");
 
         let mut conn = cm.clone();
-        assert_eq!(get_total(&mut conn, &kg, &k).await, Some(1));
-        assert_eq!(get_declined(&mut conn, &kg, &k).await, Some(0));
+        let total = get_total(&mut conn, &kg, &k).await;
+        assert_eq!(
+            total,
+            Some(1),
+            "expected total to be 1, instead got {total:?}"
+        );
+
+        let declined = get_declined(&mut conn, &kg, &k).await.unwrap_or(0);
+        assert_eq!(
+            declined, 0,
+            "expected declined to be 0, instead got {declined:?}"
+        );
     });
 }
 
