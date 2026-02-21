@@ -128,7 +128,7 @@ impl SuppressedRedisRateLimiter {
                     suppression_factor = 1 - (rate_limit / perceived_rate_limit)
                 end
 
-                redis.call("SET", suppression_factor_key, 1, "PX", suppression_factor_cache_ms)
+                redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
             end
 
 
@@ -315,7 +315,7 @@ impl SuppressedRedisRateLimiter {
                     suppression_factor = 1 - (rate_limit / perceived_rate_limit)
                 end
 
-                redis.call("SET", suppression_factor_key, 1, "PX", suppression_factor_cache_ms)
+                redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
             end
 
             return tostring(suppression_factor)

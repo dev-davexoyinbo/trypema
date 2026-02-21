@@ -2,11 +2,11 @@ use std::{env, time::Duration};
 
 use redis::AsyncCommands;
 
+use crate::common::SuppressionFactorCacheMs;
 use crate::{
     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
     RedisRateLimiterOptions, SuppressedRedisRateLimiter, WindowSizeSeconds, common::RateType,
 };
-use crate::common::SuppressionFactorCacheMs;
 
 fn redis_url() -> String {
     env::var("REDIS_URL")
@@ -219,7 +219,7 @@ fn hard_limit_factor_one_never_allows_when_suppression_factor_is_forced_to_one()
 }
 
 #[test]
-fn suppression_factor_gt_one_is_returned_and_never_allows() {
+fn suppression_factor_gt_one_is_invalid_and_is_recomputed() {
     let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -234,18 +234,22 @@ fn suppression_factor_gt_one_is_returned_and_never_allows() {
         let _: () = conn.set_ex(&sf_key, 2.0_f64, 60).await.unwrap();
 
         let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
-        assert!(matches!(
-            decision,
-            RateLimitDecision::Suppressed {
-                suppression_factor,
-                is_allowed: false
-            } if (suppression_factor - 2.0).abs() < 1e-12
-        ));
+
+        // Invalid cached suppression factors should be ignored and recomputed.
+        assert!(matches!(decision, RateLimitDecision::Allowed));
+
+        let cached: Option<f64> = conn.get(&sf_key).await.unwrap();
+        let cached = cached.expect("expected suppression factor to be cached");
+        assert!(
+            (0.0..=1.0).contains(&cached),
+            "cached sf in valid range: {cached}"
+        );
+        assert!((cached - 0.0).abs() < 1e-12, "cached sf: {cached}");
     });
 }
 
 #[test]
-fn negative_suppression_factor_returns_suppressed_and_allows() {
+fn suppression_factor_negative_is_invalid_and_is_recomputed() {
     let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -261,13 +265,15 @@ fn negative_suppression_factor_returns_suppressed_and_allows() {
         let _: () = conn.set_ex(&sf_key, -0.01_f64, 60).await.unwrap();
 
         let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
-        assert!(matches!(
-            decision,
-            RateLimitDecision::Suppressed {
-                suppression_factor,
-                is_allowed: true
-            } if (suppression_factor - (-0.01)).abs() < 1e-12
-        ));
+        assert!(matches!(decision, RateLimitDecision::Allowed));
+
+        let cached: Option<f64> = conn.get(&sf_key).await.unwrap();
+        let cached = cached.expect("expected suppression factor to be cached");
+        assert!(
+            (0.0..=1.0).contains(&cached),
+            "cached sf in valid range: {cached}"
+        );
+        assert!((cached - 0.0).abs() < 1e-12, "cached sf: {cached}");
 
         let mut conn = cm.clone();
         assert_eq!(get_total(&mut conn, &kg, &k).await, Some(1));
