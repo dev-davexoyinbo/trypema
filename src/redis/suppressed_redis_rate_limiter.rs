@@ -296,7 +296,7 @@ impl SuppressedRedisRateLimiter {
                     local total_in_last_second = 0
 
                     if #active_keys_in_1s > 0 then
-                        local values = redis.call("HMGET", active_keys, unpack(active_keys_in_1s))
+                        local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
                         for i = 1, #values do
                             local value = tonumber(cjson.decode(values[i]).count)
                             if value then
