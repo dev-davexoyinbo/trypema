@@ -202,6 +202,8 @@ impl SuppressedLocalRateLimiter {
 
         let should_allow = if suppression_factor == 0f64 {
             true
+        } else if suppression_factor == 1f64 {
+            false
         } else {
             random_bool(1f64 - suppression_factor)
         };
