@@ -177,7 +177,7 @@ impl SuppressedRedisRateLimiter {
                 local latest_hash_field_group_timestamp = tonumber(latest_hash_field_entry[2])
                 local latest_hash_field_age_ms = timestamp_ms - latest_hash_field_group_timestamp
 
-                if latest_hash_field_age_ms > 0 and latest_hash_field_age_ms < rate_group_size_ms then
+                if latest_hash_field_age_ms >= 0 and latest_hash_field_age_ms < rate_group_size_ms then
                     timestamp_ms = tonumber(latest_hash_field)
                 end
             end
