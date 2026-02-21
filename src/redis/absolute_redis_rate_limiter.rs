@@ -16,17 +16,13 @@ pub struct AbsoluteRedisRateLimiter {
 
 impl AbsoluteRedisRateLimiter {
     pub(crate) fn new(options: RedisRateLimiterOptions) -> Self {
-        Self::with_rate_type(RateType::Absolute, options)
-    }
-
-    pub(crate) fn with_rate_type(rate_type: RateType, options: RedisRateLimiterOptions) -> Self {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
         Self {
             connection_manager: options.connection_manager,
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
-            key_generator: RedisKeyGenerator::new(prefix, rate_type),
+            key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
         }
     } // end method with_rate_type
 

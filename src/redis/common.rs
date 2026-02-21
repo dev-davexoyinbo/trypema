@@ -1,6 +1,6 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::{common::RateType, TrypemaError};
+use crate::{TrypemaError, common::RateType};
 
 /// A validated newtype for Redis keys.
 ///
