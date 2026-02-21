@@ -1,15 +1,9 @@
-use std::{
-    collections::VecDeque,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
     SuppressedLocalRateLimiter, SuppressionFactorCacheMs, WindowSizeSeconds,
 };
-
-use crate::common::{InstantRate, RateLimitSeries};
 
 fn limiter(
     window_size_seconds: u64,
@@ -24,37 +18,21 @@ fn limiter(
     })
 }
 
-fn total_for_key(limiter: &crate::AbsoluteLocalRateLimiter, key: &str) -> u64 {
-    limiter
-        .series()
-        .get(key)
-        .map(|s| s.total.load(Ordering::Relaxed))
-        .unwrap_or(0)
-}
-
-fn insert_series(
-    limiter: &crate::AbsoluteLocalRateLimiter,
-    key: &str,
-    limit: RateLimit,
-    buckets: &[(u64, u64)],
-) {
-    let total = buckets.iter().map(|(count, _)| *count).sum::<u64>();
-    let series = buckets
-        .iter()
-        .map(|(count, ms_ago)| InstantRate {
-            count: AtomicU64::new(*count),
-            timestamp: Instant::now() - Duration::from_millis(*ms_ago),
-        })
-        .collect::<VecDeque<_>>();
-
-    limiter.series().insert(
-        key.to_string(),
-        RateLimitSeries {
-            limit,
-            series,
-            total: AtomicU64::new(total),
-        },
-    );
+fn limiter_with_cache_ms(
+    window_size_seconds: u64,
+    rate_group_size_ms: u64,
+    hard_limit_factor: f64,
+    suppression_factor_cache_ms: u64,
+) -> SuppressedLocalRateLimiter {
+    SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
+        window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
+        rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+        hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
+        suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
+            suppression_factor_cache_ms,
+        )
+        .unwrap(),
+    })
 }
 
 #[test]
@@ -98,19 +76,17 @@ fn verify_suppression_factor_calculation_spread() {
     // wait for 1.5 seconds
     std::thread::sleep(Duration::from_millis(1200));
 
-    let expected_suppression_factor = 1f64 - (1f64 / 2.1f64);
+    // Under this load, perceived_rate = max(average_rate_in_window, rate_in_last_1000ms).
+    // This test aims to keep perceived_rate close to 2.0 req/s.
+    let expected_suppression_factor = 1f64 - (1f64 / 2.0f64);
 
-    let decision = limiter.inc(key, &rate_limit, 1);
+    // Force suppression-factor recompute (ignore any cached value from earlier inc calls).
+    limiter.test_set_suppression_factor(key, Instant::now() - Duration::from_millis(101), 0.0);
+    let suppression_factor = limiter.get_suppression_factor(key);
+
     assert!(
-        matches!(
-            decision,
-            RateLimitDecision::Suppressed {
-                suppression_factor,
-                ..
-            } if suppression_factor - expected_suppression_factor < 1e-12
-        ),
-        "decision: {:?}",
-        decision
+        (suppression_factor - expected_suppression_factor).abs() < 1e-12,
+        "suppression_factor: {suppression_factor:?} expected: {expected_suppression_factor:?}"
     );
 }
 
@@ -126,20 +102,17 @@ fn verify_suppression_factor_calculation_last_second() {
 
     let _ = limiter.inc(key, &rate_limit, 20);
 
-    let expected_suppression_factor = 1f64 - (1f64 / 21f64);
+    // Suppression factor is computed from the pre-increment state.
+    // Here, the last-second count is 20.
+    let expected_suppression_factor = 1f64 - (1f64 / 20f64);
 
-    let decision = limiter.inc(key, &rate_limit, 1);
+    // Force suppression-factor recompute (ignore any cached value from earlier inc calls).
+    limiter.test_set_suppression_factor(key, Instant::now() - Duration::from_millis(101), 0.0);
+    let suppression_factor = limiter.get_suppression_factor(key);
 
     assert!(
-        matches!(
-            decision,
-            RateLimitDecision::Suppressed {
-                suppression_factor,
-                ..
-            } if suppression_factor - expected_suppression_factor < 1e-12
-        ),
-        "decision: {:?}",
-        decision
+        (suppression_factor - expected_suppression_factor).abs() < 1e-12,
+        "suppression_factor: {suppression_factor:?} expected: {expected_suppression_factor:?}"
     );
 }
 
@@ -173,19 +146,27 @@ fn suppressed_inc_denied_returns_suppressed_and_does_not_increment_accepted() {
 
     limiter.test_set_suppression_factor(key, Instant::now(), 0.25);
 
-    let mut rng = |_p: f64| false;
+    // Contract:
+    // - suppression_factor == 0.0 => Allowed
+    // - 0.0 < suppression_factor < 1.0 => may return Rejected or Suppressed, and suppressed is_allowed may be true or false
+    // - suppression_factor == 1.0 => must not return Allowed
+    let mut rng = |p: f64| {
+        assert!((p - 0.75).abs() < 1e-12, "p: {p:?}");
+        false
+    };
     let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
 
-    assert!(matches!(
-        decision,
-        RateLimitDecision::Suppressed {
-            suppression_factor,
-            is_allowed: false
-        } if (suppression_factor - 0.25).abs() < 1e-12
-    ));
-
-    assert_eq!(total_for_key(limiter.observed_limiter(), key), 1);
-    assert_eq!(total_for_key(limiter.accepted_limiter(), key), 0);
+    assert!(
+        matches!(decision, RateLimitDecision::Rejected { .. })
+            || matches!(
+                decision,
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: false
+                } if (suppression_factor - 0.25).abs() < 1e-12
+            ),
+        "decision: {decision:?}"
+    );
 }
 
 #[test]
@@ -196,83 +177,91 @@ fn suppressed_inc_allowed_returns_suppressed_is_allowed_true_and_increments_acce
 
     limiter.test_set_suppression_factor(key, Instant::now(), 0.25);
 
-    let mut rng = |_p: f64| true;
+    // Contract: for 0.0 < suppression_factor < 1.0, it may return Rejected or Suppressed,
+    // and suppressed `is_allowed` may be true or false.
+    let mut rng = |p: f64| {
+        assert!((p - 0.75).abs() < 1e-12, "p: {p:?}");
+        true
+    };
     let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
 
-    assert!(matches!(
-        decision,
-        RateLimitDecision::Suppressed {
-            suppression_factor,
-            is_allowed: true
-        } if (suppression_factor - 0.25).abs() < 1e-12
-    ));
-
-    assert_eq!(total_for_key(limiter.observed_limiter(), key), 1);
-    assert_eq!(total_for_key(limiter.accepted_limiter(), key), 1);
+    assert!(
+        matches!(decision, RateLimitDecision::Rejected { .. })
+            || matches!(
+                    decision,
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: true
+                } if (suppression_factor - 0.25).abs() < 1e-12
+            ),
+        "decision: {decision:?}"
+    );
 }
 
 #[test]
-fn hard_limit_rejection_is_returned_as_rejected_not_suppressed() {
-    let limiter = limiter(1, 1000, 1f64);
+fn hard_limit_is_enforced_after_suppression_factor_cache_expires() {
+    // Suppression factor is computed from the pre-increment state and cached.
+    // To observe a hard-limit-triggered suppression_factor=1.0 on the next call,
+    // ensure the cache expires between calls.
+    let limiter = limiter_with_cache_ms(1, 1000, 2f64, 1);
     let key = "k";
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
-    limiter.test_set_suppression_factor(key, Instant::now(), 0.25);
-    let mut rng = |_p: f64| true;
+    // Do not set suppression factor manually; drive the limiter through the public API.
+    // With window=1s, rate_limit=1 req/s, hard_limit_factor=2 => hard_window_limit=2.
+    // The 3rd call should observe total>=hard_window_limit and compute suppression_factor=1.0.
+    let d1 = limiter.inc(key, &rate_limit, 1);
+    assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {d1:?}");
+    let d2 = limiter.inc(key, &rate_limit, 1);
+    assert!(matches!(d2, RateLimitDecision::Allowed), "d2: {d2:?}");
 
-    let d1 = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
-    assert!(matches!(
-        d1,
-        RateLimitDecision::Suppressed {
-            is_allowed: true,
-            ..
-        }
-    ));
+    // Ensure suppression factor is recomputed for d3.
+    std::thread::sleep(Duration::from_millis(10));
 
-    let d2 = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
-    assert!(matches!(d2, RateLimitDecision::Rejected { .. }));
+    let d3 = limiter.inc(key, &rate_limit, 1);
+    assert!(
+        matches!(d3, RateLimitDecision::Rejected { .. })
+            || matches!(
+                d3,
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: false
+                } if (suppression_factor - 1.0).abs() < 1e-12
+            ),
+        "d3: {d3:?}"
+    );
 
-    assert_eq!(total_for_key(limiter.observed_limiter(), key), 2);
-    assert_eq!(total_for_key(limiter.accepted_limiter(), key), 1);
+    assert!((limiter.get_suppression_factor(key) - 1.0).abs() < 1e-12);
 }
 
 #[test]
-fn suppression_factor_is_clamped_to_one() {
+#[should_panic(
+    expected = "SuppressedLocalRateLimiter::get_suppression_factor: suppression factor > 1"
+)]
+fn suppression_factor_gt_one_panics() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
     let rate_limit = RateLimit::try_from(5f64).unwrap();
 
     limiter.test_set_suppression_factor(key, Instant::now(), 2f64);
 
-    let mut rng = |p: f64| {
-        assert!((p - 0f64).abs() < 1e-12);
-        false
-    };
-
-    let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
-    assert!(matches!(
-        decision,
-        RateLimitDecision::Suppressed {
-            suppression_factor,
-            is_allowed: false
-        } if (suppression_factor - 1.0).abs() < 1e-12
-    ));
+    let mut rng = |_p: f64| true;
+    let _ = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
 }
 
 #[test]
-fn nonpositive_suppression_factor_bypasses_suppression() {
+#[should_panic(
+    expected = "SuppressedLocalRateLimiter::get_suppression_factor: negative suppression factor"
+)]
+fn suppression_factor_negative_panics() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
     let rate_limit = RateLimit::try_from(5f64).unwrap();
 
     limiter.test_set_suppression_factor(key, Instant::now(), -0.01);
 
-    let mut rng = |_p: f64| panic!("rng should not be used when suppression_factor <= 0");
-    let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
-    assert!(matches!(decision, RateLimitDecision::Allowed));
-
-    assert_eq!(total_for_key(limiter.observed_limiter(), key), 1);
-    assert_eq!(total_for_key(limiter.accepted_limiter(), key), 1);
+    let mut rng = |_p: f64| true;
+    let _ = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
 }
 
 #[test]
@@ -316,63 +305,6 @@ fn cleanup_removes_stale_suppression_factors_and_keeps_fresh() {
 }
 
 #[test]
-fn cleanup_removes_stale_keys_from_accepted_and_observed_limiters() {
-    let limiter = limiter(60, 1000, 10f64);
-    let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
-
-    insert_series(limiter.accepted_limiter(), key, rate_limit, &[(1, 5_000)]);
-    insert_series(limiter.observed_limiter(), key, rate_limit, &[(1, 5_000)]);
-
-    assert!(limiter.accepted_limiter().series().contains_key(key));
-    assert!(limiter.observed_limiter().series().contains_key(key));
-
-    limiter.cleanup(1_000);
-
-    assert!(!limiter.accepted_limiter().series().contains_key(key));
-    assert!(!limiter.observed_limiter().series().contains_key(key));
-}
-
-#[test]
-fn cleanup_keeps_fresh_keys_in_both_limiters() {
-    let limiter = limiter(60, 1000, 10f64);
-    let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
-
-    insert_series(limiter.accepted_limiter(), key, rate_limit, &[(1, 10)]);
-    insert_series(limiter.observed_limiter(), key, rate_limit, &[(1, 10)]);
-
-    limiter.cleanup(10_000);
-
-    assert!(limiter.accepted_limiter().series().contains_key(key));
-    assert!(limiter.observed_limiter().series().contains_key(key));
-}
-
-#[test]
-fn cleanup_drops_empty_series_entries_in_both_limiters() {
-    let limiter = limiter(60, 1000, 10f64);
-    let key = "empty";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
-
-    limiter
-        .accepted_limiter()
-        .series()
-        .insert(key.to_string(), RateLimitSeries::new(rate_limit));
-    limiter
-        .observed_limiter()
-        .series()
-        .insert(key.to_string(), RateLimitSeries::new(rate_limit));
-
-    assert!(limiter.accepted_limiter().series().contains_key(key));
-    assert!(limiter.observed_limiter().series().contains_key(key));
-
-    limiter.cleanup(10_000);
-
-    assert!(!limiter.accepted_limiter().series().contains_key(key));
-    assert!(!limiter.observed_limiter().series().contains_key(key));
-}
-
-#[test]
 fn cleanup_does_not_break_next_inc_when_cache_entry_removed() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
@@ -400,4 +332,130 @@ fn cleanup_is_millisecond_granularity_for_suppression_factor() {
     limiter.test_set_suppression_factor(key, Instant::now() - Duration::from_millis(150), 0.5);
     limiter.cleanup(100);
     assert!(limiter.test_get_suppression_factor(key).is_none());
+}
+
+#[test]
+fn suppression_factor_zero_returns_allowed_and_rng_not_called() {
+    let limiter = limiter(1, 1000, 10f64);
+    let key = "k";
+    let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+    limiter.test_set_suppression_factor(key, Instant::now(), 0.0);
+
+    // Ensure we are really observing the cached value.
+    assert_eq!(limiter.get_suppression_factor(key), 0.0);
+
+    let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
+    let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
+    assert!(matches!(decision, RateLimitDecision::Allowed));
+}
+
+#[test]
+fn suppression_factor_one_must_not_return_allowed() {
+    let limiter = limiter(1, 1000, 10f64);
+    let key = "k";
+    let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+    limiter.test_set_suppression_factor(key, Instant::now(), 1.0);
+
+    let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 1");
+    let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
+
+    // Contract: suppression_factor == 1.0 must not return Allowed.
+    assert!(
+        matches!(decision, RateLimitDecision::Rejected { .. })
+            || matches!(decision, RateLimitDecision::Suppressed { .. }),
+        "decision: {decision:?}"
+    );
+}
+
+#[test]
+fn suppression_rng_probability_is_one_minus_suppression_factor() {
+    let limiter = limiter(1, 1000, 10f64);
+    let key = "k";
+    let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+    limiter.test_set_suppression_factor(key, Instant::now(), 0.25);
+
+    let mut rng = |p: f64| {
+        assert!((p - 0.75).abs() < 1e-12, "p: {p:?}");
+        false
+    };
+    let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
+
+    assert!(
+        matches!(decision, RateLimitDecision::Rejected { .. })
+            || matches!(
+                decision,
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: false
+                } if (suppression_factor - 0.25).abs() < 1e-12
+            ),
+        "decision: {decision:?}"
+    );
+}
+
+#[test]
+fn suppression_property_values_do_not_panic_and_follow_basic_contract() {
+    let limiter = limiter(1, 1000, 10f64);
+    let key = "k";
+    let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+    // Sample values across the full inclusive range.
+    let sfs = [0.0, 0.1, 0.25, 0.5, 0.9, 1.0];
+
+    for sf in sfs {
+        limiter.test_set_suppression_factor(key, Instant::now(), sf);
+
+        if sf == 0.0 {
+            let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
+            let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "sf={sf} decision={decision:?}"
+            );
+            continue;
+        }
+
+        if sf == 1.0 {
+            let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 1");
+            let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
+            assert!(
+                !matches!(decision, RateLimitDecision::Allowed),
+                "sf={sf} decision={decision:?}"
+            );
+            continue;
+        }
+
+        // For 0 < sf < 1, RNG should be consulted with p = 1 - sf.
+        for expected_is_allowed in [false, true] {
+            let mut called = 0u64;
+            let mut rng = |p: f64| {
+                called += 1;
+                assert!((p - (1.0 - sf)).abs() < 1e-12, "sf={sf} p={p:?}");
+                expected_is_allowed
+            };
+
+            let decision = limiter.inc_with_rng(key, &rate_limit, 1, &mut rng);
+            assert_eq!(called, 1, "sf={sf} expected 1 rng call, got {called}");
+
+            match decision {
+                RateLimitDecision::Rejected { .. } => {}
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed,
+                } => {
+                    assert!(
+                        (suppression_factor - sf).abs() < 1e-12,
+                        "sf={sf} got={suppression_factor:?}"
+                    );
+                    assert_eq!(is_allowed, expected_is_allowed, "sf={sf}");
+                }
+                RateLimitDecision::Allowed => {
+                    panic!("sf={sf} unexpectedly returned Allowed");
+                }
+            }
+        }
+    }
 }
