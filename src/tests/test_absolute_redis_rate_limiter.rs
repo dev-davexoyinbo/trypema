@@ -2,11 +2,11 @@ use std::{env, thread, time::Duration};
 
 use redis::AsyncCommands;
 
+use crate::common::SuppressionFactorCacheMs;
 use crate::{
     AbsoluteRedisRateLimiter, RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey,
     RedisKeyGenerator, RedisRateLimiterOptions, WindowSizeSeconds, common::RateType,
 };
-use crate::common::SuppressionFactorCacheMs;
 
 fn redis_url() -> String {
     env::var("REDIS_URL")
@@ -38,10 +38,7 @@ async fn absolute_keys_exist(
     (h_exists, a_exists, w_exists, t_exists)
 }
 
-async fn sum_hash_counts(
-    conn: &mut redis::aio::ConnectionManager,
-    hash_key: String,
-) -> u64 {
+async fn sum_hash_counts(conn: &mut redis::aio::ConnectionManager, hash_key: String) -> u64 {
     let values: Vec<String> = conn.hvals(hash_key).await.unwrap();
     values
         .into_iter()
@@ -607,19 +604,28 @@ fn cleanup_deletes_state_and_index_for_stale_entities() {
         limiter.cleanup(1000).await.unwrap();
 
         let (a_h, a_ak, a_w, a_t) = absolute_keys_exist(&mut conn, &kg, &a).await;
-        assert!(!a_h && !a_ak && !a_w && !a_t, "expected all keys for a deleted");
+        assert!(
+            !a_h && !a_ak && !a_w && !a_t,
+            "expected all keys for a deleted"
+        );
 
         let a_sf: bool = conn.exists(&sf_a).await.unwrap();
         assert!(!a_sf, "expected suppression-factor key for a deleted");
 
         let (b_h, b_ak, b_w, b_t) = absolute_keys_exist(&mut conn, &kg, &b).await;
-        assert!(!b_h && !b_ak && !b_w && !b_t, "expected all keys for b deleted");
+        assert!(
+            !b_h && !b_ak && !b_w && !b_t,
+            "expected all keys for b deleted"
+        );
 
         let b_sf: bool = conn.exists(&sf_b).await.unwrap();
         assert!(!b_sf, "expected suppression-factor key for b deleted");
 
         let (c_h, c_ak, c_w, c_t) = absolute_keys_exist(&mut conn, &kg, &c).await;
-        assert!(c_h && c_ak && c_w && c_t, "expected all keys for c retained");
+        assert!(
+            c_h && c_ak && c_w && c_t,
+            "expected all keys for c retained"
+        );
 
         let c_sf: bool = conn.exists(&sf_c).await.unwrap();
         assert!(c_sf, "expected suppression-factor key for c retained");
@@ -739,14 +745,23 @@ fn cleanup_is_prefix_scoped() {
         limiter1.cleanup(1000).await.unwrap();
 
         let (k1_h, k1_ak, k1_w, k1_t) = absolute_keys_exist(&mut conn1, &kg1, &k1).await;
-        assert!(!k1_h && !k1_ak && !k1_w && !k1_t, "expected prefix1 keys deleted");
+        assert!(
+            !k1_h && !k1_ak && !k1_w && !k1_t,
+            "expected prefix1 keys deleted"
+        );
         let k1_score: Option<f64> = conn1.zscore(&ae1, &*k1).await.unwrap();
         assert!(k1_score.is_none(), "expected prefix1 index entry removed");
 
         let mut conn2 = cm2.clone();
         let (k2_h, k2_ak, k2_w, k2_t) = absolute_keys_exist(&mut conn2, &kg2, &k2).await;
-        assert!(k2_h && k2_ak && k2_w && k2_t, "expected prefix2 keys retained");
-        let k2_score: Option<f64> = conn2.zscore(kg2.get_active_entities_key(), &*k2).await.unwrap();
+        assert!(
+            k2_h && k2_ak && k2_w && k2_t,
+            "expected prefix2 keys retained"
+        );
+        let k2_score: Option<f64> = conn2
+            .zscore(kg2.get_active_entities_key(), &*k2)
+            .await
+            .unwrap();
         assert!(k2_score.is_some(), "expected prefix2 index entry retained");
     });
 }

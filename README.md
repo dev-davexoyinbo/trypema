@@ -353,7 +353,14 @@ let decision = RateLimitDecision::Suppressed {
 - `suppression_factor`: Calculated suppression rate (0.0 = no suppression, 1.0 = full suppression)
 - `is_allowed`: Whether this specific call was admitted (**use this as the admission signal**)
 
-When `is_allowed: false`, the increment was **not** recorded in the accepted series.
+When `is_allowed: false`, the call was not admitted.
+
+In both providers, the suppressed strategy tracks:
+
+- `observed`: total calls seen for the key (always incremented)
+- `declined`: calls denied by suppression (`is_allowed: false`)
+
+From these, you can derive accepted usage as: `accepted = observed - declined`.
 
 ## Rate Limiting Strategies
 
@@ -390,14 +397,14 @@ A probabilistic strategy that gracefully degrades under load by suppressing a po
 
 **Behavior:**
 
-1. **Below capacity** (`accepted_usage < window_capacity`):
+1. **Below capacity** (`observed_usage < window_capacity`):
    - Suppression is bypassed, calls return `Allowed`
-2. **At or above capacity:**
+2. **At or above capacity (but below hard limit):**
    - Suppression activates probabilistically based on current rate
    - Returns `Suppressed { is_allowed: true/false }` to indicate suppression state
-3. **Above hard limit** (`rate >= rate_limit × hard_limit_factor`):
+3. **At/above hard limit** (`observed_usage >= window_capacity × hard_limit_factor`):
    - Local provider: returns `Suppressed { is_allowed: false, suppression_factor: 1.0 }`
-   - Redis provider: returns `Rejected` (hard rejection)
+   - Redis provider: returns `Suppressed { is_allowed: false, suppression_factor: 1.0 }`
 
 **Suppression calculation:**
 
