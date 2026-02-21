@@ -76,20 +76,24 @@ impl SuppressedRedisRateLimiter {
                 local remove_sum = 0
                 local decline_sum = 0
 
+
                 for i = 1, #to_remove do
                     local value = cjson.decode(to_remove[i])
-                    local sum_count = tonumber(value.count)
-                    local sum_declined = tonumber(value.declined)
 
-                    if sum_count then
-                        remove_sum = remove_sum + sum_count
-                    end
+                    if value ~= nil then
+                        local sum_count = tonumber(value.count)
+                        local sum_declined = tonumber(value.declined)
 
-                    if sum_declined then
-                        decline_sum = decline_sum + sum_declined
+
+                        if sum_count then
+                            remove_sum = remove_sum + sum_count
+                        end
+
+                        if sum_declined then
+                            decline_sum = decline_sum + sum_declined
+                        end
                     end
                 end
-
 
                 local count_delta = math.floor(remove_sum) == 0 and 0 or -1 * math.floor(remove_sum)
                 local declined_delta = math.floor(decline_sum) == 0 and 0 or -1 * math.floor(decline_sum)
@@ -116,10 +120,12 @@ impl SuppressedRedisRateLimiter {
                     if #active_keys_in_1s > 0 then
                         local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
                         for i = 1, #values do
-                            local value = tonumber(cjson.decode(values[i]).count)
-
-                            if value then
-                                total_in_last_second = total_in_last_second + value
+                            local value = cjson.decode(values[i])
+                            if value ~= nil then
+                                local count_inc = tonumber(value.count)
+                                if count_inc then
+                                    total_in_last_second = total_in_last_second + count_inc
+                                end
                             end
                         end
                     end
@@ -269,16 +275,19 @@ impl SuppressedRedisRateLimiter {
 
                 for i = 1, #to_remove do
                     local value = cjson.decode(to_remove[i])
-                    local sum_count = tonumber(value.count)
-                    local sum_declined = tonumber(value.declined)
+
+                    if value ~= nil then
+                        local sum_count = tonumber(value.count)
+                        local sum_declined = tonumber(value.declined)
 
 
-                    if sum_count then
-                        remove_sum = remove_sum + sum_count
-                    end
+                        if sum_count then
+                            remove_sum = remove_sum + sum_count
+                        end
 
-                    if sum_declined then
-                        decline_sum = decline_sum + sum_declined
+                        if sum_declined then
+                            decline_sum = decline_sum + sum_declined
+                        end
                     end
                 end
 
@@ -309,9 +318,12 @@ impl SuppressedRedisRateLimiter {
                     if #active_keys_in_1s > 0 then
                         local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
                         for i = 1, #values do
-                            local value = tonumber(cjson.decode(values[i]).count)
-                            if value then
-                                total_in_last_second = total_in_last_second + value
+                            local value = cjson.decode(values[i])
+                            if value ~= nil then
+                                local count_inc = tonumber(value.count)
+                                if count_inc then
+                                    total_in_last_second = total_in_last_second + count_inc
+                                end
                             end
                         end
                     end
