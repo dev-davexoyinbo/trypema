@@ -245,7 +245,7 @@ impl SuppressedRedisRateLimiter {
                 is_allowed: should_allow == 1,
             }),
             _ => Err(TrypemaError::UnexpectedRedisScriptResult {
-                operation: "absolute.inc",
+                operation: "suppressed.inc",
                 key: key.to_string(),
                 result,
             }),
