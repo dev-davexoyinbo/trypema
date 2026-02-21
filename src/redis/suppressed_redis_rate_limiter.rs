@@ -95,7 +95,7 @@ impl SuppressedRedisRateLimiter {
 
             local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
 
-            local suppression_factor = tonumber(redis.call("GET", suppressed_factor_key))
+            local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
             if suppression_factor == nil then
                 if total_count >= window_limit then
@@ -128,7 +128,7 @@ impl SuppressedRedisRateLimiter {
                     suppression_factor = 1 - (rate_limit / perceived_rate_limit)
                 end
 
-                redis.call("SET", suppressed_factor_key, 1, "PX", suppression_factor_cache_ms)
+                redis.call("SET", suppression_factor_key, 1, "PX", suppression_factor_cache_ms)
             end
 
 
@@ -156,7 +156,7 @@ impl SuppressedRedisRateLimiter {
             local hash_field = tostring(timestamp_ms)
 
             local raw_prev = redis.call("HGET", hash_key, hash_field)
-            local prev_value = raw and cjson.decode(raw_prev) or {count = 0, declined = 0}
+            local prev_value = raw_prev and cjson.decode(raw_prev) or {count = 0, declined = 0}
 
             local new_count = tonumber(prev_value.count) + count
             local new_declined = tonumber(prev_value.declined)
@@ -279,7 +279,7 @@ impl SuppressedRedisRateLimiter {
 
             local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
 
-            local suppression_factor = tonumber(redis.call("GET", suppressed_factor_key))
+            local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
             if suppression_factor == nil then
                 local window_limit = tonumber(redis.call("GET", window_limit_key)) 
@@ -315,7 +315,7 @@ impl SuppressedRedisRateLimiter {
                     suppression_factor = 1 - (rate_limit / perceived_rate_limit)
                 end
 
-                redis.call("SET", suppressed_factor_key, 1, "PX", suppression_factor_cache_ms)
+                redis.call("SET", suppression_factor_key, 1, "PX", suppression_factor_cache_ms)
             end
 
             return tostring(suppression_factor)

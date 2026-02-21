@@ -3,9 +3,8 @@ use std::{env, time::Duration};
 use redis::AsyncCommands;
 
 use crate::{
-    AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RedisKey, RedisKeyGenerator, RedisRateLimiterOptions, SuppressedRedisRateLimiter,
-    WindowSizeSeconds, common::RateType,
+    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
+    RedisRateLimiterOptions, SuppressedRedisRateLimiter, WindowSizeSeconds, common::RateType,
 };
 use crate::common::SuppressionFactorCacheMs;
 
@@ -48,7 +47,19 @@ async fn get_total(
     kg: &RedisKeyGenerator,
     key: &RedisKey,
 ) -> Option<u64> {
-    conn.get(kg.get_total_count_key(key)).await.unwrap()
+    conn.hget(kg.get_total_count_key(key), "count")
+        .await
+        .unwrap()
+}
+
+async fn get_declined(
+    conn: &mut redis::aio::ConnectionManager,
+    kg: &RedisKeyGenerator,
+    key: &RedisKey,
+) -> Option<u64> {
+    conn.hget(kg.get_total_count_key(key), "declined")
+        .await
+        .unwrap()
 }
 
 async fn set_zset_score_ms_ago(
@@ -107,7 +118,7 @@ async fn build_limiter(
 }
 
 #[test]
-fn denied_path_returns_suppressed_and_does_not_increment_accepted() {
+fn suppression_factor_one_returns_suppressed_denied_and_increments_declined() {
     let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -116,36 +127,31 @@ fn denied_path_returns_suppressed_and_does_not_increment_accepted() {
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
 
-        let kg_observed = keygen(&prefix, RateType::SuppressedObserved);
-        let kg_accepted = keygen(&prefix, RateType::Suppressed);
+        let kg = keygen(&prefix, RateType::Suppressed);
 
         // Force suppression factor and deny.
         let mut conn = cm.clone();
-        let sf_key = kg_observed.get_suppression_factor_key(&k);
-        let _: () = conn.set_ex(&sf_key, 0.25_f64, 60).await.unwrap();
+        let sf_key = kg.get_suppression_factor_key(&k);
+        let _: () = conn.set_ex(&sf_key, 1.0_f64, 60).await.unwrap();
 
-        let mut rng = |_p: f64| false;
-        let decision = limiter
-            .inc_with_rng(&k, &rate_limit, 1, &mut rng)
-            .await
-            .unwrap();
+        let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
         assert!(matches!(
             decision,
             RateLimitDecision::Suppressed {
                 suppression_factor,
                 is_allowed: false
-            } if (suppression_factor - 0.25).abs() < 1e-12
+            } if (suppression_factor - 1.0).abs() < 1e-12
         ));
 
         let mut conn = cm.clone();
-        assert_eq!(get_total(&mut conn, &kg_observed, &k).await, Some(1));
-        assert_eq!(get_total(&mut conn, &kg_accepted, &k).await, None);
+        assert_eq!(get_total(&mut conn, &kg, &k).await, Some(1));
+        assert_eq!(get_declined(&mut conn, &kg, &k).await, Some(1));
     });
 }
 
 #[test]
-fn allowed_path_returns_suppressed_and_increments_both() {
+fn suppression_factor_zero_bypasses_suppression_and_declined_not_incremented() {
     let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -154,38 +160,24 @@ fn allowed_path_returns_suppressed_and_increments_both() {
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
 
-        let kg_observed = keygen(&prefix, RateType::SuppressedObserved);
-        let kg_accepted = keygen(&prefix, RateType::Suppressed);
+        let kg = keygen(&prefix, RateType::Suppressed);
 
         let mut conn = cm.clone();
-        let sf_key = kg_observed.get_suppression_factor_key(&k);
-        let _: () = conn.set_ex(&sf_key, 0.25_f64, 60).await.unwrap();
+        let sf_key = kg.get_suppression_factor_key(&k);
+        let _: () = conn.set_ex(&sf_key, 0.0_f64, 60).await.unwrap();
 
-        let mut rng = |_p: f64| true;
-        let decision = limiter
-            .inc_with_rng(&k, &rate_limit, 1, &mut rng)
-            .await
-            .unwrap();
+        let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
-        assert!(
-            matches!(
-                decision,
-                RateLimitDecision::Suppressed {
-                    suppression_factor,
-                    ..
-                } if (suppression_factor - 0.25).abs() < 1e-12
-            ),
-            "expected suppression factor to be 0.25 instead got {decision:?}"
-        );
+        assert!(matches!(decision, RateLimitDecision::Allowed));
 
         let mut conn = cm.clone();
-        assert_eq!(get_total(&mut conn, &kg_observed, &k).await, Some(1));
-        assert_eq!(get_total(&mut conn, &kg_accepted, &k).await, Some(1));
+        assert_eq!(get_total(&mut conn, &kg, &k).await, Some(1));
+        assert_eq!(get_declined(&mut conn, &kg, &k).await, Some(0));
     });
 }
 
 #[test]
-fn hard_limit_rejection_is_returned_as_rejected() {
+fn hard_limit_factor_one_never_allows_when_suppression_factor_is_forced_to_one() {
     let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -195,41 +187,39 @@ fn hard_limit_rejection_is_returned_as_rejected() {
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
 
-        let kg_observed = keygen(&prefix, RateType::SuppressedObserved);
-        let kg_accepted = keygen(&prefix, RateType::Suppressed);
+        let kg = keygen(&prefix, RateType::Suppressed);
 
         let mut conn = cm.clone();
-        let sf_key = kg_observed.get_suppression_factor_key(&k);
-        let _: () = conn.set_ex(&sf_key, 0.25_f64, 60).await.unwrap();
+        let sf_key = kg.get_suppression_factor_key(&k);
+        let _: () = conn.set_ex(&sf_key, 1.0_f64, 60).await.unwrap();
 
-        let mut rng = |_p: f64| true;
-
-        let d1 = limiter
-            .inc_with_rng(&k, &rate_limit, 1, &mut rng)
-            .await
-            .unwrap();
+        // Force suppression to 100% so we get deterministic non-admission.
+        let d1 = limiter.inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(
             d1,
             RateLimitDecision::Suppressed {
-                is_allowed: true,
-                ..
-            }
+                is_allowed: false,
+                suppression_factor,
+            } if (suppression_factor - 1.0).abs() < 1e-12
         ));
 
-        let d2 = limiter
-            .inc_with_rng(&k, &rate_limit, 1, &mut rng)
-            .await
-            .unwrap();
-        assert!(matches!(d2, RateLimitDecision::Rejected { .. }));
+        let d2 = limiter.inc(&k, &rate_limit, 1).await.unwrap();
+        assert!(matches!(
+            d2,
+            RateLimitDecision::Suppressed {
+                is_allowed: false,
+                suppression_factor,
+            } if (suppression_factor - 1.0).abs() < 1e-12
+        ));
 
         let mut conn = cm.clone();
-        assert_eq!(get_total(&mut conn, &kg_observed, &k).await, Some(2));
-        assert_eq!(get_total(&mut conn, &kg_accepted, &k).await, Some(1));
+        assert_eq!(get_total(&mut conn, &kg, &k).await, Some(2));
+        assert_eq!(get_declined(&mut conn, &kg, &k).await, Some(2));
     });
 }
 
 #[test]
-fn suppression_factor_is_clamped_to_one() {
+fn suppression_factor_gt_one_is_returned_and_never_allows() {
     let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -238,32 +228,24 @@ fn suppression_factor_is_clamped_to_one() {
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
 
-        let kg_observed = keygen(&prefix, RateType::SuppressedObserved);
+        let kg = keygen(&prefix, RateType::Suppressed);
         let mut conn = cm.clone();
-        let sf_key = kg_observed.get_suppression_factor_key(&k);
+        let sf_key = kg.get_suppression_factor_key(&k);
         let _: () = conn.set_ex(&sf_key, 2.0_f64, 60).await.unwrap();
 
-        let mut rng = |p: f64| {
-            assert!((p - 0.0).abs() < 1e-12);
-            false
-        };
-
-        let decision = limiter
-            .inc_with_rng(&k, &rate_limit, 1, &mut rng)
-            .await
-            .unwrap();
+        let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(
             decision,
             RateLimitDecision::Suppressed {
                 suppression_factor,
                 is_allowed: false
-            } if (suppression_factor - 1.0).abs() < 1e-12
+            } if (suppression_factor - 2.0).abs() < 1e-12
         ));
     });
 }
 
 #[test]
-fn nonpositive_suppression_factor_bypasses_suppression_rng_not_called() {
+fn negative_suppression_factor_returns_suppressed_and_allows() {
     let url = redis_url();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -272,23 +254,24 @@ fn nonpositive_suppression_factor_bypasses_suppression_rng_not_called() {
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
 
-        let kg_observed = keygen(&prefix, RateType::SuppressedObserved);
-        let kg_accepted = keygen(&prefix, RateType::Suppressed);
+        let kg = keygen(&prefix, RateType::Suppressed);
 
         let mut conn = cm.clone();
-        let sf_key = kg_observed.get_suppression_factor_key(&k);
+        let sf_key = kg.get_suppression_factor_key(&k);
         let _: () = conn.set_ex(&sf_key, -0.01_f64, 60).await.unwrap();
 
-        let mut rng = |_p: f64| panic!("rng should not be called when suppression_factor <= 0");
-        let decision = limiter
-            .inc_with_rng(&k, &rate_limit, 1, &mut rng)
-            .await
-            .unwrap();
-        assert!(matches!(decision, RateLimitDecision::Allowed));
+        let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
+        assert!(matches!(
+            decision,
+            RateLimitDecision::Suppressed {
+                suppression_factor,
+                is_allowed: true
+            } if (suppression_factor - (-0.01)).abs() < 1e-12
+        ));
 
         let mut conn = cm.clone();
-        assert_eq!(get_total(&mut conn, &kg_observed, &k).await, Some(1));
-        assert_eq!(get_total(&mut conn, &kg_accepted, &k).await, Some(1));
+        assert_eq!(get_total(&mut conn, &kg, &k).await, Some(1));
+        assert_eq!(get_declined(&mut conn, &kg, &k).await, Some(0));
     });
 }
 
@@ -303,24 +286,20 @@ fn suppression_factor_cache_is_written_and_has_positive_ttl() {
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
 
-        let kg_observed = keygen(&prefix, RateType::SuppressedObserved);
+        let kg = keygen(&prefix, RateType::Suppressed);
         let mut conn = cm.clone();
-        let sf_key = kg_observed.get_suppression_factor_key(&k);
+        let sf_key = kg.get_suppression_factor_key(&k);
         let _: u64 = conn.del(&sf_key).await.unwrap();
 
-        // With no accepted usage, suppression_factor should resolve to 0 and bypass suppression.
-        let mut rng = |_p: f64| panic!("rng should not be used when suppression_factor <= 0");
-        let decision = limiter
-            .inc_with_rng(&k, &rate_limit, 1, &mut rng)
-            .await
-            .unwrap();
+        // With no usage, suppression_factor should resolve to 0 and bypass suppression.
+        let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
 
         let pttl: i64 = conn.pttl(&sf_key).await.unwrap();
         assert!(pttl > 0, "expected sf key to have positive TTL");
         assert!(
-            pttl <= rate_group_size_ms as i64 + 50,
-            "expected sf TTL <= rate_group_size_ms (+small slack), got {pttl}"
+            pttl <= *SuppressionFactorCacheMs::default() as i64 + 100,
+            "expected sf TTL <= suppression_factor_cache_ms (+slack), got {pttl}"
         );
     });
 }
@@ -336,26 +315,14 @@ fn suppression_factor_recompute_does_not_error_when_no_recent_activity_in_last_1
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
 
-        // Seed accepted usage to capacity using the accepted limiter directly.
-        let accepted = AbsoluteRedisRateLimiter::with_rate_type(
-            RateType::Suppressed,
-            RedisRateLimiterOptions {
-                connection_manager: cm.clone(),
-                prefix: Some(prefix.clone()),
-                window_size_seconds: WindowSizeSeconds::try_from(10).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(50).unwrap(),
-                hard_limit_factor: HardLimitFactor::try_from(10f64).unwrap(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-            },
-        );
-        accepted.inc(&k, &rate_limit, 10).await.unwrap();
+        // Seed usage in the suppressed limiter keyspace.
+        limiter.inc(&k, &rate_limit, 10).await.unwrap();
 
-        let kg_accepted = keygen(&prefix, RateType::Suppressed);
-        let kg_observed = keygen(&prefix, RateType::SuppressedObserved);
+        let kg = keygen(&prefix, RateType::Suppressed);
 
         // Force all accepted activity to be older than 1s.
         let mut conn = cm.clone();
-        let ak_key = kg_accepted.get_active_keys(&k);
+        let ak_key = kg.get_active_keys(&k);
         let members: Vec<String> = conn.zrange(&ak_key, 0, -1).await.unwrap();
         for m in members {
             // Make each member score older than 1s but within window.
@@ -379,11 +346,10 @@ fn suppression_factor_recompute_does_not_error_when_no_recent_activity_in_last_1
         }
 
         // Force suppression-factor recompute.
-        let sf_key = kg_observed.get_suppression_factor_key(&k);
+        let sf_key = kg.get_suppression_factor_key(&k);
         let _: u64 = conn.del(&sf_key).await.unwrap();
 
-        let mut rng = |_p: f64| true;
-        let res = limiter.inc_with_rng(&k, &rate_limit, 1, &mut rng).await;
+        let res = limiter.inc(&k, &rate_limit, 1).await;
         assert!(res.is_ok(), "expected recompute to not error, instead got {res:?}");
     });
 }
@@ -399,43 +365,25 @@ fn cleanup_removes_stale_entities_for_both_keyspaces_including_sf() {
         let rate_limit = RateLimit::try_from(1000f64).unwrap();
 
         // Create some state.
-        let mut rng = |_p: f64| true;
-        let _ = limiter
-            .inc_with_rng(&k, &rate_limit, 1, &mut rng)
-            .await
-            .unwrap();
+        let _ = limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
-        let kg_accepted = keygen(&prefix, RateType::Suppressed);
-        let kg_observed = keygen(&prefix, RateType::SuppressedObserved);
+        let kg = keygen(&prefix, RateType::Suppressed);
 
         // Ensure sf exists so we can assert it is deleted.
         let mut conn = cm.clone();
-        let sf_key = kg_observed.get_suppression_factor_key(&k);
+        let sf_key = kg.get_suppression_factor_key(&k);
         let _: () = conn.set_ex(&sf_key, 0.5_f64, 60).await.unwrap();
         let sf_exists_before: bool = conn.exists(&sf_key).await.unwrap();
         assert!(sf_exists_before, "expected sf to exist before cleanup");
 
         // Force staleness in the shared active_entities index.
-        let ae_key = kg_accepted.get_active_entities_key();
+        let ae_key = kg.get_active_entities_key();
         set_zset_score_ms_ago(&mut conn, &ae_key, &k, 1050).await;
 
         limiter.cleanup(1000).await.unwrap();
 
-        // Accepted keys should be deleted.
-        let (a_h, a_ak, a_w, a_t, a_sf) = suppressed_keys_exist(&mut conn, &kg_accepted, &k).await;
-        assert!(
-            !a_h && !a_ak && !a_w && !a_t,
-            "expected accepted keyspace deleted"
-        );
-        // Accepted keyspace should not have sf key, but assert false anyway.
-        assert!(!a_sf);
-
-        // Observed keys should be deleted, including sf.
-        let (o_h, o_ak, o_w, o_t, o_sf) = suppressed_keys_exist(&mut conn, &kg_observed, &k).await;
-        assert!(
-            !o_h && !o_ak && !o_w && !o_t && !o_sf,
-            "expected observed keyspace (including sf) deleted"
-        );
+        let (h, ak, w, t, sf) = suppressed_keys_exist(&mut conn, &kg, &k).await;
+        assert!(!h && !ak && !w && !t && !sf, "expected keyspace deleted");
     });
 }
 
@@ -470,7 +418,7 @@ fn verify_suppression_factor_calculation_spread_redis() {
                 RateLimitDecision::Suppressed {
                     suppression_factor,
                     ..
-                } if suppression_factor - expected_suppression_factor < 1e-12
+                } if (suppression_factor - expected_suppression_factor).abs() < 1e-12
             ),
             "decision: {:?}",
             decision
@@ -504,7 +452,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
                 RateLimitDecision::Suppressed {
                     suppression_factor,
                     ..
-                } if suppression_factor - expected_suppression_factor < 1e-12
+                } if (suppression_factor - expected_suppression_factor).abs() < 1e-12
             ),
             "decision: {:?}",
             decision

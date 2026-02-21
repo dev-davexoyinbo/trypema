@@ -465,8 +465,6 @@ pub(crate) enum RateType {
     Absolute,
     #[strum(to_string = "suppressed")]
     Suppressed,
-    #[strum(to_string = "suppressed_observed")]
-    SuppressedObserved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]

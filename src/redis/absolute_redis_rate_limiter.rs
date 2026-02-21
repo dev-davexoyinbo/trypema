@@ -26,10 +26,6 @@ impl AbsoluteRedisRateLimiter {
         }
     } // end method with_rate_type
 
-    pub(crate) fn key_generator(&self) -> &RedisKeyGenerator {
-        &self.key_generator
-    } // end method key_generator
-
     /// Check admission and, if allowed, increment the observed count for `key`.
     pub async fn inc(
         &self,
