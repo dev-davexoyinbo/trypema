@@ -88,8 +88,6 @@ pub struct RedisRateLimiterOptions {
     /// Hard cutoff multiplier for the suppressed strategy.
     ///
     /// Same semantics as local provider. See [`HardLimitFactor`] for details.
-    ///
-    /// **Note:** Currently only used by absolute strategy in Redis (suppressed is placeholder).
     pub hard_limit_factor: HardLimitFactor,
 
     /// Cache duration (milliseconds) for suppression factor recomputation.
@@ -119,8 +117,7 @@ pub struct RedisRateLimiterOptions {
 /// - **Best-effort limiting:** Overall rate limiting is approximate (not linearizable)
 /// - **Concurrent overshoot:** Multiple clients can exceed limits simultaneously
 ///
-/// See [`docs/redis.md`](https://github.com/your-repo/docs/redis.md) for detailed
-/// information on data model, cleanup, and operational considerations.
+/// See crate-level documentation for data model, cleanup, and operational considerations.
 ///
 /// # Examples
 ///

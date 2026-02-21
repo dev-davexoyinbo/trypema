@@ -33,7 +33,10 @@ impl SuppressedRedisRateLimiter {
         }
     }
 
-    /// Check admission and, if allowed, increment the observed count for `key`.
+    /// Check admission and increment counters for `key`.
+    ///
+    /// The suppressed strategy always increments the total observed counter. If the call is
+    /// denied (`is_allowed: false`), it also increments the declined counter.
     pub async fn inc(
         &self,
         key: &RedisKey,
@@ -229,6 +232,8 @@ impl SuppressedRedisRateLimiter {
     ///
     /// If a cached value exists in Redis, it is returned. Otherwise, this recomputes the
     /// suppression factor and writes it back to Redis with a TTL.
+    ///
+    /// If the cached value is outside `[0.0, 1.0]`, this recomputes and overwrites it.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         let script = Script::new(
             r#"
@@ -327,7 +332,6 @@ impl SuppressedRedisRateLimiter {
         let mut connection_manager = self.connection_manager.clone();
 
         let suppression_factor: f64 = script
-            .key(self.key_generator.get_total_count_key(key))
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))

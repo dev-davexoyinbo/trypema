@@ -20,6 +20,7 @@
 # Env / secrets
 .env
 .env.*
+!.env.example
 
 # Logs
 *.log

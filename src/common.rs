@@ -161,9 +161,12 @@ pub enum RateLimitDecision {
 
     /// Request handled by probabilistic suppression (suppressed strategy only).
     ///
-    /// The suppressed strategy tracks both observed (all calls) and accepted (admitted calls)
-    /// rates. When observed rate exceeds target, it probabilistically denies some requests
-    /// to keep accepted rate near the limit.
+    /// The suppressed strategy tracks the total observed rate (all calls) and the number of
+    /// calls declined by suppression. From these you can derive accepted usage as:
+    /// `accepted = observed - declined`.
+    ///
+    /// When observed rate exceeds target, it probabilistically denies some requests to keep
+    /// accepted rate near the limit.
     ///
     /// **Always check `is_allowed`** to determine if this specific call was admitted.
     Suppressed {
@@ -174,8 +177,8 @@ pub enum RateLimitDecision {
 
         /// Whether this specific call was admitted.
         ///
-        /// - `true`: Request allowed, increment recorded in accepted series
-        /// - `false`: Request suppressed, increment **not** recorded in accepted series
+        /// - `true`: Request allowed
+        /// - `false`: Request suppressed (do not proceed)
         ///
         /// **Use this as the admission decision.**
         is_allowed: bool,

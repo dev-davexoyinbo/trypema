@@ -499,9 +499,13 @@ fn verify_hard_limit_rejects() {
         let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
         assert!(
-            matches!(decision, RateLimitDecision::Rejected { .. } )
-            ||
-            matches!(decision, RateLimitDecision::Suppressed { suppression_factor, .. } if suppression_factor == 1.0f64),
+            matches!(
+                decision,
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: false,
+                } if suppression_factor == 1.0f64
+            ),
             "decision: {:?}",
             decision
         );
