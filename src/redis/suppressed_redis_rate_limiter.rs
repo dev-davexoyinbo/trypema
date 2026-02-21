@@ -125,8 +125,6 @@ impl SuppressedRedisRateLimiter {
                         perceived_rate_limit = total_in_last_second
                     end
 
-                    redis.log(redis.LOG_WARNING, "total_in_last_second is: " .. total_in_last_second)
-
                     local rate_limit = window_limit / window_size_seconds / hard_limit_factor
 
                     suppression_factor = 1 - (rate_limit / perceived_rate_limit)

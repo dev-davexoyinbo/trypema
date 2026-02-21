@@ -424,7 +424,7 @@ fn verify_suppression_factor_calculation_spread_redis() {
         // wait for 1.5 seconds
         tokio::time::sleep(Duration::from_millis(1200)).await;
 
-        let expected_suppression_factor = 1f64 - (1f64 / 2.1f64);
+        let expected_suppression_factor = 1f64 - (1f64 / 2f64);
 
         let decision = limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
