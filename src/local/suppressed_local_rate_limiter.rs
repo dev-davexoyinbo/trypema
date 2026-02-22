@@ -185,12 +185,6 @@ impl SuppressedLocalRateLimiter {
         count: u64,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> RateLimitDecision {
-        if !self.series.contains_key(key) {
-            self.series
-                .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(self.get_hard_limit(rate_limit)));
-        }
-
         let suppression_factor = self.get_suppression_factor(key);
 
         let should_allow = if suppression_factor == 0f64 {
@@ -201,8 +195,19 @@ impl SuppressedLocalRateLimiter {
             random_bool(1f64 - suppression_factor)
         };
 
-        let Some(rate_limit_series) = self.series.get(key) else {
-            unreachable!("SuppressedLocalRateLimiter::inc: key should be in map");
+        let rate_limit_series = match self.series.get(key) {
+            Some(rate_limit_series) => rate_limit_series,
+            None => {
+                self.series
+                    .entry(key.to_string())
+                    .or_insert_with(|| RateLimitSeries::new(self.get_hard_limit(rate_limit)));
+
+                let Some(rate_limit_series) = self.series.get(key) else {
+                    unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
+                };
+
+                rate_limit_series
+            }
         };
 
         if let Some(last_entry) = rate_limit_series.series.back()
@@ -219,10 +224,9 @@ impl SuppressedLocalRateLimiter {
         } else {
             drop(rate_limit_series);
 
-            let mut rate_limit_series = self
-                .series
-                .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(self.get_hard_limit(rate_limit)));
+            let Some(mut rate_limit_series) = self.series.get_mut(key) else {
+                unreachable!("SuppressedLocalRateLimiter::inc: key should be in map");
+            };
 
             rate_limit_series.series.push_back(InstantRate {
                 count: count.into(),

@@ -249,14 +249,18 @@ impl AbsoluteLocalRateLimiter {
             return is_allowed;
         }
 
-        if !self.series.contains_key(key) {
-            self.series
-                .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-        }
+        let rate_limit_series = match self.series.get(key) {
+            Some(rate_limit_series) => rate_limit_series,
+            None => {
+                self.series
+                    .entry(key.to_string())
+                    .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+                let Some(rate_limit_series) = self.series.get(key) else {
+                    unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
+                };
 
-        let Some(rate_limit_series) = self.series.get(key) else {
-            unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
+                rate_limit_series
+            }
         };
 
         if let Some(last_entry) = rate_limit_series.series.back()
@@ -267,10 +271,9 @@ impl AbsoluteLocalRateLimiter {
         } else {
             drop(rate_limit_series);
 
-            let mut rate_limit_series = self
-                .series
-                .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+            let Some(mut rate_limit_series) = self.series.get_mut(key) else {
+                unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
+            };
 
             rate_limit_series.series.push_back(InstantRate {
                 count: count.into(),
