@@ -96,27 +96,22 @@ stress-redis-compare:
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 20 \
+		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema; \
-	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 20 \
+		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter cell --cell-burst 15; \
-	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 20 \
+		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter gcra --gcra-burst 15; \
-	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 20 \
+		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema; \
-	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 20 \
+		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter cell --cell-burst 1000000; \
-	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 20 \
+		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter gcra --gcra-burst 1000000
 
 stress-local-compare:
