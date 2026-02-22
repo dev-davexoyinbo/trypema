@@ -4,6 +4,7 @@
 	stress \
 	stress-local stress-redis \
 	stress-local-hot stress-local-uniform stress-local-burst \
+	stress-local-uniform-matrix \
 	stress-redis-hot stress-redis-skew \
 	stress-redis-compare \
 	stress-local-compare
@@ -65,6 +66,57 @@ stress-local-uniform:
 	@cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 \
 		--key-dist uniform --key-space 100000 --duration-s 60
+
+# Uniform distribution sweep across (key_space, rate_limit_per_s).
+#
+# Notes:
+# - Runs in max-throughput mode (no pacing).
+# - For `trypema` we run both `absolute` and `suppressed` strategies.
+# - For `burster` and `governor`, `--strategy suppressed` is ignored by the harness.
+#
+# Override any of these from your shell, e.g.
+#   STRESS_UNIFORM_KEY_SPACES='1 10 100' STRESS_UNIFORM_RATES='64 128 256' make stress-local-uniform-matrix
+STRESS_UNIFORM_DURATION_S ?= 30
+STRESS_UNIFORM_THREADS ?= 16
+STRESS_UNIFORM_WINDOW_S ?= 10
+STRESS_UNIFORM_GROUP_MS ?= 10
+STRESS_UNIFORM_KEY_SPACES ?= 10 1000 10000
+STRESS_UNIFORM_RATES ?= 1 10 100 10000 100000
+
+stress-local-uniform-matrix:
+	@set -e; \
+	for ks in $(STRESS_UNIFORM_KEY_SPACES); do \
+	  for r in $(STRESS_UNIFORM_RATES); do \
+	    echo "== local trypema absolute: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    cargo run --release -p trypema-stress -- \
+	      --provider local --local-limiter trypema --strategy absolute --threads $(STRESS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_UNIFORM_WINDOW_S) --group-ms $(STRESS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_UNIFORM_DURATION_S); \
+	    echo "== local trypema suppressed: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    cargo run --release -p trypema-stress -- \
+	      --provider local --local-limiter trypema --strategy suppressed --threads $(STRESS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_UNIFORM_WINDOW_S) --group-ms $(STRESS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_UNIFORM_DURATION_S); \
+	    echo "== local burster absolute: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    cargo run --release -p trypema-stress -- \
+	      --provider local --local-limiter burster --strategy absolute --threads $(STRESS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_UNIFORM_WINDOW_S) --group-ms $(STRESS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_UNIFORM_DURATION_S); \
+	    echo "== local governor absolute: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    cargo run --release -p trypema-stress -- \
+	      --provider local --local-limiter governor --strategy absolute --threads $(STRESS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_UNIFORM_WINDOW_S) --group-ms $(STRESS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_UNIFORM_DURATION_S); \
+	  done; \
+	done
 
 stress-local-burst:
 	@cargo run --release -p trypema-stress -- \

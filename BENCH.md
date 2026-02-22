@@ -30,6 +30,7 @@ Local stress test (max throughput):
 ```bash
 make stress-local-hot
 make stress-local-uniform
+make stress-local-uniform-matrix
 ```
 
 Redis stress test (contention + high-cardinality skew):
@@ -70,6 +71,9 @@ cargo run --release -p trypema-stress -- \
 cargo run --release -p trypema-stress -- \
   --provider local --strategy absolute --threads 16 \
   --key-dist uniform --key-space 100000 --duration-s 60
+
+# Local: uniform sweep across (key_space, rate_limit_per_s).
+make stress-local-uniform-matrix
 
 # Local: skewed distribution, burst traffic, suppressed
 cargo run --release -p trypema-stress -- \

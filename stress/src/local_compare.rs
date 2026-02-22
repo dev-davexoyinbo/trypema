@@ -236,15 +236,15 @@ pub(crate) fn run(args2: Args) {
                             break;
                         }
 
-                        if args.mode != Mode::Max {
-                            if let Some(qps) = qps_for_now(&args, started) {
-                                let per_op_ns = 1_000_000_000u64 / qps.max(1);
-                                let now = Instant::now();
-                                if now < next_deadline {
-                                    std::thread::sleep(next_deadline - now);
-                                }
-                                next_deadline += Duration::from_nanos(per_op_ns);
+                        if args.mode != Mode::Max
+                            && let Some(qps) = qps_for_now(&args, started)
+                        {
+                            let per_op_ns = 1_000_000_000u64 / qps.max(1);
+                            let now = Instant::now();
+                            if now < next_deadline {
+                                std::thread::sleep(next_deadline - now);
                             }
+                            next_deadline += Duration::from_nanos(per_op_ns);
                         }
 
                         i = i.wrapping_add(1);
