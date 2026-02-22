@@ -18,13 +18,15 @@ use trypema::{
 #[cfg(feature = "redis-tokio")]
 mod redis_compare;
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+mod local_compare;
+
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 enum Provider {
     Local,
     Redis,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 enum Strategy {
     Absolute,
     Suppressed,
@@ -41,6 +43,16 @@ enum KeyDist {
 enum Mode {
     Max,
     TargetQps,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum LocalLimiter {
+    /// Use trypema local provider.
+    Trypema,
+    /// Use burster SlidingWindowLog (strict rolling window log).
+    Burster,
+    /// Use governor (GCRA).
+    Governor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
@@ -100,6 +112,10 @@ struct Args {
 
     #[arg(long, default_value_t = 1000.0)]
     rate_limit_per_s: f64,
+
+    /// Only used when `--provider local`.
+    #[arg(long, value_enum, default_value_t = LocalLimiter::Trypema)]
+    local_limiter: LocalLimiter,
 
     #[arg(long, value_enum, default_value_t = RedisLimiter::Trypema)]
     redis_limiter: RedisLimiter,
@@ -256,6 +272,11 @@ fn print_results(
 }
 
 fn run_local(args: &Args) {
+    if args.local_limiter != LocalLimiter::Trypema {
+        local_compare::run(args.clone());
+        return;
+    }
+
     let args = args.clone();
     let keys = build_keys(&args);
 

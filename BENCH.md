@@ -117,6 +117,25 @@ Notes:
 - `redis-cell` is loaded into the Redis container as a module via `compose.yaml`.
 - `--redis-limiter cell|gcra` uses different semantics than trypema's sliding window; treat results as backend cost comparisons, not strict behavioral equivalence.
 
+## Local Comparison (trypema vs burster vs governor)
+
+This suite compares three in-process limiters using the same stress harness:
+
+- `trypema` local provider (bucketed/coalesced rolling window)
+- `burster` `SlidingWindowLog` (strict rolling window log)
+- `governor` (GCRA; different semantics)
+
+Notes:
+
+- For `burster`, the window is a const-generic (`W` ms). The harness currently supports `--window-s 10|60|300`.
+- For `governor`, we configure `Quota::per_second(rate).allow_burst(rate * window_s)` to roughly match “capacity per window”. This is still not a strict sliding window.
+
+Run:
+
+```bash
+make stress-local-compare
+```
+
 ## Recommended Baseline Suite (1/2/3)
 
 Single-host throughput (local):

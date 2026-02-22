@@ -406,16 +406,19 @@ impl AbsoluteLocalRateLimiter {
                     return RateLimitDecision::Allowed;
                 };
 
+                let mut removed_count = 0;
+
                 while let Some(instant_rate) = rate_limit.series.front()
                     && instant_rate.timestamp.elapsed().as_millis()
                         > (*self.window_size_seconds * 1000) as u128
                 {
-                    let count = instant_rate.count.load(Ordering::Relaxed);
-                    rate_limit.total.fetch_sub(count, Ordering::Relaxed);
-                    total_count -= count;
+                    removed_count += instant_rate.count.load(Ordering::Relaxed);
 
                     rate_limit.series.pop_front();
                 }
+
+                rate_limit.total.fetch_sub(removed_count, Ordering::Relaxed);
+                total_count -= removed_count;
 
                 drop(rate_limit);
 
