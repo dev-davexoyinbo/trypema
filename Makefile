@@ -99,6 +99,9 @@ stress-redis-compare:
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider redis --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter cell --cell-burst 15; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
@@ -106,6 +109,9 @@ stress-redis-compare:
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter gcra --gcra-burst 15; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider redis --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
@@ -123,6 +129,9 @@ stress-local-compare:
 		--provider local --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--rate-limit-per-s 1000 --window-s 10 --local-limiter trypema; \
 	cargo run --release -p trypema-stress -- \
+		--provider local --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
+		--rate-limit-per-s 1000 --window-s 10 --local-limiter trypema; \
+	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--rate-limit-per-s 1000 --window-s 10 --local-limiter governor; \
 	cargo run --release -p trypema-stress -- \
@@ -130,6 +139,9 @@ stress-local-compare:
 		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter burster; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
+		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter trypema; \
+	cargo run --release -p trypema-stress -- \
+		--provider local --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter trypema; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
