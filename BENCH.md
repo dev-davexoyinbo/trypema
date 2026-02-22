@@ -98,6 +98,25 @@ cargo run --release -p trypema-stress --features redis-tokio -- \
   --duration-s 120
 ```
 
+## Redis Comparison (trypema vs redis-cell vs GCRA)
+
+This suite benchmarks three Redis-backed limiters using the same harness:
+
+- `trypema` Redis provider (Lua scripts)
+- `redis-cell` module (`CL.THROTTLE`)
+- GCRA Lua script (equivalent to go-redis/redis_rate `allowN`)
+
+Run:
+
+```bash
+make stress-redis-compare
+```
+
+Notes:
+
+- `redis-cell` is loaded into the Redis container as a module via `compose.yaml`.
+- `--redis-limiter cell|gcra` uses different semantics than trypema's sliding window; treat results as backend cost comparisons, not strict behavioral equivalence.
+
 ## Recommended Baseline Suite (1/2/3)
 
 Single-host throughput (local):

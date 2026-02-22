@@ -15,6 +15,9 @@ use trypema::{
     RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 
+#[cfg(feature = "redis-tokio")]
+mod redis_compare;
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Provider {
     Local,
@@ -38,6 +41,16 @@ enum KeyDist {
 enum Mode {
     Max,
     TargetQps,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum RedisLimiter {
+    /// Use trypema's Redis provider (Lua scripts).
+    Trypema,
+    /// Use redis-cell module (CL.THROTTLE).
+    Cell,
+    /// Use GCRA Lua script (similar to go-redis/redis_rate).
+    Gcra,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -87,6 +100,17 @@ struct Args {
 
     #[arg(long, default_value_t = 1000.0)]
     rate_limit_per_s: f64,
+
+    #[arg(long, value_enum, default_value_t = RedisLimiter::Trypema)]
+    redis_limiter: RedisLimiter,
+
+    /// Only used when `--redis-limiter cell`.
+    #[arg(long, default_value_t = 15)]
+    cell_burst: u64,
+
+    /// Only used when `--redis-limiter gcra`.
+    #[arg(long, default_value_t = 15)]
+    gcra_burst: u64,
 
     #[arg(long)]
     target_qps: Option<u64>,
@@ -386,9 +410,23 @@ fn run_redis(args: &Args) {
         .unwrap();
 
     rt.block_on(async move {
+        if args2.redis_limiter != RedisLimiter::Trypema {
+            let limiter = match args2.redis_limiter {
+                RedisLimiter::Cell => redis_compare::RedisLimiter::Cell,
+                RedisLimiter::Gcra => redis_compare::RedisLimiter::Gcra,
+                RedisLimiter::Trypema => unreachable!(),
+            };
+
+            // Note: this path compares alternative Redis rate limiters.
+            // Strategy is ignored because semantics differ.
+            redis_compare::run(args2.clone(), limiter).await;
+            return;
+        }
+
         let keys = build_keys(&args2);
         let client = redis::Client::open(args2.redis_url.as_str()).unwrap();
         let connection_manager = client.get_connection_manager().await.unwrap();
+
         let rate = RateLimit::try_from(args2.rate_limit_per_s).unwrap();
 
         let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
