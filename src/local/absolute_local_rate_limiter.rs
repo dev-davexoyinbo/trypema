@@ -1,6 +1,7 @@
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
+    u64,
 };
 
 use ahash::RandomState;
@@ -412,10 +413,12 @@ impl AbsoluteLocalRateLimiter {
                 };
 
                 let now = Instant::now();
+                let window =
+                    Duration::from_millis(u64::try_from(self.window_size_ms).unwrap_or(u64::MAX));
 
-                let split = rate_limit.series.partition_point(|r| {
-                    now.duration_since(r.timestamp).as_millis() > self.window_size_ms
-                });
+                let split = rate_limit
+                    .series
+                    .partition_point(|r| now.duration_since(r.timestamp) > window);
 
                 let total = rate_limit
                     .series

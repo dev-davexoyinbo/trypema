@@ -1,6 +1,6 @@
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use ahash::RandomState;
@@ -152,6 +152,7 @@ use crate::{
 #[derive(Debug)]
 pub struct SuppressedLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
+    window_size_ms: u128,
     rate_group_size_ms: RateGroupSizeMs,
     series: DashMap<String, RateLimitSeries, RandomState>,
     hard_limit_factor: HardLimitFactor,
@@ -163,6 +164,7 @@ impl SuppressedLocalRateLimiter {
     pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
         Self {
             hard_limit_factor: options.hard_limit_factor,
+            window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
             window_size_seconds: options.window_size_seconds,
             suppression_factor_cache_ms: options.suppression_factor_cache_ms,
             rate_group_size_ms: options.rate_group_size_ms,
@@ -261,7 +263,7 @@ impl SuppressedLocalRateLimiter {
             return;
         };
 
-        if instant_rate.timestamp.elapsed().as_millis() <= *self.window_size_seconds as u128 {
+        if instant_rate.timestamp.elapsed().as_millis() <= self.window_size_ms {
             return;
         }
 
@@ -271,21 +273,30 @@ impl SuppressedLocalRateLimiter {
             return;
         };
 
-        while let Some(instant_rate) = rate_limit_series.series.front()
-            && instant_rate.timestamp.elapsed().as_millis()
-                > (*self.window_size_seconds * 1000) as u128
-        {
-            rate_limit_series.total.fetch_sub(
-                instant_rate.count.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            rate_limit_series.total_declined.fetch_sub(
-                instant_rate.declined.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+        let now = Instant::now();
+        let window = Duration::from_millis(u64::try_from(self.window_size_ms).unwrap_or(u64::MAX));
 
-            rate_limit_series.series.pop_front();
-        }
+        let split = rate_limit_series
+            .series
+            .partition_point(|r| now.duration_since(r.timestamp) > window);
+
+        let (removed_count, removed_declined) =
+            rate_limit_series
+                .series
+                .drain(..split)
+                .fold((0u64, 0u64), |(count, declined), r| {
+                    (
+                        count + r.count.load(Ordering::Relaxed),
+                        declined + r.declined.load(Ordering::Relaxed),
+                    )
+                });
+
+        rate_limit_series
+            .total
+            .fetch_sub(removed_count, Ordering::Relaxed);
+        rate_limit_series
+            .total_declined
+            .fetch_sub(removed_declined, Ordering::Relaxed);
     } // end method remove_expired_buckets
 
     /// Get the current suppression factor for `key`.
