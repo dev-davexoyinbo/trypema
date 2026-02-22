@@ -382,6 +382,15 @@ impl AbsoluteLocalRateLimiter {
             return RateLimitDecision::Allowed;
         };
 
+        let mut total_count = rate_limit.total.load(Ordering::Relaxed);
+        let window_limit = *self.window_size_seconds as f64 * *rate_limit.limit;
+
+        if total_count < window_limit as u64 {
+            return RateLimitDecision::Allowed;
+        }
+
+        // Delay cleanup only if there is a possibility of rejection
+
         let rate_limit = match rate_limit.series.front() {
             None => rate_limit,
             Some(instant_rate)
@@ -401,10 +410,9 @@ impl AbsoluteLocalRateLimiter {
                     && instant_rate.timestamp.elapsed().as_millis()
                         > (*self.window_size_seconds * 1000) as u128
                 {
-                    rate_limit.total.fetch_sub(
-                        instant_rate.count.load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                    );
+                    let count = instant_rate.count.load(Ordering::Relaxed);
+                    rate_limit.total.fetch_sub(count, Ordering::Relaxed);
+                    total_count -= count;
 
                     rate_limit.series.pop_front();
                 }
@@ -419,9 +427,7 @@ impl AbsoluteLocalRateLimiter {
             }
         };
 
-        let window_limit = *self.window_size_seconds as f64 * *rate_limit.limit;
-
-        if rate_limit.total.load(Ordering::Relaxed) < window_limit as u64 {
+        if total_count < window_limit as u64 {
             return RateLimitDecision::Allowed;
         }
 
