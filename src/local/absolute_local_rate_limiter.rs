@@ -126,6 +126,7 @@ use crate::{
 pub struct AbsoluteLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
     window_size_ms: u128,
+    window_duration: Duration,
     rate_group_size_ms: RateGroupSizeMs,
     series: DashMap<String, RateLimitSeries, RandomState>,
 }
@@ -134,6 +135,7 @@ impl AbsoluteLocalRateLimiter {
     pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
         Self {
             window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
+            window_duration: Duration::from_secs(*options.window_size_seconds),
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
             series: DashMap::default(),
@@ -390,9 +392,9 @@ impl AbsoluteLocalRateLimiter {
         };
 
         let mut total_count = rate_limit.total.load(Ordering::Relaxed);
-        let window_limit = *self.window_size_seconds as f64 * *rate_limit.limit;
+        let window_limit = (*self.window_size_seconds as f64 * *rate_limit.limit) as u64;
 
-        if total_count < window_limit as u64 {
+        if total_count < window_limit {
             return RateLimitDecision::Allowed;
         }
 
@@ -413,12 +415,10 @@ impl AbsoluteLocalRateLimiter {
                 };
 
                 let now = Instant::now();
-                let window =
-                    Duration::from_millis(u64::try_from(self.window_size_ms).unwrap_or(u64::MAX));
 
                 let split = rate_limit
                     .series
-                    .partition_point(|r| now.duration_since(r.timestamp) > window);
+                    .partition_point(|r| now.duration_since(r.timestamp) > self.window_duration);
 
                 let total = rate_limit
                     .series
@@ -439,7 +439,7 @@ impl AbsoluteLocalRateLimiter {
             }
         };
 
-        if total_count < window_limit as u64 {
+        if total_count < window_limit {
             return RateLimitDecision::Allowed;
         }
 
