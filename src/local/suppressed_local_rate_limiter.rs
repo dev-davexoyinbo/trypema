@@ -3,6 +3,7 @@ use std::{
     time::Instant,
 };
 
+use ahash::RandomState;
 use dashmap::DashMap;
 
 use crate::{
@@ -152,10 +153,10 @@ use crate::{
 pub struct SuppressedLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
     rate_group_size_ms: RateGroupSizeMs,
-    series: DashMap<String, RateLimitSeries>,
+    series: DashMap<String, RateLimitSeries, RandomState>,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
-    suppression_factors: DashMap<String, (Instant, f64)>,
+    suppression_factors: DashMap<String, (Instant, f64), RandomState>,
 }
 
 impl SuppressedLocalRateLimiter {
@@ -165,8 +166,8 @@ impl SuppressedLocalRateLimiter {
             window_size_seconds: options.window_size_seconds,
             suppression_factor_cache_ms: options.suppression_factor_cache_ms,
             rate_group_size_ms: options.rate_group_size_ms,
-            series: DashMap::new(),
-            suppression_factors: DashMap::new(),
+            series: DashMap::default(),
+            suppression_factors: DashMap::default(),
         }
     } // end constructor
 

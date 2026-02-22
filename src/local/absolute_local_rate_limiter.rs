@@ -3,6 +3,7 @@ use std::{
     time::Instant,
 };
 
+use ahash::RandomState;
 use dashmap::DashMap;
 
 use crate::{
@@ -124,7 +125,7 @@ use crate::{
 pub struct AbsoluteLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
     rate_group_size_ms: RateGroupSizeMs,
-    series: DashMap<String, RateLimitSeries>,
+    series: DashMap<String, RateLimitSeries, RandomState>,
 }
 
 impl AbsoluteLocalRateLimiter {
@@ -132,12 +133,12 @@ impl AbsoluteLocalRateLimiter {
         Self {
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
-            series: DashMap::new(),
+            series: DashMap::default(),
         }
     } // end constructor
 
     #[cfg(test)]
-    pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries> {
+    pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries, RandomState> {
         &self.series
     }
 
