@@ -153,6 +153,7 @@ use crate::{
 pub struct SuppressedLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
     window_size_ms: u128,
+    window_duration: Duration,
     rate_group_size_ms: RateGroupSizeMs,
     series: DashMap<String, RateLimitSeries, RandomState>,
     hard_limit_factor: HardLimitFactor,
@@ -166,6 +167,7 @@ impl SuppressedLocalRateLimiter {
             hard_limit_factor: options.hard_limit_factor,
             window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
             window_size_seconds: options.window_size_seconds,
+            window_duration: Duration::from_secs(*options.window_size_seconds),
             suppression_factor_cache_ms: options.suppression_factor_cache_ms,
             rate_group_size_ms: options.rate_group_size_ms,
             series: DashMap::default(),
@@ -274,11 +276,10 @@ impl SuppressedLocalRateLimiter {
         };
 
         let now = Instant::now();
-        let window = Duration::from_millis(u64::try_from(self.window_size_ms).unwrap_or(u64::MAX));
 
         let split = rate_limit_series
             .series
-            .partition_point(|r| now.duration_since(r.timestamp) > window);
+            .partition_point(|r| now.duration_since(r.timestamp) > self.window_duration);
 
         let (removed_count, removed_declined) =
             rate_limit_series
