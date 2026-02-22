@@ -1,7 +1,6 @@
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
-    u64,
 };
 
 use ahash::RandomState;
