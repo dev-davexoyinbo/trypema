@@ -87,6 +87,132 @@ local function calculate_suppression_factor(hash_key, active_keys, total_count, 
 end
 "#;
 
+const SUPPRESSED_INC_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local hash_key = KEYS[1]
+    local active_keys = KEYS[2]
+    local window_limit_key = KEYS[3]
+    local total_count_key = KEYS[4]
+    local get_active_entities_key = KEYS[5]
+    local suppression_factor_key = KEYS[6]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local window_limit_to_consider = tonumber(ARGV[3])
+    local rate_group_size_ms = tonumber(ARGV[4])
+    local suppression_factor_cache_ms = tonumber(ARGV[5])
+    local hard_limit_factor = tonumber(ARGV[6])
+    local count = tonumber(ARGV[7])
+
+    local window_limit = tonumber(redis.call("GET", window_limit_key)) or window_limit_to_consider
+
+    redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
+
+    cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
+
+    local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
+
+    local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
+
+    if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
+        suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+
+        redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
+    end
+
+
+    local should_allow = true
+
+    if suppression_factor == 0 then
+        should_allow = true
+    elseif suppression_factor == 1 then
+        should_allow = false
+    else
+        should_allow = math.random() < (1 - suppression_factor)
+    end
+
+    local latest_hash_field_entry = redis.call("ZRANGE", active_keys, 0, 0, "REV", "WITHSCORES")
+    if #latest_hash_field_entry > 0 then
+        local latest_hash_field = latest_hash_field_entry[1]
+        local latest_hash_field_group_timestamp = tonumber(latest_hash_field_entry[2])
+        local latest_hash_field_age_ms = timestamp_ms - latest_hash_field_group_timestamp
+
+        if latest_hash_field_age_ms >= 0 and latest_hash_field_age_ms < rate_group_size_ms then
+            timestamp_ms = tonumber(latest_hash_field)
+        end
+    end
+
+    local hash_field = tostring(timestamp_ms)
+
+    local raw_prev = redis.call("HGET", hash_key, hash_field)
+    local prev_value = raw_prev and cjson.decode(raw_prev) or {count = 0, declined = 0}
+
+    local new_count = (tonumber(prev_value.count) or 0) + count
+    local new_declined = tonumber(prev_value.declined) or 0
+
+    if not should_allow then
+        new_declined = new_declined + count
+    end
+
+    redis.call("HSET", hash_key, hash_field, cjson.encode({count = new_count, declined = new_declined}))
+    redis.call("HINCRBY", total_count_key, "count", count)
+    if not should_allow then
+        redis.call("HINCRBY", total_count_key, "declined", count)
+    end
+
+    if new_count == count then
+    redis.call("ZADD", active_keys, timestamp_ms, hash_field)
+    redis.call("SET", window_limit_key, window_limit)
+    end
+
+    redis.call("EXPIRE", window_limit_key, window_size_seconds)
+
+    if suppression_factor == 0 then
+        return {"allowed", 0, 0}
+    else
+        return {"suppressed", tostring(suppression_factor), should_allow and "1" or "0"}
+    end
+"#;
+
+const SUPPRESSED_GET_FACTOR_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local hash_key = KEYS[1]
+    local active_keys = KEYS[2]
+    local window_limit_key = KEYS[3]
+    local total_count_key = KEYS[4]
+    local get_active_entities_key = KEYS[5]
+    local suppression_factor_key = KEYS[6]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local rate_group_size_ms = tonumber(ARGV[3])
+    local suppression_factor_cache_ms = tonumber(ARGV[4])
+    local hard_limit_factor = tonumber(ARGV[5])
+
+    redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
+
+    cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
+
+    local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
+
+    local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
+
+    if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
+        local window_limit = tonumber(redis.call("GET", window_limit_key)) 
+        if window_limit == nil then
+            suppression_factor = 0
+        else
+            suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+        end
+
+        redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
+    end
+
+    return tostring(suppression_factor)
+"#;
+
 /// A rate limiter backed by Redis.
 #[derive(Clone, Debug)]
 pub struct SuppressedRedisRateLimiter {
@@ -96,6 +222,8 @@ pub struct SuppressedRedisRateLimiter {
     rate_group_size_ms: RateGroupSizeMs,
     window_size_seconds: WindowSizeSeconds,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
+    inc_script: Script,
+    get_suppression_factor_script: Script,
 }
 
 impl SuppressedRedisRateLimiter {
@@ -110,6 +238,11 @@ impl SuppressedRedisRateLimiter {
             hard_limit_factor: options.hard_limit_factor,
             suppression_factor_cache_ms: options.suppression_factor_cache_ms,
             key_generator,
+            inc_script: Script::new(&format!("{}\n{}", LUA_HELPERS, SUPPRESSED_INC_LUA)),
+            get_suppression_factor_script: Script::new(&format!(
+                "{}\n{}",
+                LUA_HELPERS, SUPPRESSED_GET_FACTOR_LUA
+            )),
         }
     }
 
@@ -123,105 +256,12 @@ impl SuppressedRedisRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let script_src = format!(
-            "{}\n{}",
-            LUA_HELPERS,
-            r#"
-            local timestamp_ms = now_ms()
-
-            local hash_key = KEYS[1]
-            local active_keys = KEYS[2]
-            local window_limit_key = KEYS[3]
-            local total_count_key = KEYS[4]
-            local get_active_entities_key = KEYS[5]
-            local suppression_factor_key = KEYS[6]
-
-            local entity = ARGV[1]
-            local window_size_seconds = tonumber(ARGV[2])
-            local window_limit_to_consider = tonumber(ARGV[3])
-            local rate_group_size_ms = tonumber(ARGV[4])
-            local suppression_factor_cache_ms = tonumber(ARGV[5])
-            local hard_limit_factor = tonumber(ARGV[6])
-            local count = tonumber(ARGV[7])
-
-            local window_limit = tonumber(redis.call("GET", window_limit_key)) or window_limit_to_consider
-
-            redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
-
-            cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
-
-            local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
-
-            local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
-
-            if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
-                suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
-
-                redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
-            end
-
-
-            local should_allow = true
-
-            if suppression_factor == 0 then
-                should_allow = true
-            elseif suppression_factor == 1 then
-                should_allow = false
-            else
-                should_allow = math.random() < (1 - suppression_factor)
-            end
-
-            local latest_hash_field_entry = redis.call("ZRANGE", active_keys, 0, 0, "REV", "WITHSCORES")
-            if #latest_hash_field_entry > 0 then
-                local latest_hash_field = latest_hash_field_entry[1]
-                local latest_hash_field_group_timestamp = tonumber(latest_hash_field_entry[2])
-                local latest_hash_field_age_ms = timestamp_ms - latest_hash_field_group_timestamp
-
-                if latest_hash_field_age_ms >= 0 and latest_hash_field_age_ms < rate_group_size_ms then
-                    timestamp_ms = tonumber(latest_hash_field)
-                end
-            end
-
-            local hash_field = tostring(timestamp_ms)
-
-            local raw_prev = redis.call("HGET", hash_key, hash_field)
-            local prev_value = raw_prev and cjson.decode(raw_prev) or {count = 0, declined = 0}
-
-            local new_count = (tonumber(prev_value.count) or 0) + count
-            local new_declined = tonumber(prev_value.declined) or 0
-
-            if not should_allow then
-                new_declined = new_declined + count
-            end
-
-            redis.call("HSET", hash_key, hash_field, cjson.encode({count = new_count, declined = new_declined}))
-            redis.call("HINCRBY", total_count_key, "count", count)
-            if not should_allow then
-                redis.call("HINCRBY", total_count_key, "declined", count)
-            end
-
-            if new_count == count then
-               redis.call("ZADD", active_keys, timestamp_ms, hash_field)
-               redis.call("SET", window_limit_key, window_limit)
-            end
-
-            redis.call("EXPIRE", window_limit_key, window_size_seconds)
-
-            if suppression_factor == 0 then
-                return {"allowed", 0, 0}
-            else
-                return {"suppressed", tostring(suppression_factor), should_allow and "1" or "0"}
-            end
-        "#,
-        );
-
-        let script = redis::Script::new(&script_src);
-
         let window_limit =
             *self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor;
         let mut connection_manager = self.connection_manager.clone();
 
-        let (result, suppression_factor, should_allow): (String, f64, u8) = script
+        let (result, suppression_factor, should_allow): (String, f64, u8) = self
+            .inc_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))
@@ -261,53 +301,10 @@ impl SuppressedRedisRateLimiter {
     ///
     /// If the cached value is outside `[0.0, 1.0]`, this recomputes and overwrites it.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
-        let script_src = format!(
-            "{}\n{}",
-            LUA_HELPERS,
-            r#"
-            local timestamp_ms = now_ms()
-
-            local hash_key = KEYS[1]
-            local active_keys = KEYS[2]
-            local window_limit_key = KEYS[3]
-            local total_count_key = KEYS[4]
-            local get_active_entities_key = KEYS[5]
-            local suppression_factor_key = KEYS[6]
-
-            local entity = ARGV[1]
-            local window_size_seconds = tonumber(ARGV[2])
-            local rate_group_size_ms = tonumber(ARGV[3])
-            local suppression_factor_cache_ms = tonumber(ARGV[4])
-            local hard_limit_factor = tonumber(ARGV[5])
-
-            redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
-
-            cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
-
-            local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
-
-            local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
-
-            if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
-                local window_limit = tonumber(redis.call("GET", window_limit_key)) 
-                if window_limit == nil then
-                    suppression_factor = 0
-                else
-                    suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
-                end
-
-                redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
-            end
-
-            return tostring(suppression_factor)
-        "#,
-        );
-
-        let script = Script::new(&script_src);
-
         let mut connection_manager = self.connection_manager.clone();
 
-        let suppression_factor: f64 = script
+        let suppression_factor: f64 = self
+            .get_suppression_factor_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))
