@@ -228,7 +228,7 @@ impl AbsoluteRedisRateLimiter {
         let window_limit = *self.window_size_seconds as f64 * **rate_limit;
         let mut connection_manager = self.connection_manager.clone();
 
-        let (result, retry_after_ms, remaining_after_waiting): (String, u64, u64) = self
+        let (result, retry_after_ms, remaining_after_waiting): (String, u128, u64) = self
             .inc_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
@@ -268,7 +268,7 @@ impl AbsoluteRedisRateLimiter {
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let (result, retry_after_ms, remaining_after_waiting): (String, u64, u64) = self
+        let (result, retry_after_ms, remaining_after_waiting): (String, u128, u64) = self
             .is_allowed_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
