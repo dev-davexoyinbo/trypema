@@ -407,7 +407,7 @@ impl AbsoluteLocalRateLimiter {
                 drop(rate_limit);
 
                 let Some(mut rate_limit) = self.series.get_mut(key) else {
-                    return RateLimitDecision::Allowed;
+                    unreachable!("AbsoluteLocalRateLimiter::is_allowed: key should be in map");
                 };
 
                 let mut removed_count = 0;
@@ -427,7 +427,7 @@ impl AbsoluteLocalRateLimiter {
                 drop(rate_limit);
 
                 let Some(rate_limit) = self.series.get(key) else {
-                    return RateLimitDecision::Allowed;
+                    unreachable!("AbsoluteLocalRateLimiter::is_allowed: key should be in map");
                 };
 
                 rate_limit
