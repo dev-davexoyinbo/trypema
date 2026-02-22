@@ -19,6 +19,16 @@ repository = "https://github.com/dev-davexoyinbo/trypema"
 homepage = "https://trypema.davidoyinbo.com/"
 exclude = [".github", "Makefile", "compose.yaml", "stress", "BENCH.md"]
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+# opt-level = 3
+# opt-level = "z"
+# opt-level = "s"
+opt-level = 3
+# strip = "debuginfo"
+strip = "symbols"
+
 [workspace]
 members = ["stress"]
 

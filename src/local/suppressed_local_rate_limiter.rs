@@ -177,6 +177,7 @@ impl SuppressedLocalRateLimiter {
         self.inc_with_rng(key, rate_limit, count, &mut rng)
     }
 
+    #[inline(always)]
     pub(crate) fn inc_with_rng(
         &self,
         key: &str,

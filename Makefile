@@ -127,22 +127,22 @@ stress-local-compare:
 		--rate-limit-per-s 1000 --window-s 10 --local-limiter burster; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
+		--rate-limit-per-s 1000 --window-s 10 --local-limiter governor; \
+	cargo run --release -p trypema-stress -- \
+		--provider local --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--rate-limit-per-s 1000 --window-s 10 --local-limiter trypema; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
 		--rate-limit-per-s 1000 --window-s 10 --local-limiter trypema; \
 	cargo run --release -p trypema-stress -- \
-		--provider local --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
-		--rate-limit-per-s 1000 --window-s 10 --local-limiter governor; \
-	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter burster; \
+	cargo run --release -p trypema-stress -- \
+		--provider local --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
+		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter governor; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter trypema; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter trypema; \
-	cargo run --release -p trypema-stress -- \
-		--provider local --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter governor
+		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter trypema 
