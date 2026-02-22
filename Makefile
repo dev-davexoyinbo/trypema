@@ -48,17 +48,7 @@ stress-help:
 
 stress-local: stress-local-hot stress-local-uniform stress-local-burst
 
-stress-redis:
-	@set -e; \
-	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
-	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy absolute --threads 256 \
-		--key-dist hot --duration-s 60 --redis-url "$(REDIS_URL)" --redis-prefix stress; \
-	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy suppressed --threads 256 \
-		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
-		--duration-s 120 --redis-url "$(REDIS_URL)" --redis-prefix stress
+stress-redis: stress-redis-hot stress-redis-skew
 
 stress: stress-local stress-redis
 
