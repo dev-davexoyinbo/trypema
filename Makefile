@@ -1,9 +1,17 @@
-.PHONY: test-redis test redis-up redis-down
+.PHONY: \
+	test-redis test redis-up redis-down \
+	bench-local bench-redis bench \
+	stress \
+	stress-local stress-redis \
+	stress-local-hot stress-local-uniform stress-local-burst \
+	stress-redis-hot stress-redis-skew \
+	stress-help
 
 REDIS_PORT ?= 16379
-REDIS_URL ?= redis://127.0.0.1:$(REDIS_PORT)
+REDIS_URL ?= redis://127.0.0.1:$(REDIS_PORT)/
 
 redis-up:
+	@docker info >/dev/null 2>&1 || (echo "docker daemon not running" >&2; exit 1)
 	@docker compose up -d redis
 	@sh -c 'for i in $$(seq 1 60); do \
 		if docker compose exec -T redis redis-cli ping >/dev/null 2>&1; then exit 0; fi; \
@@ -18,6 +26,73 @@ test-redis:
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
-	REDIS_URL="$(REDIS_URL)" cargo test --features redis-tokio
+	REDIS_URL="$(REDIS_URL)" cargo test -p trypema --features redis-tokio
 
 test: test-redis
+
+bench-local:
+	@cargo bench -p trypema --bench local_absolute
+	@cargo bench -p trypema --bench local_suppressed
+
+bench-redis:
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_absolute; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_suppressed
+
+bench: bench-local bench-redis
+
+stress-help:
+	@cargo run -p trypema-stress -- --help
+
+stress-local: stress-local-hot stress-local-uniform stress-local-burst
+
+stress-redis:
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider redis --strategy absolute --threads 256 \
+		--key-dist hot --duration-s 60 --redis-url "$(REDIS_URL)" --redis-prefix stress; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider redis --strategy suppressed --threads 256 \
+		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
+		--duration-s 120 --redis-url "$(REDIS_URL)" --redis-prefix stress
+
+stress: stress-local stress-redis
+
+stress-local-hot:
+	@cargo run --release -p trypema-stress -- \
+		--provider local --strategy absolute --threads 16 \
+		--key-dist hot --duration-s 30
+
+stress-local-uniform:
+	@cargo run --release -p trypema-stress -- \
+		--provider local --strategy absolute --threads 16 \
+		--key-dist uniform --key-space 100000 --duration-s 60
+
+stress-local-burst:
+	@cargo run --release -p trypema-stress -- \
+		--provider local --strategy suppressed --threads 16 \
+		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
+		--mode target-qps --target-qps 20000 --burst-qps 200000 \
+		--burst-period-ms 30000 --burst-duration-ms 5000 \
+		--duration-s 120
+
+stress-redis-hot:
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider redis --strategy absolute --threads 16 \
+		--key-dist hot --duration-s 60 --redis-url "$(REDIS_URL)" --redis-prefix stress
+
+stress-redis-skew:
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider redis --strategy suppressed --threads 16 \
+		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
+		--duration-s 120 --redis-url "$(REDIS_URL)" --redis-prefix stress
