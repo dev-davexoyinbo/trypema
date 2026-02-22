@@ -125,31 +125,31 @@ stress-local-compare:
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--rate-limit-per-s 1000 --window-s 10 --local-limiter burster; \
-	sleep 5 \
+	sleep 5; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--rate-limit-per-s 1000 --window-s 10 --local-limiter governor; \
-	sleep 5 \
+	sleep 5; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--rate-limit-per-s 1000 --window-s 10 --local-limiter trypema; \
-	sleep 5 \
+	sleep 5; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
 		--rate-limit-per-s 1000 --window-s 10 --local-limiter trypema; \
-	sleep 5 \
+	sleep 5; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter burster; \
-	sleep 5 \
+	sleep 5; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter governor; \
-	sleep 5 \
+	sleep 5; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter trypema; \
-	sleep 5 \
+	sleep 5; \
 	cargo run --release -p trypema-stress -- \
 		--provider local --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--rate-limit-per-s 1000000000 --window-s 10 --local-limiter trypema 
