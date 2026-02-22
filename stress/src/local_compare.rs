@@ -1,6 +1,6 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,7 @@ use governor::{DefaultKeyedRateLimiter, Quota};
 use hdrhistogram::Histogram;
 
 use crate::{
-    qps_for_now, should_sample, Args, Counts, KeyDist, LocalLimiter, Mode, Provider, Strategy,
+    Args, Counts, KeyDist, LocalLimiter, Mode, Provider, Strategy, qps_for_now, should_sample,
 };
 
 static BURSTER_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -81,10 +81,8 @@ pub(crate) fn run(args2: Args) {
         LocalLimiter::Burster | LocalLimiter::Governor => Some(16 * 1024 * 1024),
     };
 
-    if args.mode != Mode::Max {
-        if args.target_qps.is_none() {
-            eprintln!("note: --mode target-qps without --target-qps behaves like --mode max");
-        }
+    if args.mode != Mode::Max && args.target_qps.is_none() {
+        eprintln!("note: --mode target-qps without --target-qps behaves like --mode max");
     }
 
     if args.local_limiter != LocalLimiter::Trypema && args.strategy == Strategy::Suppressed {
@@ -103,11 +101,52 @@ pub(crate) fn run(args2: Args) {
 
     // Shared limiter state
     let trypema_rl = if args.local_limiter == LocalLimiter::Trypema {
-        Some(Arc::new(trypema::RateLimiter::new(
-            trypema::RateLimiterOptions {
-                local: crate::build_local_options(&args),
-            },
-        )))
+        Some({
+            #[cfg(not(feature = "redis-tokio"))]
+            {
+                Arc::new(trypema::RateLimiter::new(trypema::RateLimiterOptions {
+                    local: crate::build_local_options(&args),
+                }))
+            }
+
+            // When built with redis support, RateLimiterOptions requires a Redis config.
+            // Local comparisons still run against the local provider, but we satisfy the
+            // struct shape by opening a connection manager (same approach as stress/src/main.rs).
+            #[cfg(feature = "redis-tokio")]
+            {
+                use trypema::redis::{RedisKey, RedisRateLimiterOptions};
+                use trypema::{
+                    HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds,
+                };
+
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    let client = redis::Client::open(args.redis_url.as_str()).unwrap();
+                    let connection_manager = client.get_connection_manager().await.unwrap();
+
+                    Arc::new(trypema::RateLimiter::new(trypema::RateLimiterOptions {
+                        local: crate::build_local_options(&args),
+                        redis: RedisRateLimiterOptions {
+                            connection_manager,
+                            prefix: Some(RedisKey::try_from(args.redis_prefix.clone()).unwrap()),
+                            window_size_seconds: WindowSizeSeconds::try_from(args.window_s)
+                                .unwrap(),
+                            rate_group_size_ms: RateGroupSizeMs::try_from(args.group_ms).unwrap(),
+                            hard_limit_factor: HardLimitFactor::try_from(args.hard_limit_factor)
+                                .unwrap(),
+                            suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
+                                args.suppression_cache_ms,
+                            )
+                            .unwrap(),
+                        },
+                    }))
+                })
+            }
+        })
     } else {
         None
     };
