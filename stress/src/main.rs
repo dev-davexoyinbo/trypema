@@ -250,7 +250,7 @@ fn print_results(
         counts.suppressed_denied.load(Ordering::Relaxed),
         counts.errors.load(Ordering::Relaxed)
     );
-    if hist.len() > 0 {
+    if !hist.is_empty() {
         let p50 = hist.value_at_quantile(0.50);
         let p95 = hist.value_at_quantile(0.95);
         let p99 = hist.value_at_quantile(0.99);
@@ -334,7 +334,6 @@ fn run_local(args: &Args) {
         let counts = Arc::clone(&counts);
         let total_ops = Arc::clone(&total_ops);
         let args = args.clone();
-        let rate = rate;
 
         handles.push(std::thread::spawn(move || {
             let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
@@ -478,7 +477,6 @@ fn run_redis(args: &Args) {
             let total_ops = Arc::clone(&total_ops);
             let args = args2.clone();
             let keys = keys.clone();
-            let rate = rate;
 
             join.push(tokio::spawn(async move {
                 let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
