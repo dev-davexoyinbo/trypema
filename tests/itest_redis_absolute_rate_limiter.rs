@@ -88,6 +88,26 @@ async fn saturate_to_rejected(rl: &Arc<RateLimiter>, k: &RedisKey, rate: &RateLi
 }
 
 #[test]
+fn accepts_within_window_limit() {
+    let Some(url) = redis_url() else {
+        return;
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let rl = build_rate_limiter(&url, 1, 10).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(2f64).unwrap();
+
+        let d0 = rl.redis().absolute().inc(&k, &rate, 1).await.unwrap();
+        assert!(matches!(d0, RateLimitDecision::Allowed));
+
+        let d1 = rl.redis().absolute().inc(&k, &rate, 1).await.unwrap();
+        assert!(matches!(d1, RateLimitDecision::Allowed));
+    });
+}
+
+#[test]
 fn rejects_at_exact_window_limit() {
     let Some(url) = redis_url() else {
         return;
