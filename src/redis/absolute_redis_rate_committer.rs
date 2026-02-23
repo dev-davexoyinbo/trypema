@@ -99,7 +99,7 @@ impl AbsoluteRedisRateCommitter {
                     }
                 }
 
-                let pipe = Self::build_pipeline(&batch, &script);
+                let pipe = Self::build_pipeline(&batch, &script, false);
 
                 if let Err::<(), RedisError>(err) = pipe.query_async(&mut connection_manager).await
                 {
@@ -108,12 +108,7 @@ impl AbsoluteRedisRateCommitter {
                         continue;
                     }
 
-                    if let Err(err) = script.load_async(&mut connection_manager).await {
-                        tracing::error!("redis.commit.error, error loading script: {:?}", err);
-                        continue;
-                    }
-
-                    let pipe = Self::build_pipeline(&batch, &script);
+                    let pipe = Self::build_pipeline(&batch, &script, true);
 
                     if let Err::<(), _>(err) = pipe.query_async(&mut connection_manager).await {
                         tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
@@ -128,26 +123,18 @@ impl AbsoluteRedisRateCommitter {
         sender
     }
 
-    fn build_pipeline(commits: &Vec<AbsoluteRedisCommit>, script: &Script) -> redis::Pipeline {
+    #[inline]
+    fn build_pipeline(
+        commits: &Vec<AbsoluteRedisCommit>,
+        script: &Script,
+        should_load_script: bool,
+    ) -> redis::Pipeline {
         let mut pipe = redis::Pipeline::new();
+        if should_load_script {
+            pipe.load_script(script).ignore();
+        }
 
         for commit in commits {
-            // let window_limit = *self.window_size_seconds as f64 * **rate_limit;
-
-            // .check_script
-            // .key(self.key_generator.get_hash_key(key))
-            // .key(self.key_generator.get_active_keys(key))
-            // .key(self.key_generator.get_window_limit_key(key))
-            // .key(self.key_generator.get_total_count_key(key))
-            // .key(self.key_generator.get_active_entities_key())
-            // .arg(key.to_string())
-            // .arg(*self.window_size_seconds)
-            // .arg(window_limit)
-            // .arg(*self.rate_group_size_ms)
-            // .arg(count)
-            // .invoke_async(&mut connection_manager)
-            // .await?;
-
             pipe.invoke_script(
                 script
                     .key(commit.hash_key.as_str())
