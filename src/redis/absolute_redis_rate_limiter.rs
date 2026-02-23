@@ -9,12 +9,13 @@ const ABSOLUTE_CHECK_LUA: &str = r#"
     local time_array = redis.call("TIME")
     local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 
-
+    -- keys
     local hash_key = KEYS[1]
     local active_keys = KEYS[2]
     local window_limit_key = KEYS[3]
     local total_count_key = KEYS[4]
 
+    -- args
     local window_size_ms = tonumber(ARGV[1])
     local count = tonumber(ARGV[2])
 
@@ -22,7 +23,6 @@ const ABSOLUTE_CHECK_LUA: &str = r#"
     if window_limit == nil then
         return {"allowed", 0, 0}
     end
-
 
     local total_count = tonumber(redis.call("GET", total_count_key)) or 0
 
@@ -175,7 +175,6 @@ impl AbsoluteRedisRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let window_limit = *self.window_size_seconds as f64 * **rate_limit;
         let mut connection_manager = self.connection_manager.clone();
 
         let (result, timestamp_ms, retry_after_ms, remaining_after_waiting): (
@@ -190,11 +189,11 @@ impl AbsoluteRedisRateLimiter {
             .key(self.key_generator.get_window_limit_key(key))
             .key(self.key_generator.get_total_count_key(key))
             .arg(self.window_size_ms)
-            .arg(window_limit)
-            .arg(*self.rate_group_size_ms)
             .arg(count)
             .invoke_async(&mut connection_manager)
             .await?;
+
+        let window_limit = *self.window_size_seconds as f64 * **rate_limit;
 
         // .check_script
         // .key(self.key_generator.get_hash_key(key))
