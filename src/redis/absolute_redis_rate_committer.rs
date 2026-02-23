@@ -99,6 +99,8 @@ impl AbsoluteRedisRateCommitter {
                     }
                 }
 
+                // eprintln!("batch size: {}", batch.len());
+
                 let pipe = Self::build_pipeline(&batch, &script, false);
 
                 if let Err::<(), RedisError>(err) = pipe.query_async(&mut connection_manager).await

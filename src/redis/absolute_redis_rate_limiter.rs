@@ -22,27 +22,29 @@ const ABSOLUTE_CHECK_LUA: &str = r#"
     local window_size_ms = tonumber(ARGV[1])
     local count = tonumber(ARGV[2])
 
-    local window_limit = tonumber(redis.call("GET", window_limit_key))
+    local res = redis.call("MGET", window_limit_key, total_count_key)
+
+    local window_limit = tonumber(res[1])
     if window_limit == nil then
-        return {"allowed", tostring(timestamp_ms), 0, 0}
+        return {"allowed", timestamp_ms, 0, 0}
     end
 
-    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+    local total_count = tonumber(res[2]) or 0
 
     if total_count + count > window_limit then
         local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
 
         if #oldest_hash_fields == 0 then
-            return {"rejected", tostring(timestamp_ms), 0, 0}
+            return {"rejected", timestamp_ms, 0, 0}
         end
 
         local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_fields[1])) or 0
         local ttl = window_size_ms - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
 
-        return {"rejected",tostring(timestamp_ms), ttl, oldest_count}
+        return {"rejected", timestamp_ms, ttl, oldest_count}
     end
 
-    return {"allowed", tostring(timestamp_ms), 0, 0}
+    return {"allowed", timestamp_ms, 0, 0}
 "#;
 
 const ABSOLUTE_CLEANUP_LUA: &str = r#"
