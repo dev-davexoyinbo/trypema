@@ -166,16 +166,24 @@ fn test_stop_then_restart_cleanup_loop_works() {
 #[cfg(feature = "redis-tokio")]
 #[test]
 fn test_redis_cleanup_loop_with_tokio() {
-    use crate::RedisKey;
-
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        // Setup Redis connection
-        let client = redis::Client::open(
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string()),
-        )
-        .unwrap();
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| {
+            eprintln!("skipping: REDIS_URL not set");
+            String::new()
+        });
+        if url.is_empty() {
+            return;
+        }
+
+        let client = redis::Client::open(url).unwrap();
         let connection_manager = client.get_connection_manager().await.unwrap();
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let prefix = crate::RedisKey::try_from(format!("test_cleanup_{unique}")).unwrap();
 
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
@@ -186,9 +194,10 @@ fn test_redis_cleanup_loop_with_tokio() {
             },
             redis: crate::RedisRateLimiterOptions {
                 connection_manager,
-                prefix: Some(RedisKey::try_from("test_cleanup".to_string()).unwrap()),
-                window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                prefix: Some(prefix),
+                // Use a long window so Allowed-after-cleanup can't be natural expiry.
+                window_size_seconds: WindowSizeSeconds::try_from(30).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(1000).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
                 suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
             },
@@ -196,43 +205,66 @@ fn test_redis_cleanup_loop_with_tokio() {
 
         let rl = Arc::new(RateLimiter::new(options));
 
-        // Add some Redis entries
-        let rate_limit = RateLimit::try_from(10.0).unwrap();
-        let key = RedisKey::try_from("test_key".to_string()).unwrap();
-        let _ = rl.redis().absolute().inc(&key, &rate_limit, 1).await;
+        let rate_limit = RateLimit::try_from(1.0).unwrap();
+        let key = crate::RedisKey::try_from(format!("test_key_{unique}")).unwrap();
 
-        // Start cleanup loop (it will detect the Tokio runtime)
-        rl.run_cleanup_loop_with_config(100, 50);
+        // capacity = 30 (30s * 1/s)
+        let d0 = rl.redis().absolute().inc(&key, &rate_limit, 30).await.unwrap();
+        assert!(matches!(d0, crate::RateLimitDecision::Allowed));
 
-        // Wait a bit for cleanup to run
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait until state is observed as rejected (commit has applied).
+        let start = std::time::Instant::now();
+        loop {
+            let d = rl.redis().absolute().is_allowed(&key).await.unwrap();
+            if matches!(d, crate::RateLimitDecision::Rejected { .. }) {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("expected key to become rejected after saturating");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
-        // The key should be cleaned up after becoming stale
-        // (We can't easily verify Redis state without adding more test infrastructure,
-        // but at least verify the loop runs without panicking)
+        // Start cleanup loop and wait for it to delete stale state.
+        rl.run_cleanup_loop_with_config(50, 50);
+
+        let start = std::time::Instant::now();
+        loop {
+            let d = rl.redis().absolute().is_allowed(&key).await.unwrap();
+            if matches!(d, crate::RateLimitDecision::Allowed) {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("expected cleanup loop to make key allowed");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        rl.stop_cleanup_loop();
     });
 }
 
 #[cfg(feature = "redis-tokio")]
 #[test]
 fn test_redis_stop_cleanup_loop_prevents_cleanup() {
-    use redis::AsyncCommands;
-
-    use crate::{RedisKey, RedisKeyGenerator, common::RateType};
-
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let client = redis::Client::open(
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string()),
-        )
-        .unwrap();
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| {
+            eprintln!("skipping: REDIS_URL not set");
+            String::new()
+        });
+        if url.is_empty() {
+            return;
+        }
+
+        let client = redis::Client::open(url).unwrap();
         let connection_manager = client.get_connection_manager().await.unwrap();
 
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let prefix = RedisKey::try_from(format!("test_stop_cleanup_{}", unique)).unwrap();
+        let prefix = crate::RedisKey::try_from(format!("test_stop_cleanup_{}", unique)).unwrap();
 
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
@@ -253,15 +285,26 @@ fn test_redis_stop_cleanup_loop_prevents_cleanup() {
 
         let rl = Arc::new(RateLimiter::new(options));
 
-        let rate_limit = RateLimit::try_from(10.0).unwrap();
-        let key = RedisKey::try_from(format!("test_key_{}", unique)).unwrap();
-        let _ = rl.redis().absolute().inc(&key, &rate_limit, 1).await;
+        // Use a long window so Allowed can't be natural expiry.
+        let rate_limit = RateLimit::try_from(1.0).unwrap();
+        let key = crate::RedisKey::try_from(format!("test_key_{}", unique)).unwrap();
 
-        // Sanity: ensure the keys exist before cleanup might run.
-        let kg = RedisKeyGenerator::new(prefix.clone(), RateType::Absolute);
-        let mut conn = connection_manager.clone();
-        let h_exists: bool = conn.exists(kg.get_hash_key(&key)).await.unwrap();
-        assert!(h_exists, "expected hash key to exist before cleanup");
+        // capacity = 1s * 1/s = 1
+        let d0 = rl.redis().absolute().inc(&key, &rate_limit, 1).await.unwrap();
+        assert!(matches!(d0, crate::RateLimitDecision::Allowed));
+
+        // Wait until the key is observed as rejected (commit has applied).
+        let start = std::time::Instant::now();
+        loop {
+            let d = rl.redis().absolute().is_allowed(&key).await.unwrap();
+            if matches!(d, crate::RateLimitDecision::Rejected { .. }) {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("expected key to become rejected after saturating");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         // Start loop with a long interval (first Redis cleanup would occur after the first tick).
         rl.run_cleanup_loop_with_config(50, 200);
@@ -270,21 +313,10 @@ fn test_redis_stop_cleanup_loop_prevents_cleanup() {
         rl.stop_cleanup_loop();
         rl.stop_cleanup_loop();
 
-        // Wait longer than the interval; if cleanup ran, it would delete the keys.
-        tokio::time::sleep(Duration::from_millis(320)).await;
+        // Wait longer than the interval; if cleanup ran, it would delete state and allow the key.
+        std::thread::sleep(Duration::from_millis(320));
 
-        let mut conn = connection_manager.clone();
-        let h_exists: bool = conn.exists(kg.get_hash_key(&key)).await.unwrap();
-        let a_exists: bool = conn.exists(kg.get_active_keys(&key)).await.unwrap();
-        let w_exists: bool = conn.exists(kg.get_window_limit_key(&key)).await.unwrap();
-        let t_exists: bool = conn.exists(kg.get_total_count_key(&key)).await.unwrap();
-        assert!(
-            h_exists && a_exists && w_exists && t_exists,
-            "expected keys to remain after stopping cleanup loop"
-        );
-
-        let ae_key = kg.get_active_entities_key();
-        let score: Option<f64> = conn.zscore(&ae_key, &**key).await.unwrap();
-        assert!(score.is_some(), "expected active_entities entry to remain");
+        let d = rl.redis().absolute().is_allowed(&key).await.unwrap();
+        assert!(matches!(d, crate::RateLimitDecision::Rejected { .. }));
     });
 }

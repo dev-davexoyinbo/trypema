@@ -1,5 +1,5 @@
 .PHONY: \
-	test-redis test redis-up redis-down \
+	test redis-up redis-down \
 	bench-local bench-redis bench \
 	stress \
 	stress-local stress-redis \
@@ -25,13 +25,11 @@ redis-up:
 redis-down:
 	@docker compose down -v --remove-orphans
 
-test-redis:
+test:
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
-	REDIS_URL="$(REDIS_URL)" cargo test -p trypema --features redis-tokio
-
-test: test-redis
+	REDIS_URL="$(REDIS_URL)" cargo test --tests --features redis-tokio -- --show-output
 
 bench-local:
 	@cargo bench -p trypema --bench local_absolute

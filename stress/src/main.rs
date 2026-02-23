@@ -93,7 +93,7 @@ struct Args {
     window_s: u64,
 
     #[arg(long, default_value_t = 10)]
-    group_ms: u64,
+    group_ms: u128,
 
     #[arg(long, default_value_t = 1.5)]
     hard_limit_factor: f64,
