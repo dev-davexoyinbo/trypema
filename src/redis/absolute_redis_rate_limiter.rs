@@ -5,11 +5,44 @@ use crate::{
     RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds, common::RateType,
 };
 
-const ABSOLUTE_INC_LUA: &str = r#"
+const ABSOLUTE_CHECK_LUA: &str = r#"
     local time_array = redis.call("TIME")
     local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 
 
+    local hash_key = KEYS[1]
+    local active_keys = KEYS[2]
+    local window_limit_key = KEYS[3]
+    local total_count_key = KEYS[4]
+
+    local window_size_ms = tonumber(ARGV[1])
+    local count = tonumber(ARGV[2])
+
+    local window_limit = tonumber(redis.call("GET", window_limit_key))
+    if window_limit == nil then
+        return {"allowed", 0, 0}
+    end
+
+
+    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+
+    if total_count + count > window_limit then
+        local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
+
+        if #oldest_hash_fields == 0 then
+            return {"rejected", tostring(timestamp_ms), 0, 0}
+        end
+
+        local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_fields[1])) or 0
+        local ttl = window_size_ms - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
+
+        return {"rejected",tostring(timestamp_ms), ttl, oldest_count}
+    end
+
+    return {"allowed", tostring(timestamp_ms), 0, 0}
+"#;
+
+const ABSOLUTE_COMMIT_LUA: &str = r#"
     local hash_key = KEYS[1]
     local active_keys = KEYS[2]
     local window_limit_key = KEYS[3]
@@ -21,61 +54,36 @@ const ABSOLUTE_INC_LUA: &str = r#"
     local window_limit = tonumber(ARGV[3])
     local rate_group_size_ms = tonumber(ARGV[4])
     local count = tonumber(ARGV[5])
+    local timestamp_ms = tonumber(ARGV[6])
 
-    redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
+    -- evict expired buckets
+    local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
+    if #to_remove_keys > 0 then
+        local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+        redis.call("HDEL", hash_key, unpack(to_remove_keys))
 
-    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+        local remove_sum = 0
 
-    if total_count + count > window_limit then
-        local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
-
-        if #to_remove_keys > 0 then
-            local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
-            redis.call("HDEL", hash_key, unpack(to_remove_keys))
-
-            local remove_sum = 0
-
-            for i = 1, #to_remove do
-                local value = tonumber(to_remove[i])
-                if value then
-                    remove_sum = remove_sum + value
-                end
-            end
-
-            total_count = redis.call("DECRBY", total_count_key, remove_sum)
-            redis.call("ZREM", active_keys, unpack(to_remove_keys))
-        end
-    end
-
-    if total_count + count > window_limit then
-        local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
-
-        if #oldest_hash_fields == 0 then
-            return {"rejected", 0, 0}
+        for i = 1, #to_remove do
+            remove_sum = remove_sum + (tonumber(to_remove[i]) or 0)
         end
 
-        local oldest_hash_field = oldest_hash_fields[1]
-        local oldest_hash_field_group_timestamp = tonumber(oldest_hash_fields[2])
-        local oldest_hash_field_ttl = (window_size_seconds * 1000) - timestamp_ms + oldest_hash_field_group_timestamp
-        local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_field)) or 0
-
-        return {"rejected", oldest_hash_field_ttl, oldest_count}
+        redis.call("DECRBY", total_count_key, remove_sum)
+        redis.call("ZREM", active_keys, unpack(to_remove_keys))
     end
 
+    --group bucketing
     local latest_hash_field_entry = redis.call("ZRANGE", active_keys, 0, 0, "REV", "WITHSCORES")
     if #latest_hash_field_entry > 0 then
-        local latest_hash_field = latest_hash_field_entry[1]
-        local latest_hash_field_group_timestamp = tonumber(latest_hash_field_entry[2])
-        local latest_hash_field_age_ms = timestamp_ms - latest_hash_field_group_timestamp
-
-        if latest_hash_field_age_ms > 0 and latest_hash_field_age_ms < rate_group_size_ms then
-            timestamp_ms = tonumber(latest_hash_field)
+        local age_ms = timestamp_ms - tonumber(latest_hash_field_entry[2])
+        
+        if age_ms > 0 and age_ms < rate_group_size_ms then
+            timestamp_ms = tonumber(latest_hash_field_entry[1])
         end
     end
 
     local hash_field = tostring(timestamp_ms)
-
     local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
     redis.call("INCRBY", total_count_key, count)
 
@@ -85,69 +93,9 @@ const ABSOLUTE_INC_LUA: &str = r#"
     end
 
     redis.call("EXPIRE", window_limit_key, window_size_seconds)
+    redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
-    return {"allowed", 0, 0}
-"#;
-
-const ABSOLUTE_IS_ALLOWED_LUA: &str = r#"
-    local time_array = redis.call("TIME")
-    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-
-
-    local hash_key = KEYS[1]
-    local active_keys = KEYS[2]
-    local window_limit_key = KEYS[3]
-    local total_count_key = KEYS[4]
-
-    local window_size_seconds = tonumber(ARGV[1])
-    local rate_group_size_ms = tonumber(ARGV[2])
-
-    local window_limit = tonumber(redis.call("GET", window_limit_key))
-    if window_limit == nil then
-        return {"allowed", 0, 0}
-    end
-
-
-    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
-
-    if total_count >= window_limit then
-        local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
-
-        if #to_remove_keys > 0 then
-            local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
-            redis.call("HDEL", hash_key, unpack(to_remove_keys))
-
-            local remove_sum = 0
-
-            for i = 1, #to_remove do
-                local value = tonumber(to_remove[i])
-                if value then
-                    remove_sum = remove_sum + value
-                end
-            end
-
-            total_count = redis.call("DECRBY", total_count_key, remove_sum)
-            redis.call("ZREM", active_keys, unpack(to_remove_keys))
-        end
-    end
-
-
-    if total_count >= window_limit then
-        local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
-
-        if #oldest_hash_fields == 0 then
-            return {"rejected", 0, 0}
-        end
-
-        local oldest_hash_field = oldest_hash_fields[1]
-        local oldest_hash_field_group_timestamp = tonumber(oldest_hash_fields[2])
-        local oldest_hash_field_ttl = (window_size_seconds * 1000) - timestamp_ms + oldest_hash_field_group_timestamp
-        local oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_field)) or 0
-
-        return {"rejected", oldest_hash_field_ttl, oldest_count}
-    end
-
-    return {"allowed", 0, 0}
+    return 1
 "#;
 
 const ABSOLUTE_CLEANUP_LUA: &str = r#"
@@ -196,10 +144,11 @@ const ABSOLUTE_CLEANUP_LUA: &str = r#"
 pub struct AbsoluteRedisRateLimiter {
     connection_manager: ConnectionManager,
     window_size_seconds: WindowSizeSeconds,
+    window_size_ms: u128,
     rate_group_size_ms: RateGroupSizeMs,
     key_generator: RedisKeyGenerator,
-    inc_script: Script,
-    is_allowed_script: Script,
+    check_script: Script,
+    commit_script: Script,
     cleanup_script: Script,
 }
 
@@ -210,10 +159,11 @@ impl AbsoluteRedisRateLimiter {
         Self {
             connection_manager: options.connection_manager,
             window_size_seconds: options.window_size_seconds,
+            window_size_ms: *options.window_size_seconds as u128 * 1000,
             rate_group_size_ms: options.rate_group_size_ms,
             key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
-            inc_script: Script::new(ABSOLUTE_INC_LUA),
-            is_allowed_script: Script::new(ABSOLUTE_IS_ALLOWED_LUA),
+            check_script: Script::new(ABSOLUTE_CHECK_LUA),
+            commit_script: Script::new(ABSOLUTE_COMMIT_LUA),
             cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
         }
     } // end method with_rate_type
@@ -228,20 +178,37 @@ impl AbsoluteRedisRateLimiter {
         let window_limit = *self.window_size_seconds as f64 * **rate_limit;
         let mut connection_manager = self.connection_manager.clone();
 
-        let (result, retry_after_ms, remaining_after_waiting): (String, u128, u64) = self
-            .inc_script
+        let (result, timestamp_ms, retry_after_ms, remaining_after_waiting): (
+            String,
+            String,
+            u128,
+            u64,
+        ) = self
+            .check_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))
             .key(self.key_generator.get_total_count_key(key))
-            .key(self.key_generator.get_active_entities_key())
-            .arg(key.to_string())
-            .arg(*self.window_size_seconds)
+            .arg(self.window_size_ms)
             .arg(window_limit)
             .arg(*self.rate_group_size_ms)
             .arg(count)
             .invoke_async(&mut connection_manager)
             .await?;
+
+        // .check_script
+        // .key(self.key_generator.get_hash_key(key))
+        // .key(self.key_generator.get_active_keys(key))
+        // .key(self.key_generator.get_window_limit_key(key))
+        // .key(self.key_generator.get_total_count_key(key))
+        // .key(self.key_generator.get_active_entities_key())
+        // .arg(key.to_string())
+        // .arg(*self.window_size_seconds)
+        // .arg(window_limit)
+        // .arg(*self.rate_group_size_ms)
+        // .arg(count)
+        // .invoke_async(&mut connection_manager)
+        // .await?;
 
         match result.as_str() {
             "allowed" => Ok(RateLimitDecision::Allowed),
@@ -269,7 +236,7 @@ impl AbsoluteRedisRateLimiter {
         let mut connection_manager = self.connection_manager.clone();
 
         let (result, retry_after_ms, remaining_after_waiting): (String, u128, u64) = self
-            .is_allowed_script
+            .commit_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))
