@@ -24,7 +24,7 @@ const ABSOLUTE_CHECK_LUA: &str = r#"
 
     local window_limit = tonumber(redis.call("GET", window_limit_key))
     if window_limit == nil then
-        return {"allowed", 0, 0}
+        return {"allowed", tostring(timestamp_ms), 0, 0}
     end
 
     local total_count = tonumber(redis.call("GET", total_count_key)) or 0
