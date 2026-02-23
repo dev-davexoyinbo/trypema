@@ -15,13 +15,18 @@ use trypema::{
     RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[cfg(feature = "redis-tokio")]
+mod redis_compare;
+
+mod local_compare;
+
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 enum Provider {
     Local,
     Redis,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 enum Strategy {
     Absolute,
     Suppressed,
@@ -38,6 +43,26 @@ enum KeyDist {
 enum Mode {
     Max,
     TargetQps,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum LocalLimiter {
+    /// Use trypema local provider.
+    Trypema,
+    /// Use burster SlidingWindowLog (strict rolling window log).
+    Burster,
+    /// Use governor (GCRA).
+    Governor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum RedisLimiter {
+    /// Use trypema's Redis provider (Lua scripts).
+    Trypema,
+    /// Use redis-cell module (CL.THROTTLE).
+    Cell,
+    /// Use GCRA Lua script (similar to go-redis/redis_rate).
+    Gcra,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -87,6 +112,21 @@ struct Args {
 
     #[arg(long, default_value_t = 1000.0)]
     rate_limit_per_s: f64,
+
+    /// Only used when `--provider local`.
+    #[arg(long, value_enum, default_value_t = LocalLimiter::Trypema)]
+    local_limiter: LocalLimiter,
+
+    #[arg(long, value_enum, default_value_t = RedisLimiter::Trypema)]
+    redis_limiter: RedisLimiter,
+
+    /// Only used when `--redis-limiter cell`.
+    #[arg(long, default_value_t = 15)]
+    cell_burst: u64,
+
+    /// Only used when `--redis-limiter gcra`.
+    #[arg(long, default_value_t = 15)]
+    gcra_burst: u64,
 
     #[arg(long)]
     target_qps: Option<u64>,
@@ -138,7 +178,8 @@ fn should_sample(iter: u64, sample_every: u64) -> bool {
     if sample_every <= 1 {
         return true;
     }
-    iter % sample_every == 0
+
+    iter.is_multiple_of(sample_every)
 }
 
 fn qps_for_now(args: &Args, started: Instant) -> Option<u64> {
@@ -146,11 +187,8 @@ fn qps_for_now(args: &Args, started: Instant) -> Option<u64> {
         return None;
     }
 
-    let base = args.target_qps;
+    let base = args.target_qps?;
     let burst = args.burst_qps;
-    if base.is_none() {
-        return None;
-    }
 
     if let Some(burst_qps) = burst {
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -160,7 +198,7 @@ fn qps_for_now(args: &Args, started: Instant) -> Option<u64> {
         }
     }
 
-    base
+    Some(base)
 }
 
 fn pick_key<'a>(args: &Args, keys: &'a [String], thread_rng: &mut impl FnMut() -> u64) -> &'a str {
@@ -212,7 +250,7 @@ fn print_results(
         counts.suppressed_denied.load(Ordering::Relaxed),
         counts.errors.load(Ordering::Relaxed)
     );
-    if hist.len() > 0 {
+    if !hist.is_empty() {
         let p50 = hist.value_at_quantile(0.50);
         let p95 = hist.value_at_quantile(0.95);
         let p99 = hist.value_at_quantile(0.99);
@@ -232,6 +270,11 @@ fn print_results(
 }
 
 fn run_local(args: &Args) {
+    if args.local_limiter != LocalLimiter::Trypema {
+        local_compare::run(args.clone());
+        return;
+    }
+
     let args = args.clone();
     let keys = build_keys(&args);
 
@@ -291,7 +334,6 @@ fn run_local(args: &Args) {
         let counts = Arc::clone(&counts);
         let total_ops = Arc::clone(&total_ops);
         let args = args.clone();
-        let rate = rate;
 
         handles.push(std::thread::spawn(move || {
             let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
@@ -386,9 +428,23 @@ fn run_redis(args: &Args) {
         .unwrap();
 
     rt.block_on(async move {
+        if args2.redis_limiter != RedisLimiter::Trypema {
+            let limiter = match args2.redis_limiter {
+                RedisLimiter::Cell => redis_compare::RedisLimiter::Cell,
+                RedisLimiter::Gcra => redis_compare::RedisLimiter::Gcra,
+                RedisLimiter::Trypema => unreachable!(),
+            };
+
+            // Note: this path compares alternative Redis rate limiters.
+            // Strategy is ignored because semantics differ.
+            redis_compare::run(args2.clone(), limiter).await;
+            return;
+        }
+
         let keys = build_keys(&args2);
         let client = redis::Client::open(args2.redis_url.as_str()).unwrap();
         let connection_manager = client.get_connection_manager().await.unwrap();
+
         let rate = RateLimit::try_from(args2.rate_limit_per_s).unwrap();
 
         let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
@@ -421,7 +477,6 @@ fn run_redis(args: &Args) {
             let total_ops = Arc::clone(&total_ops);
             let args = args2.clone();
             let keys = keys.clone();
-            let rate = rate;
 
             join.push(tokio::spawn(async move {
                 let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();

@@ -147,7 +147,7 @@ pub enum RateLimitDecision {
         /// - New increments extending bucket lifetimes
         ///
         /// Use as a backoff hint, not a guarantee.
-        retry_after_ms: u64,
+        retry_after_ms: u128,
 
         /// **Best-effort** estimate of window usage after waiting `retry_after_ms`.
         ///

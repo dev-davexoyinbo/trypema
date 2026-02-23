@@ -1,7 +1,22 @@
 services:
   redis:
-    image: redis:6.2-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    build:
+      context: .
+      dockerfile: docker/redis-with-cell/Dockerfile
+      args:
+        REDIS_VERSION: "7.2-bookworm"
+        REDIS_CELL_VERSION: "v0.5.0"
+        REDIS_CELL_ASSET: "redis-cell-v0.5.0-aarch64-unknown-linux-gnu.tar.gz"
+    command:
+      [
+        "redis-server",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+        "--loadmodule",
+        "/usr/lib/redis/modules/libredis_cell.so",
+      ]
     ports:
       - "${REDIS_PORT:-16379}:6379"
     healthcheck:

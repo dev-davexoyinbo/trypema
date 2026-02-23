@@ -30,6 +30,7 @@ Local stress test (max throughput):
 ```bash
 make stress-local-hot
 make stress-local-uniform
+make stress-local-uniform-matrix
 ```
 
 Redis stress test (contention + high-cardinality skew):
@@ -71,6 +72,9 @@ cargo run --release -p trypema-stress -- \
   --provider local --strategy absolute --threads 16 \
   --key-dist uniform --key-space 100000 --duration-s 60
 
+# Local: uniform sweep across (key_space, rate_limit_per_s).
+make stress-local-uniform-matrix
+
 # Local: skewed distribution, burst traffic, suppressed
 cargo run --release -p trypema-stress -- \
   --provider local --strategy suppressed --threads 16 \
@@ -96,6 +100,44 @@ cargo run --release -p trypema-stress --features redis-tokio -- \
   --provider redis --strategy suppressed --threads 256 \
   --key-dist skewed --key-space 100000 --hot-fraction 0.8 \
   --duration-s 120
+```
+
+## Redis Comparison (trypema vs redis-cell vs GCRA)
+
+This suite benchmarks three Redis-backed limiters using the same harness:
+
+- `trypema` Redis provider (Lua scripts)
+- `redis-cell` module (`CL.THROTTLE`)
+- GCRA Lua script (equivalent to go-redis/redis_rate `allowN`)
+
+Run:
+
+```bash
+make stress-redis-compare
+```
+
+Notes:
+
+- `redis-cell` is loaded into the Redis container as a module via `compose.yaml`.
+- `--redis-limiter cell|gcra` uses different semantics than trypema's sliding window; treat results as backend cost comparisons, not strict behavioral equivalence.
+
+## Local Comparison (trypema vs burster vs governor)
+
+This suite compares three in-process limiters using the same stress harness:
+
+- `trypema` local provider (bucketed/coalesced rolling window)
+- `burster` `SlidingWindowLog` (strict rolling window log)
+- `governor` (GCRA; different semantics)
+
+Notes:
+
+- For `burster`, the window is a const-generic (`W` ms). The harness currently supports `--window-s 10|60|300`.
+- For `governor`, we configure `Quota::per_second(rate).allow_burst(rate * window_s)` to roughly match “capacity per window”. This is still not a strict sliding window.
+
+Run:
+
+```bash
+make stress-local-compare
 ```
 
 ## Recommended Baseline Suite (1/2/3)

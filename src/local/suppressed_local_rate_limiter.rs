@@ -1,8 +1,9 @@
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use ahash::RandomState;
 use dashmap::DashMap;
 
 use crate::{
@@ -151,22 +152,26 @@ use crate::{
 #[derive(Debug)]
 pub struct SuppressedLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
+    window_size_ms: u128,
+    window_duration: Duration,
     rate_group_size_ms: RateGroupSizeMs,
-    series: DashMap<String, RateLimitSeries>,
+    series: DashMap<String, RateLimitSeries, RandomState>,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
-    suppression_factors: DashMap<String, (Instant, f64)>,
+    suppression_factors: DashMap<String, (Instant, f64), RandomState>,
 }
 
 impl SuppressedLocalRateLimiter {
     pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
         Self {
             hard_limit_factor: options.hard_limit_factor,
+            window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
             window_size_seconds: options.window_size_seconds,
+            window_duration: Duration::from_secs(*options.window_size_seconds),
             suppression_factor_cache_ms: options.suppression_factor_cache_ms,
             rate_group_size_ms: options.rate_group_size_ms,
-            series: DashMap::new(),
-            suppression_factors: DashMap::new(),
+            series: DashMap::default(),
+            suppression_factors: DashMap::default(),
         }
     } // end constructor
 
@@ -176,6 +181,7 @@ impl SuppressedLocalRateLimiter {
         self.inc_with_rng(key, rate_limit, count, &mut rng)
     }
 
+    #[inline(always)]
     pub(crate) fn inc_with_rng(
         &self,
         key: &str,
@@ -183,12 +189,6 @@ impl SuppressedLocalRateLimiter {
         count: u64,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> RateLimitDecision {
-        if !self.series.contains_key(key) {
-            self.series
-                .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(self.get_hard_limit(rate_limit)));
-        }
-
         let suppression_factor = self.get_suppression_factor(key);
 
         let should_allow = if suppression_factor == 0f64 {
@@ -199,8 +199,19 @@ impl SuppressedLocalRateLimiter {
             random_bool(1f64 - suppression_factor)
         };
 
-        let Some(rate_limit_series) = self.series.get(key) else {
-            unreachable!("SuppressedLocalRateLimiter::inc: key should be in map");
+        let rate_limit_series = match self.series.get(key) {
+            Some(rate_limit_series) => rate_limit_series,
+            None => {
+                self.series
+                    .entry(key.to_string())
+                    .or_insert_with(|| RateLimitSeries::new(self.get_hard_limit(rate_limit)));
+
+                let Some(rate_limit_series) = self.series.get(key) else {
+                    unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
+                };
+
+                rate_limit_series
+            }
         };
 
         if let Some(last_entry) = rate_limit_series.series.back()
@@ -217,10 +228,9 @@ impl SuppressedLocalRateLimiter {
         } else {
             drop(rate_limit_series);
 
-            let mut rate_limit_series = self
-                .series
-                .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(self.get_hard_limit(rate_limit)));
+            let Some(mut rate_limit_series) = self.series.get_mut(key) else {
+                unreachable!("SuppressedLocalRateLimiter::inc: key should be in map");
+            };
 
             rate_limit_series.series.push_back(InstantRate {
                 count: count.into(),
@@ -255,7 +265,7 @@ impl SuppressedLocalRateLimiter {
             return;
         };
 
-        if instant_rate.timestamp.elapsed().as_millis() <= *self.window_size_seconds as u128 {
+        if instant_rate.timestamp.elapsed().as_millis() <= self.window_size_ms {
             return;
         }
 
@@ -265,21 +275,29 @@ impl SuppressedLocalRateLimiter {
             return;
         };
 
-        while let Some(instant_rate) = rate_limit_series.series.front()
-            && instant_rate.timestamp.elapsed().as_millis()
-                > (*self.window_size_seconds * 1000) as u128
-        {
-            rate_limit_series.total.fetch_sub(
-                instant_rate.count.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            rate_limit_series.total_declined.fetch_sub(
-                instant_rate.declined.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+        let now = Instant::now();
 
-            rate_limit_series.series.pop_front();
-        }
+        let split = rate_limit_series
+            .series
+            .partition_point(|r| now.duration_since(r.timestamp) > self.window_duration);
+
+        let (removed_count, removed_declined) =
+            rate_limit_series
+                .series
+                .drain(..split)
+                .fold((0u64, 0u64), |(count, declined), r| {
+                    (
+                        count + r.count.load(Ordering::Relaxed),
+                        declined + r.declined.load(Ordering::Relaxed),
+                    )
+                });
+
+        rate_limit_series
+            .total
+            .fetch_sub(removed_count, Ordering::Relaxed);
+        rate_limit_series
+            .total_declined
+            .fetch_sub(removed_declined, Ordering::Relaxed);
     } // end method remove_expired_buckets
 
     /// Get the current suppression factor for `key`.

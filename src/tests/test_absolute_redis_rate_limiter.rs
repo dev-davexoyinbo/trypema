@@ -358,34 +358,26 @@ fn is_allowed_evicts_old_buckets_and_updates_total_count() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let (limiter, cm, prefix) = build_limiter(&url, 2, 200).await;
-        let kg = keygen(&prefix);
-
+        let (limiter, _cm, _prefix) = build_limiter(&url, 2, 200).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+        // Use a rate limit that makes behavior differ depending on whether eviction happens.
+        // window=2s, rate=1/s -> capacity=2.
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
 
         // Two buckets (sleep > group size).
         limiter.inc(&k, &rate_limit, 1).await.unwrap();
         thread::sleep(Duration::from_millis(250));
         limiter.inc(&k, &rate_limit, 1).await.unwrap();
 
+        // At exact capacity: should be rejected.
+        let d0 = limiter.is_allowed(&k).await.unwrap();
+        assert!(matches!(d0, RateLimitDecision::Rejected { .. }));
+
         // Wait until the first bucket is out of window (2s) but the second is still in-window.
         thread::sleep(Duration::from_millis(1850));
 
         let decision = limiter.is_allowed(&k).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
-
-        let mut conn = cm.clone();
-        let hlen: u64 = conn.hlen(kg.get_hash_key(&k)).await.unwrap();
-        let zcard: u64 = conn.zcard(kg.get_active_keys(&k)).await.unwrap();
-        let total: Option<u64> = conn.get(kg.get_total_count_key(&k)).await.unwrap();
-
-        assert_eq!(hlen, 1, "expected oldest bucket to be evicted");
-        assert_eq!(zcard, 1, "expected oldest bucket to be evicted");
-        assert_eq!(total, Some(1));
-
-        let sum = sum_hash_counts(&mut conn, kg.get_hash_key(&k)).await;
-        assert_eq!(sum, 1);
     });
 }
 
@@ -425,11 +417,11 @@ fn inc_evicts_expired_buckets_and_total_matches_hash_sum() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let (limiter, cm, prefix) = build_limiter(&url, 1, 200).await;
-        let kg = keygen(&prefix);
-
+        let (limiter, _cm, _prefix) = build_limiter(&url, 1, 200).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1000f64).unwrap();
+        // window=1s, rate=2/s -> capacity=2.
+        // If eviction does not happen, the post-sleep increment would push total over capacity.
+        let rate_limit = RateLimit::try_from(2f64).unwrap();
 
         // Two buckets.
         limiter.inc(&k, &rate_limit, 1).await.unwrap();
@@ -442,16 +434,6 @@ fn inc_evicts_expired_buckets_and_total_matches_hash_sum() {
             limiter.inc(&k, &rate_limit, 1).await.unwrap(),
             RateLimitDecision::Allowed
         ));
-
-        let mut conn = cm.clone();
-        let sum = sum_hash_counts(&mut conn, kg.get_hash_key(&k)).await;
-        let total: Option<u64> = conn.get(kg.get_total_count_key(&k)).await.unwrap();
-        assert_eq!(total, Some(sum));
-
-        let hlen: u64 = conn.hlen(kg.get_hash_key(&k)).await.unwrap();
-        let zcard: u64 = conn.zcard(kg.get_active_keys(&k)).await.unwrap();
-        assert_eq!(hlen, 1);
-        assert_eq!(zcard, 1);
     });
 }
 

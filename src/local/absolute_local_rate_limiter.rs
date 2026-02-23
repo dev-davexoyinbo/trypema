@@ -1,8 +1,9 @@
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use ahash::RandomState;
 use dashmap::DashMap;
 
 use crate::{
@@ -123,21 +124,25 @@ use crate::{
 #[derive(Debug)]
 pub struct AbsoluteLocalRateLimiter {
     window_size_seconds: WindowSizeSeconds,
+    window_size_ms: u128,
+    window_duration: Duration,
     rate_group_size_ms: RateGroupSizeMs,
-    series: DashMap<String, RateLimitSeries>,
+    series: DashMap<String, RateLimitSeries, RandomState>,
 }
 
 impl AbsoluteLocalRateLimiter {
     pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
         Self {
+            window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
+            window_duration: Duration::from_secs(*options.window_size_seconds),
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
-            series: DashMap::new(),
+            series: DashMap::default(),
         }
     } // end constructor
 
     #[cfg(test)]
-    pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries> {
+    pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries, RandomState> {
         &self.series
     }
 
@@ -248,14 +253,18 @@ impl AbsoluteLocalRateLimiter {
             return is_allowed;
         }
 
-        if !self.series.contains_key(key) {
-            self.series
-                .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-        }
+        let rate_limit_series = match self.series.get(key) {
+            Some(rate_limit_series) => rate_limit_series,
+            None => {
+                self.series
+                    .entry(key.to_string())
+                    .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+                let Some(rate_limit_series) = self.series.get(key) else {
+                    unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
+                };
 
-        let Some(rate_limit_series) = self.series.get(key) else {
-            unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
+                rate_limit_series
+            }
         };
 
         if let Some(last_entry) = rate_limit_series.series.back()
@@ -266,10 +275,9 @@ impl AbsoluteLocalRateLimiter {
         } else {
             drop(rate_limit_series);
 
-            let mut rate_limit_series = self
-                .series
-                .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+            let Some(mut rate_limit_series) = self.series.get_mut(key) else {
+                unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
+            };
 
             rate_limit_series.series.push_back(InstantRate {
                 count: count.into(),
@@ -382,11 +390,19 @@ impl AbsoluteLocalRateLimiter {
             return RateLimitDecision::Allowed;
         };
 
+        let mut total_count = rate_limit.total.load(Ordering::Relaxed);
+        let window_limit = (*self.window_size_seconds as f64 * *rate_limit.limit) as u64;
+
+        if total_count < window_limit {
+            return RateLimitDecision::Allowed;
+        }
+
+        // Delay cleanup only if there is a possibility of rejection
+
         let rate_limit = match rate_limit.series.front() {
             None => rate_limit,
             Some(instant_rate)
-                if instant_rate.timestamp.elapsed().as_millis()
-                    <= (*self.window_size_seconds * 1000) as u128 =>
+                if instant_rate.timestamp.elapsed().as_millis() <= self.window_size_ms =>
             {
                 rate_limit
             }
@@ -394,44 +410,43 @@ impl AbsoluteLocalRateLimiter {
                 drop(rate_limit);
 
                 let Some(mut rate_limit) = self.series.get_mut(key) else {
-                    return RateLimitDecision::Allowed;
+                    unreachable!("AbsoluteLocalRateLimiter::is_allowed: key should be in map");
                 };
 
-                while let Some(instant_rate) = rate_limit.series.front()
-                    && instant_rate.timestamp.elapsed().as_millis()
-                        > (*self.window_size_seconds * 1000) as u128
-                {
-                    rate_limit.total.fetch_sub(
-                        instant_rate.count.load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                    );
+                let now = Instant::now();
 
-                    rate_limit.series.pop_front();
-                }
+                let split = rate_limit
+                    .series
+                    .partition_point(|r| now.duration_since(r.timestamp) > self.window_duration);
+
+                let total = rate_limit
+                    .series
+                    .drain(..split)
+                    .map(|r| r.count.load(Ordering::Relaxed))
+                    .sum::<u64>();
+
+                rate_limit.total.fetch_sub(total, Ordering::Relaxed);
+                total_count -= total;
 
                 drop(rate_limit);
 
                 let Some(rate_limit) = self.series.get(key) else {
-                    return RateLimitDecision::Allowed;
+                    unreachable!("AbsoluteLocalRateLimiter::is_allowed: key should be in map");
                 };
 
                 rate_limit
             }
         };
 
-        let window_limit = *self.window_size_seconds as f64 * *rate_limit.limit;
-
-        if rate_limit.total.load(Ordering::Relaxed) < window_limit as u64 {
+        if total_count < window_limit {
             return RateLimitDecision::Allowed;
         }
 
         let (retry_after_ms, remaining_after_waiting) = match rate_limit.series.front() {
             None => (0, 0),
             Some(instant_rate) => {
-                let window_ms = self.window_size_seconds.saturating_mul(1000);
                 let elapsed_ms = instant_rate.timestamp.elapsed().as_millis();
-                let elapsed_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
-                let retry_after_ms = window_ms.saturating_sub(elapsed_ms);
+                let retry_after_ms = self.window_size_ms.saturating_sub(elapsed_ms);
 
                 let current_total = rate_limit.total.load(Ordering::Relaxed);
                 let oldest_count = instant_rate.count.load(Ordering::Relaxed);
