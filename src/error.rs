@@ -175,4 +175,10 @@ pub enum TrypemaError {
     /// The duration must be greater than 0.
     #[error("invalid suppression factor cache duration: {0}")]
     InvalidSuppressionFactorCacheMs(String),
+
+    /// Redis committer send error.
+    ///
+    /// Not typically encountered by end users.
+    #[error("redis committer send error: {0}")]
+    RedisCommitterSendError(String),
 }

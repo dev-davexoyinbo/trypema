@@ -53,6 +53,7 @@ tokio = { version = "1.49.0", optional = true, features = [
 ] }
 smol = { version = "2.0.2", optional = true }
 ahash = "0.8.12"
+async-channel = { version = "2.5.0", optional = true }
 
 [features]
 redis-tokio = [
@@ -61,6 +62,7 @@ redis-tokio = [
   "redis/aio",
   "redis/connection-manager",
   "dep:tokio",
+  "dep:async-channel",
 ]
 redis-smol = [
   "redis",
@@ -68,6 +70,7 @@ redis-smol = [
   "redis/aio",
   "redis/connection-manager",
   "dep:smol",
+  "dep:async-channel",
 ]
 
 [dev-dependencies]

@@ -78,7 +78,7 @@ async fn set_active_entity_score_ms_ago(
 async fn build_limiter(
     url: &str,
     window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    rate_group_size_ms: u128,
 ) -> (
     AbsoluteRedisRateLimiter,
     redis::aio::ConnectionManager,

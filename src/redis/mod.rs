@@ -9,3 +9,5 @@ pub use suppressed_redis_rate_limiter::*;
 
 mod common;
 pub use common::*;
+
+mod absolute_redis_rate_committer;

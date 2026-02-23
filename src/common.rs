@@ -361,10 +361,10 @@ impl TryFrom<u64> for WindowSizeSeconds {
 /// assert!(RateGroupSizeMs::try_from(0).is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct RateGroupSizeMs(u64);
+pub struct RateGroupSizeMs(u128);
 
 impl Deref for RateGroupSizeMs {
-    type Target = u64;
+    type Target = u128;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -377,10 +377,10 @@ impl DerefMut for RateGroupSizeMs {
     }
 }
 
-impl TryFrom<u64> for RateGroupSizeMs {
+impl TryFrom<u128> for RateGroupSizeMs {
     type Error = TrypemaError;
 
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
+    fn try_from(value: u128) -> Result<Self, Self::Error> {
         if value == 0 {
             Err(TrypemaError::InvalidRateGroupSizeMs(
                 "Rate group size must be greater than 0".to_string(),

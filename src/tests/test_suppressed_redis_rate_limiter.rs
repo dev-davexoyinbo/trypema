@@ -96,7 +96,7 @@ async fn set_zset_score_ms_ago(
 async fn build_limiter(
     url: &str,
     window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    rate_group_size_ms: u128,
     hard_limit_factor: f64,
 ) -> (
     SuppressedRedisRateLimiter,
@@ -116,7 +116,7 @@ async fn build_limiter(
 async fn build_limiter_with_cache_ms(
     url: &str,
     window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    rate_group_size_ms: u128,
     hard_limit_factor: f64,
     suppression_factor_cache_ms: u64,
 ) -> (
@@ -588,7 +588,7 @@ fn suppression_factor_cache_is_written_and_has_positive_ttl() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let rate_group_size_ms = 200_u64;
+        let rate_group_size_ms = 200_u128;
         let (limiter, cm, prefix) = build_limiter(&url, 10, rate_group_size_ms, 10f64).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();

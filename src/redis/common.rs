@@ -9,6 +9,7 @@ use crate::{TrypemaError, common::RateType};
 /// - Must not contain colons
 #[derive(Debug, Clone, PartialEq, PartialOrd, Hash, Eq)]
 pub struct RedisKey(String);
+// TODO: make RedisKey Arc<str> to avoid cloning
 
 impl RedisKey {
     /// Create a new default prefix.

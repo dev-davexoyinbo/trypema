@@ -11,7 +11,7 @@ use crate::common::{
 };
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};
 
-fn limiter(window_size_seconds: u64, rate_group_size_ms: u64) -> AbsoluteLocalRateLimiter {
+fn limiter(window_size_seconds: u64, rate_group_size_ms: u128) -> AbsoluteLocalRateLimiter {
     AbsoluteLocalRateLimiter::new(LocalRateLimiterOptions {
         window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),

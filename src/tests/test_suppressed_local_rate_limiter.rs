@@ -7,7 +7,7 @@ use crate::{
 
 fn limiter(
     window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    rate_group_size_ms: u128,
     hard_limit_factor: f64,
 ) -> SuppressedLocalRateLimiter {
     SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
@@ -20,7 +20,7 @@ fn limiter(
 
 fn limiter_with_cache_ms(
     window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    rate_group_size_ms: u128,
     hard_limit_factor: f64,
     suppression_factor_cache_ms: u64,
 ) -> SuppressedLocalRateLimiter {

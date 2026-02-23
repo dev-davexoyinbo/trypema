@@ -30,11 +30,11 @@ fn window_size_seconds_try_from_validates_min_1() {
 
 #[test]
 fn rate_group_size_ms_try_from_validates_nonzero() {
-    let g = RateGroupSizeMs::try_from(1u64).unwrap();
-    assert_eq!(*g, 1u64);
+    let g = RateGroupSizeMs::try_from(1u128).unwrap();
+    assert_eq!(*g, 1u128);
 
     assert_eq!(
-        RateGroupSizeMs::try_from(0u64).unwrap_err().to_string(),
+        RateGroupSizeMs::try_from(0u128).unwrap_err().to_string(),
         "invalid rate group size: Rate group size must be greater than 0"
     );
 }

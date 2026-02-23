@@ -268,7 +268,7 @@ impl AbsoluteLocalRateLimiter {
         };
 
         if let Some(last_entry) = rate_limit_series.series.back()
-            && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
+            && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms
         {
             last_entry.count.fetch_add(count, Ordering::Relaxed);
             rate_limit_series.total.fetch_add(count, Ordering::Relaxed);
