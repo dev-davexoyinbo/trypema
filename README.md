@@ -10,6 +10,11 @@ Trypema is a Rust rate limiting library supporting both in-process and Redis-bac
 
 Documentation: <https://trypema.davidoyinbo.com>
 
+Benchmarks and comparisons:
+
+- Local provider: <https://trypema.davidoyinbo.com/benchmarks/benchmark-results/local-benchmark-comparison>
+- Redis provider: <https://trypema.davidoyinbo.com/benchmarks/benchmark-results/redis-benchmark-comparison>
+
 ### Features
 
 **Providers:**
