@@ -178,7 +178,8 @@ fn should_sample(iter: u64, sample_every: u64) -> bool {
     if sample_every <= 1 {
         return true;
     }
-    iter % sample_every == 0
+
+    iter.is_multiple_of(sample_every)
 }
 
 fn qps_for_now(args: &Args, started: Instant) -> Option<u64> {
@@ -186,11 +187,8 @@ fn qps_for_now(args: &Args, started: Instant) -> Option<u64> {
         return None;
     }
 
-    let base = args.target_qps;
+    let base = args.target_qps?;
     let burst = args.burst_qps;
-    if base.is_none() {
-        return None;
-    }
 
     if let Some(burst_qps) = burst {
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -200,7 +198,7 @@ fn qps_for_now(args: &Args, started: Instant) -> Option<u64> {
         }
     }
 
-    base
+    Some(base)
 }
 
 fn pick_key<'a>(args: &Args, keys: &'a [String], thread_rng: &mut impl FnMut() -> u64) -> &'a str {
