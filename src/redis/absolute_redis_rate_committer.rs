@@ -1,7 +1,10 @@
 use async_channel::Sender;
-use redis::{RedisError, Script, aio::ConnectionManager};
+use redis::{RedisError, Script};
 
-use crate::{RateGroupSizeMs, WindowSizeSeconds, redis::RedisKey};
+use crate::{
+    RateGroupSizeMs, WindowSizeSeconds,
+    redis::{RedisKey, TrypemaRedisClient},
+};
 
 const ABSOLUTE_COMMIT_LUA: &str = r#"
     local hash_key = KEYS[1]
@@ -79,13 +82,14 @@ pub(crate) struct AbsoluteRedisRateCommitter {} // end struct AbsoluteRedisRateC
 
 impl AbsoluteRedisRateCommitter {
     pub(crate) fn run(
-        mut connection_manager: ConnectionManager,
+        client: TrypemaRedisClient,
         channel_size: usize,
         max_batch_size: usize,
     ) -> Sender<AbsoluteRedisCommit> {
         let (sender, receiver) = async_channel::bounded(channel_size);
 
         tokio::spawn(async move {
+            let mut connection_manager = client.get();
             let mut batch = Vec::with_capacity(max_batch_size);
             let script = Script::new(ABSOLUTE_COMMIT_LUA);
 
@@ -101,22 +105,22 @@ impl AbsoluteRedisRateCommitter {
 
                 // eprintln!("batch size: {}", batch.len());
 
-                let pipe = Self::build_pipeline(&batch, &script, false);
-
-                if let Err::<(), RedisError>(err) = pipe.query_async(&mut connection_manager).await
-                {
-                    if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
-                        tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
-                        continue;
-                    }
-
-                    let pipe = Self::build_pipeline(&batch, &script, true);
-
-                    if let Err::<(), _>(err) = pipe.query_async(&mut connection_manager).await {
-                        tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
-                        continue;
-                    }
-                }
+                // let pipe = Self::build_pipeline(&batch, &script, false);
+                //
+                // if let Err::<(), RedisError>(err) = pipe.query_async(&mut connection_manager).await
+                // {
+                //     if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
+                //         tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                //         continue;
+                //     }
+                //
+                //     let pipe = Self::build_pipeline(&batch, &script, true);
+                //
+                //     if let Err::<(), _>(err) = pipe.query_async(&mut connection_manager).await {
+                //         tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                //         continue;
+                //     }
+                // }
 
                 batch.clear();
             }

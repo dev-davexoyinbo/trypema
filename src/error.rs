@@ -181,4 +181,16 @@ pub enum TrypemaError {
     /// Not typically encountered by end users.
     #[error("redis committer send error: {0}")]
     RedisCommitterSendError(String),
+
+    /// Redis checker send error.
+    ///
+    /// Not typically encountered by end users.
+    #[error("redis checker send error: {0}")]
+    RedisCheckerSendError(String),
+
+    /// Invalid Redis client connection count.
+    ///
+    /// The connection count must be greater than 0.
+    #[error("invalid redis client connection count: {0}")]
+    InvalidRedisClientConnectionCount(String),
 }

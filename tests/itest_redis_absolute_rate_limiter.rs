@@ -62,7 +62,7 @@ async fn build_rate_limiter(
             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
         },
         redis: RedisRateLimiterOptions {
-            connection_manager,
+            client: connection_manager,
             prefix: Some(prefix),
             window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
             rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),

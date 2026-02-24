@@ -1,11 +1,17 @@
+use std::hint::black_box;
+
 use async_channel::Sender;
-use redis::{Script, aio::ConnectionManager};
+use chrono::Utc;
+use redis::Script;
 
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
     RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
     common::RateType,
-    redis::absolute_redis_rate_committer::{AbsoluteRedisCommit, AbsoluteRedisRateCommitter},
+    redis::{
+        TrypemaRedisClient,
+        absolute_redis_rate_committer::{AbsoluteRedisCommit, AbsoluteRedisRateCommitter},
+    },
 };
 
 const ABSOLUTE_CHECK_LUA: &str = r#"
@@ -89,9 +95,9 @@ const ABSOLUTE_CLEANUP_LUA: &str = r#"
 "#;
 
 /// A rate limiter backed by Redis.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AbsoluteRedisRateLimiter {
-    connection_manager: ConnectionManager,
+    client: TrypemaRedisClient,
     window_size_seconds: WindowSizeSeconds,
     window_size_ms: u128,
     rate_group_size_ms: RateGroupSizeMs,
@@ -106,18 +112,14 @@ impl AbsoluteRedisRateLimiter {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
         Self {
-            connection_manager: options.connection_manager.clone(),
+            client: options.client.clone(),
             window_size_seconds: options.window_size_seconds,
             window_size_ms: *options.window_size_seconds as u128 * 1000,
             rate_group_size_ms: options.rate_group_size_ms,
             key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
             check_script: Script::new(ABSOLUTE_CHECK_LUA),
             cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
-            committer_sender: AbsoluteRedisRateCommitter::run(
-                options.connection_manager,
-                8192,
-                128,
-            ),
+            committer_sender: AbsoluteRedisRateCommitter::run(options.client, 8192, 128),
         }
     } // end method with_rate_type
 
@@ -177,23 +179,33 @@ impl AbsoluteRedisRateLimiter {
         key: &RedisKey,
         count: u64,
     ) -> Result<(RateLimitDecision, String), TrypemaError> {
-        let mut connection_manager = self.connection_manager.clone();
+        let mut connection_manager = self.client.get();
 
+        // let (result, timestamp_ms, retry_after_ms, remaining_after_waiting): (
+        //     String,
+        //     String,
+        //     u128,
+        //     u64,
+        // ) = self
+        let x = black_box(
+            self.check_script
+                .key(black_box(self.key_generator.get_hash_key(key)))
+                .key(self.key_generator.get_active_keys(key))
+                .key(self.key_generator.get_window_limit_key(key))
+                .key(self.key_generator.get_total_count_key(key))
+                .arg(self.window_size_ms)
+                .arg(count),
+        );
+        // .invoke_async(&mut connection_manager)
+        // .await?;
+
+        let now = Utc::now().timestamp_millis();
         let (result, timestamp_ms, retry_after_ms, remaining_after_waiting): (
             String,
             String,
             u128,
             u64,
-        ) = self
-            .check_script
-            .key(self.key_generator.get_hash_key(key))
-            .key(self.key_generator.get_active_keys(key))
-            .key(self.key_generator.get_window_limit_key(key))
-            .key(self.key_generator.get_total_count_key(key))
-            .arg(self.window_size_ms)
-            .arg(count)
-            .invoke_async(&mut connection_manager)
-            .await?;
+        ) = ("allowed".to_string(), now.to_string(), 0, 0);
 
         let decision = match result.as_str() {
             "allowed" => RateLimitDecision::Allowed,
@@ -216,7 +228,7 @@ impl AbsoluteRedisRateLimiter {
 
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        let mut connection_manager = self.connection_manager.clone();
+        let mut connection_manager = self.client.get();
 
         let _: () = self
             .cleanup_script

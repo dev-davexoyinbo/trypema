@@ -298,12 +298,16 @@ fn run_local(args: &Args) {
             .unwrap();
 
         rt.block_on(async {
+            use trypema::redis::TrypemaRedisClient;
+
             let client = redis::Client::open(args.redis_url.as_str()).unwrap();
-            let connection_manager = client.get_connection_manager().await.unwrap();
             Arc::new(RateLimiter::new(RateLimiterOptions {
                 local: build_local_options(&args),
                 redis: RedisRateLimiterOptions {
-                    connection_manager,
+                    client: TrypemaRedisClient::default_from_client(client)
+                        .await
+                        .unwrap(),
+
                     prefix: Some(RedisKey::try_from(args.redis_prefix.clone()).unwrap()),
                     window_size_seconds: WindowSizeSeconds::try_from(args.window_s).unwrap(),
                     rate_group_size_ms: RateGroupSizeMs::try_from(args.group_ms).unwrap(),
@@ -428,6 +432,8 @@ fn run_redis(args: &Args) {
         .unwrap();
 
     rt.block_on(async move {
+        use trypema::redis::TrypemaRedisClient;
+
         if args2.redis_limiter != RedisLimiter::Trypema {
             let limiter = match args2.redis_limiter {
                 RedisLimiter::Cell => redis_compare::RedisLimiter::Cell,
@@ -443,14 +449,15 @@ fn run_redis(args: &Args) {
 
         let keys = build_keys(&args2);
         let client = redis::Client::open(args2.redis_url.as_str()).unwrap();
-        let connection_manager = client.get_connection_manager().await.unwrap();
 
         let rate = RateLimit::try_from(args2.rate_limit_per_s).unwrap();
 
         let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
             local: build_local_options(&args2),
             redis: RedisRateLimiterOptions {
-                connection_manager,
+                client: TrypemaRedisClient::default_from_client(client)
+                    .await
+                    .unwrap(),
                 prefix: Some(RedisKey::try_from(args2.redis_prefix.clone()).unwrap()),
                 window_size_seconds: WindowSizeSeconds::try_from(args2.window_s).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(args2.group_ms).unwrap(),

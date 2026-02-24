@@ -40,7 +40,7 @@ mod enabled {
                     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
                 },
                 redis: RedisRateLimiterOptions {
-                    connection_manager,
+                    client: connection_manager,
                     prefix: Some(RedisKey::try_from("bench".to_string()).unwrap()),
                     window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
                     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),

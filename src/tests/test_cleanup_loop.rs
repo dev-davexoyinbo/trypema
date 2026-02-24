@@ -193,7 +193,7 @@ fn test_redis_cleanup_loop_with_tokio() {
                 suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
             },
             redis: crate::RedisRateLimiterOptions {
-                connection_manager,
+                client: connection_manager,
                 prefix: Some(prefix),
                 // Use a long window so Allowed-after-cleanup can't be natural expiry.
                 window_size_seconds: WindowSizeSeconds::try_from(30).unwrap(),
@@ -209,7 +209,12 @@ fn test_redis_cleanup_loop_with_tokio() {
         let key = crate::RedisKey::try_from(format!("test_key_{unique}")).unwrap();
 
         // capacity = 30 (30s * 1/s)
-        let d0 = rl.redis().absolute().inc(&key, &rate_limit, 30).await.unwrap();
+        let d0 = rl
+            .redis()
+            .absolute()
+            .inc(&key, &rate_limit, 30)
+            .await
+            .unwrap();
         assert!(matches!(d0, crate::RateLimitDecision::Allowed));
 
         // Wait until state is observed as rejected (commit has applied).
@@ -274,7 +279,7 @@ fn test_redis_stop_cleanup_loop_prevents_cleanup() {
                 suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
             },
             redis: crate::RedisRateLimiterOptions {
-                connection_manager: connection_manager.clone(),
+                client: connection_manager.clone(),
                 prefix: Some(prefix.clone()),
                 window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
@@ -290,7 +295,12 @@ fn test_redis_stop_cleanup_loop_prevents_cleanup() {
         let key = crate::RedisKey::try_from(format!("test_key_{}", unique)).unwrap();
 
         // capacity = 1s * 1/s = 1
-        let d0 = rl.redis().absolute().inc(&key, &rate_limit, 1).await.unwrap();
+        let d0 = rl
+            .redis()
+            .absolute()
+            .inc(&key, &rate_limit, 1)
+            .await
+            .unwrap();
         assert!(matches!(d0, crate::RateLimitDecision::Allowed));
 
         // Wait until the key is observed as rejected (commit has applied).

@@ -125,13 +125,16 @@ pub(crate) fn run(args2: Args) {
                     .unwrap();
 
                 rt.block_on(async {
+                    use trypema::redis::TrypemaRedisClient;
+
                     let client = redis::Client::open(args.redis_url.as_str()).unwrap();
-                    let connection_manager = client.get_connection_manager().await.unwrap();
 
                     Arc::new(trypema::RateLimiter::new(trypema::RateLimiterOptions {
                         local: crate::build_local_options(&args),
                         redis: RedisRateLimiterOptions {
-                            connection_manager,
+                            client: TrypemaRedisClient::default_from_client(client)
+                                .await
+                                .unwrap(),
                             prefix: Some(RedisKey::try_from(args.redis_prefix.clone()).unwrap()),
                             window_size_seconds: WindowSizeSeconds::try_from(args.window_s)
                                 .unwrap(),

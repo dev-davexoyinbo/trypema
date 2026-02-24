@@ -1,10 +1,10 @@
-use redis::{Script, aio::ConnectionManager};
+use redis::Script;
 
 use crate::{
     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey,
     RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
     common::{RateType, SuppressionFactorCacheMs},
-    redis::RedisKeyGenerator,
+    redis::{RedisKeyGenerator, TrypemaRedisClient},
 };
 
 const LUA_HELPERS: &str = r#"
@@ -216,7 +216,7 @@ const SUPPRESSED_GET_FACTOR_LUA: &str = r#"
 /// A rate limiter backed by Redis.
 #[derive(Clone, Debug)]
 pub struct SuppressedRedisRateLimiter {
-    connection_manager: ConnectionManager,
+    client: TrypemaRedisClient,
     key_generator: RedisKeyGenerator,
     hard_limit_factor: HardLimitFactor,
     rate_group_size_ms: RateGroupSizeMs,
@@ -232,7 +232,7 @@ impl SuppressedRedisRateLimiter {
         let key_generator = RedisKeyGenerator::new(prefix, RateType::Suppressed);
 
         Self {
-            connection_manager: options.connection_manager,
+            client: options.client,
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
             hard_limit_factor: options.hard_limit_factor,
@@ -258,7 +258,7 @@ impl SuppressedRedisRateLimiter {
     ) -> Result<RateLimitDecision, TrypemaError> {
         let window_limit =
             *self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor;
-        let mut connection_manager = self.connection_manager.clone();
+        let mut connection_manager = self.client.get();
 
         let (result, suppression_factor, should_allow): (String, f64, u8) = self
             .inc_script
@@ -301,7 +301,7 @@ impl SuppressedRedisRateLimiter {
     ///
     /// If the cached value is outside `[0.0, 1.0]`, this recomputes and overwrites it.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
-        let mut connection_manager = self.connection_manager.clone();
+        let mut connection_manager = self.client.get();
 
         let suppression_factor: f64 = self
             .get_suppression_factor_script
@@ -366,7 +366,7 @@ impl SuppressedRedisRateLimiter {
         "#,
         );
 
-        let mut connection_manager = self.connection_manager.clone();
+        let mut connection_manager = self.client.get();
 
         let _: () = script
             .key(self.key_generator.prefix.to_string())

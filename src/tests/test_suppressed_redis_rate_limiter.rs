@@ -129,7 +129,7 @@ async fn build_limiter_with_cache_ms(
     let prefix = unique_prefix();
 
     let limiter = SuppressedRedisRateLimiter::new(RedisRateLimiterOptions {
-        connection_manager: cm.clone(),
+        client: cm.clone(),
         prefix: Some(prefix.clone()),
         window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
         rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),

@@ -1,6 +1,66 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+use redis::{Client, aio::ConnectionManager};
 
 use crate::{TrypemaError, common::RateType};
+
+/// A wrapper for a vector of [`redis::aio::ConnectionManager`]s.
+#[derive(Debug)]
+pub struct TrypemaRedisClient {
+    connection_managers: Arc<Vec<ConnectionManager>>,
+    track_index: AtomicUsize,
+}
+
+impl TrypemaRedisClient {
+    /// Create a new [`RedisClient`] from a single [`redis::aio::ConnectionManager`].
+    pub async fn default_from_client(client: Client) -> Result<Self, TrypemaError> {
+        Self::from_client(client, 1).await
+    }
+
+    /// Create a new [`RedisClient`] from a vector of [`redis::aio::ConnectionManager`]s.
+    pub async fn from_client(
+        client: Client,
+        connection_count: usize,
+    ) -> Result<Self, TrypemaError> {
+        if connection_count == 0 {
+            return Err(TrypemaError::InvalidRedisClientConnectionCount(
+                "connection count must be > 0".to_string(),
+            ));
+        }
+
+        let mut connection_managers = Vec::with_capacity(connection_count);
+
+        for _ in 0..connection_count {
+            connection_managers.push(client.get_connection_manager().await?);
+        }
+
+        Ok(Self {
+            connection_managers: Arc::new(connection_managers),
+            track_index: AtomicUsize::new(0),
+        })
+    }
+
+    /// Get a [`redis::aio::ConnectionManager`] from the client.
+    pub(crate) fn get(&self) -> ConnectionManager {
+        let index = self.track_index.fetch_add(1, Ordering::Relaxed);
+        self.connection_managers[index % self.connection_managers.len()].clone()
+    } // end method get
+} // end impl RedisClient
+
+impl Clone for TrypemaRedisClient {
+    fn clone(&self) -> Self {
+        Self {
+            connection_managers: self.connection_managers.clone(),
+            track_index: AtomicUsize::new(0),
+        }
+    }
+}
 
 /// A validated newtype for Redis keys.
 ///

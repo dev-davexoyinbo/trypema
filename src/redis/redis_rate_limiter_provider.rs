@@ -1,8 +1,7 @@
-use redis::aio::ConnectionManager;
-
 use crate::{
     AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RedisKey,
     SuppressedRedisRateLimiter, TrypemaError, WindowSizeSeconds, common::SuppressionFactorCacheMs,
+    redis::TrypemaRedisClient,
 };
 
 /// Configuration for Redis-backed rate limiters.
@@ -47,7 +46,7 @@ pub struct RedisRateLimiterOptions {
     ///     todo!("create redis::aio::ConnectionManager");
     /// # Ok(()) }
     /// ```
-    pub connection_manager: ConnectionManager,
+    pub client: TrypemaRedisClient,
 
     /// Optional prefix for all Redis keys.
     ///
@@ -159,7 +158,7 @@ pub struct RedisRateLimiterOptions {
 /// }
 /// # Ok(()) }
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RedisRateLimiterProvider {
     absolute: AbsoluteRedisRateLimiter,
     suppressed: SuppressedRedisRateLimiter,

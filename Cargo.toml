@@ -54,6 +54,7 @@ tokio = { version = "1.49.0", optional = true, features = [
 smol = { version = "2.0.2", optional = true }
 ahash = "0.8.12"
 async-channel = { version = "2.5.0", optional = true }
+chrono = "0.4.44"
 
 [features]
 redis-tokio = [
