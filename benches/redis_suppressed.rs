@@ -8,7 +8,7 @@ mod enabled {
     use std::hint::black_box;
 
     use trypema::local::LocalRateLimiterOptions;
-    use trypema::redis::{RedisKey, RedisRateLimiterOptions};
+    use trypema::redis::{RedisKey, RedisRateLimiterOptions, TrypemaRedisClient};
     use trypema::{
         HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions,
         SuppressionFactorCacheMs, WindowSizeSeconds,
@@ -30,7 +30,9 @@ mod enabled {
 
         let rl = rt.block_on(async {
             let client = redis::Client::open(redis_url()).unwrap();
-            let connection_manager = client.get_connection_manager().await.unwrap();
+            let client = TrypemaRedisClient::default_from_client(client)
+                .await
+                .unwrap();
 
             Arc::new(RateLimiter::new(RateLimiterOptions {
                 local: LocalRateLimiterOptions {
@@ -40,7 +42,7 @@ mod enabled {
                     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
                 },
                 redis: RedisRateLimiterOptions {
-                    client: connection_manager,
+                    client,
                     prefix: Some(RedisKey::try_from("bench".to_string()).unwrap()),
                     window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
                     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
