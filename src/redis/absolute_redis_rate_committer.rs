@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_channel::Sender;
 use redis::{RedisError, Script};
 
@@ -64,11 +66,11 @@ const ABSOLUTE_COMMIT_LUA: &str = r#"
 
 pub(crate) struct AbsoluteRedisCommit {
     // keys
-    pub hash_key: String,
-    pub active_keys_key: String,
-    pub window_limit_key: String,
-    pub total_count_key: String,
-    pub active_entities_key: String,
+    pub hash_key: Arc<str>,
+    pub active_keys_key: Arc<str>,
+    pub window_limit_key: Arc<str>,
+    pub total_count_key: Arc<str>,
+    pub active_entities_key: Arc<str>,
     // args
     pub entity_key: RedisKey,
     pub window_size_seconds: WindowSizeSeconds,
@@ -105,22 +107,22 @@ impl AbsoluteRedisRateCommitter {
 
                 // eprintln!("batch size: {}", batch.len());
 
-                // let pipe = Self::build_pipeline(&batch, &script, false);
-                //
-                // if let Err::<(), RedisError>(err) = pipe.query_async(&mut connection_manager).await
-                // {
-                //     if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
-                //         tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
-                //         continue;
-                //     }
-                //
-                //     let pipe = Self::build_pipeline(&batch, &script, true);
-                //
-                //     if let Err::<(), _>(err) = pipe.query_async(&mut connection_manager).await {
-                //         tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
-                //         continue;
-                //     }
-                // }
+                let pipe = Self::build_pipeline(&batch, &script, false);
+
+                if let Err::<(), RedisError>(err) = pipe.query_async(&mut connection_manager).await
+                {
+                    if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
+                        tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                        continue;
+                    }
+
+                    let pipe = Self::build_pipeline(&batch, &script, true);
+
+                    if let Err::<(), _>(err) = pipe.query_async(&mut connection_manager).await {
+                        tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                        continue;
+                    }
+                }
 
                 batch.clear();
             }
@@ -143,12 +145,12 @@ impl AbsoluteRedisRateCommitter {
         for commit in commits {
             pipe.invoke_script(
                 script
-                    .key(commit.hash_key.as_str())
-                    .key(commit.active_keys_key.as_str())
-                    .key(commit.window_limit_key.as_str())
-                    .key(commit.total_count_key.as_str())
-                    .key(commit.active_entities_key.as_str())
-                    .arg(&*commit.entity_key)
+                    .key(&*commit.hash_key)
+                    .key(&*commit.active_keys_key)
+                    .key(&*commit.window_limit_key)
+                    .key(&*commit.total_count_key)
+                    .key(&*commit.active_entities_key)
+                    .arg(&**commit.entity_key)
                     .arg(*commit.window_size_seconds)
                     .arg(commit.window_limit)
                     .arg(*commit.rate_group_size_ms)

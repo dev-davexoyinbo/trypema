@@ -1,7 +1,4 @@
-use std::hint::black_box;
-
 use async_channel::Sender;
-use chrono::Utc;
 use redis::Script;
 
 use crate::{
@@ -181,31 +178,29 @@ impl AbsoluteRedisRateLimiter {
     ) -> Result<(RateLimitDecision, String), TrypemaError> {
         let mut connection_manager = self.client.get();
 
-        // let (result, timestamp_ms, retry_after_ms, remaining_after_waiting): (
-        //     String,
-        //     String,
-        //     u128,
-        //     u64,
-        // ) = self
-        let x = black_box(
-            self.check_script
-                .key(black_box(self.key_generator.get_hash_key(key)))
-                .key(self.key_generator.get_active_keys(key))
-                .key(self.key_generator.get_window_limit_key(key))
-                .key(self.key_generator.get_total_count_key(key))
-                .arg(self.window_size_ms)
-                .arg(count),
-        );
-        // .invoke_async(&mut connection_manager)
-        // .await?;
-
-        let now = Utc::now().timestamp_millis();
         let (result, timestamp_ms, retry_after_ms, remaining_after_waiting): (
             String,
             String,
             u128,
             u64,
-        ) = ("allowed".to_string(), now.to_string(), 0, 0);
+        ) = self
+            .check_script
+            .key(&*self.key_generator.get_hash_key(key))
+            .key(&*self.key_generator.get_active_keys(key))
+            .key(&*self.key_generator.get_window_limit_key(key))
+            .key(&*self.key_generator.get_total_count_key(key))
+            .arg(self.window_size_ms)
+            .arg(count)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        // let now = Utc::now().timestamp_millis();
+        // let (result, timestamp_ms, retry_after_ms, remaining_after_waiting): (
+        //     String,
+        //     String,
+        //     u128,
+        //     u64,
+        // ) = ("allowed".to_string(), now.to_string(), 0, 0);
 
         let decision = match result.as_str() {
             "allowed" => RateLimitDecision::Allowed,
@@ -234,7 +229,7 @@ impl AbsoluteRedisRateLimiter {
             .cleanup_script
             .key(self.key_generator.prefix.to_string())
             .key(self.key_generator.rate_type.to_string())
-            .key(self.key_generator.get_active_entities_key())
+            .key(&*self.key_generator.get_active_entities_key())
             .arg(stale_after_ms)
             .arg(self.key_generator.hash_key_suffix.to_string())
             .arg(self.key_generator.window_limit_key_suffix.to_string())

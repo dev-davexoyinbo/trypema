@@ -262,12 +262,12 @@ impl SuppressedRedisRateLimiter {
 
         let (result, suppression_factor, should_allow): (String, f64, u8) = self
             .inc_script
-            .key(self.key_generator.get_hash_key(key))
-            .key(self.key_generator.get_active_keys(key))
-            .key(self.key_generator.get_window_limit_key(key))
-            .key(self.key_generator.get_total_count_key(key))
-            .key(self.key_generator.get_active_entities_key())
-            .key(self.key_generator.get_suppression_factor_key(key))
+            .key(&*self.key_generator.get_hash_key(key))
+            .key(&*self.key_generator.get_active_keys(key))
+            .key(&*self.key_generator.get_window_limit_key(key))
+            .key(&*self.key_generator.get_total_count_key(key))
+            .key(&*self.key_generator.get_active_entities_key())
+            .key(&*self.key_generator.get_suppression_factor_key(key))
             .arg(key.to_string())
             .arg(*self.window_size_seconds)
             .arg(window_limit)
@@ -305,12 +305,12 @@ impl SuppressedRedisRateLimiter {
 
         let suppression_factor: f64 = self
             .get_suppression_factor_script
-            .key(self.key_generator.get_hash_key(key))
-            .key(self.key_generator.get_active_keys(key))
-            .key(self.key_generator.get_window_limit_key(key))
-            .key(self.key_generator.get_total_count_key(key))
-            .key(self.key_generator.get_active_entities_key())
-            .key(self.key_generator.get_suppression_factor_key(key))
+            .key(&*self.key_generator.get_hash_key(key))
+            .key(&*self.key_generator.get_active_keys(key))
+            .key(&*self.key_generator.get_window_limit_key(key))
+            .key(&*self.key_generator.get_total_count_key(key))
+            .key(&*self.key_generator.get_active_entities_key())
+            .key(&*self.key_generator.get_suppression_factor_key(key))
             .arg(key.to_string())
             .arg(*self.window_size_seconds)
             .arg(*self.rate_group_size_ms)
@@ -371,7 +371,7 @@ impl SuppressedRedisRateLimiter {
         let _: () = script
             .key(self.key_generator.prefix.to_string())
             .key(self.key_generator.rate_type.to_string())
-            .key(self.key_generator.get_active_entities_key())
+            .key(&*self.key_generator.get_active_entities_key())
             .arg(stale_after_ms)
             .arg(self.key_generator.hash_key_suffix.to_string())
             .arg(self.key_generator.window_limit_key_suffix.to_string())

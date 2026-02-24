@@ -1,11 +1,12 @@
 use std::{
-    ops::{Deref, DerefMut},
+    ops::Deref,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
+use dashmap::DashMap;
 use redis::{Client, aio::ConnectionManager};
 
 use crate::{TrypemaError, common::RateType};
@@ -68,27 +69,21 @@ impl Clone for TrypemaRedisClient {
 /// - Must not be empty
 /// - Must not contain colons
 #[derive(Debug, Clone, PartialEq, PartialOrd, Hash, Eq)]
-pub struct RedisKey(String);
+pub struct RedisKey(Arc<str>);
 // TODO: make RedisKey Arc<str> to avoid cloning
 
 impl RedisKey {
     /// Create a new default prefix.
     pub fn default_prefix() -> Self {
-        Self("trypema".to_string())
+        Self(Arc::from("trypema"))
     }
 }
 
 impl Deref for RedisKey {
-    type Target = String;
+    type Target = Arc<str>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-impl DerefMut for RedisKey {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
     }
 }
 
@@ -109,7 +104,7 @@ impl TryFrom<String> for RedisKey {
                 "Redis key must not contain colons".to_string(),
             ))
         } else {
-            Ok(Self(value))
+            Ok(Self(Arc::from(value)))
         }
     }
 }
@@ -118,25 +113,40 @@ impl TryFrom<String> for RedisKey {
 pub(crate) struct RedisKeyGenerator {
     pub prefix: RedisKey,
     pub rate_type: RateType,
-    pub active_entities_key_suffix: String,
+    pub active_entities_key: Arc<str>,
     pub hash_key_suffix: String,
     pub window_limit_key_suffix: String,
     pub total_count_key_suffix: String,
     pub active_keys_key_suffix: String,
     pub suppression_factor_key_suffix: String,
+
+    // caches
+    hash_key_cache: DashMap<RedisKey, Arc<str>>,
+    window_limit_key_cache: DashMap<RedisKey, Arc<str>>,
+    total_count_key_cache: DashMap<RedisKey, Arc<str>>,
+    active_keys_key_cache: DashMap<RedisKey, Arc<str>>,
+    suppression_factor_key_cache: DashMap<RedisKey, Arc<str>>,
 }
 
 impl RedisKeyGenerator {
     pub(crate) fn new(prefix: RedisKey, rate_type: RateType) -> Self {
+        let active_entities_key = format!("{}:{}", *prefix, "active_entities");
+        let active_entities_key: Arc<str> = Arc::from(active_entities_key);
+
         Self {
             prefix,
             rate_type,
-            active_entities_key_suffix: "active_entities".to_string(),
+            active_entities_key,
             hash_key_suffix: "h".to_string(),
             window_limit_key_suffix: "w".to_string(),
             total_count_key_suffix: "t".to_string(),
             active_keys_key_suffix: "a".to_string(),
             suppression_factor_key_suffix: "sf".to_string(),
+            hash_key_cache: DashMap::new(),
+            window_limit_key_cache: DashMap::new(),
+            total_count_key_cache: DashMap::new(),
+            active_keys_key_cache: DashMap::new(),
+            suppression_factor_key_cache: DashMap::new(),
         }
     }
 
@@ -144,27 +154,76 @@ impl RedisKeyGenerator {
         format!("{}:{}:{}:{}", *self.prefix, **key, self.rate_type, suffix)
     }
 
-    pub(crate) fn get_hash_key(&self, key: &RedisKey) -> String {
-        self.get_key_with_suffix(key, &self.hash_key_suffix)
+    pub(crate) fn get_hash_key(&self, key: &RedisKey) -> Arc<str> {
+        match self.hash_key_cache.get(key) {
+            Some(value) => value.clone(),
+            None => {
+                let value = self.get_key_with_suffix(key, &self.hash_key_suffix);
+                let value: Arc<str> = Arc::from(value);
+                self.hash_key_cache.insert(key.clone(), value.clone());
+
+                value
+            }
+        }
     }
 
-    pub(crate) fn get_window_limit_key(&self, key: &RedisKey) -> String {
-        self.get_key_with_suffix(key, &self.window_limit_key_suffix)
+    pub(crate) fn get_window_limit_key(&self, key: &RedisKey) -> Arc<str> {
+        match self.window_limit_key_cache.get(key) {
+            Some(value) => value.clone(),
+            None => {
+                let value = self.get_key_with_suffix(key, &self.window_limit_key_suffix);
+                let value: Arc<str> = Arc::from(value);
+                self.window_limit_key_cache
+                    .insert(key.clone(), value.clone());
+
+                value
+            }
+        }
     }
 
-    pub(crate) fn get_total_count_key(&self, key: &RedisKey) -> String {
-        self.get_key_with_suffix(key, &self.total_count_key_suffix)
+    pub(crate) fn get_total_count_key(&self, key: &RedisKey) -> Arc<str> {
+        match self.total_count_key_cache.get(key) {
+            Some(value) => value.clone(),
+            None => {
+                let value = self.get_key_with_suffix(key, &self.total_count_key_suffix);
+                let value: Arc<str> = Arc::from(value);
+                self.total_count_key_cache
+                    .insert(key.clone(), value.clone());
+
+                value
+            }
+        }
     }
 
-    pub(crate) fn get_active_keys(&self, key: &RedisKey) -> String {
-        self.get_key_with_suffix(key, &self.active_keys_key_suffix)
+    pub(crate) fn get_active_keys(&self, key: &RedisKey) -> Arc<str> {
+        match self.active_keys_key_cache.get(key) {
+            Some(value) => value.clone(),
+            None => {
+                let value = self.get_key_with_suffix(key, &self.active_keys_key_suffix);
+                let value: Arc<str> = Arc::from(value);
+                self.active_keys_key_cache
+                    .insert(key.clone(), value.clone());
+
+                value
+            }
+        }
     }
 
-    pub(crate) fn get_active_entities_key(&self) -> String {
-        format!("{}:{}", *self.prefix, self.active_entities_key_suffix)
+    pub(crate) fn get_active_entities_key(&self) -> Arc<str> {
+        self.active_entities_key.clone()
     }
 
-    pub(crate) fn get_suppression_factor_key(&self, key: &RedisKey) -> String {
-        self.get_key_with_suffix(key, &self.suppression_factor_key_suffix)
+    pub(crate) fn get_suppression_factor_key(&self, key: &RedisKey) -> Arc<str> {
+        match self.suppression_factor_key_cache.get(key) {
+            Some(value) => value.clone(),
+            None => {
+                let value = self.get_key_with_suffix(key, &self.suppression_factor_key_suffix);
+                let value: Arc<str> = Arc::from(value);
+                self.suppression_factor_key_cache
+                    .insert(key.clone(), value.clone());
+
+                value
+            }
+        }
     }
 }
