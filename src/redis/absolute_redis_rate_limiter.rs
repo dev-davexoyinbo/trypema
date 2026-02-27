@@ -246,6 +246,7 @@ pub struct AbsoluteRedisRateLimiter {
 
     // ...
     limiting_state: DashMap<RedisKey, Arc<RwLock<AbsoluteRedisLimitingState>>>,
+    local_cache_duration_ms: u64,
 }
 
 impl AbsoluteRedisRateLimiter {
@@ -257,8 +258,10 @@ impl AbsoluteRedisRateLimiter {
         let redis_proxy =
             AbsoluteRedisProxy::new(prefix.clone(), options.connection_manager.clone());
 
+        let local_cache_duration_ms = 50u64;
+
         let commiter_sender = AbsoluteRedisCommitter::run(AbsoluteRedisCommitterOptions {
-            local_cache_duration: Duration::from_millis(50),
+            local_cache_duration: Duration::from_millis(local_cache_duration_ms),
             channel_capacity: 8192,
             max_batch_size: 128,
             limiter_sender: tx,
@@ -276,6 +279,7 @@ impl AbsoluteRedisRateLimiter {
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::new(),
+            local_cache_duration_ms,
         };
 
         let limiter = Arc::new(limiter);
@@ -451,17 +455,28 @@ impl AbsoluteRedisRateLimiter {
             last_rate_group_count,
         } = state_lock.deref()
         {
+            let elapsed = time_instant.elapsed().as_millis();
+
             if count.load(Ordering::Relaxed) + check_count <= *accept_limit {
-                count.fetch_add(increment, Ordering::Relaxed);
-                return Ok(RateLimitDecision::Allowed);
+                if elapsed < self.local_cache_duration_ms as u128 {
+                    count.fetch_add(increment, Ordering::Relaxed);
+                    return Ok(RateLimitDecision::Allowed);
+                } else {
+                    drop(state_lock);
+                    return self
+                        .reset_state_from_redis_read_result_and_get_decision(
+                            key,
+                            check_count,
+                            increment,
+                        )
+                        .await;
+                }
             }
 
-            let elapsed = time_instant.elapsed().as_millis();
             let last_rate_group_ttl: Option<u64> = *last_rate_group_ttl;
             let last_rate_group_count: Option<u64> = *last_rate_group_count;
             let current_total_count = count.load(Ordering::Relaxed);
             let window_limit = *window_limit;
-            let accept_limit = *accept_limit;
 
             drop(state_lock);
             let mut state = state_entry.write().await;
