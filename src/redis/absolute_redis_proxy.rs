@@ -216,31 +216,58 @@ impl AbsoluteRedisProxy {
 
     pub(crate) async fn batch_commit_state(
         self: &AbsoluteRedisProxy,
-        commits: Vec<AbsoluteRedisCommit>,
+        commits: &Vec<AbsoluteRedisCommit>,
     ) -> Result<Vec<AbsoluteRedisProxyCommitStateResult>, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let pipe = self.build_pipeline(&commits, false);
+        let pipe = self.build_pipeline(commits, false);
 
-        if let Err::<Vec<(String, u64, u64, Option<u64>, Option<u64>)>, RedisError>(err) =
-            pipe.query_async(&mut connection_manager).await
+        let results = match pipe
+            .query_async::<Vec<(String, u64, u64, Option<u64>, Option<u64>)>>(
+                &mut connection_manager,
+            )
+            .await
         {
-            if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
-                tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
-                return Err(TrypemaError::RedisError(err));
+            Ok(results) => results,
+            Err(err) => {
+                if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
+                    tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                    return Err(TrypemaError::RedisError(err));
+                }
+
+                let pipe = self.build_pipeline(commits, true);
+
+                match pipe
+                    .query_async::<Vec<(String, u64, u64, Option<u64>, Option<u64>)>>(
+                        &mut connection_manager,
+                    )
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(err) => {
+                        tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                        return Err(TrypemaError::RedisError(err));
+                    }
+                }
             }
+        };
 
-            let pipe = self.build_pipeline(&commits, true);
+        let results: Vec<AbsoluteRedisProxyCommitStateResult> = results
+            .into_iter()
+            .map(
+                |(entity, total_count, window_limit, oldest_ttl, oldest_count)| {
+                    AbsoluteRedisProxyCommitStateResult {
+                        key: RedisKey::from(entity),
+                        current_total_count: total_count,
+                        window_limit,
+                        last_rate_group_ttl: oldest_ttl,
+                        last_rate_group_count: oldest_count,
+                    }
+                },
+            )
+            .collect();
 
-            if let Err::<Vec<(String, u64, u64, Option<u64>, Option<u64>)>, _>(err) =
-                pipe.query_async(&mut connection_manager).await
-            {
-                tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
-                return Err(TrypemaError::RedisError(err));
-            }
-        }
-
-        todo!()
+        Ok(results)
     } // end method batch_commit_state
 
     #[inline]

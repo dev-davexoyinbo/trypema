@@ -5,7 +5,13 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use crate::redis::{RedisKey, RedisRateLimiterSignal, absolute_redis_proxy::AbsoluteRedisProxy};
+use crate::{
+    TrypemaError,
+    redis::{
+        RedisKey, RedisRateLimiterSignal,
+        absolute_redis_proxy::{AbsoluteRedisProxy, AbsoluteRedisProxyCommitStateResult},
+    },
+};
 
 pub(crate) struct AbsoluteRedisCommit {
     pub key: RedisKey,
@@ -77,7 +83,10 @@ impl AbsoluteRedisCommitter {
                     batch.push(commit);
                 }
 
-                Self::flush_to_redis(&redis_proxy, &batch).await;
+                if let Err(err) = Self::flush_to_redis(&redis_proxy, &batch).await {
+                    tracing::error!(error = ?err, "Failed to flush to Redis");
+                    continue;
+                };
 
                 batch.clear();
             }
@@ -86,7 +95,10 @@ impl AbsoluteRedisCommitter {
         tx
     } // end method run
 
-    async fn flush_to_redis(redis_proxy: &AbsoluteRedisProxy, batch: &Vec<AbsoluteRedisCommit>) {
-        todo!()
+    async fn flush_to_redis(
+        redis_proxy: &AbsoluteRedisProxy,
+        batch: &Vec<AbsoluteRedisCommit>,
+    ) -> Result<Vec<AbsoluteRedisProxyCommitStateResult>, TrypemaError> {
+        redis_proxy.batch_commit_state(batch).await
     } // end method flush_to_redis
 } // end impl AbsoluteRedisCommitter
