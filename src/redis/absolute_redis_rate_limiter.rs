@@ -177,9 +177,12 @@ impl AbsoluteRedisRateLimiter {
         }
 
         let state_entry = self.limiting_state.get(key).expect("Key should be present");
+        let state_lock = state_entry.read().await;
 
-        if let AbsoluteRedisLimitingState::Undefined = state_entry.read().await.deref() {
+        if let AbsoluteRedisLimitingState::Undefined = state_lock.deref() {
+            drop(state_lock);
             let mut state = state_entry.write().await;
+
             let window_limit = *self.window_size_seconds as f64 * **rate_limit;
 
             *state = AbsoluteRedisLimitingState::Accepting {
@@ -212,10 +215,14 @@ impl AbsoluteRedisRateLimiter {
         check_count: u64,
         increment: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
+        eprintln!("resetting state from redis read result ==========================");
         let read_state_result = self
             .redis_proxy
             .read_state(key, *self.window_size_seconds as u128 * 1000)
             .await?;
+        eprintln!(
+            "resetting state from redis read result <<<<<<<<<<<<<<<<<, {read_state_result:?}"
+        );
 
         self.reset_single_state_from_read_result(read_state_result, check_count, increment)
             .await
