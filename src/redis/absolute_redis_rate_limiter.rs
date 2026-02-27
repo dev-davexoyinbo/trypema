@@ -361,6 +361,23 @@ impl AbsoluteRedisRateLimiter {
         check_count: u64,
         increment: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
+        let read_state_result = self
+            .redis_proxy
+            .read_state(key, *self.window_size_seconds as u128 * 1000)
+            .await?;
+
+        self.reset_single_state_from_read_result(read_state_result, check_count, increment)
+            .await
+    } // end method reset_state_from_redis_read_result
+
+    async fn reset_single_state_from_read_result(
+        &self,
+        read_state_result: AbsoluteRedisProxyReadStateResult,
+        check_count: u64,
+        increment: u64,
+    ) -> Result<RateLimitDecision, TrypemaError> {
+        let key = &read_state_result.key;
+
         let state_entry = match self.limiting_state.get(key) {
             Some(state) => state,
             None => {
@@ -374,24 +391,8 @@ impl AbsoluteRedisRateLimiter {
             }
         };
 
-        let state = state_entry.write().await;
+        let mut state = state_entry.write().await;
 
-        let read_state_result = self
-            .redis_proxy
-            .read_state(key, *self.window_size_seconds as u128 * 1000)
-            .await?;
-
-        self.reset_single_state_from_read_result(state, read_state_result, check_count, increment)
-            .await
-    } // end method reset_state_from_redis_read_result
-
-    async fn reset_single_state_from_read_result(
-        &self,
-        mut state: RwLockWriteGuard<'_, AbsoluteRedisLimitingState>,
-        read_state_result: AbsoluteRedisProxyReadStateResult,
-        check_count: u64,
-        increment: u64,
-    ) -> Result<RateLimitDecision, TrypemaError> {
         if let AbsoluteRedisLimitingState::Accepting {
             window_limit,
             count,
@@ -402,7 +403,7 @@ impl AbsoluteRedisRateLimiter {
 
             if count > 0 {
                 let commit = AbsoluteRedisCommit {
-                    key: read_state_result.key.clone(),
+                    key: key.clone(),
                     window_size_seconds: *self.window_size_seconds,
                     window_limit: *window_limit,
                     rate_group_size_ms: *self.rate_group_size_ms,
@@ -609,7 +610,7 @@ impl AbsoluteRedisRateLimiter {
         Ok(())
     }
 
-    async fn flush(&self) {
+    async fn flush(&self) -> Result<(), TrypemaError> {
         let mut resets: Vec<RedisKey> = Vec::new();
 
         for state in self.limiting_state.iter() {
@@ -621,11 +622,18 @@ impl AbsoluteRedisRateLimiter {
             }
         }
 
-        // TODO: batch reset
-        for key in resets {
-            self.reset_state_from_redis_read_result_and_get_decision(&key, 0, 0)
-                .await
-                .unwrap();
+        let read_state_results = self
+            .redis_proxy
+            .batch_read_state(&resets, *self.window_size_seconds as u128 * 1000)
+            .await?;
+
+        for result in read_state_results {
+            if let Err(err) = self.reset_single_state_from_read_result(result, 0, 0).await {
+                tracing::error!(error = ?err, "Failed to reset state from redis read result");
+                continue;
+            }
         }
+
+        Ok(())
     } // end method flush
 }
