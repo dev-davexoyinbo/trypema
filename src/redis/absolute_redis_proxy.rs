@@ -1,4 +1,4 @@
-use redis::{RedisError, Script, aio::ConnectionManager};
+use redis::{Script, aio::ConnectionManager};
 
 use crate::{
     TrypemaError,
@@ -220,7 +220,7 @@ impl AbsoluteRedisProxy {
     ) -> Result<Vec<AbsoluteRedisProxyCommitStateResult>, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let pipe = self.build_pipeline(commits, false);
+        let pipe = self.build_commit_pipeline(commits, false);
 
         let results = match pipe
             .query_async::<Vec<(String, u64, u64, Option<u64>, Option<u64>)>>(
@@ -235,7 +235,7 @@ impl AbsoluteRedisProxy {
                     return Err(TrypemaError::RedisError(err));
                 }
 
-                let pipe = self.build_pipeline(commits, true);
+                let pipe = self.build_commit_pipeline(commits, true);
 
                 match pipe
                     .query_async::<Vec<(String, u64, u64, Option<u64>, Option<u64>)>>(
@@ -271,7 +271,7 @@ impl AbsoluteRedisProxy {
     } // end method batch_commit_state
 
     #[inline]
-    fn build_pipeline(
+    fn build_commit_pipeline(
         &self,
         commits: &Vec<AbsoluteRedisCommit>,
         should_load_script: bool,
@@ -294,8 +294,91 @@ impl AbsoluteRedisProxy {
                     .arg(commit.window_limit)
                     .arg(commit.rate_group_size_ms)
                     .arg(commit.count),
+            );
+        }
+
+        pipe
+    }
+
+    pub(crate) async fn batch_read_state(
+        self: &AbsoluteRedisProxy,
+        keys: &Vec<RedisKey>,
+        window_size_ms: u128,
+    ) -> Result<Vec<AbsoluteRedisProxyReadStateResult>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let pipe = self.build_read_pipeline(keys, window_size_ms, false);
+
+        let results = match pipe
+            .query_async::<Vec<(String, u64, Option<u64>, Option<u64>, Option<u64>)>>(
+                &mut connection_manager,
             )
-            .ignore();
+            .await
+        {
+            Ok(results) => results,
+            Err(err) => {
+                if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
+                    tracing::error!("redis.read.error, error executing pipeline: {:?}", err);
+                    return Err(TrypemaError::RedisError(err));
+                }
+
+                let pipe = self.build_read_pipeline(keys, window_size_ms, true);
+
+                match pipe
+                    .query_async::<Vec<(String, u64, Option<u64>, Option<u64>, Option<u64>)>>(
+                        &mut connection_manager,
+                    )
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(err) => {
+                        tracing::error!("redis.read.error, error executing pipeline: {:?}", err);
+                        return Err(TrypemaError::RedisError(err));
+                    }
+                }
+            }
+        };
+
+        let results: Vec<AbsoluteRedisProxyReadStateResult> = results
+            .into_iter()
+            .map(
+                |(entity, total_count, window_limit, oldest_ttl, oldest_count)| {
+                    AbsoluteRedisProxyReadStateResult {
+                        key: RedisKey::from(entity),
+                        current_total_count: total_count,
+                        window_limit,
+                        last_rate_group_ttl: oldest_ttl,
+                        last_rate_group_count: oldest_count,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(results)
+    } // end method batch_commit_state
+
+    #[inline]
+    fn build_read_pipeline(
+        &self,
+        keys: &Vec<RedisKey>,
+        window_size_ms: u128,
+        should_load_script: bool,
+    ) -> redis::Pipeline {
+        let mut pipe = redis::Pipeline::new();
+        if should_load_script {
+            pipe.load_script(&self.read_state_script).ignore();
+        }
+
+        for key in keys {
+            pipe.invoke_script(
+                self.read_state_script
+                    .key(self.key_generator.get_hash_key(key))
+                    .key(self.key_generator.get_active_keys(key))
+                    .key(self.key_generator.get_window_limit_key(key))
+                    .key(self.key_generator.get_total_count_key(key))
+                    .arg(key.as_str())
+                    .arg(window_size_ms),
+            );
         }
 
         pipe
