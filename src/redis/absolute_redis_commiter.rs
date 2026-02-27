@@ -5,9 +5,15 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use crate::redis::{RedisRateLimiterSignal, absolute_redis_proxy::AbsoluteRedisProxy};
+use crate::redis::{RedisKey, RedisRateLimiterSignal, absolute_redis_proxy::AbsoluteRedisProxy};
 
-pub(crate) struct AbsoluteRedisCommit {}
+pub(crate) struct AbsoluteRedisCommit {
+    pub key: RedisKey,
+    pub window_size_seconds: u64,
+    pub window_limit: u64,
+    pub rate_group_size_ms: u64,
+    pub count: u64,
+}
 
 pub(crate) struct AbsoluteRedisCommitterOptions {
     pub local_cache_duration: Duration,

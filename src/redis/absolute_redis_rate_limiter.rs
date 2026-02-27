@@ -455,6 +455,8 @@ impl AbsoluteRedisRateLimiter {
             let elapsed = time_instant.elapsed().as_millis();
             let last_rate_group_ttl: Option<u64> = *last_rate_group_ttl;
             let last_rate_group_count: Option<u64> = *last_rate_group_count;
+            let current_total_count = count.load(Ordering::Relaxed);
+            let window_limit = *window_limit;
 
             drop(state_lock);
             let mut state = state_entry.write().await;
@@ -467,6 +469,20 @@ impl AbsoluteRedisRateLimiter {
                 let remaining_after_waiting = last_rate_group_count;
                 let window_size_seconds = *self.window_size_seconds;
 
+                let commit = AbsoluteRedisCommit {
+                    key: key.clone(),
+                    window_size_seconds: *self.window_size_seconds,
+                    window_limit,
+                    rate_group_size_ms: *self.rate_group_size_ms,
+                    count: current_total_count,
+                };
+
+                self.commiter_sender.send(commit).await.map_err(|e| {
+                    TrypemaError::CustomError(format!(
+                        "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
+                    ))
+                })?;
+
                 *state = AbsoluteRedisLimitingState::Rejecting {
                     time_instant: Instant::now(),
                     release_time_instant: Instant::now()
@@ -474,14 +490,6 @@ impl AbsoluteRedisRateLimiter {
                     ttl_ms: last_rate_group_ttl,
                     count_after_release: remaining_after_waiting,
                 };
-
-                let commit = AbsoluteRedisCommit {};
-
-                self.commiter_sender.send(commit).await.map_err(|e| {
-                    TrypemaError::CustomError(format!(
-                        "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
-                    ))
-                })?;
 
                 return Ok(RateLimitDecision::Rejected {
                     window_size_seconds,

@@ -179,7 +179,7 @@ impl AbsoluteRedisProxy {
         key: &RedisKey,
         window_size_seconds: u64,
         window_limit: u64,
-        rate_group_size_ms: u128,
+        rate_group_size_ms: u64,
         count: u64,
     ) -> Result<AbsoluteRedisProxyCommitStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
