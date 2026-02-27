@@ -398,19 +398,23 @@ impl AbsoluteRedisRateLimiter {
             ..
         } = state.deref()
         {
-            let commit = AbsoluteRedisCommit {
-                key: read_state_result.key.clone(),
-                window_size_seconds: *self.window_size_seconds,
-                window_limit: *window_limit,
-                rate_group_size_ms: *self.rate_group_size_ms,
-                count: count.load(Ordering::Relaxed),
-            };
+            let count = count.load(Ordering::Relaxed);
 
-            self.commiter_sender.send(commit).await.map_err(|e| {
-                TrypemaError::CustomError(format!(
-                    "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
-                ))
-            })?;
+            if count > 0 {
+                let commit = AbsoluteRedisCommit {
+                    key: read_state_result.key.clone(),
+                    window_size_seconds: *self.window_size_seconds,
+                    window_limit: *window_limit,
+                    rate_group_size_ms: *self.rate_group_size_ms,
+                    count,
+                };
+
+                self.commiter_sender.send(commit).await.map_err(|e| {
+                    TrypemaError::CustomError(format!(
+                        "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
+                    ))
+                })?;
+            }
         }
 
         let Some(window_limit) = read_state_result.window_limit else {
@@ -520,19 +524,21 @@ impl AbsoluteRedisRateLimiter {
                 let remaining_after_waiting = last_rate_group_count;
                 let window_size_seconds = *self.window_size_seconds;
 
-                let commit = AbsoluteRedisCommit {
-                    key: key.clone(),
-                    window_size_seconds: *self.window_size_seconds,
-                    window_limit,
-                    rate_group_size_ms: *self.rate_group_size_ms,
-                    count: current_total_count,
-                };
+                if current_total_count > 0 {
+                    let commit = AbsoluteRedisCommit {
+                        key: key.clone(),
+                        window_size_seconds: *self.window_size_seconds,
+                        window_limit,
+                        rate_group_size_ms: *self.rate_group_size_ms,
+                        count: current_total_count,
+                    };
 
-                self.commiter_sender.send(commit).await.map_err(|e| {
-                    TrypemaError::CustomError(format!(
-                        "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
-                    ))
-                })?;
+                    self.commiter_sender.send(commit).await.map_err(|e| {
+                        TrypemaError::CustomError(format!(
+                            "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
+                        ))
+                    })?;
+                }
 
                 *state = AbsoluteRedisLimitingState::Rejecting {
                     time_instant: Instant::now(),
