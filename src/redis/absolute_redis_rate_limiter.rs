@@ -1,7 +1,15 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    ops::Deref,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
+use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
@@ -202,6 +210,25 @@ const ABSOLUTE_CLEANUP_LUA: &str = r#"
     return
 "#;
 
+#[derive(Debug)]
+enum AbsoluteRedisLimitingState {
+    Accepting {
+        window_limit: u64,
+        count: AtomicU64,
+        time_instant: Instant,
+        last_rate_group_ttl: Option<u64>,
+        last_rate_group_count: Option<u64>,
+    },
+    Undefined {
+        time_instant: Instant,
+    },
+    Rejecting {
+        time_instant: Instant,
+        release_time_instant: Instant,
+        count_after_release: u64,
+    },
+}
+
 /// A rate limiter backed by Redis.
 #[derive(Clone, Debug)]
 pub struct AbsoluteRedisRateLimiter {
@@ -214,6 +241,9 @@ pub struct AbsoluteRedisRateLimiter {
     cleanup_script: Script,
     commiter_sender: mpsc::Sender<AbsoluteRedisCommit>,
     redis_proxy: AbsoluteRedisProxy,
+
+    // ...
+    limiting_state: DashMap<RedisKey, Arc<RwLock<AbsoluteRedisLimitingState>>>,
 }
 
 impl AbsoluteRedisRateLimiter {
@@ -243,6 +273,7 @@ impl AbsoluteRedisRateLimiter {
             cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
             commiter_sender,
             redis_proxy,
+            limiting_state: DashMap::new(),
         };
 
         let limiter = Arc::new(limiter);
@@ -321,33 +352,112 @@ impl AbsoluteRedisRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
-        let mut connection_manager = self.connection_manager.clone();
+        let state_entry = match self.limiting_state.get(key) {
+            Some(state) => state,
+            None => {
+                self.limiting_state.entry(key.clone()).or_insert_with(|| {
+                    Arc::new(RwLock::new(AbsoluteRedisLimitingState::Undefined {
+                        time_instant: Instant::now(),
+                    }))
+                });
 
-        let (result, retry_after_ms, remaining_after_waiting): (String, u128, u64) = self
-            .is_allowed_script
-            .key(self.key_generator.get_hash_key(key))
-            .key(self.key_generator.get_active_keys(key))
-            .key(self.key_generator.get_window_limit_key(key))
-            .key(self.key_generator.get_total_count_key(key))
-            .arg(*self.window_size_seconds)
-            .arg(*self.rate_group_size_ms)
-            .invoke_async(&mut connection_manager)
-            .await?;
+                self.limiting_state.get(key).expect("Key should be present")
+            }
+        };
 
-        match result.as_str() {
-            "allowed" => Ok(RateLimitDecision::Allowed),
-            "rejected" => Ok(RateLimitDecision::Rejected {
-                window_size_seconds: *self.window_size_seconds,
-                retry_after_ms,
-                remaining_after_waiting,
-            }),
-            _ => Err(TrypemaError::UnexpectedRedisScriptResult {
-                operation: "absolute.is_allowed",
-                key: key.to_string(),
-                result,
-            }),
+        let state_lock = state_entry.read().await;
+
+        if let AbsoluteRedisLimitingState::Accepting {
+            window_limit,
+            count,
+            time_instant,
+            last_rate_group_ttl,
+            last_rate_group_count,
+        } = state_lock.deref()
+        {
+            if count.load(Ordering::Relaxed) < *window_limit {
+                return Ok(RateLimitDecision::Allowed);
+            }
+
+            let elapsed = time_instant.elapsed().as_millis();
+            let last_rate_group_ttl: Option<u64> = *last_rate_group_ttl;
+            let last_rate_group_count: Option<u64> = *last_rate_group_count;
+
+            drop(state_lock);
+
+            let mut state = state_entry.write().await;
+
+            if let Some(last_rate_group_ttl) = last_rate_group_ttl
+                && let Some(last_rate_group_count) = last_rate_group_count
+                && elapsed < last_rate_group_ttl as u128
+            {
+                let retry_after_ms = (last_rate_group_ttl as u128).saturating_sub(elapsed);
+                let remaining_after_waiting = last_rate_group_count;
+                let window_size_seconds = *self.window_size_seconds;
+
+                *state = AbsoluteRedisLimitingState::Rejecting {
+                    time_instant: Instant::now(),
+                    release_time_instant: Instant::now()
+                        + Duration::from_millis(retry_after_ms as u64),
+                    count_after_release: remaining_after_waiting,
+                };
+
+                return Ok(RateLimitDecision::Rejected {
+                    window_size_seconds,
+                    retry_after_ms,
+                    remaining_after_waiting,
+                });
+            }
+
+            let read_state_result = self
+                .redis_proxy
+                .read_state(key, *self.window_size_seconds as u128 * 1000)
+                .await?;
+
+            let Some(window_limit) = read_state_result.window_limit else {
+                *state = AbsoluteRedisLimitingState::Undefined {
+                    time_instant: Instant::now(),
+                };
+
+                return Ok(RateLimitDecision::Allowed);
+            };
+
+            if read_state_result.current_total_count >= window_limit
+                && let Some(retry_after_ms) = read_state_result.last_rate_group_ttl
+                && let Some(remaining_after_waiting) = read_state_result.last_rate_group_count
+            {
+                *state = AbsoluteRedisLimitingState::Rejecting {
+                    time_instant: Instant::now(),
+                    release_time_instant: Instant::now() + Duration::from_millis(retry_after_ms),
+                    count_after_release: remaining_after_waiting,
+                };
+
+                return Ok(RateLimitDecision::Rejected {
+                    window_size_seconds: *self.window_size_seconds,
+                    retry_after_ms: retry_after_ms as u128,
+                    remaining_after_waiting,
+                });
+            } else if read_state_result.current_total_count < window_limit {
+                *state = AbsoluteRedisLimitingState::Accepting {
+                    window_limit,
+                    count: AtomicU64::new(read_state_result.current_total_count),
+                    time_instant: Instant::now(),
+                    last_rate_group_ttl: read_state_result.last_rate_group_ttl,
+                    last_rate_group_count: read_state_result.last_rate_group_count,
+                };
+
+                return Ok(RateLimitDecision::Allowed);
+            }
+
+            *state = AbsoluteRedisLimitingState::Undefined {
+                time_instant: Instant::now(),
+            };
+
+            return Ok(RateLimitDecision::Allowed);
         }
-    }
+
+        todo!()
+    } // end method is_allowed
 
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {

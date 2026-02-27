@@ -95,6 +95,14 @@ const READ_STATE_SCRIPT: &str = r#"
 
 "#;
 
+pub(crate) struct AbsoluteRedisProxyReadStateResult {
+    pub key: RedisKey,
+    pub current_total_count: u64,
+    pub window_limit: Option<u64>,
+    pub last_rate_group_ttl: Option<u64>,
+    pub last_rate_group_count: Option<u64>,
+}
+
 pub(crate) enum AbsoluteRedisProxyState {
     ReadResult {
         key: RedisKey,
@@ -135,7 +143,7 @@ impl AbsoluteRedisProxy {
         self: &AbsoluteRedisProxy,
         key: &RedisKey,
         window_size_ms: u128,
-    ) -> Result<AbsoluteRedisProxyState, TrypemaError> {
+    ) -> Result<AbsoluteRedisProxyReadStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
         let (entity, total_count, window_limit, oldest_ttl, oldest_count): (
@@ -155,7 +163,7 @@ impl AbsoluteRedisProxy {
             .invoke_async(&mut connection_manager)
             .await?;
 
-        Ok(AbsoluteRedisProxyState::ReadResult {
+        Ok(AbsoluteRedisProxyReadStateResult {
             key: RedisKey::from(entity),
             current_total_count: total_count,
             window_limit,
