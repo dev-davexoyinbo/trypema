@@ -1,9 +1,9 @@
-use redis::{Script, aio::ConnectionManager};
+use redis::{RedisError, Script, aio::ConnectionManager};
 
 use crate::{
     TrypemaError,
     common::RateType,
-    redis::{RedisKey, RedisKeyGenerator},
+    redis::{RedisKey, RedisKeyGenerator, absolute_redis_commiter::AbsoluteRedisCommit},
 };
 
 const COMMIT_STATE_SCRIPT: &str = r#"
@@ -212,5 +212,65 @@ impl AbsoluteRedisProxy {
             last_rate_group_ttl: oldest_ttl,
             last_rate_group_count: oldest_count,
         })
+    }
+
+    pub(crate) async fn batch_commit_state(
+        self: &AbsoluteRedisProxy,
+        commits: Vec<AbsoluteRedisCommit>,
+    ) -> Result<Vec<AbsoluteRedisProxyCommitStateResult>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let pipe = self.build_pipeline(&commits, false);
+
+        if let Err::<Vec<(String, u64, u64, Option<u64>, Option<u64>)>, RedisError>(err) =
+            pipe.query_async(&mut connection_manager).await
+        {
+            if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
+                tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                return Err(TrypemaError::RedisError(err));
+            }
+
+            let pipe = self.build_pipeline(&commits, true);
+
+            if let Err::<Vec<(String, u64, u64, Option<u64>, Option<u64>)>, _>(err) =
+                pipe.query_async(&mut connection_manager).await
+            {
+                tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                return Err(TrypemaError::RedisError(err));
+            }
+        }
+
+        todo!()
+    } // end method batch_commit_state
+
+    #[inline]
+    fn build_pipeline(
+        &self,
+        commits: &Vec<AbsoluteRedisCommit>,
+        should_load_script: bool,
+    ) -> redis::Pipeline {
+        let mut pipe = redis::Pipeline::new();
+        if should_load_script {
+            pipe.load_script(&self.commit_state_script).ignore();
+        }
+
+        for commit in commits {
+            pipe.invoke_script(
+                self.commit_state_script
+                    .key(self.key_generator.get_hash_key(&commit.key))
+                    .key(self.key_generator.get_active_keys(&commit.key))
+                    .key(self.key_generator.get_window_limit_key(&commit.key))
+                    .key(self.key_generator.get_total_count_key(&commit.key))
+                    .key(self.key_generator.get_active_entities_key())
+                    .arg(commit.key.as_str())
+                    .arg(commit.window_size_seconds)
+                    .arg(commit.window_limit)
+                    .arg(commit.rate_group_size_ms)
+                    .arg(commit.count),
+            )
+            .ignore();
+        }
+
+        pipe
     }
 }
