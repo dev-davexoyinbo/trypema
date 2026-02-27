@@ -9,7 +9,7 @@ use std::{
 
 use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, RwLockWriteGuard, mpsc};
 
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
@@ -20,7 +20,7 @@ use crate::{
         absolute_redis_commiter::{
             AbsoluteRedisCommit, AbsoluteRedisCommitter, AbsoluteRedisCommitterOptions,
         },
-        absolute_redis_proxy::AbsoluteRedisProxy,
+        absolute_redis_proxy::{AbsoluteRedisProxy, AbsoluteRedisProxyReadStateResult},
     },
 };
 
@@ -374,13 +374,24 @@ impl AbsoluteRedisRateLimiter {
             }
         };
 
-        let mut state = state_entry.write().await;
+        let state = state_entry.write().await;
 
         let read_state_result = self
             .redis_proxy
             .read_state(key, *self.window_size_seconds as u128 * 1000)
             .await?;
 
+        self.reset_single_state_from_read_result(state, read_state_result, check_count, increment)
+            .await
+    } // end method reset_state_from_redis_read_result
+
+    async fn reset_single_state_from_read_result(
+        &self,
+        mut state: RwLockWriteGuard<'_, AbsoluteRedisLimitingState>,
+        read_state_result: AbsoluteRedisProxyReadStateResult,
+        check_count: u64,
+        increment: u64,
+    ) -> Result<RateLimitDecision, TrypemaError> {
         let Some(window_limit) = read_state_result.window_limit else {
             *state = AbsoluteRedisLimitingState::Undefined {
                 time_instant: Instant::now(),
@@ -423,7 +434,7 @@ impl AbsoluteRedisRateLimiter {
         };
 
         Ok(RateLimitDecision::Allowed)
-    } // end method reset_state_from_redis_read_result
+    }
 
     async fn is_allowed_with_count_increment(
         &self,
@@ -587,6 +598,44 @@ impl AbsoluteRedisRateLimiter {
     }
 
     async fn flush(&self) {
-        todo!()
-    }
+        let mut resets: Vec<RedisKey> = Vec::new();
+
+        for state in self.limiting_state.iter() {
+            let key = state.key();
+            let state_lock = state.value().read().await;
+
+            match state_lock.deref() {
+                AbsoluteRedisLimitingState::Undefined { .. }
+                | AbsoluteRedisLimitingState::Rejecting { .. } => {}
+                AbsoluteRedisLimitingState::Accepting {
+                    window_limit,
+                    accept_limit,
+                    count,
+                    ..
+                } => {
+                    let commit = AbsoluteRedisCommit {
+                        key: key.clone(),
+                        window_size_seconds: *self.window_size_seconds,
+                        window_limit: *window_limit,
+                        rate_group_size_ms: *self.rate_group_size_ms,
+                        count: count.load(Ordering::Relaxed),
+                    };
+
+                    if let Err(err) = self.commiter_sender.send(commit).await {
+                        tracing::error!(error = ?err, "Failed to send commit signal to Redis rate limiter");
+                        continue;
+                    }
+
+                    resets.push(key.clone());
+                }
+            }
+        }
+
+        // TODO: batch reset
+        for key in resets {
+            self.reset_state_from_redis_read_result_and_get_decision(&key, 0, 0)
+                .await
+                .unwrap();
+        }
+    } // end method flush
 }
