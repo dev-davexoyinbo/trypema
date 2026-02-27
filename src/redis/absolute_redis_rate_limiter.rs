@@ -1,8 +1,18 @@
+use std::{sync::Arc, time::Duration};
+
 use redis::{Script, aio::ConnectionManager};
+use tokio::sync::mpsc;
 
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
-    RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds, common::RateType,
+    RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
+    common::RateType,
+    redis::{
+        RedisRateLimiterSignal,
+        absolute_redis_commiter::{
+            AbsoluteRedisCommit, AbsoluteRedisCommitter, AbsoluteRedisCommitterOptions,
+        },
+    },
 };
 
 const ABSOLUTE_INC_LUA: &str = r#"
@@ -201,13 +211,23 @@ pub struct AbsoluteRedisRateLimiter {
     inc_script: Script,
     is_allowed_script: Script,
     cleanup_script: Script,
+    commiter_sender: mpsc::Sender<AbsoluteRedisCommit>,
 }
 
 impl AbsoluteRedisRateLimiter {
-    pub(crate) fn new(options: RedisRateLimiterOptions) -> Self {
+    pub(crate) fn new(options: RedisRateLimiterOptions) -> Arc<Self> {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
-        Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(4);
+
+        let commiter_sender = AbsoluteRedisCommitter::run(AbsoluteRedisCommitterOptions {
+            local_cache_duration: Duration::from_millis(50),
+            channel_capacity: 8192,
+            max_batch_size: 128,
+            limiter_sender: tx,
+        });
+
+        let limiter = Self {
             connection_manager: options.connection_manager,
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
@@ -215,8 +235,36 @@ impl AbsoluteRedisRateLimiter {
             inc_script: Script::new(ABSOLUTE_INC_LUA),
             is_allowed_script: Script::new(ABSOLUTE_IS_ALLOWED_LUA),
             cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
-        }
+            commiter_sender,
+        };
+
+        let limiter = Arc::new(limiter);
+
+        limiter.listen_for_committer_signals(rx);
+
+        limiter
     } // end method with_rate_type
+
+    fn listen_for_committer_signals(
+        self: &Arc<Self>,
+        mut rx: mpsc::Receiver<RedisRateLimiterSignal>,
+    ) {
+        let limitter = Arc::downgrade(self);
+
+        tokio::spawn(async move {
+            while let Some(signal) = rx.recv().await {
+                let Some(limiter) = limitter.upgrade() else {
+                    break;
+                };
+
+                match signal {
+                    RedisRateLimiterSignal::Flush => {
+                        limiter.flush().await;
+                    }
+                }
+            }
+        });
+    } // end method listen_for_committer_signals
 
     /// Check admission and, if allowed, increment the observed count for `key`.
     pub async fn inc(
@@ -313,5 +361,9 @@ impl AbsoluteRedisRateLimiter {
             .await?;
 
         Ok(())
+    }
+
+    async fn flush(&self) {
+        todo!()
     }
 }

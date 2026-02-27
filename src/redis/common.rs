@@ -107,3 +107,7 @@ impl RedisKeyGenerator {
         self.get_key_with_suffix(key, &self.suppression_factor_key_suffix)
     }
 }
+
+pub enum RedisRateLimiterSignal {
+    Flush,
+}

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use redis::aio::ConnectionManager;
 
 use crate::{
@@ -161,7 +163,7 @@ pub struct RedisRateLimiterOptions {
 /// ```
 #[derive(Clone, Debug)]
 pub struct RedisRateLimiterProvider {
-    absolute: AbsoluteRedisRateLimiter,
+    absolute: Arc<AbsoluteRedisRateLimiter>,
     suppressed: SuppressedRedisRateLimiter,
 }
 
