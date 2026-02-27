@@ -103,21 +103,12 @@ pub(crate) struct AbsoluteRedisProxyReadStateResult {
     pub last_rate_group_count: Option<u64>,
 }
 
-pub(crate) enum AbsoluteRedisProxyState {
-    ReadResult {
-        key: RedisKey,
-        current_total_count: u64,
-        window_limit: Option<u64>,
-        last_rate_group_ttl: Option<u64>,
-        last_rate_group_count: Option<u64>,
-    },
-    CommitResult {
-        key: String,
-        current_total_count: u64,
-        window_limit: u64,
-        last_rate_group_ttl: Option<u64>,
-        last_rate_group_count: Option<u64>,
-    },
+pub(crate) struct AbsoluteRedisProxyCommitStateResult {
+    pub key: RedisKey,
+    pub current_total_count: u64,
+    pub window_limit: u64,
+    pub last_rate_group_ttl: Option<u64>,
+    pub last_rate_group_count: Option<u64>,
 }
 
 pub(crate) struct AbsoluteRedisProxyReadOptions {}
