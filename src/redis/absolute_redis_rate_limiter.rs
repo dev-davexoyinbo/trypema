@@ -215,14 +215,10 @@ impl AbsoluteRedisRateLimiter {
         check_count: u64,
         increment: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        eprintln!("resetting state from redis read result ==========================");
         let read_state_result = self
             .redis_proxy
             .read_state(key, *self.window_size_seconds as u128 * 1000)
             .await?;
-        eprintln!(
-            "resetting state from redis read result <<<<<<<<<<<<<<<<<, {read_state_result:?}"
-        );
 
         self.reset_single_state_from_read_result(read_state_result, check_count, increment)
             .await

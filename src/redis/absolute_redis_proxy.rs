@@ -65,7 +65,7 @@ const COMMIT_STATE_SCRIPT: &str = r#"
 
     if #oldest_hash_fields > 0 then
         oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_fields[1])) or 0
-        oldest_ttl = window_size_ms - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
+        oldest_ttl = (window_size_seconds * 1000) - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
     end
 
     redis.call("EXPIRE", window_limit_key, window_size_seconds)
@@ -145,8 +145,6 @@ impl AbsoluteRedisProxy {
     ) -> Result<AbsoluteRedisProxyReadStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        eprintln!("reading state from redis ==========================");
-
         let res: (String, u64, i64, i64, i64) = self
             .read_state_script
             .key(self.key_generator.get_hash_key(key))
@@ -157,8 +155,6 @@ impl AbsoluteRedisProxy {
             .arg(window_size_ms)
             .invoke_async(&mut connection_manager)
             .await?;
-
-        eprintln!("reading state from redis <<<<<<<<<<<<<<<<<, {:?}", res.0);
 
         Ok(map_redis_read_result_to_state(res))
     } // end method read_state

@@ -13,6 +13,7 @@ use crate::{
     },
 };
 
+#[derive(Debug)]
 pub(crate) struct AbsoluteRedisCommit {
     pub key: RedisKey,
     pub window_size_seconds: u64,
@@ -99,6 +100,10 @@ impl AbsoluteRedisCommitter {
         redis_proxy: &AbsoluteRedisProxy,
         batch: &Vec<AbsoluteRedisCommit>,
     ) -> Result<Vec<AbsoluteRedisProxyCommitStateResult>, TrypemaError> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
         redis_proxy.batch_commit_state(batch).await
     } // end method flush_to_redis
 } // end impl AbsoluteRedisCommitter
