@@ -166,7 +166,7 @@ impl AbsoluteRedisProxy {
     pub(crate) fn commit_state(
         self: &AbsoluteRedisProxy,
         options: AbsoluteRedisProxyCommitOptions,
-    ) -> Result<AbsoluteRedisProxyState, TrypemaError> {
+    ) -> Result<AbsoluteRedisProxyCommitStateResult, TrypemaError> {
         todo!()
     }
 }

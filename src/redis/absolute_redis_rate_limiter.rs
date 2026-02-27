@@ -312,37 +312,30 @@ impl AbsoluteRedisRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let window_limit = *self.window_size_seconds as f64 * **rate_limit;
-        let mut connection_manager = self.connection_manager.clone();
-
-        let (result, retry_after_ms, remaining_after_waiting): (String, u128, u64) = self
-            .inc_script
-            .key(self.key_generator.get_hash_key(key))
-            .key(self.key_generator.get_active_keys(key))
-            .key(self.key_generator.get_window_limit_key(key))
-            .key(self.key_generator.get_total_count_key(key))
-            .key(self.key_generator.get_active_entities_key())
-            .arg(key.to_string())
-            .arg(*self.window_size_seconds)
-            .arg(window_limit)
-            .arg(*self.rate_group_size_ms)
-            .arg(count)
-            .invoke_async(&mut connection_manager)
+        let decision = self
+            .is_allowed_with_count_increment(key, count, count)
             .await?;
 
-        match result.as_str() {
-            "allowed" => Ok(RateLimitDecision::Allowed),
-            "rejected" => Ok(RateLimitDecision::Rejected {
-                window_size_seconds: *self.window_size_seconds,
-                retry_after_ms,
-                remaining_after_waiting,
-            }),
-            _ => Err(TrypemaError::UnexpectedRedisScriptResult {
-                operation: "absolute.inc",
-                key: key.to_string(),
-                result,
-            }),
+        if !matches!(decision, RateLimitDecision::Allowed) {
+            return Ok(decision);
         }
+
+        let state_entry = self.limiting_state.get(key).expect("Key should be present");
+
+        if let AbsoluteRedisLimitingState::Undefined { .. } = state_entry.read().await.deref() {
+            let mut state = state_entry.write().await;
+            let window_limit = *self.window_size_seconds as f64 * **rate_limit;
+
+            *state = AbsoluteRedisLimitingState::Accepting {
+                window_limit: window_limit as u64,
+                count: AtomicU64::new(count),
+                time_instant: Instant::now(),
+                last_rate_group_ttl: None,
+                last_rate_group_count: None,
+            };
+        }
+
+        Ok(decision)
     } // end method inc
 
     /// Determine whether `key` is currently allowed.
