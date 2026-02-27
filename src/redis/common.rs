@@ -15,6 +15,10 @@ impl RedisKey {
     pub fn default_prefix() -> Self {
         Self("trypema".to_string())
     }
+
+    pub(crate) fn from(value: String) -> Self {
+        Self(value)
+    }
 }
 
 impl Deref for RedisKey {

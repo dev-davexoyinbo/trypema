@@ -5,7 +5,7 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use crate::redis::RedisRateLimiterSignal;
+use crate::redis::{RedisRateLimiterSignal, absolute_redis_proxy::AbsoluteRedisProxy};
 
 pub(crate) struct AbsoluteRedisCommit {}
 
@@ -14,6 +14,7 @@ pub(crate) struct AbsoluteRedisCommitterOptions {
     pub channel_capacity: usize,
     pub max_batch_size: usize,
     pub limiter_sender: mpsc::Sender<RedisRateLimiterSignal>,
+    pub redis_proxy: AbsoluteRedisProxy,
 }
 
 pub(crate) struct AbsoluteRedisCommitter; // end struct AbsoluteRedisCommitter
@@ -25,6 +26,7 @@ impl AbsoluteRedisCommitter {
             channel_capacity,
             max_batch_size,
             limiter_sender,
+            redis_proxy,
         } = options;
 
         let (tx, mut rx) = mpsc::channel::<AbsoluteRedisCommit>(channel_capacity);
@@ -69,7 +71,7 @@ impl AbsoluteRedisCommitter {
                     batch.push(commit);
                 }
 
-                Self::flush_to_redis(&batch).await;
+                Self::flush_to_redis(&redis_proxy, &batch).await;
 
                 batch.clear();
             }
@@ -78,7 +80,7 @@ impl AbsoluteRedisCommitter {
         tx
     } // end method run
 
-    async fn flush_to_redis(batch: &Vec<AbsoluteRedisCommit>) {
+    async fn flush_to_redis(redis_proxy: &AbsoluteRedisProxy, batch: &Vec<AbsoluteRedisCommit>) {
         todo!()
     } // end method flush_to_redis
 } // end impl AbsoluteRedisCommitter

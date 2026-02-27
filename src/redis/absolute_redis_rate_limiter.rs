@@ -12,6 +12,7 @@ use crate::{
         absolute_redis_commiter::{
             AbsoluteRedisCommit, AbsoluteRedisCommitter, AbsoluteRedisCommitterOptions,
         },
+        absolute_redis_proxy::AbsoluteRedisProxy,
     },
 };
 
@@ -212,6 +213,7 @@ pub struct AbsoluteRedisRateLimiter {
     is_allowed_script: Script,
     cleanup_script: Script,
     commiter_sender: mpsc::Sender<AbsoluteRedisCommit>,
+    redis_proxy: AbsoluteRedisProxy,
 }
 
 impl AbsoluteRedisRateLimiter {
@@ -220,11 +222,15 @@ impl AbsoluteRedisRateLimiter {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(4);
 
+        let redis_proxy =
+            AbsoluteRedisProxy::new(prefix.clone(), options.connection_manager.clone());
+
         let commiter_sender = AbsoluteRedisCommitter::run(AbsoluteRedisCommitterOptions {
             local_cache_duration: Duration::from_millis(50),
             channel_capacity: 8192,
             max_batch_size: 128,
             limiter_sender: tx,
+            redis_proxy: redis_proxy.clone(),
         });
 
         let limiter = Self {
@@ -236,6 +242,7 @@ impl AbsoluteRedisRateLimiter {
             is_allowed_script: Script::new(ABSOLUTE_IS_ALLOWED_LUA),
             cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
             commiter_sender,
+            redis_proxy,
         };
 
         let limiter = Arc::new(limiter);
