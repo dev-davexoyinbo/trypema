@@ -392,6 +392,27 @@ impl AbsoluteRedisRateLimiter {
         check_count: u64,
         increment: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
+        if let AbsoluteRedisLimitingState::Accepting {
+            window_limit,
+            count,
+            ..
+        } = state.deref()
+        {
+            let commit = AbsoluteRedisCommit {
+                key: read_state_result.key.clone(),
+                window_size_seconds: *self.window_size_seconds,
+                window_limit: *window_limit,
+                rate_group_size_ms: *self.rate_group_size_ms,
+                count: count.load(Ordering::Relaxed),
+            };
+
+            self.commiter_sender.send(commit).await.map_err(|e| {
+                TrypemaError::CustomError(format!(
+                    "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
+                ))
+            })?;
+        }
+
         let Some(window_limit) = read_state_result.window_limit else {
             *state = AbsoluteRedisLimitingState::Undefined {
                 time_instant: Instant::now(),
@@ -478,21 +499,6 @@ impl AbsoluteRedisRateLimiter {
                     return Ok(RateLimitDecision::Allowed);
                 } else {
                     drop(state_lock);
-
-                    let commit = AbsoluteRedisCommit {
-                        key: key.clone(),
-                        window_size_seconds: *self.window_size_seconds,
-                        window_limit,
-                        rate_group_size_ms: *self.rate_group_size_ms,
-                        count: current_total_count,
-                    };
-
-                    self.commiter_sender.send(commit).await.map_err(|e| {
-                        TrypemaError::CustomError(format!(
-                            "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
-                        ))
-                    })?;
-
                     return self
                         .reset_state_from_redis_read_result_and_get_decision(
                             key,
@@ -602,32 +608,10 @@ impl AbsoluteRedisRateLimiter {
 
         for state in self.limiting_state.iter() {
             let key = state.key();
-            let state_lock = state.value().read().await;
 
-            match state_lock.deref() {
-                AbsoluteRedisLimitingState::Undefined { .. }
-                | AbsoluteRedisLimitingState::Rejecting { .. } => {}
-                AbsoluteRedisLimitingState::Accepting {
-                    window_limit,
-                    accept_limit,
-                    count,
-                    ..
-                } => {
-                    let commit = AbsoluteRedisCommit {
-                        key: key.clone(),
-                        window_size_seconds: *self.window_size_seconds,
-                        window_limit: *window_limit,
-                        rate_group_size_ms: *self.rate_group_size_ms,
-                        count: count.load(Ordering::Relaxed),
-                    };
-
-                    if let Err(err) = self.commiter_sender.send(commit).await {
-                        tracing::error!(error = ?err, "Failed to send commit signal to Redis rate limiter");
-                        continue;
-                    }
-
-                    resets.push(key.clone());
-                }
+            if let AbsoluteRedisLimitingState::Accepting { .. } = state.value().read().await.deref()
+            {
+                resets.push(key.clone());
             }
         }
 
