@@ -5,18 +5,18 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use crate::redis::{AbsoluteRedisRateLimiter, RedisRateLimiterSignal};
+use crate::redis::RedisRateLimiterSignal;
 
-pub struct AbsoluteRedisCommit {}
+pub(crate) struct AbsoluteRedisCommit {}
 
-pub struct AbsoluteRedisCommitterOptions {
+pub(crate) struct AbsoluteRedisCommitterOptions {
     pub local_cache_duration: Duration,
     pub channel_capacity: usize,
     pub max_batch_size: usize,
     pub limiter_sender: mpsc::Sender<RedisRateLimiterSignal>,
 }
 
-pub struct AbsoluteRedisCommitter; // end struct AbsoluteRedisCommitter
+pub(crate) struct AbsoluteRedisCommitter; // end struct AbsoluteRedisCommitter
 
 impl AbsoluteRedisCommitter {
     pub fn run(options: AbsoluteRedisCommitterOptions) -> mpsc::Sender<AbsoluteRedisCommit> {

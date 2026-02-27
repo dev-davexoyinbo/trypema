@@ -11,3 +11,4 @@ mod common;
 pub use common::*;
 
 mod absolute_redis_commiter;
+mod absolute_redis_proxy;
