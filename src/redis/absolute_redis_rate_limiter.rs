@@ -303,7 +303,9 @@ impl AbsoluteRedisRateLimiter {
 
                 match signal {
                     RedisRateLimiterSignal::Flush => {
-                        limiter.flush().await;
+                        if let Err(err) = limiter.flush().await {
+                            tracing::error!(error = ?err, "Failed to flush redis rate limiter");
+                        }
                     }
                 }
             }
