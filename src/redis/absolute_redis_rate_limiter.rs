@@ -475,6 +475,14 @@ impl AbsoluteRedisRateLimiter {
                     count_after_release: remaining_after_waiting,
                 };
 
+                let commit = AbsoluteRedisCommit {};
+
+                self.commiter_sender.send(commit).await.map_err(|e| {
+                    TrypemaError::CustomError(format!(
+                        "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
+                    ))
+                })?;
+
                 return Ok(RateLimitDecision::Rejected {
                     window_size_seconds,
                     retry_after_ms,

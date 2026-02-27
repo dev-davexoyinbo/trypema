@@ -6,7 +6,10 @@ use crate::{
     redis::{RedisKey, RedisKeyGenerator},
 };
 
-const ABSOLUTE_COMMIT_LUA: &str = r#"
+const COMMIT_STATE_SCRIPT: &str = r#"
+    local time_array = redis.call("TIME")
+    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+
     local hash_key = KEYS[1]
     local active_keys = KEYS[2]
     local window_limit_key = KEYS[3]
@@ -18,7 +21,6 @@ const ABSOLUTE_COMMIT_LUA: &str = r#"
     local window_limit = tonumber(ARGV[3])
     local rate_group_size_ms = tonumber(ARGV[4])
     local count = tonumber(ARGV[5])
-    local timestamp_ms = tonumber(ARGV[6])
 
 
     -- evict expired buckets
@@ -49,17 +51,27 @@ const ABSOLUTE_COMMIT_LUA: &str = r#"
 
     local hash_field = tostring(timestamp_ms)
     local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
-    redis.call("INCRBY", total_count_key, count)
+    local total_count = redis.call("INCRBY", total_count_key, count)
 
     if new_count == count then
         redis.call("ZADD", active_keys, timestamp_ms, hash_field)
         redis.call("SET", window_limit_key, window_limit)
     end
 
+
+    local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
+    local oldest_ttl = nil
+    local oldest_count = nil
+
+    if #oldest_hash_fields == 0 then
+        oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_fields[1])) or 0
+        oldest_ttl = window_size_ms - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
+    end
+
     redis.call("EXPIRE", window_limit_key, window_size_seconds)
     redis.call("ZADD", active_entities_key, timestamp_ms, entity)
 
-    return 1
+    {entity, total_count, window_limit, oldest_ttl, oldest_count}
 "#;
 
 const READ_STATE_SCRIPT: &str = r#"
@@ -111,13 +123,11 @@ pub(crate) struct AbsoluteRedisProxyCommitStateResult {
     pub last_rate_group_count: Option<u64>,
 }
 
-pub(crate) struct AbsoluteRedisProxyReadOptions {}
-pub(crate) struct AbsoluteRedisProxyCommitOptions {}
-
 #[derive(Clone, Debug)]
 pub(crate) struct AbsoluteRedisProxy {
     key_generator: RedisKeyGenerator,
     read_state_script: Script,
+    commit_state_script: Script,
     connection_manager: ConnectionManager,
 }
 
@@ -126,6 +136,7 @@ impl AbsoluteRedisProxy {
         Self {
             key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
             read_state_script: Script::new(READ_STATE_SCRIPT),
+            commit_state_script: Script::new(COMMIT_STATE_SCRIPT),
             connection_manager,
         }
     }
@@ -163,10 +174,43 @@ impl AbsoluteRedisProxy {
         })
     } // end method read_state
 
-    pub(crate) fn commit_state(
+    pub(crate) async fn commit_state(
         self: &AbsoluteRedisProxy,
-        options: AbsoluteRedisProxyCommitOptions,
+        key: &RedisKey,
+        window_size_seconds: u64,
+        window_limit: u64,
+        rate_group_size_ms: u128,
+        count: u64,
     ) -> Result<AbsoluteRedisProxyCommitStateResult, TrypemaError> {
-        todo!()
+        let mut connection_manager = self.connection_manager.clone();
+
+        let (entity, total_count, window_limit, oldest_ttl, oldest_count): (
+            String,
+            u64,
+            u64,
+            Option<u64>,
+            Option<u64>,
+        ) = self
+            .commit_state_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .arg(key.as_str())
+            .arg(window_size_seconds)
+            .arg(window_limit)
+            .arg(rate_group_size_ms)
+            .arg(count)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(AbsoluteRedisProxyCommitStateResult {
+            key: RedisKey::from(entity),
+            current_total_count: total_count,
+            window_limit,
+            last_rate_group_ttl: oldest_ttl,
+            last_rate_group_count: oldest_count,
+        })
     }
 }
