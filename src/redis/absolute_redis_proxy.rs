@@ -71,7 +71,7 @@ const COMMIT_STATE_SCRIPT: &str = r#"
     redis.call("EXPIRE", window_limit_key, window_size_seconds)
     redis.call("ZADD", active_entities_key, timestamp_ms, entity)
 
-    {entity, total_count, window_limit, oldest_ttl, oldest_count}
+    return {entity, total_count, window_limit, oldest_ttl, oldest_count}
 "#;
 
 const READ_STATE_SCRIPT: &str = r#"
@@ -102,9 +102,7 @@ const READ_STATE_SCRIPT: &str = r#"
         oldest_ttl = window_size_ms - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
     end
 
-
-    {entity, total_count, window_limit, oldest_ttl, oldest_count}
-
+    return {entity, total_count, window_limit, oldest_ttl, oldest_count}
 "#;
 
 pub(crate) struct AbsoluteRedisProxyReadStateResult {
