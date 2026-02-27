@@ -214,6 +214,7 @@ const ABSOLUTE_CLEANUP_LUA: &str = r#"
 enum AbsoluteRedisLimitingState {
     Accepting {
         window_limit: u64,
+        accept_limit: u64,
         count: AtomicU64,
         time_instant: Instant,
         last_rate_group_ttl: Option<u64>,
@@ -328,6 +329,7 @@ impl AbsoluteRedisRateLimiter {
 
             *state = AbsoluteRedisLimitingState::Accepting {
                 window_limit: window_limit as u64,
+                accept_limit: window_limit as u64,
                 count: AtomicU64::new(count),
                 time_instant: Instant::now(),
                 last_rate_group_ttl: None,
@@ -402,7 +404,8 @@ impl AbsoluteRedisRateLimiter {
         } else if read_state_result.current_total_count + check_count <= window_limit {
             *state = AbsoluteRedisLimitingState::Accepting {
                 window_limit,
-                count: AtomicU64::new(read_state_result.current_total_count + increment),
+                accept_limit: window_limit - read_state_result.current_total_count,
+                count: AtomicU64::new(increment),
                 time_instant: Instant::now(),
                 last_rate_group_ttl: read_state_result.last_rate_group_ttl,
                 last_rate_group_count: read_state_result.last_rate_group_count,
@@ -441,13 +444,14 @@ impl AbsoluteRedisRateLimiter {
 
         if let AbsoluteRedisLimitingState::Accepting {
             window_limit,
+            accept_limit,
             count,
             time_instant,
             last_rate_group_ttl,
             last_rate_group_count,
         } = state_lock.deref()
         {
-            if count.load(Ordering::Relaxed) + check_count <= *window_limit {
+            if count.load(Ordering::Relaxed) + check_count <= *accept_limit {
                 count.fetch_add(increment, Ordering::Relaxed);
                 return Ok(RateLimitDecision::Allowed);
             }
@@ -457,6 +461,7 @@ impl AbsoluteRedisRateLimiter {
             let last_rate_group_count: Option<u64> = *last_rate_group_count;
             let current_total_count = count.load(Ordering::Relaxed);
             let window_limit = *window_limit;
+            let accept_limit = *accept_limit;
 
             drop(state_lock);
             let mut state = state_entry.write().await;
