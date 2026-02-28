@@ -208,9 +208,18 @@ impl AbsoluteRedisRateLimiter {
         .await
     } // end method reset_state_from_redis_read_result
 
+    async fn send_commit(&self, commit: AbsoluteRedisCommit) -> Result<(), TrypemaError> {
+        self.commiter_sender
+            .send(commit.into())
+            .await
+            .map_err(|err| TrypemaError::CustomError(format!("Failed to send commit: {err:?}")))?;
+
+        Ok(())
+    } // end method send_commit
+
     async fn reset_single_state_from_read_result(
         &self,
-        mut read_state_result: AbsoluteRedisProxyReadStateResult,
+        read_state_result: AbsoluteRedisProxyReadStateResult,
         check_count: u64,
         increment: u64,
         rate_limit: Option<&RateLimit>,
@@ -218,7 +227,6 @@ impl AbsoluteRedisRateLimiter {
         let mut current_total_count = read_state_result.current_total_count;
         let mut current_window_limit = read_state_result.window_limit;
         let key = &read_state_result.key;
-        let mut commit: Option<AbsoluteRedisCommit> = None;
 
         let state = match self.limiting_state.get(key) {
             Some(state) => state,
@@ -231,38 +239,50 @@ impl AbsoluteRedisRateLimiter {
             }
         };
 
-        if let AbsoluteRedisLimitingState::Accepting {
-            window_limit,
-            count,
-            ..
-        } = state.deref()
-        {
-            let count = count.load(Ordering::Relaxed);
+        let state = match state.deref() {
+            AbsoluteRedisLimitingState::Undefined
+            | AbsoluteRedisLimitingState::Rejecting { .. } => state,
+            AbsoluteRedisLimitingState::Accepting {
+                window_limit,
+                count,
+                ..
+            } => {
+                let count = count.load(Ordering::Relaxed);
 
-            if current_window_limit.is_none() {
-                current_window_limit = Some(*window_limit.borrow());
+                if current_window_limit.is_none() {
+                    current_window_limit = Some(*window_limit.borrow());
+                }
+
+                if count > 0 {
+                    current_total_count += count;
+
+                    let commit = AbsoluteRedisCommit {
+                        key: key.clone(),
+                        window_size_seconds: *self.window_size_seconds,
+                        window_limit: current_window_limit.expect("Window limit should be set"),
+                        rate_group_size_ms: *self.rate_group_size_ms,
+                        count,
+                    };
+
+                    drop(state);
+                    // TODO: fix the Send issue
+                    self.send_commit(commit).await?;
+
+                    self.limiting_state.get(key).expect("Key should be present")
+                } else {
+                    state
+                }
             }
-
-            if count > 0 {
-                commit = Some(AbsoluteRedisCommit {
-                    key: key.clone(),
-                    window_size_seconds: *self.window_size_seconds,
-                    window_limit: current_window_limit.expect("Window limit should be set"),
-                    rate_group_size_ms: *self.rate_group_size_ms,
-                    count,
-                });
-
-                current_total_count += count;
-            }
-        }
+        };
 
         let new_window_limit = match current_window_limit {
             Some(window_limit) => window_limit,
             None => {
                 let Some(rate_limit) = rate_limit else {
-                    if !matches!(state.deref(), AbsoluteRedisLimitingState::Undefined) {
-                        drop(state);
+                    let is_undefined =
+                        matches!(state.deref(), AbsoluteRedisLimitingState::Undefined);
 
+                    if is_undefined {
                         *self
                             .limiting_state
                             .get_mut(key)
