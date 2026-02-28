@@ -1,8 +1,8 @@
 use std::{
-    cell::RefCell,
     ops::Deref,
     sync::{
         Arc,
+        Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -70,19 +70,25 @@ const ABSOLUTE_CLEANUP_LUA: &str = r#"
 #[derive(Debug)]
 enum AbsoluteRedisLimitingState {
     Accepting {
-        window_limit: RefCell<u64>,
-        accept_limit: RefCell<u64>,
+        window_limit: Mutex<u64>,
+        accept_limit: Mutex<u64>,
         count: AtomicU64,
-        time_instant: RefCell<Instant>,
-        last_rate_group_ttl: RefCell<Option<u64>>,
-        last_rate_group_count: RefCell<Option<u64>>,
+        time_instant: Mutex<Instant>,
+        last_rate_group_ttl: Mutex<Option<u64>>,
+        last_rate_group_count: Mutex<Option<u64>>,
     },
     Undefined,
     Rejecting {
-        time_instant: RefCell<Instant>,
-        ttl_ms: RefCell<u64>,
-        count_after_release: RefCell<u64>,
+        time_instant: Mutex<Instant>,
+        ttl_ms: Mutex<u64>,
+        count_after_release: Mutex<u64>,
     },
+}
+
+fn lock<'a, T>(m: &'a Mutex<T>, what: &'static str) -> Result<std::sync::MutexGuard<'a, T>, TrypemaError> {
+    m.lock().map_err(|_| {
+        TrypemaError::CustomError(format!("mutex poisoned: {what}"))
+    })
 }
 
 /// A rate limiter backed by Redis.
@@ -250,7 +256,7 @@ impl AbsoluteRedisRateLimiter {
                 let count = count.load(Ordering::Relaxed);
 
                 if current_window_limit.is_none() {
-                    current_window_limit = Some(*window_limit.borrow());
+                    current_window_limit = Some(*lock(window_limit, "accepting.window_limit")?);
                 }
 
                 if count > 0 {
@@ -311,9 +317,9 @@ impl AbsoluteRedisRateLimiter {
                 count_after_release,
             } = state.deref()
             {
-                time_instant.replace(new_time_instant);
-                ttl_ms.replace(new_ttl_ms);
-                count_after_release.replace(new_count_after_release);
+                *lock(time_instant, "rejecting.time_instant")? = new_time_instant;
+                *lock(ttl_ms, "rejecting.ttl_ms")? = new_ttl_ms;
+                *lock(count_after_release, "rejecting.count_after_release")? = new_count_after_release;
             } else {
                 drop(state);
                 let mut state = self
@@ -322,9 +328,9 @@ impl AbsoluteRedisRateLimiter {
                     .expect("Key should be present");
 
                 *state = AbsoluteRedisLimitingState::Rejecting {
-                    time_instant: RefCell::new(new_time_instant),
-                    ttl_ms: RefCell::new(new_ttl_ms),
-                    count_after_release: RefCell::new(new_count_after_release),
+                    time_instant: Mutex::new(new_time_instant),
+                    ttl_ms: Mutex::new(new_ttl_ms),
+                    count_after_release: Mutex::new(new_count_after_release),
                 };
             }
 
@@ -346,12 +352,12 @@ impl AbsoluteRedisRateLimiter {
             last_rate_group_count,
         } = state.deref()
         {
-            window_limit.replace(new_window_limit);
-            accept_limit.replace(new_accept_limit);
+            *lock(window_limit, "accepting.window_limit")? = new_window_limit;
+            *lock(accept_limit, "accepting.accept_limit")? = new_accept_limit;
             count.store(increment, Ordering::Relaxed);
-            time_instant.replace(new_time_instant);
-            last_rate_group_ttl.replace(read_state_result.last_rate_group_ttl);
-            last_rate_group_count.replace(read_state_result.last_rate_group_count);
+            *lock(time_instant, "accepting.time_instant")? = new_time_instant;
+            *lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")? = read_state_result.last_rate_group_ttl;
+            *lock(last_rate_group_count, "accepting.last_rate_group_count")? = read_state_result.last_rate_group_count;
         } else {
             drop(state);
             let mut state = self
@@ -360,12 +366,12 @@ impl AbsoluteRedisRateLimiter {
                 .expect("Key should be present");
 
             *state = AbsoluteRedisLimitingState::Accepting {
-                window_limit: RefCell::new(new_window_limit),
-                accept_limit: RefCell::new(new_accept_limit),
+                window_limit: Mutex::new(new_window_limit),
+                accept_limit: Mutex::new(new_accept_limit),
                 count: AtomicU64::new(increment),
-                time_instant: RefCell::new(new_time_instant),
-                last_rate_group_ttl: RefCell::new(read_state_result.last_rate_group_ttl),
-                last_rate_group_count: RefCell::new(read_state_result.last_rate_group_count),
+                time_instant: Mutex::new(new_time_instant),
+                last_rate_group_ttl: Mutex::new(read_state_result.last_rate_group_ttl),
+                last_rate_group_count: Mutex::new(read_state_result.last_rate_group_count),
             };
         }
 
@@ -395,21 +401,28 @@ impl AbsoluteRedisRateLimiter {
             ttl_ms,
             count_after_release,
         } = state_entry.deref()
-            && time_instant.borrow().elapsed().as_millis() < *ttl_ms.borrow() as u128
         {
-            return Ok(RateLimitDecision::Rejected {
-                window_size_seconds: *self.window_size_seconds,
-                retry_after_ms: (*ttl_ms.borrow() as u128)
-                    .saturating_sub(time_instant.borrow().elapsed().as_millis()),
-                remaining_after_waiting: *count_after_release.borrow(),
-            });
-        } else if let AbsoluteRedisLimitingState::Accepting {
+            let elapsed_ms = lock(time_instant, "rejecting.time_instant")?.elapsed().as_millis();
+            let ttl_ms = *lock(ttl_ms, "rejecting.ttl_ms")? as u128;
+
+            if elapsed_ms < ttl_ms {
+                let remaining_after_waiting = *lock(count_after_release, "rejecting.count_after_release")?;
+                return Ok(RateLimitDecision::Rejected {
+                    window_size_seconds: *self.window_size_seconds,
+                    retry_after_ms: ttl_ms.saturating_sub(elapsed_ms),
+                    remaining_after_waiting,
+                });
+            }
+        }
+
+        if let AbsoluteRedisLimitingState::Accepting {
             accept_limit,
             count,
             ..
         } = state_entry.deref()
         {
-            if count.load(Ordering::Relaxed) + check_count <= *accept_limit.borrow() {
+            let accept_limit = *lock(accept_limit, "accepting.accept_limit")?;
+            if count.load(Ordering::Relaxed) + check_count <= accept_limit {
                 count.fetch_add(increment, Ordering::Relaxed);
                 return Ok(RateLimitDecision::Allowed);
             }
@@ -436,10 +449,11 @@ impl AbsoluteRedisRateLimiter {
                 let current_total_count = count.load(Ordering::Relaxed);
 
                 if current_total_count > 0 {
+                    let window_limit = *lock(window_limit, "accepting.window_limit")?;
                     let commit = AbsoluteRedisCommit {
                         key: key.clone(),
                         window_size_seconds: *self.window_size_seconds,
-                        window_limit: *window_limit.borrow(),
+                        window_limit,
                         rate_group_size_ms: *self.rate_group_size_ms,
                         count: current_total_count,
                     };
@@ -447,23 +461,22 @@ impl AbsoluteRedisRateLimiter {
                     permit.send(commit.into());
                 }
 
-                let last_rate_group_ttl: u128 = last_rate_group_ttl
-                    .borrow()
+                let last_rate_group_ttl: u128 = (*lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")?)
                     .map(|el| el as u128)
                     .unwrap_or(self.window_size_ms);
-                let elapsed = time_instant.borrow().elapsed().as_millis();
+                let elapsed = lock(time_instant, "accepting.time_instant")?.elapsed().as_millis();
                 let retry_after_ms = last_rate_group_ttl.saturating_sub(elapsed);
-                let remaining_after_waiting = last_rate_group_count
-                    .borrow()
+                let remaining_after_waiting = (*lock(last_rate_group_count, "accepting.last_rate_group_count")?)
                     .unwrap_or(current_total_count);
 
                 // If we can still increment by at least one, then we don't set the state to
                 // rejecting
-                if current_total_count >= *window_limit.borrow() {
+                let window_limit = *lock(window_limit, "accepting.window_limit")?;
+                if current_total_count >= window_limit {
                     *state_entry = AbsoluteRedisLimitingState::Rejecting {
-                        time_instant: RefCell::new(Instant::now()),
-                        ttl_ms: RefCell::new(retry_after_ms as u64),
-                        count_after_release: RefCell::new(remaining_after_waiting),
+                        time_instant: Mutex::new(Instant::now()),
+                        ttl_ms: Mutex::new(retry_after_ms as u64),
+                        count_after_release: Mutex::new(remaining_after_waiting),
                     };
                 }
 

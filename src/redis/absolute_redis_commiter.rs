@@ -1,7 +1,4 @@
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -55,50 +52,36 @@ impl AbsoluteRedisCommitter {
 
         tokio::spawn(async move {
             let mut flush_interval = tokio::time::interval(local_cache_duration);
-            let is_idle = AtomicBool::new(true);
-            let mut batch: Vec<AbsoluteRedisCommit> = Vec::with_capacity(max_batch_size);
+            let mut batch: Vec<AbsoluteRedisCommit> = Vec::new();
 
             // discard the first tick
             flush_interval.tick().await;
 
             loop {
-                if is_idle.load(Ordering::Relaxed) {
-                    tokio::select! {
-                        _ = flush_interval.tick() => {
-                            if let Err(err) = limiter_sender.try_send(RedisRateLimiterSignal::Flush) {
-                                tracing::debug!(error = ?err, "Failed to send flush signal to Redis rate limiter");
-                                continue;
-                            }
-                        },
-                        commit = rx.recv() => {
-                            let Some(AbsoluteRedisCommitterSignal::Commit(commit)) = commit else {
-                                break;
-                            };
+                tokio::select! {
+                    _ = flush_interval.tick() => {
+                        if let Err(err) = Self::flush_to_redis(&redis_proxy, &mut batch, max_batch_size).await {
+                            tracing::error!(error = ?err, "Failed to flush to Redis");
+                            continue;
+                        };
 
-                            batch.push(commit);
+                        if let Err(err) = limiter_sender.try_send(RedisRateLimiterSignal::Flush) {
+                            tracing::debug!(error = ?err, "Failed to send flush signal to Redis rate limiter");
+                            continue;
                         }
+                    },
+                    commit = rx.recv() => {
+                        let Some(AbsoluteRedisCommitterSignal::Commit(commit)) = commit else {
+                            break;
+                        };
+
+                        batch.push(commit);
                     }
-                } else {
-                    let Some(AbsoluteRedisCommitterSignal::Commit(commit)) = rx.recv().await else {
-                        is_idle.store(true, Ordering::Relaxed);
-                        break;
-                    };
-
-                    batch.push(commit);
                 }
 
-                while batch.len() < max_batch_size
-                    && let Ok(AbsoluteRedisCommitterSignal::Commit(commit)) = rx.try_recv()
-                {
+                while let Ok(AbsoluteRedisCommitterSignal::Commit(commit)) = rx.try_recv() {
                     batch.push(commit);
                 }
-
-                if let Err(err) = Self::flush_to_redis(&redis_proxy, &batch).await {
-                    tracing::error!(error = ?err, "Failed to flush to Redis");
-                    continue;
-                };
-
-                batch.clear();
             }
         });
 
@@ -107,12 +90,26 @@ impl AbsoluteRedisCommitter {
 
     async fn flush_to_redis(
         redis_proxy: &AbsoluteRedisProxy,
-        batch: &Vec<AbsoluteRedisCommit>,
+        batch: &mut Vec<AbsoluteRedisCommit>,
+        max_batch_size: usize,
     ) -> Result<(), TrypemaError> {
         if batch.is_empty() {
             return Ok(());
         }
 
-        redis_proxy.batch_commit_state(batch).await
+        let mut processed = 0;
+
+        while processed < batch.len() {
+            let end = (processed + max_batch_size).min(batch.len());
+            let chunk = &batch[processed..end];
+
+            redis_proxy.batch_commit_state(chunk).await?;
+
+            processed = end;
+        }
+
+        batch.drain(..processed);
+
+        Ok(())
     } // end method flush_to_redis
 } // end impl AbsoluteRedisCommitter

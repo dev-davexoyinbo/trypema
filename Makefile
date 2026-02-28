@@ -139,7 +139,7 @@ stress-redis-skew:
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy suppressed --threads 16 \
+		--provider redis --strategy absolute --threads 16 \
 		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
 		--duration-s 120 --redis-url "$(REDIS_URL)" --redis-prefix stress
 

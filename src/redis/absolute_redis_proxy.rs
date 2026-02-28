@@ -195,7 +195,7 @@ impl AbsoluteRedisProxy {
 
     pub(crate) async fn batch_commit_state(
         self: &AbsoluteRedisProxy,
-        commits: &Vec<AbsoluteRedisCommit>,
+        commits: &[AbsoluteRedisCommit],
     ) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
@@ -227,7 +227,7 @@ impl AbsoluteRedisProxy {
     #[inline]
     fn build_commit_pipeline(
         &self,
-        commits: &Vec<AbsoluteRedisCommit>,
+        commits: &[AbsoluteRedisCommit],
         should_load_script: bool,
     ) -> redis::Pipeline {
         let mut pipe = redis::Pipeline::new();
