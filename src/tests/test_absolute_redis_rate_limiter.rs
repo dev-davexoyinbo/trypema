@@ -291,13 +291,19 @@ fn is_allowed_evicts_old_buckets_and_updates_total_count() {
 
         // At exact capacity: should be rejected.
         let d0 = rl.redis().absolute().is_allowed(&k).await.unwrap();
-        assert!(matches!(d0, RateLimitDecision::Rejected { .. }));
+        assert!(
+            matches!(d0, RateLimitDecision::Rejected { .. }),
+            "should be rejected, instead got {d0:?}"
+        );
 
         // Wait until the first bucket is out of window (2s) but the second is still in-window.
         thread::sleep(Duration::from_millis(1850));
 
         let decision = rl.redis().absolute().is_allowed(&k).await.unwrap();
-        assert!(matches!(decision, RateLimitDecision::Allowed));
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "should be allowed, instead got {decision:?}"
+        );
     });
 }
 
