@@ -63,6 +63,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use crate::hybrid::HybridRateLimiterProvider;
 use crate::{LocalRateLimiterOptions, LocalRateLimiterProvider};
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -196,6 +198,9 @@ pub struct RateLimiter {
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     redis: RedisRateLimiterProvider,
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+    hybrid: HybridRateLimiterProvider,
     is_loop_running: AtomicBool,
 }
 
@@ -249,7 +254,10 @@ impl RateLimiter {
             local: LocalRateLimiterProvider::new(options.local),
             #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
             #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
-            redis: RedisRateLimiterProvider::new(options.redis),
+            redis: RedisRateLimiterProvider::new(options.redis.clone()),
+            #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+            #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+            hybrid: HybridRateLimiterProvider::new(options.redis),
             is_loop_running: AtomicBool::new(false),
         }
     }
@@ -361,6 +369,13 @@ impl RateLimiter {
                             "Redis cleanup failed, will retry"
                         );
                     }
+
+                    if let Err(e) = rl.hybrid.cleanup(stale_after_ms).await {
+                        tracing::warn!(
+                            error = ?e,
+                            "Hybrid cleanup failed, will retry"
+                        );
+                    }
                 }
             });
         }
@@ -387,6 +402,13 @@ impl RateLimiter {
                         tracing::warn!(
                             error = ?e,
                             "Redis cleanup failed, will retry"
+                        );
+                    }
+
+                    if let Err(e) = rl.hybrid.cleanup(stale_after_ms).await {
+                        tracing::warn!(
+                            error = ?e,
+                            "Hybrid cleanup failed, will retry"
                         );
                     }
                 }
@@ -446,6 +468,13 @@ impl RateLimiter {
     #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     pub fn redis(&self) -> &RedisRateLimiterProvider {
         &self.redis
+    }
+
+    ///...
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+    pub fn hybrid(&self) -> &HybridRateLimiterProvider {
+        &self.hybrid
     }
 
     /// Access the local provider for in-process rate limiting.

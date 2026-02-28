@@ -94,7 +94,7 @@ fn lock<'a, T>(
 
 /// A rate limiter backed by Redis.
 #[derive(Debug)]
-pub struct AbsoluteRedisRateLimiter {
+pub struct AbsoluteHybridRateLimiter {
     connection_manager: ConnectionManager,
     window_size_seconds: WindowSizeSeconds,
     window_size_ms: u128,
@@ -108,7 +108,7 @@ pub struct AbsoluteRedisRateLimiter {
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
 }
 
-impl AbsoluteRedisRateLimiter {
+impl AbsoluteHybridRateLimiter {
     pub(crate) fn new(options: RedisRateLimiterOptions) -> Arc<Self> {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
