@@ -141,25 +141,25 @@ impl AbsoluteRedisRateLimiter {
 
     fn listen_for_committer_signals(
         self: &Arc<Self>,
-        mut _rx: mpsc::Receiver<RedisRateLimiterSignal>,
+        mut rx: mpsc::Receiver<RedisRateLimiterSignal>,
     ) {
-        let _limitter = Arc::downgrade(self);
-        //
-        // tokio::spawn(async move {
-        //     while let Some(signal) = rx.recv().await {
-        //         let Some(limiter) = limitter.upgrade() else {
-        //             break;
-        //         };
-        //
-        //         match signal {
-        //             RedisRateLimiterSignal::Flush => {
-        //                 if let Err(err) = limiter.flush().await {
-        //                     tracing::error!(error = ?err, "Failed to flush redis rate limiter");
-        //                 }
-        //             }
-        //         }
-        //     }
-        // });
+        let limitter = Arc::downgrade(self);
+
+        tokio::spawn(async move {
+            while let Some(signal) = rx.recv().await {
+                let Some(limiter) = limitter.upgrade() else {
+                    break;
+                };
+
+                match signal {
+                    RedisRateLimiterSignal::Flush => {
+                        if let Err(err) = limiter.flush().await {
+                            tracing::error!(error = ?err, "Failed to flush redis rate limiter");
+                        }
+                    }
+                }
+            }
+        });
     } // end method listen_for_committer_signals
 
     /// Check admission and, if allowed, increment the observed count for `key`.
