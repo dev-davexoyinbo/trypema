@@ -6,6 +6,33 @@ use crate::{
     RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
 };
 
+fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
+    ((window_size_seconds as f64) * **rate_limit) as u64
+}
+
+fn record_decision(
+    decision: RateLimitDecision,
+    count: u64,
+    accepted_volume: &mut u64,
+    rejected_volume: &mut u64,
+    allowed_ops: &mut u64,
+    rejected_ops: &mut u64,
+) {
+    match decision {
+        RateLimitDecision::Allowed => {
+            *accepted_volume += count;
+            *allowed_ops += 1;
+        }
+        RateLimitDecision::Rejected { .. } => {
+            *rejected_volume += count;
+            *rejected_ops += 1;
+        }
+        RateLimitDecision::Suppressed { .. } => {
+            panic!("suppressed decision is not expected in absolute strategy")
+        }
+    }
+}
+
 #[cfg(feature = "redis-tokio")]
 fn block_on<F, T>(f: F) -> T
 where
@@ -54,6 +81,35 @@ async fn build_limiter(
         redis: RedisRateLimiterOptions {
             connection_manager: cm,
             prefix: Some(prefix.clone()),
+            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
+            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+            hard_limit_factor: HardLimitFactor::default(),
+            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+        },
+    };
+
+    std::sync::Arc::new(RateLimiter::new(options))
+}
+
+async fn build_limiter_with_prefix(
+    url: &str,
+    window_size_seconds: u64,
+    rate_group_size_ms: u64,
+    prefix: RedisKey,
+) -> std::sync::Arc<RateLimiter> {
+    let client = redis::Client::open(url).unwrap();
+    let cm = client.get_connection_manager().await.unwrap();
+
+    let options = RateLimiterOptions {
+        local: LocalRateLimiterOptions {
+            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
+            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+            hard_limit_factor: HardLimitFactor::default(),
+            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+        },
+        redis: RedisRateLimiterOptions {
+            connection_manager: cm,
+            prefix: Some(prefix),
             window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
             rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
@@ -134,6 +190,7 @@ fn rate_grouping_merges_within_group_affects_remaining_after_waiting() {
         rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap();
         thread::sleep(Duration::from_millis(50));
         rl.redis().absolute().inc(&k, &rate_limit, 4).await.unwrap();
+        thread::sleep(Duration::from_millis(100));
 
         // At capacity (6 * 1 = 6). Next increment should be rejected.
         let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
@@ -142,12 +199,15 @@ fn rate_grouping_merges_within_group_affects_remaining_after_waiting() {
             ..
         } = decision
         else {
-            panic!("expected rejected decision");
+            panic!("expected rejected decision, got {decision:?}");
         };
 
         // When usage is merged into one bucket, waiting for the oldest bucket to expire clears
         // the full capacity.
-        assert_eq!(remaining_after_waiting, 6);
+        assert_eq!(
+            remaining_after_waiting, 6,
+            "remaining_after_waiting: {remaining_after_waiting}, decision: {decision:?}"
+        );
     });
 }
 
@@ -407,6 +467,245 @@ fn is_allowed_returns_allowed_when_below_limit() {
         assert!(
             matches!(decision, RateLimitDecision::Allowed),
             "should be allowed"
+        );
+    });
+}
+
+#[test]
+fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
+    let Some(url) = redis_url() else { return };
+
+    block_on(async {
+        let window_size_seconds = 1_u64;
+        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(50f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 50);
+
+        let mut accepted_volume = 0_u64;
+        let mut rejected_volume = 0_u64;
+        let mut allowed_ops = 0_u64;
+        let mut rejected_ops = 0_u64;
+
+        for _ in 0..80_u64 {
+            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            record_decision(
+                decision,
+                1,
+                &mut accepted_volume,
+                &mut rejected_volume,
+                &mut allowed_ops,
+                &mut rejected_ops,
+            );
+        }
+
+        assert_eq!(accepted_volume, capacity);
+        assert_eq!(rejected_volume, 80 - capacity);
+        assert_eq!(allowed_ops, capacity);
+        assert_eq!(rejected_ops, 80 - capacity);
+    });
+}
+
+#[test]
+fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
+    let Some(url) = redis_url() else { return };
+
+    block_on(async {
+        let window_size_seconds = 1_u64;
+        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(10f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 10);
+
+        let mut accepted_volume = 0_u64;
+        let mut rejected_volume = 0_u64;
+        let mut allowed_ops = 0_u64;
+        let mut rejected_ops = 0_u64;
+
+        // Allowed: consumes 9 of 10.
+        let d1 = rl.redis().absolute().inc(&k, &rate_limit, 9).await.unwrap();
+        record_decision(
+            d1,
+            9,
+            &mut accepted_volume,
+            &mut rejected_volume,
+            &mut allowed_ops,
+            &mut rejected_ops,
+        );
+
+        // Rejected: would push total to 11.
+        let d2 = rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap();
+        assert!(
+            matches!(d2, RateLimitDecision::Rejected { .. }),
+            "d2: {d2:?}"
+        );
+        record_decision(
+            d2,
+            2,
+            &mut accepted_volume,
+            &mut rejected_volume,
+            &mut allowed_ops,
+            &mut rejected_ops,
+        );
+
+        // Allowed: proves the rejected batch did not consume capacity.
+        let d3 = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        record_decision(
+            d3,
+            1,
+            &mut accepted_volume,
+            &mut rejected_volume,
+            &mut allowed_ops,
+            &mut rejected_ops,
+        );
+
+        assert_eq!(accepted_volume, capacity);
+        assert_eq!(rejected_volume, 2);
+        assert_eq!(allowed_ops, 2);
+        assert_eq!(rejected_ops, 1);
+    });
+}
+
+#[test]
+fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
+    let Some(url) = redis_url() else { return };
+
+    block_on(async {
+        let window_size_seconds = 1_u64;
+        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 2);
+
+        // Fill capacity.
+        for _ in 0..capacity {
+            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "decision: {decision:?}"
+            );
+        }
+
+        // Many rejected attempts should not change what we can do after the window expires.
+        let mut rejected_ops = 0_u64;
+        for _ in 0..20_u64 {
+            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            assert!(
+                matches!(decision, RateLimitDecision::Rejected { .. }),
+                "decision: {decision:?}"
+            );
+            rejected_ops += 1;
+        }
+        assert_eq!(rejected_ops, 20);
+
+        thread::sleep(Duration::from_millis(1100));
+
+        let mut accepted_after_expiry = 0_u64;
+        for _ in 0..capacity {
+            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "decision: {decision:?}"
+            );
+            accepted_after_expiry += 1;
+        }
+        assert_eq!(accepted_after_expiry, capacity);
+    });
+}
+
+#[test]
+fn volume_non_integer_rate_uses_truncating_capacity() {
+    let Some(url) = redis_url() else { return };
+
+    block_on(async {
+        let window_size_seconds = 1_u64;
+        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(2.9f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 2);
+
+        for _ in 0..capacity {
+            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "decision: {decision:?}"
+            );
+        }
+
+        let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        assert!(
+            matches!(decision, RateLimitDecision::Rejected { .. }),
+            "decision: {decision:?}"
+        );
+    });
+}
+
+#[test]
+fn volume_is_visible_to_other_instances_after_commit_flush() {
+    let Some(url) = redis_url() else { return };
+
+    block_on(async {
+        // Use a shared prefix so both instances address the same Redis keys.
+        let prefix = unique_prefix();
+
+        let window_size_seconds = 1_u64;
+        let rate_group_size_ms = 1000_u64;
+        let rl_a = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            prefix.clone(),
+        )
+        .await;
+        let rl_b =
+            build_limiter_with_prefix(&url, window_size_seconds, rate_group_size_ms, prefix).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 5);
+
+        // Fill the local cache up to capacity.
+        for _ in 0..capacity {
+            let d = rl_a
+                .redis()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+        }
+
+        // Force a commit to Redis by crossing the accept limit (triggers a commit + reject).
+        let d = rl_a
+            .redis()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
+
+        // Deterministic: wait longer than the committer flush interval (~50ms).
+        thread::sleep(Duration::from_millis(200));
+
+        // The other instance should now see the full window usage and reject.
+        let d2 = rl_b
+            .redis()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(d2, RateLimitDecision::Rejected { .. }),
+            "d2: {d2:?}"
         );
     });
 }
