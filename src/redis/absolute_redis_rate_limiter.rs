@@ -420,13 +420,17 @@ impl AbsoluteRedisRateLimiter {
                 let retry_after_ms = last_rate_group_ttl.saturating_sub(elapsed);
                 let remaining_after_waiting = last_rate_group_count.unwrap_or(current_total_count);
 
-                *state = AbsoluteRedisLimitingState::Rejecting {
-                    time_instant: Instant::now(),
-                    release_time_instant: Instant::now()
-                        + Duration::from_millis(retry_after_ms as u64),
-                    ttl_ms: retry_after_ms as u64,
-                    count_after_release: remaining_after_waiting,
-                };
+                // If we can still increment by at least one, then we don't set the state to
+                // rejecting
+                if current_total_count >= *window_limit {
+                    *state = AbsoluteRedisLimitingState::Rejecting {
+                        time_instant: Instant::now(),
+                        release_time_instant: Instant::now()
+                            + Duration::from_millis(retry_after_ms as u64),
+                        ttl_ms: retry_after_ms as u64,
+                        count_after_release: remaining_after_waiting,
+                    };
+                }
 
                 return Ok(RateLimitDecision::Rejected {
                     window_size_seconds: *self.window_size_seconds,

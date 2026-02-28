@@ -259,11 +259,17 @@ fn rejected_inc_does_not_consume_capacity() {
 
         // Capacity is 2 (1s * 2/s). current_total=1; count=2 would push to 3, so reject.
         let decision = rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap();
-        assert!(matches!(decision, RateLimitDecision::Rejected { .. }));
+        assert!(
+            matches!(decision, RateLimitDecision::Rejected { .. }),
+            "should be rejected, received decision: {decision:?}"
+        );
 
         // If the rejected increment mutated state, this would be rejected.
         let decision2 = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
-        assert!(matches!(decision2, RateLimitDecision::Allowed));
+        assert!(
+            matches!(decision2, RateLimitDecision::Allowed),
+            "should be allowed, received decision: {decision2:?}"
+        );
     });
 }
 
