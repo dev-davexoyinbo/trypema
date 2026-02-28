@@ -20,7 +20,7 @@ pub(crate) struct AbsoluteHybridCommit {
 }
 
 pub(crate) struct AbsoluteHybridCommitterOptions {
-    pub local_cache_duration: Duration,
+    pub sync_interval: Duration,
     pub channel_capacity: usize,
     pub max_batch_size: usize,
     pub limiter_sender: mpsc::Sender<RedisRateLimiterSignal>,
@@ -44,7 +44,7 @@ impl AbsoluteHybridCommitter {
         options: AbsoluteHybridCommitterOptions,
     ) -> mpsc::Sender<AbsoluteHybridCommitterSignal> {
         let AbsoluteHybridCommitterOptions {
-            local_cache_duration,
+            sync_interval,
             channel_capacity,
             max_batch_size,
             limiter_sender,
@@ -54,7 +54,7 @@ impl AbsoluteHybridCommitter {
         let (tx, mut rx) = mpsc::channel::<AbsoluteHybridCommitterSignal>(channel_capacity);
 
         tokio::spawn(async move {
-            let mut flush_interval = tokio::time::interval(local_cache_duration);
+            let mut flush_interval = tokio::time::interval(sync_interval);
             let mut batch: Vec<AbsoluteHybridCommit> = Vec::new();
 
             // discard the first tick

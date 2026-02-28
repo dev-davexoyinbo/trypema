@@ -117,10 +117,8 @@ impl AbsoluteHybridRateLimiter {
         let redis_proxy =
             AbsoluteHybridRedisProxy::new(prefix.clone(), options.connection_manager.clone());
 
-        let local_cache_duration_ms = 50u64;
-
         let commiter_sender = AbsoluteHybridCommitter::run(AbsoluteHybridCommitterOptions {
-            local_cache_duration: Duration::from_millis(local_cache_duration_ms),
+            sync_interval: Duration::from_millis(*options.sync_interval_ms),
             channel_capacity: 8192,
             max_batch_size: 128,
             limiter_sender: tx,

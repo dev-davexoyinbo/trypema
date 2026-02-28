@@ -363,6 +363,13 @@ impl TryFrom<u64> for WindowSizeSeconds {
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct RateGroupSizeMs(u64);
 
+impl Default for RateGroupSizeMs {
+    /// Returns a rate group size of 100 ms.
+    fn default() -> Self {
+        Self(100)
+    }
+}
+
 impl Deref for RateGroupSizeMs {
     type Target = u64;
 

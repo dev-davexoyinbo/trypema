@@ -3,6 +3,7 @@ use redis::aio::ConnectionManager;
 use crate::{
     AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RedisKey,
     SuppressedRedisRateLimiter, TrypemaError, WindowSizeSeconds, common::SuppressionFactorCacheMs,
+    hybrid::SyncIntervalMs,
 };
 
 /// Configuration for Redis-backed rate limiters.
@@ -94,6 +95,11 @@ pub struct RedisRateLimiterOptions {
     ///
     /// Same semantics as local provider.
     pub suppression_factor_cache_ms: SuppressionFactorCacheMs,
+
+    /// Sync interval (milliseconds) for flushing local cache.
+    ///
+    /// Same semantics as local provider.
+    pub sync_interval_ms: SyncIntervalMs,
 }
 
 /// Provider for Redis-backed distributed rate limiting.
