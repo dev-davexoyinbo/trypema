@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     ops::Deref,
     sync::{
         Arc,
@@ -69,18 +70,18 @@ const ABSOLUTE_CLEANUP_LUA: &str = r#"
 #[derive(Debug)]
 enum AbsoluteRedisLimitingState {
     Accepting {
-        window_limit: u64,
-        accept_limit: u64,
+        window_limit: RefCell<u64>,
+        accept_limit: RefCell<u64>,
         count: AtomicU64,
-        time_instant: Instant,
-        last_rate_group_ttl: Option<u64>,
-        last_rate_group_count: Option<u64>,
+        time_instant: RefCell<Instant>,
+        last_rate_group_ttl: RefCell<Option<u64>>,
+        last_rate_group_count: RefCell<Option<u64>>,
     },
     Undefined,
     Rejecting {
-        time_instant: Instant,
-        ttl_ms: u64,
-        count_after_release: u64,
+        time_instant: RefCell<Instant>,
+        ttl_ms: RefCell<u64>,
+        count_after_release: RefCell<u64>,
     },
 }
 
@@ -104,12 +105,12 @@ impl AbsoluteRedisRateLimiter {
     pub(crate) fn new(options: RedisRateLimiterOptions) -> Arc<Self> {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(1);
 
         let redis_proxy =
             AbsoluteRedisProxy::new(prefix.clone(), options.connection_manager.clone());
 
-        let local_cache_duration_ms = 1u64;
+        let local_cache_duration_ms = 50u64;
 
         let commiter_sender = AbsoluteRedisCommitter::run(AbsoluteRedisCommitterOptions {
             local_cache_duration: Duration::from_millis(local_cache_duration_ms),
@@ -214,16 +215,21 @@ impl AbsoluteRedisRateLimiter {
         increment: u64,
         rate_limit: Option<&RateLimit>,
     ) -> Result<RateLimitDecision, TrypemaError> {
+        let mut current_total_count = read_state_result.current_total_count;
+        let mut current_window_limit = read_state_result.window_limit;
         let key = &read_state_result.key;
+        let mut commit: Option<AbsoluteRedisCommit> = None;
 
-        let permit = self.commiter_sender.reserve().await.map_err(|_| {
-            TrypemaError::CustomError("Failed to reserve commiter sender".to_string())
-        })?;
+        let state = match self.limiting_state.get(key) {
+            Some(state) => state,
+            None => {
+                self.limiting_state
+                    .entry(key.clone())
+                    .or_insert_with(|| AbsoluteRedisLimitingState::Undefined);
 
-        let mut state = self
-            .limiting_state
-            .entry(key.clone())
-            .or_insert_with(|| AbsoluteRedisLimitingState::Undefined);
+                self.limiting_state.get(key).expect("Key should be present")
+            }
+        };
 
         if let AbsoluteRedisLimitingState::Accepting {
             window_limit,
@@ -233,91 +239,117 @@ impl AbsoluteRedisRateLimiter {
         {
             let count = count.load(Ordering::Relaxed);
 
+            if current_window_limit.is_none() {
+                current_window_limit = Some(*window_limit.borrow());
+            }
+
             if count > 0 {
-                let commit = AbsoluteRedisCommit {
+                commit = Some(AbsoluteRedisCommit {
                     key: key.clone(),
                     window_size_seconds: *self.window_size_seconds,
-                    window_limit: *window_limit,
+                    window_limit: current_window_limit.expect("Window limit should be set"),
                     rate_group_size_ms: *self.rate_group_size_ms,
                     count,
-                };
+                });
 
-                permit.send(commit.into());
-                read_state_result.current_total_count += count;
+                current_total_count += count;
             }
         }
 
-        let Some(window_limit) = read_state_result.window_limit else {
-            let Some(rate_limit) = rate_limit else {
-                *state = AbsoluteRedisLimitingState::Undefined;
-                return Ok(RateLimitDecision::Allowed);
-            };
+        let new_window_limit = match current_window_limit {
+            Some(window_limit) => window_limit,
+            None => {
+                let Some(rate_limit) = rate_limit else {
+                    if !matches!(state.deref(), AbsoluteRedisLimitingState::Undefined) {
+                        drop(state);
 
-            let window_limit = (*self.window_size_seconds as f64) * **rate_limit;
-            let proposed_total = read_state_result
-                .current_total_count
-                .saturating_add(check_count);
+                        *self
+                            .limiting_state
+                            .get_mut(key)
+                            .expect("Key should be present") =
+                            AbsoluteRedisLimitingState::Undefined;
+                    }
 
-            if (proposed_total as f64) > window_limit {
-                *state = AbsoluteRedisLimitingState::Rejecting {
-                    time_instant: Instant::now(),
-                    ttl_ms: read_state_result
-                        .last_rate_group_ttl
-                        .unwrap_or(self.window_size_ms as u64),
-                    count_after_release: read_state_result.current_total_count,
+                    return Ok(RateLimitDecision::Allowed);
                 };
 
-                return Ok(RateLimitDecision::Rejected {
-                    window_size_seconds: *self.window_size_seconds,
-                    retry_after_ms: self.window_size_ms,
-                    remaining_after_waiting: read_state_result.current_total_count,
-                });
+                ((*self.window_size_seconds as f64) * **rate_limit) as u64
             }
-
-            *state = AbsoluteRedisLimitingState::Accepting {
-                window_limit: window_limit as u64,
-                accept_limit: (window_limit as u64)
-                    .saturating_sub(read_state_result.current_total_count),
-                count: AtomicU64::new(increment),
-                time_instant: Instant::now(),
-                last_rate_group_ttl: None,
-                last_rate_group_count: None,
-            };
-
-            return Ok(RateLimitDecision::Allowed);
         };
 
-        if read_state_result.current_total_count + check_count > window_limit {
-            let retry_after_ms = read_state_result
+        let new_time_instant = Instant::now();
+
+        if current_total_count.saturating_add(check_count) > new_window_limit {
+            let new_ttl_ms = read_state_result
                 .last_rate_group_ttl
                 .unwrap_or(self.window_size_ms as u64);
-            let remaining_after_waiting = read_state_result
-                .last_rate_group_count
-                .unwrap_or(read_state_result.current_total_count);
+            let new_count_after_release = read_state_result.current_total_count;
 
-            *state = AbsoluteRedisLimitingState::Rejecting {
-                time_instant: Instant::now(),
-                ttl_ms: retry_after_ms,
-                count_after_release: remaining_after_waiting,
-            };
+            if let AbsoluteRedisLimitingState::Rejecting {
+                time_instant,
+                ttl_ms,
+                count_after_release,
+            } = state.deref()
+            {
+                time_instant.replace(new_time_instant);
+                ttl_ms.replace(new_ttl_ms);
+                count_after_release.replace(new_count_after_release);
+            } else {
+                drop(state);
+                let mut state = self
+                    .limiting_state
+                    .get_mut(key)
+                    .expect("Key should be present");
 
-            Ok(RateLimitDecision::Rejected {
+                *state = AbsoluteRedisLimitingState::Rejecting {
+                    time_instant: RefCell::new(new_time_instant),
+                    ttl_ms: RefCell::new(new_ttl_ms),
+                    count_after_release: RefCell::new(new_count_after_release),
+                };
+            }
+
+            return Ok(RateLimitDecision::Rejected {
                 window_size_seconds: *self.window_size_seconds,
-                retry_after_ms: retry_after_ms as u128,
-                remaining_after_waiting,
-            })
-        } else {
-            *state = AbsoluteRedisLimitingState::Accepting {
-                window_limit,
-                accept_limit: window_limit - read_state_result.current_total_count,
-                count: AtomicU64::new(increment),
-                time_instant: Instant::now(),
-                last_rate_group_ttl: read_state_result.last_rate_group_ttl,
-                last_rate_group_count: read_state_result.last_rate_group_count,
-            };
-
-            Ok(RateLimitDecision::Allowed)
+                retry_after_ms: self.window_size_ms,
+                remaining_after_waiting: new_count_after_release,
+            });
         }
+
+        let new_accept_limit = (new_window_limit as u64).saturating_sub(current_total_count);
+
+        if let AbsoluteRedisLimitingState::Accepting {
+            window_limit,
+            accept_limit,
+            count,
+            time_instant,
+            last_rate_group_ttl,
+            last_rate_group_count,
+        } = state.deref()
+        {
+            window_limit.replace(new_window_limit);
+            accept_limit.replace(new_accept_limit);
+            count.store(increment, Ordering::Relaxed);
+            time_instant.replace(new_time_instant);
+            last_rate_group_ttl.replace(read_state_result.last_rate_group_ttl);
+            last_rate_group_count.replace(read_state_result.last_rate_group_count);
+        } else {
+            drop(state);
+            let mut state = self
+                .limiting_state
+                .get_mut(key)
+                .expect("Key should be present");
+
+            *state = AbsoluteRedisLimitingState::Accepting {
+                window_limit: RefCell::new(new_window_limit),
+                accept_limit: RefCell::new(new_accept_limit),
+                count: AtomicU64::new(increment),
+                time_instant: RefCell::new(new_time_instant),
+                last_rate_group_ttl: RefCell::new(read_state_result.last_rate_group_ttl),
+                last_rate_group_count: RefCell::new(read_state_result.last_rate_group_count),
+            };
+        }
+
+        Ok(RateLimitDecision::Allowed)
     }
 
     async fn is_allowed_with_count_increment(
