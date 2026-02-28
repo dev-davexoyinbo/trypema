@@ -86,7 +86,7 @@ enum AbsoluteRedisLimitingState {
 }
 
 /// A rate limiter backed by Redis.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AbsoluteRedisRateLimiter {
     connection_manager: ConnectionManager,
     window_size_seconds: WindowSizeSeconds,
@@ -98,7 +98,7 @@ pub struct AbsoluteRedisRateLimiter {
     redis_proxy: AbsoluteRedisProxy,
 
     // ...
-    limiting_state: DashMap<RedisKey, Arc<RwLock<AbsoluteRedisLimitingState>>>,
+    limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
     local_cache_duration_ms: u64,
 }
 
@@ -219,18 +219,10 @@ impl AbsoluteRedisRateLimiter {
     ) -> Result<RateLimitDecision, TrypemaError> {
         let key = &read_state_result.key;
 
-        let state_entry = match self.limiting_state.get(key) {
-            Some(state) => state,
-            None => {
-                self.limiting_state.entry(key.clone()).or_insert_with(|| {
-                    Arc::new(RwLock::new(AbsoluteRedisLimitingState::Undefined))
-                });
-
-                self.limiting_state.get(key).expect("Key should be present")
-            }
-        };
-
-        let mut state = state_entry.write().await;
+        let mut state = self
+            .limiting_state
+            .entry(key.clone())
+            .or_insert_with(|| AbsoluteRedisLimitingState::Undefined);
 
         if let AbsoluteRedisLimitingState::Accepting {
             window_limit,
@@ -249,6 +241,7 @@ impl AbsoluteRedisRateLimiter {
                     count,
                 };
 
+                // TODO: remove this, don't await
                 self.commiter_sender.send(commit.into()).await.map_err(|e| {
                     TrypemaError::CustomError(format!(
                         "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
@@ -345,22 +338,20 @@ impl AbsoluteRedisRateLimiter {
         let state_entry = match self.limiting_state.get(key) {
             Some(state) => state,
             None => {
-                self.limiting_state.entry(key.clone()).or_insert_with(|| {
-                    Arc::new(RwLock::new(AbsoluteRedisLimitingState::Undefined))
-                });
+                self.limiting_state
+                    .entry(key.clone())
+                    .or_insert_with(|| AbsoluteRedisLimitingState::Undefined);
 
                 self.limiting_state.get(key).expect("Key should be present")
             }
         };
-
-        let state_lock = state_entry.read().await;
 
         if let AbsoluteRedisLimitingState::Rejecting {
             time_instant,
             ttl_ms,
             release_time_instant,
             count_after_release,
-        } = state_lock.deref()
+        } = state_entry.deref()
             && time_instant.elapsed().as_millis() < *ttl_ms as u128
         {
             return Ok(RateLimitDecision::Rejected {
@@ -373,15 +364,17 @@ impl AbsoluteRedisRateLimiter {
             accept_limit,
             count,
             ..
-        } = state_lock.deref()
+        } = state_entry.deref()
         {
             if count.load(Ordering::Relaxed) + check_count <= *accept_limit {
                 count.fetch_add(increment, Ordering::Relaxed);
                 return Ok(RateLimitDecision::Allowed);
             }
 
-            drop(state_lock);
-            let mut state = state_entry.write().await;
+            drop(state_entry);
+            let Some(mut state) = self.limiting_state.get_mut(key) else {
+                unreachable!("Key should be present");
+            };
 
             if let AbsoluteRedisLimitingState::Accepting {
                 window_limit,
@@ -403,6 +396,7 @@ impl AbsoluteRedisRateLimiter {
                         count: current_total_count,
                     };
 
+                    // TODO: remove this, don't await
                     self.commiter_sender.send(commit.into()).await.map_err(|e| {
                         TrypemaError::CustomError(format!(
                             "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
@@ -446,7 +440,7 @@ impl AbsoluteRedisRateLimiter {
                 .await;
         }
 
-        drop(state_lock);
+        drop(state_entry);
         self.reset_state_from_redis_read_result_and_get_decision(
             key,
             check_count,
@@ -483,8 +477,7 @@ impl AbsoluteRedisRateLimiter {
         for state in self.limiting_state.iter() {
             let key = state.key();
 
-            if let AbsoluteRedisLimitingState::Accepting { .. } = state.value().read().await.deref()
-            {
+            if let AbsoluteRedisLimitingState::Accepting { .. } = state.deref() {
                 resets.push(key.clone());
             }
         }
