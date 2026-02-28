@@ -9,7 +9,7 @@ use std::{
 
 use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
@@ -219,6 +219,10 @@ impl AbsoluteRedisRateLimiter {
     ) -> Result<RateLimitDecision, TrypemaError> {
         let key = &read_state_result.key;
 
+        let permit = self.commiter_sender.reserve().await.map_err(|_| {
+            TrypemaError::CustomError("Failed to reserve commiter sender".to_string())
+        })?;
+
         let mut state = self
             .limiting_state
             .entry(key.clone())
@@ -241,13 +245,7 @@ impl AbsoluteRedisRateLimiter {
                     count,
                 };
 
-                // TODO: remove this, don't await
-                self.commiter_sender.send(commit.into()).await.map_err(|e| {
-                    TrypemaError::CustomError(format!(
-                        "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
-                    ))
-                })?;
-
+                permit.send(commit.into());
                 read_state_result.current_total_count += count;
             }
         }
@@ -372,7 +370,12 @@ impl AbsoluteRedisRateLimiter {
             }
 
             drop(state_entry);
-            let Some(mut state) = self.limiting_state.get_mut(key) else {
+
+            let permit = self.commiter_sender.reserve().await.map_err(|_| {
+                TrypemaError::CustomError("Failed to reserve commiter sender".to_string())
+            })?;
+
+            let Some(mut state_entry) = self.limiting_state.get_mut(key) else {
                 unreachable!("Key should be present");
             };
 
@@ -383,7 +386,7 @@ impl AbsoluteRedisRateLimiter {
                 last_rate_group_ttl,
                 last_rate_group_count,
                 ..
-            } = state.deref()
+            } = state_entry.deref()
             {
                 let current_total_count = count.load(Ordering::Relaxed);
 
@@ -396,12 +399,7 @@ impl AbsoluteRedisRateLimiter {
                         count: current_total_count,
                     };
 
-                    // TODO: remove this, don't await
-                    self.commiter_sender.send(commit.into()).await.map_err(|e| {
-                        TrypemaError::CustomError(format!(
-                            "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
-                        ))
-                    })?;
+                    permit.send(commit.into());
                 }
 
                 let last_rate_group_ttl: u128 = last_rate_group_ttl
@@ -414,7 +412,7 @@ impl AbsoluteRedisRateLimiter {
                 // If we can still increment by at least one, then we don't set the state to
                 // rejecting
                 if current_total_count >= *window_limit {
-                    *state = AbsoluteRedisLimitingState::Rejecting {
+                    *state_entry = AbsoluteRedisLimitingState::Rejecting {
                         time_instant: Instant::now(),
                         release_time_instant: Instant::now()
                             + Duration::from_millis(retry_after_ms as u64),
@@ -430,6 +428,7 @@ impl AbsoluteRedisRateLimiter {
                 });
             }
 
+            drop(state_entry);
             return self
                 .reset_state_from_redis_read_result_and_get_decision(
                     key,
