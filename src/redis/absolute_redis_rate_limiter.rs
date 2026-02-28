@@ -19,6 +19,7 @@ use crate::{
         RedisRateLimiterSignal,
         absolute_redis_commiter::{
             AbsoluteRedisCommit, AbsoluteRedisCommitter, AbsoluteRedisCommitterOptions,
+            AbsoluteRedisCommitterSignal,
         },
         absolute_redis_proxy::{AbsoluteRedisProxy, AbsoluteRedisProxyReadStateResult},
     },
@@ -92,7 +93,7 @@ pub struct AbsoluteRedisRateLimiter {
     rate_group_size_ms: RateGroupSizeMs,
     key_generator: RedisKeyGenerator,
     cleanup_script: Script,
-    commiter_sender: mpsc::Sender<AbsoluteRedisCommit>,
+    commiter_sender: mpsc::Sender<AbsoluteRedisCommitterSignal>,
     redis_proxy: AbsoluteRedisProxy,
 
     // ...
@@ -262,7 +263,7 @@ impl AbsoluteRedisRateLimiter {
                     count,
                 };
 
-                self.commiter_sender.send(commit).await.map_err(|e| {
+                self.commiter_sender.send(commit.into()).await.map_err(|e| {
                     TrypemaError::CustomError(format!(
                         "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
                     ))
@@ -380,7 +381,7 @@ impl AbsoluteRedisRateLimiter {
                         count: current_total_count,
                     };
 
-                    self.commiter_sender.send(commit).await.map_err(|e| {
+                    self.commiter_sender.send(commit.into()).await.map_err(|e| {
                         TrypemaError::CustomError(format!(
                             "Failed to send commit signal to absolute Redis rate limiter commiter: {e}"
                         ))
