@@ -91,6 +91,22 @@ const READ_STATE_SCRIPT: &str = r#"
     local window_limit = tonumber(res[1])
     local total_count = tonumber(res[2]) or 0
 
+    -- evict expired buckets
+    local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_ms, "BYSCORE")
+    if #to_remove_keys > 0 then
+        local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+        redis.call("HDEL", hash_key, unpack(to_remove_keys))
+
+        local remove_sum = 0
+
+        for i = 1, #to_remove do
+            remove_sum = remove_sum + (tonumber(to_remove[i]) or 0)
+        end
+
+        total_count = redis.call("DECRBY", total_count_key, remove_sum)
+        redis.call("ZREM", active_keys, unpack(to_remove_keys))
+    end
+
     local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
     local oldest_ttl = nil
     local oldest_count = nil

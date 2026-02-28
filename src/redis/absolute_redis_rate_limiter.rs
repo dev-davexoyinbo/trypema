@@ -9,7 +9,7 @@ use std::{
 
 use dashmap::DashMap;
 use redis::{Script, aio::ConnectionManager};
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc};
 
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
@@ -171,13 +171,12 @@ impl AbsoluteRedisRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
+        eprintln!("<<<<<<<<<<<<<<<<<<<<<<<<<<,,");
         let decision = self
             .is_allowed_with_count_increment(key, count, count, Some(rate_limit))
             .await?;
 
-        if !matches!(decision, RateLimitDecision::Allowed) {
-            return Ok(decision);
-        }
+        eprintln!("================");
 
         Ok(decision)
     } // end method inc

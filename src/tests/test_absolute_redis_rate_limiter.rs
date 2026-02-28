@@ -313,12 +313,10 @@ fn inc_evicts_expired_buckets_and_total_matches_hash_sum() {
 
         // Wait past the window so both buckets are expired.
         thread::sleep(Duration::from_millis(1200));
+        let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
-            matches!(
-                rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
-                RateLimitDecision::Allowed
-            ),
-            "fourth increment should be allowed"
+            matches!(decision, RateLimitDecision::Allowed),
+            "fourth increment should be allowed, instead got {decision:?}"
         );
     });
 }
