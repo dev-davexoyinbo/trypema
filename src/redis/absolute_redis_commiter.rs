@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     TrypemaError,
@@ -30,10 +30,23 @@ pub(crate) struct AbsoluteRedisCommitterOptions {
     pub redis_proxy: AbsoluteRedisProxy,
 }
 
+pub(crate) enum AbsoluteRedisCommitterSignal {
+    Flush(oneshot::Sender<Result<(), TrypemaError>>),
+    Commit(AbsoluteRedisCommit),
+}
+
+impl From<AbsoluteRedisCommit> for AbsoluteRedisCommitterSignal {
+    fn from(commit: AbsoluteRedisCommit) -> Self {
+        Self::Commit(commit)
+    }
+}
+
 pub(crate) struct AbsoluteRedisCommitter; // end struct AbsoluteRedisCommitter
 
 impl AbsoluteRedisCommitter {
-    pub fn run(options: AbsoluteRedisCommitterOptions) -> mpsc::Sender<AbsoluteRedisCommit> {
+    pub fn run(
+        options: AbsoluteRedisCommitterOptions,
+    ) -> mpsc::Sender<AbsoluteRedisCommitterSignal> {
         let AbsoluteRedisCommitterOptions {
             local_cache_duration,
             channel_capacity,
@@ -42,7 +55,7 @@ impl AbsoluteRedisCommitter {
             redis_proxy,
         } = options;
 
-        let (tx, mut rx) = mpsc::channel::<AbsoluteRedisCommit>(channel_capacity);
+        let (tx, mut rx) = mpsc::channel::<AbsoluteRedisCommitterSignal>(channel_capacity);
 
         tokio::spawn(async move {
             let mut flush_interval = tokio::time::interval(local_cache_duration);
@@ -66,7 +79,14 @@ impl AbsoluteRedisCommitter {
                                 break;
                             };
 
-                            batch.push(commit);
+                            match commit {
+                                AbsoluteRedisCommitterSignal::Flush(sender) => {
+                                    sender.send(Ok(())).ok();
+                                }
+                                AbsoluteRedisCommitterSignal::Commit(commit) => {
+                                    batch.push(commit);
+                                }
+                            }
                         }
                     }
                 } else {
@@ -75,13 +95,27 @@ impl AbsoluteRedisCommitter {
                         break;
                     };
 
-                    batch.push(commit);
+                    match commit {
+                        AbsoluteRedisCommitterSignal::Flush(sender) => {
+                            sender.send(Ok(())).ok();
+                        }
+                        AbsoluteRedisCommitterSignal::Commit(commit) => {
+                            batch.push(commit);
+                        }
+                    }
                 }
 
                 while batch.len() < max_batch_size
                     && let Ok(commit) = rx.try_recv()
                 {
-                    batch.push(commit);
+                    match commit {
+                        AbsoluteRedisCommitterSignal::Flush(sender) => {
+                            sender.send(Ok(())).ok();
+                        }
+                        AbsoluteRedisCommitterSignal::Commit(commit) => {
+                            batch.push(commit);
+                        }
+                    }
                 }
 
                 if let Err(err) = Self::flush_to_redis(&redis_proxy, &batch).await {
