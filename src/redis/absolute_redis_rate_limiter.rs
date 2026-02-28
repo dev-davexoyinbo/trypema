@@ -1,8 +1,7 @@
 use std::{
     ops::Deref,
     sync::{
-        Arc,
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -85,10 +84,12 @@ enum AbsoluteRedisLimitingState {
     },
 }
 
-fn lock<'a, T>(m: &'a Mutex<T>, what: &'static str) -> Result<std::sync::MutexGuard<'a, T>, TrypemaError> {
-    m.lock().map_err(|_| {
-        TrypemaError::CustomError(format!("mutex poisoned: {what}"))
-    })
+fn lock<'a, T>(
+    m: &'a Mutex<T>,
+    what: &'static str,
+) -> Result<std::sync::MutexGuard<'a, T>, TrypemaError> {
+    m.lock()
+        .map_err(|_| TrypemaError::CustomError(format!("mutex poisoned: {what}")))
 }
 
 /// A rate limiter backed by Redis.
@@ -289,6 +290,7 @@ impl AbsoluteRedisRateLimiter {
                         matches!(state.deref(), AbsoluteRedisLimitingState::Undefined);
 
                     if is_undefined {
+                        drop(state);
                         *self
                             .limiting_state
                             .get_mut(key)
@@ -319,7 +321,8 @@ impl AbsoluteRedisRateLimiter {
             {
                 *lock(time_instant, "rejecting.time_instant")? = new_time_instant;
                 *lock(ttl_ms, "rejecting.ttl_ms")? = new_ttl_ms;
-                *lock(count_after_release, "rejecting.count_after_release")? = new_count_after_release;
+                *lock(count_after_release, "rejecting.count_after_release")? =
+                    new_count_after_release;
             } else {
                 drop(state);
                 let mut state = self
@@ -356,8 +359,10 @@ impl AbsoluteRedisRateLimiter {
             *lock(accept_limit, "accepting.accept_limit")? = new_accept_limit;
             count.store(increment, Ordering::Relaxed);
             *lock(time_instant, "accepting.time_instant")? = new_time_instant;
-            *lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")? = read_state_result.last_rate_group_ttl;
-            *lock(last_rate_group_count, "accepting.last_rate_group_count")? = read_state_result.last_rate_group_count;
+            *lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")? =
+                read_state_result.last_rate_group_ttl;
+            *lock(last_rate_group_count, "accepting.last_rate_group_count")? =
+                read_state_result.last_rate_group_count;
         } else {
             drop(state);
             let mut state = self
@@ -402,11 +407,14 @@ impl AbsoluteRedisRateLimiter {
             count_after_release,
         } = state_entry.deref()
         {
-            let elapsed_ms = lock(time_instant, "rejecting.time_instant")?.elapsed().as_millis();
+            let elapsed_ms = lock(time_instant, "rejecting.time_instant")?
+                .elapsed()
+                .as_millis();
             let ttl_ms = *lock(ttl_ms, "rejecting.ttl_ms")? as u128;
 
             if elapsed_ms < ttl_ms {
-                let remaining_after_waiting = *lock(count_after_release, "rejecting.count_after_release")?;
+                let remaining_after_waiting =
+                    *lock(count_after_release, "rejecting.count_after_release")?;
                 return Ok(RateLimitDecision::Rejected {
                     window_size_seconds: *self.window_size_seconds,
                     retry_after_ms: ttl_ms.saturating_sub(elapsed_ms),
@@ -461,13 +469,17 @@ impl AbsoluteRedisRateLimiter {
                     permit.send(commit.into());
                 }
 
-                let last_rate_group_ttl: u128 = (*lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")?)
-                    .map(|el| el as u128)
-                    .unwrap_or(self.window_size_ms);
-                let elapsed = lock(time_instant, "accepting.time_instant")?.elapsed().as_millis();
+                let last_rate_group_ttl: u128 =
+                    (*lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")?)
+                        .map(|el| el as u128)
+                        .unwrap_or(self.window_size_ms);
+                let elapsed = lock(time_instant, "accepting.time_instant")?
+                    .elapsed()
+                    .as_millis();
                 let retry_after_ms = last_rate_group_ttl.saturating_sub(elapsed);
-                let remaining_after_waiting = (*lock(last_rate_group_count, "accepting.last_rate_group_count")?)
-                    .unwrap_or(current_total_count);
+                let remaining_after_waiting =
+                    (*lock(last_rate_group_count, "accepting.last_rate_group_count")?)
+                        .unwrap_or(current_total_count);
 
                 // If we can still increment by at least one, then we don't set the state to
                 // rejecting
