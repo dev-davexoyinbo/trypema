@@ -272,7 +272,6 @@ impl AbsoluteRedisRateLimiter {
                     };
 
                     drop(state);
-                    // TODO: fix the Send issue
                     self.send_commit(commit).await?;
 
                     self.limiting_state.get(key).expect("Key should be present")
@@ -339,7 +338,7 @@ impl AbsoluteRedisRateLimiter {
 
             return Ok(RateLimitDecision::Rejected {
                 window_size_seconds: *self.window_size_seconds,
-                retry_after_ms: self.window_size_ms,
+                retry_after_ms: new_ttl_ms as u128,
                 remaining_after_waiting: new_count_after_release,
             });
         }
@@ -455,9 +454,9 @@ impl AbsoluteRedisRateLimiter {
             } = state_entry.deref()
             {
                 let current_total_count = count.load(Ordering::Relaxed);
+                let window_limit = *lock(window_limit, "accepting.window_limit")?;
 
                 if current_total_count > 0 {
-                    let window_limit = *lock(window_limit, "accepting.window_limit")?;
                     let commit = AbsoluteRedisCommit {
                         key: key.clone(),
                         window_size_seconds: *self.window_size_seconds,
@@ -483,7 +482,6 @@ impl AbsoluteRedisRateLimiter {
 
                 // If we can still increment by at least one, then we don't set the state to
                 // rejecting
-                let window_limit = *lock(window_limit, "accepting.window_limit")?;
                 if current_total_count >= window_limit {
                     *state_entry = AbsoluteRedisLimitingState::Rejecting {
                         time_instant: Mutex::new(Instant::now()),
@@ -500,17 +498,10 @@ impl AbsoluteRedisRateLimiter {
             }
 
             drop(state_entry);
-            return self
-                .reset_state_from_redis_read_result_and_get_decision(
-                    key,
-                    check_count,
-                    increment,
-                    rate_limit,
-                )
-                .await;
+        } else {
+            drop(state_entry);
         }
 
-        drop(state_entry);
         self.reset_state_from_redis_read_result_and_get_decision(
             key,
             check_count,
