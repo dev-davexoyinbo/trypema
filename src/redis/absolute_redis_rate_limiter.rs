@@ -80,7 +80,6 @@ enum AbsoluteRedisLimitingState {
     Rejecting {
         time_instant: Instant,
         ttl_ms: u64,
-        release_time_instant: Instant,
         count_after_release: u64,
     },
 }
@@ -99,7 +98,6 @@ pub struct AbsoluteRedisRateLimiter {
 
     // ...
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
-    local_cache_duration_ms: u64,
 }
 
 impl AbsoluteRedisRateLimiter {
@@ -111,7 +109,7 @@ impl AbsoluteRedisRateLimiter {
         let redis_proxy =
             AbsoluteRedisProxy::new(prefix.clone(), options.connection_manager.clone());
 
-        let local_cache_duration_ms = 50u64;
+        let local_cache_duration_ms = 1u64;
 
         let commiter_sender = AbsoluteRedisCommitter::run(AbsoluteRedisCommitterOptions {
             local_cache_duration: Duration::from_millis(local_cache_duration_ms),
@@ -131,7 +129,6 @@ impl AbsoluteRedisRateLimiter {
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::new(),
-            local_cache_duration_ms,
         };
 
         let limiter = Arc::new(limiter);
@@ -264,8 +261,6 @@ impl AbsoluteRedisRateLimiter {
             if (proposed_total as f64) > window_limit {
                 *state = AbsoluteRedisLimitingState::Rejecting {
                     time_instant: Instant::now(),
-                    release_time_instant: Instant::now()
-                        + Duration::from_millis(self.local_cache_duration_ms),
                     ttl_ms: read_state_result
                         .last_rate_group_ttl
                         .unwrap_or(self.window_size_ms as u64),
@@ -302,7 +297,6 @@ impl AbsoluteRedisRateLimiter {
 
             *state = AbsoluteRedisLimitingState::Rejecting {
                 time_instant: Instant::now(),
-                release_time_instant: Instant::now() + Duration::from_millis(retry_after_ms),
                 ttl_ms: retry_after_ms,
                 count_after_release: remaining_after_waiting,
             };
@@ -347,7 +341,6 @@ impl AbsoluteRedisRateLimiter {
         if let AbsoluteRedisLimitingState::Rejecting {
             time_instant,
             ttl_ms,
-            release_time_instant,
             count_after_release,
         } = state_entry.deref()
             && time_instant.elapsed().as_millis() < *ttl_ms as u128
@@ -414,8 +407,6 @@ impl AbsoluteRedisRateLimiter {
                 if current_total_count >= *window_limit {
                     *state_entry = AbsoluteRedisLimitingState::Rejecting {
                         time_instant: Instant::now(),
-                        release_time_instant: Instant::now()
-                            + Duration::from_millis(retry_after_ms as u64),
                         ttl_ms: retry_after_ms as u64,
                         count_after_release: remaining_after_waiting,
                     };

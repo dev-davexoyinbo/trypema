@@ -70,8 +70,6 @@ const COMMIT_STATE_SCRIPT: &str = r#"
 
     redis.call("EXPIRE", window_limit_key, window_size_seconds)
     redis.call("ZADD", active_entities_key, timestamp_ms, entity)
-
-    return {entity, total_count, window_limit, oldest_ttl, oldest_count}
 "#;
 
 const READ_STATE_SCRIPT: &str = r#"
@@ -128,14 +126,6 @@ pub(crate) struct AbsoluteRedisProxyReadStateResult {
     pub last_rate_group_count: Option<u64>,
 }
 
-pub(crate) struct AbsoluteRedisProxyCommitStateResult {
-    pub key: RedisKey,
-    pub current_total_count: u64,
-    pub window_limit: u64,
-    pub last_rate_group_ttl: Option<u64>,
-    pub last_rate_group_count: Option<u64>,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct AbsoluteRedisProxy {
     key_generator: RedisKeyGenerator,
@@ -175,17 +165,17 @@ impl AbsoluteRedisProxy {
         Ok(map_redis_read_result_to_state(res))
     } // end method read_state
 
-    pub(crate) async fn commit_state(
+    pub(crate) async fn _commit_state(
         self: &AbsoluteRedisProxy,
         key: &RedisKey,
         window_size_seconds: u64,
         window_limit: u64,
         rate_group_size_ms: u64,
         count: u64,
-    ) -> Result<AbsoluteRedisProxyCommitStateResult, TrypemaError> {
+    ) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let res: (String, u64, u64, i64, i64) = self
+        let _: () = self
             .commit_state_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
@@ -200,21 +190,18 @@ impl AbsoluteRedisProxy {
             .invoke_async(&mut connection_manager)
             .await?;
 
-        Ok(map_redis_commit_result_to_state(res))
+        Ok(())
     }
 
     pub(crate) async fn batch_commit_state(
         self: &AbsoluteRedisProxy,
         commits: &Vec<AbsoluteRedisCommit>,
-    ) -> Result<Vec<AbsoluteRedisProxyCommitStateResult>, TrypemaError> {
+    ) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
         let pipe = self.build_commit_pipeline(commits, false);
 
-        let results = match pipe
-            .query_async::<Vec<(String, u64, u64, i64, i64)>>(&mut connection_manager)
-            .await
-        {
+        let _: () = match pipe.query_async(&mut connection_manager).await {
             Ok(results) => results,
             Err(err) => {
                 if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
@@ -224,10 +211,7 @@ impl AbsoluteRedisProxy {
 
                 let pipe = self.build_commit_pipeline(commits, true);
 
-                match pipe
-                    .query_async::<Vec<(String, u64, u64, i64, i64)>>(&mut connection_manager)
-                    .await
-                {
+                match pipe.query_async::<()>(&mut connection_manager).await {
                     Ok(results) => results,
                     Err(err) => {
                         tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
@@ -237,12 +221,7 @@ impl AbsoluteRedisProxy {
             }
         };
 
-        let results: Vec<AbsoluteRedisProxyCommitStateResult> = results
-            .into_iter()
-            .map(map_redis_commit_result_to_state)
-            .collect();
-
-        Ok(results)
+        Ok(())
     } // end method batch_commit_state
 
     #[inline]
@@ -357,22 +336,6 @@ fn map_redis_read_result_to_state(
         key: RedisKey::from(entity),
         current_total_count: total_count,
         window_limit: map_negative_to_none(window_limit),
-        last_rate_group_ttl: map_negative_to_none(oldest_ttl),
-        last_rate_group_count: map_negative_to_none(oldest_count),
-    }
-}
-
-fn map_redis_commit_result_to_state(
-    (entity, total_count, window_limit, oldest_ttl, oldest_count): (String, u64, u64, i64, i64),
-) -> AbsoluteRedisProxyCommitStateResult {
-    fn map_negative_to_none(value: i64) -> Option<u64> {
-        if value < 0 { None } else { Some(value as u64) }
-    }
-
-    AbsoluteRedisProxyCommitStateResult {
-        key: RedisKey::from(entity),
-        current_total_count: total_count,
-        window_limit,
         last_rate_group_ttl: map_negative_to_none(oldest_ttl),
         last_rate_group_count: map_negative_to_none(oldest_count),
     }
