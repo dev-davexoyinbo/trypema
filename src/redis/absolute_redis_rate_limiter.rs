@@ -201,8 +201,6 @@ impl AbsoluteRedisRateLimiter {
             .read_state(key, *self.window_size_seconds as u128 * 1000)
             .await?;
 
-        eprintln!("read_state_result: {:?}", read_state_result);
-
         self.reset_single_state_from_read_result(
             read_state_result,
             check_count,
@@ -356,7 +354,6 @@ impl AbsoluteRedisRateLimiter {
         };
 
         let state_lock = state_entry.read().await;
-        eprintln!("state_lock: {:?}", state_lock);
 
         if let AbsoluteRedisLimitingState::Rejecting {
             time_instant,

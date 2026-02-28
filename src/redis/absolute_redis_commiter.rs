@@ -69,7 +69,7 @@ impl AbsoluteRedisCommitter {
                 if is_idle.load(Ordering::Relaxed) {
                     tokio::select! {
                         _ = flush_interval.tick() => {
-                            if let Err(err) = limiter_sender.send(RedisRateLimiterSignal::Flush).await {
+                            if let Err(err) = limiter_sender.try_send(RedisRateLimiterSignal::Flush) {
                                 tracing::error!(error = ?err, "Failed to send flush signal to Redis rate limiter");
                                 break;
                             }
