@@ -3,7 +3,8 @@ use redis::{Script, aio::ConnectionManager};
 use crate::{
     TrypemaError,
     common::RateType,
-    redis::{RedisKey, RedisKeyGenerator, absolute_redis_commiter::AbsoluteRedisCommit},
+    hybrid::AbsoluteHybridCommit,
+    redis::{RedisKey, RedisKeyGenerator},
 };
 
 const COMMIT_STATE_SCRIPT: &str = r#"
@@ -118,7 +119,7 @@ const READ_STATE_SCRIPT: &str = r#"
 "#;
 
 #[derive(Debug)]
-pub(crate) struct AbsoluteRedisProxyReadStateResult {
+pub(crate) struct AbsoluteHybridRedisProxyReadStateResult {
     pub key: RedisKey,
     pub current_total_count: u64,
     pub window_limit: Option<u64>,
@@ -127,14 +128,14 @@ pub(crate) struct AbsoluteRedisProxyReadStateResult {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AbsoluteRedisProxy {
+pub(crate) struct AbsoluteHybridRedisProxy {
     key_generator: RedisKeyGenerator,
     read_state_script: Script,
     commit_state_script: Script,
     connection_manager: ConnectionManager,
 }
 
-impl AbsoluteRedisProxy {
+impl AbsoluteHybridRedisProxy {
     pub(crate) fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
@@ -145,10 +146,10 @@ impl AbsoluteRedisProxy {
     }
 
     pub(crate) async fn read_state(
-        self: &AbsoluteRedisProxy,
+        self: &AbsoluteHybridRedisProxy,
         key: &RedisKey,
         window_size_ms: u128,
-    ) -> Result<AbsoluteRedisProxyReadStateResult, TrypemaError> {
+    ) -> Result<AbsoluteHybridRedisProxyReadStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
         let res: (String, u64, i64, i64, i64) = self
@@ -166,7 +167,7 @@ impl AbsoluteRedisProxy {
     } // end method read_state
 
     pub(crate) async fn _commit_state(
-        self: &AbsoluteRedisProxy,
+        self: &AbsoluteHybridRedisProxy,
         key: &RedisKey,
         window_size_seconds: u64,
         window_limit: u64,
@@ -194,8 +195,8 @@ impl AbsoluteRedisProxy {
     }
 
     pub(crate) async fn batch_commit_state(
-        self: &AbsoluteRedisProxy,
-        commits: &[AbsoluteRedisCommit],
+        self: &AbsoluteHybridRedisProxy,
+        commits: &[AbsoluteHybridCommit],
     ) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
@@ -227,7 +228,7 @@ impl AbsoluteRedisProxy {
     #[inline]
     fn build_commit_pipeline(
         &self,
-        commits: &[AbsoluteRedisCommit],
+        commits: &[AbsoluteHybridCommit],
         should_load_script: bool,
     ) -> redis::Pipeline {
         let mut pipe = redis::Pipeline::new();
@@ -255,10 +256,10 @@ impl AbsoluteRedisProxy {
     }
 
     pub(crate) async fn batch_read_state(
-        self: &AbsoluteRedisProxy,
+        self: &AbsoluteHybridRedisProxy,
         keys: &Vec<RedisKey>,
         window_size_ms: u128,
-    ) -> Result<Vec<AbsoluteRedisProxyReadStateResult>, TrypemaError> {
+    ) -> Result<Vec<AbsoluteHybridRedisProxyReadStateResult>, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
         let pipe = self.build_read_pipeline(keys, window_size_ms, false);
@@ -289,7 +290,7 @@ impl AbsoluteRedisProxy {
             }
         };
 
-        let results: Vec<AbsoluteRedisProxyReadStateResult> = results
+        let results: Vec<AbsoluteHybridRedisProxyReadStateResult> = results
             .into_iter()
             .map(map_redis_read_result_to_state)
             .collect();
@@ -327,12 +328,12 @@ impl AbsoluteRedisProxy {
 
 fn map_redis_read_result_to_state(
     (entity, total_count, window_limit, oldest_ttl, oldest_count): (String, u64, i64, i64, i64),
-) -> AbsoluteRedisProxyReadStateResult {
+) -> AbsoluteHybridRedisProxyReadStateResult {
     fn map_negative_to_none(value: i64) -> Option<u64> {
         if value < 0 { None } else { Some(value as u64) }
     }
 
-    AbsoluteRedisProxyReadStateResult {
+    AbsoluteHybridRedisProxyReadStateResult {
         key: RedisKey::from(entity),
         current_total_count: total_count,
         window_limit: map_negative_to_none(window_limit),

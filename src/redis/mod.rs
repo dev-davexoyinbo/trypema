@@ -7,8 +7,5 @@ pub use absolute_redis_rate_limiter::*;
 mod suppressed_redis_rate_limiter;
 pub use suppressed_redis_rate_limiter::*;
 
-mod common;
+pub(crate) mod common;
 pub use common::*;
-
-mod absolute_redis_commiter;
-mod absolute_redis_proxy;

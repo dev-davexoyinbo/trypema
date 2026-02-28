@@ -4,11 +4,14 @@ use tokio::sync::mpsc;
 
 use crate::{
     TrypemaError,
-    redis::{RedisKey, RedisRateLimiterSignal, absolute_redis_proxy::AbsoluteRedisProxy},
+    hybrid::{
+        absolute_hybrid_redis_proxy::AbsoluteHybridRedisProxy, common::RedisRateLimiterSignal,
+    },
+    redis::RedisKey,
 };
 
 #[derive(Debug)]
-pub(crate) struct AbsoluteRedisCommit {
+pub(crate) struct AbsoluteHybridCommit {
     pub key: RedisKey,
     pub window_size_seconds: u64,
     pub window_limit: u64,
@@ -16,31 +19,31 @@ pub(crate) struct AbsoluteRedisCommit {
     pub count: u64,
 }
 
-pub(crate) struct AbsoluteRedisCommitterOptions {
+pub(crate) struct AbsoluteHybridCommitterOptions {
     pub local_cache_duration: Duration,
     pub channel_capacity: usize,
     pub max_batch_size: usize,
     pub limiter_sender: mpsc::Sender<RedisRateLimiterSignal>,
-    pub redis_proxy: AbsoluteRedisProxy,
+    pub redis_proxy: AbsoluteHybridRedisProxy,
 }
 
-pub(crate) enum AbsoluteRedisCommitterSignal {
-    Commit(AbsoluteRedisCommit),
+pub(crate) enum AbsoluteHybridCommitterSignal {
+    Commit(AbsoluteHybridCommit),
 }
 
-impl From<AbsoluteRedisCommit> for AbsoluteRedisCommitterSignal {
-    fn from(commit: AbsoluteRedisCommit) -> Self {
+impl From<AbsoluteHybridCommit> for AbsoluteHybridCommitterSignal {
+    fn from(commit: AbsoluteHybridCommit) -> Self {
         Self::Commit(commit)
     }
 }
 
-pub(crate) struct AbsoluteRedisCommitter; // end struct AbsoluteRedisCommitter
+pub(crate) struct AbsoluteHybridCommitter; // end struct AbsoluteRedisCommitter
 
-impl AbsoluteRedisCommitter {
+impl AbsoluteHybridCommitter {
     pub fn run(
-        options: AbsoluteRedisCommitterOptions,
-    ) -> mpsc::Sender<AbsoluteRedisCommitterSignal> {
-        let AbsoluteRedisCommitterOptions {
+        options: AbsoluteHybridCommitterOptions,
+    ) -> mpsc::Sender<AbsoluteHybridCommitterSignal> {
+        let AbsoluteHybridCommitterOptions {
             local_cache_duration,
             channel_capacity,
             max_batch_size,
@@ -48,11 +51,11 @@ impl AbsoluteRedisCommitter {
             redis_proxy,
         } = options;
 
-        let (tx, mut rx) = mpsc::channel::<AbsoluteRedisCommitterSignal>(channel_capacity);
+        let (tx, mut rx) = mpsc::channel::<AbsoluteHybridCommitterSignal>(channel_capacity);
 
         tokio::spawn(async move {
             let mut flush_interval = tokio::time::interval(local_cache_duration);
-            let mut batch: Vec<AbsoluteRedisCommit> = Vec::new();
+            let mut batch: Vec<AbsoluteHybridCommit> = Vec::new();
 
             // discard the first tick
             flush_interval.tick().await;
@@ -71,7 +74,7 @@ impl AbsoluteRedisCommitter {
                         }
                     },
                     commit = rx.recv() => {
-                        let Some(AbsoluteRedisCommitterSignal::Commit(commit)) = commit else {
+                        let Some(AbsoluteHybridCommitterSignal::Commit(commit)) = commit else {
                             break;
                         };
 
@@ -79,7 +82,7 @@ impl AbsoluteRedisCommitter {
                     }
                 }
 
-                while let Ok(AbsoluteRedisCommitterSignal::Commit(commit)) = rx.try_recv() {
+                while let Ok(AbsoluteHybridCommitterSignal::Commit(commit)) = rx.try_recv() {
                     batch.push(commit);
                 }
             }
@@ -89,8 +92,8 @@ impl AbsoluteRedisCommitter {
     } // end method run
 
     async fn flush_to_redis(
-        redis_proxy: &AbsoluteRedisProxy,
-        batch: &mut Vec<AbsoluteRedisCommit>,
+        redis_proxy: &AbsoluteHybridRedisProxy,
+        batch: &mut Vec<AbsoluteHybridCommit>,
         max_batch_size: usize,
     ) -> Result<(), TrypemaError> {
         if batch.is_empty() {

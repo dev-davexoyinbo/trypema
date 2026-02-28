@@ -13,6 +13,12 @@ use local::*;
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
 pub mod redis;
+
+/// Redis-specific rate limiter implementations.
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+pub mod hybrid;
+
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
 use redis::*;
