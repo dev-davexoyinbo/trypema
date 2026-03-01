@@ -23,6 +23,7 @@ use crate::{
         },
         common::RedisRateLimiterSignal,
     },
+    redis::spawn_task,
 };
 
 const ABSOLUTE_CLEANUP_LUA: &str = r#"
@@ -152,7 +153,7 @@ impl AbsoluteHybridRateLimiter {
     ) {
         let limitter = Arc::downgrade(self);
 
-        tokio::spawn(async move {
+        spawn_task(async move {
             while let Some(signal) = rx.recv().await {
                 let Some(limiter) = limitter.upgrade() else {
                     break;

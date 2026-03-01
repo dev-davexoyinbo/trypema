@@ -113,17 +113,17 @@ impl RedisKeyGenerator {
     }
 }
 
-#[cfg(feature = "redis-tokio")]
+#[cfg(all(feature = "redis-tokio", not(feature = "redis-smol")))]
 pub(crate) fn new_interval(sync_interval: Duration) -> tokio::time::Interval {
     tokio::time::interval(sync_interval)
 }
 
-#[cfg(feature = "redis-smol")]
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
 pub(crate) fn new_interval(sync_interval: Duration) -> smol::Timer {
     smol::Timer::interval(sync_interval)
 }
 
-#[cfg(feature = "redis-tokio")]
+#[cfg(all(feature = "redis-tokio", not(feature = "redis-smol")))]
 pub(crate) fn spawn_task<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -131,7 +131,7 @@ where
     tokio::spawn(fut);
 }
 
-#[cfg(feature = "redis-smol")]
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
 pub(crate) fn spawn_task<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -139,12 +139,12 @@ where
     smol::spawn(fut).detach();
 }
 
-#[cfg(feature = "redis-tokio")]
+#[cfg(all(feature = "redis-tokio", not(feature = "redis-smol")))]
 pub(crate) async fn tick(interval: &mut tokio::time::Interval) {
     interval.tick().await;
 }
 
-#[cfg(feature = "redis-smol")]
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
 pub(crate) async fn tick(interval: &mut smol::Timer) {
     use futures::StreamExt;
     interval.next().await;
