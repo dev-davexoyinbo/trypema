@@ -63,29 +63,47 @@ use trypema::{
     SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 use trypema::local::LocalRateLimiterOptions;
+# #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+# use trypema::redis::RedisRateLimiterOptions;
+# #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+# use trypema::hybrid::SyncIntervalMs;
 
-let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-let hard_limit_factor = HardLimitFactor::default();
-let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
+# fn options() -> RateLimiterOptions {
+#     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
+#     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
+#     let hard_limit_factor = HardLimitFactor::default();
+#     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
+#     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#     let sync_interval_ms = SyncIntervalMs::default();
+#
+#     RateLimiterOptions {
+#         local: LocalRateLimiterOptions {
+#             window_size_seconds,
+#             rate_group_size_ms,
+#             hard_limit_factor,
+#             suppression_factor_cache_ms,
+#         },
+#         #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#         redis: RedisRateLimiterOptions {
+#             connection_manager: todo!("create redis::aio::ConnectionManager"),
+#             prefix: None,
+#             window_size_seconds,
+#             rate_group_size_ms,
+#             hard_limit_factor,
+#             suppression_factor_cache_ms,
+#             sync_interval_ms,
+#         },
+#     }
+# }
 
-let options = RateLimiterOptions {
-    local: LocalRateLimiterOptions {
-        window_size_seconds,
-        rate_group_size_ms,
-        hard_limit_factor,
-        suppression_factor_cache_ms,
-    },
-};
-
-let rl = Arc::new(RateLimiter::new(options));
+let rl = Arc::new(RateLimiter::new(options()));
 
 // Optional: start background cleanup to remove stale keys
 // Idempotent: calling this multiple times is a no-op once running.
 rl.run_cleanup_loop();
 
 // Rate limit a key to 5 requests per second
-let key = "user_123";
+let key = "user:123";
 let rate_limit = RateLimit::try_from(5.0).unwrap();
 
 // Absolute strategy (deterministic sliding-window enforcement)
@@ -148,6 +166,9 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust,no_run
+# async fn example() -> Result<(), trypema::TrypemaError> {
+# #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+# {
 use std::sync::Arc;
 
 use trypema::{
@@ -158,86 +179,99 @@ use trypema::hybrid::SyncIntervalMs;
 use trypema::local::LocalRateLimiterOptions;
 use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 
-#[tokio::main]
-async fn main() -> Result<(), trypema::TrypemaError> {
-    // Create Redis connection manager
-    let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
-    let connection_manager = client.get_connection_manager().await.unwrap();
+// Create Redis connection manager
+let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
+let connection_manager = client.get_connection_manager().await.unwrap();
 
-    let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-    let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-    let hard_limit_factor = HardLimitFactor::default();
-    let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-    let sync_interval_ms = SyncIntervalMs::default();
+let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
+let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
+let hard_limit_factor = HardLimitFactor::default();
+let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
+let sync_interval_ms = SyncIntervalMs::default();
 
-    let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size_seconds,
-            rate_group_size_ms,
-            hard_limit_factor,
-            suppression_factor_cache_ms,
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager,
-            prefix: None,
-            window_size_seconds,
-            rate_group_size_ms,
-            hard_limit_factor,
-            suppression_factor_cache_ms,
-            sync_interval_ms,
-        },
-    }));
+let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+    local: LocalRateLimiterOptions {
+        window_size_seconds,
+        rate_group_size_ms,
+        hard_limit_factor,
+        suppression_factor_cache_ms,
+    },
+    redis: RedisRateLimiterOptions {
+        connection_manager,
+        prefix: None,
+        window_size_seconds,
+        rate_group_size_ms,
+        hard_limit_factor,
+        suppression_factor_cache_ms,
+        sync_interval_ms,
+    },
+}));
 
-    rl.run_cleanup_loop();
+rl.run_cleanup_loop();
 
-    let rate_limit = RateLimit::try_from(5.0).unwrap();
-    let key = RedisKey::try_from("user_123".to_string()).unwrap();
+let rate_limit = RateLimit::try_from(5.0).unwrap();
+let key = RedisKey::try_from("user_123".to_string()).unwrap();
 
-    // Absolute strategy (deterministic sliding-window enforcement)
-    match rl.redis().absolute().inc(&key, &rate_limit, 1).await? {
-        RateLimitDecision::Allowed => {
-            // Request allowed, proceed
-        }
-        RateLimitDecision::Rejected { retry_after_ms, .. } => {
-            // Request rejected, back off for retry_after_ms
-            let _ = retry_after_ms;
-        }
-        RateLimitDecision::Suppressed { .. } => {
-            unreachable!("absolute strategy never returns Suppressed");
-        }
+// Absolute strategy (deterministic sliding-window enforcement)
+let decision = match rl.redis().absolute().inc(&key, &rate_limit, 1).await {
+    Ok(decision) => decision,
+    Err(e) => {
+        // Handle Redis errors (connectivity, script failures, etc.)
+        return Err(e);
     }
+};
 
-    // Suppressed strategy (probabilistic suppression near/over the target rate)
-    // You can also query the current suppression factor (useful for metrics/debugging).
-    let sf = rl.redis().suppressed().get_suppression_factor(&key).await?;
-    let _ = sf;
-
-    match rl.redis().suppressed().inc(&key, &rate_limit, 1).await? {
-        RateLimitDecision::Allowed => {
-            // Below capacity: request allowed, proceed
-        }
-        RateLimitDecision::Suppressed {
-            is_allowed: true,
-            suppression_factor,
-        } => {
-            // At capacity: suppression active, but this request was allowed
-            let _ = suppression_factor;
-        }
-        RateLimitDecision::Suppressed {
-            is_allowed: false,
-            suppression_factor,
-        } => {
-            // At capacity: this request was suppressed (do not proceed)
-            let _ = suppression_factor;
-        }
-        RateLimitDecision::Rejected { retry_after_ms, .. } => {
-            // Over hard limit: request rejected
-            let _ = retry_after_ms;
-        }
+match decision {
+    RateLimitDecision::Allowed => {
+        // Request allowed, proceed
     }
-
-    Ok(())
+    RateLimitDecision::Rejected { retry_after_ms, .. } => {
+        // Request rejected, back off for retry_after_ms
+        let _ = retry_after_ms;
+    }
+    RateLimitDecision::Suppressed { .. } => {
+        unreachable!("absolute strategy never returns Suppressed");
+    }
 }
+
+// Suppressed strategy (probabilistic suppression near/over the target rate)
+// You can also query the current suppression factor (useful for metrics/debugging).
+let sf = rl.redis().suppressed().get_suppression_factor(&key).await?;
+let _ = sf;
+let decision = match rl.redis().suppressed().inc(&key, &rate_limit, 1).await {
+    Ok(decision) => decision,
+    Err(e) => {
+        // Handle Redis errors (connectivity, script failures, etc.)
+        return Err(e);
+    }
+};
+
+match decision {
+    RateLimitDecision::Allowed => {
+        // Below capacity: request allowed, proceed
+    }
+    RateLimitDecision::Suppressed {
+        is_allowed: true,
+        suppression_factor,
+    } => {
+        // At capacity: suppression active, but this request was allowed
+        let _ = suppression_factor;
+    }
+    RateLimitDecision::Suppressed {
+        is_allowed: false,
+        suppression_factor,
+    } => {
+        // At capacity: this request was suppressed (do not proceed)
+        let _ = suppression_factor;
+    }
+    RateLimitDecision::Rejected { retry_after_ms, .. } => {
+        // Over hard limit: request rejected
+        let _ = retry_after_ms;
+    }
+}
+# }
+# Ok(())
+# }
 ```
 
 ### Hybrid Provider (Local Cache + Redis Sync)
@@ -246,6 +280,9 @@ The hybrid provider is a Redis-backed limiter that keeps a local fast-path and p
 flushes to Redis. It uses `RedisRateLimiterOptions`.
 
 ```rust,no_run
+# async fn example() -> Result<(), trypema::TrypemaError> {
+# #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+# {
 use std::sync::Arc;
 
 use trypema::{
@@ -256,53 +293,49 @@ use trypema::hybrid::SyncIntervalMs;
 use trypema::local::LocalRateLimiterOptions;
 use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 
-#[tokio::main]
-async fn main() -> Result<(), trypema::TrypemaError> {
-    let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
-    let connection_manager = client.get_connection_manager().await.unwrap();
+let client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
+let connection_manager = client.get_connection_manager().await.unwrap();
 
-    let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-    let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-    let hard_limit_factor = HardLimitFactor::default();
-    let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-    let sync_interval_ms = SyncIntervalMs::default();
+let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
+let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
+let hard_limit_factor = HardLimitFactor::default();
+let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
+let sync_interval_ms = SyncIntervalMs::default();
 
-    let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size_seconds,
-            rate_group_size_ms,
-            hard_limit_factor,
-            suppression_factor_cache_ms,
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager,
-            prefix: None,
-            window_size_seconds,
-            rate_group_size_ms,
-            hard_limit_factor,
-            suppression_factor_cache_ms,
-            sync_interval_ms,
-        },
-    }));
+let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+    local: LocalRateLimiterOptions {
+        window_size_seconds,
+        rate_group_size_ms,
+        hard_limit_factor,
+        suppression_factor_cache_ms,
+    },
+    redis: RedisRateLimiterOptions {
+        connection_manager,
+        prefix: None,
+        window_size_seconds,
+        rate_group_size_ms,
+        hard_limit_factor,
+        suppression_factor_cache_ms,
+        sync_interval_ms,
+    },
+}));
 
-    let key = RedisKey::try_from("user_123".to_string())?;
-    let rate = RateLimit::try_from(10.0)?;
+let key = RedisKey::try_from("user_123".to_string())?;
+let rate = RateLimit::try_from(10.0)?;
 
-    let _decision = rl.hybrid().absolute().inc(&key, &rate, 1).await?;
+let _decision = rl.hybrid().absolute().inc(&key, &rate, 1).await?;
 
-    // Note: the hybrid suppressed strategy is not implemented yet.
-    Ok(())
-}
+// Note: the hybrid suppressed strategy is not implemented yet.
+# }
+# Ok(())
+# }
 ```
 
 ## Core Concepts
 
 ### Keyed Limiting
 
-Each key maintains independent rate limiting state.
-
-- Local provider keys are arbitrary strings.
-- Redis/hybrid provider keys use `RedisKey` (validated; see Redis Provider Details).
+Each key maintains independent rate limiting state. Keys are arbitrary strings (e.g., `"user:123"`, `"api_endpoint_v2"`).
 
 ### Rate Limits
 
@@ -497,22 +530,40 @@ use std::sync::Arc;
 
 use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
 use trypema::local::LocalRateLimiterOptions;
+# #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+# use trypema::hybrid::SyncIntervalMs;
+# #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+# use trypema::redis::RedisRateLimiterOptions;
 
-let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-let hard_limit_factor = HardLimitFactor::default();
-let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
+# fn options() -> RateLimiterOptions {
+#     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
+#     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
+#     let hard_limit_factor = HardLimitFactor::default();
+#     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
+#     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#     let sync_interval_ms = SyncIntervalMs::default();
+#
+#     RateLimiterOptions {
+#         local: LocalRateLimiterOptions {
+#             window_size_seconds,
+#             rate_group_size_ms,
+#             hard_limit_factor,
+#             suppression_factor_cache_ms,
+#         },
+#         #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#         redis: RedisRateLimiterOptions {
+#             connection_manager: todo!("create redis::aio::ConnectionManager"),
+#             prefix: None,
+#             window_size_seconds,
+#             rate_group_size_ms,
+#             hard_limit_factor,
+#             suppression_factor_cache_ms,
+#             sync_interval_ms,
+#         },
+#     }
+# }
 
-let options = RateLimiterOptions {
-    local: LocalRateLimiterOptions {
-        window_size_seconds,
-        rate_group_size_ms,
-        hard_limit_factor,
-        suppression_factor_cache_ms,
-    },
-};
-
-let rl = Arc::new(RateLimiter::new(options));
+let rl = Arc::new(RateLimiter::new(options()));
 // Idempotent: calling this multiple times is a no-op once running.
 rl.run_cleanup_loop();
 
@@ -602,7 +653,7 @@ src/
     ├── suppressed_redis_rate_limiter.rs # Redis suppressed strategy (Lua scripts)
     └── common.rs                        # Redis-specific utilities
 
- # (Rustdoc uses `docs/lib.md` for crate-level docs; this README is for GitHub/crates.io.)
+ # (Docs are currently in rustdoc and this README; there is no `docs/` directory in this repo.)
 ```
 
 ## Redis Provider Details
@@ -621,15 +672,18 @@ Redis keys use the `RedisKey` newtype with validation:
 - **Must not contain** `:` (used internally as a separator)
 
 ```rust,no_run
-use trypema::redis::RedisKey;
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+{
+    use trypema::redis::RedisKey;
 
-// Valid
-let _ = RedisKey::try_from("user_123".to_string()).unwrap();
-let _ = RedisKey::try_from("api_v2_endpoint".to_string()).unwrap();
+    // Valid
+    let _ = RedisKey::try_from("user_123".to_string()).unwrap();
+    let _ = RedisKey::try_from("api_v2_endpoint".to_string()).unwrap();
 
-// Invalid
-let _ = RedisKey::try_from("user:123".to_string());
-let _ = RedisKey::try_from("".to_string());
+    // Invalid
+    let _ = RedisKey::try_from("user:123".to_string());
+    let _ = RedisKey::try_from("".to_string());
+}
 ```
 
 ### Feature Flags
