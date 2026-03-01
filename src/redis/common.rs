@@ -1,4 +1,5 @@
 use std::ops::{Deref, DerefMut};
+use std::time::Duration;
 
 use crate::{TrypemaError, common::RateType};
 
@@ -110,4 +111,41 @@ impl RedisKeyGenerator {
     pub(crate) fn get_suppression_factor_key(&self, key: &RedisKey) -> String {
         self.get_key_with_suffix(key, &self.suppression_factor_key_suffix)
     }
+}
+
+#[cfg(feature = "redis-tokio")]
+pub(crate) fn new_interval(sync_interval: Duration) -> tokio::time::Interval {
+    tokio::time::interval(sync_interval)
+}
+
+#[cfg(feature = "redis-smol")]
+pub(crate) fn new_interval(sync_interval: Duration) -> smol::Timer {
+    smol::Timer::interval(sync_interval)
+}
+
+#[cfg(feature = "redis-tokio")]
+pub(crate) fn spawn_task<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(fut);
+}
+
+#[cfg(feature = "redis-smol")]
+pub(crate) fn spawn_task<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    smol::spawn(fut).detach();
+}
+
+#[cfg(feature = "redis-tokio")]
+pub(crate) async fn tick(interval: &mut tokio::time::Interval) {
+    interval.tick().await;
+}
+
+#[cfg(feature = "redis-smol")]
+pub(crate) async fn tick(interval: &mut smol::Timer) {
+    use futures::StreamExt;
+    interval.next().await;
 }

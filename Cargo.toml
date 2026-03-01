@@ -49,6 +49,7 @@ tracing = "0.1.44"
 tokio = { version = "1.49.0", optional = true, default-features = false }
 smol = { version = "2.0.2", optional = true }
 ahash = "0.8.12"
+futures = "0.3.32"
 
 [features]
 redis-tokio = [
