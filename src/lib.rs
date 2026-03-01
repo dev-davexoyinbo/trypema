@@ -6,6 +6,9 @@
 mod rate_limiter;
 pub use rate_limiter::*;
 
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+pub(crate) mod runtime;
+
 pub mod local;
 use local::*;
 
