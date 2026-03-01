@@ -93,36 +93,6 @@ async fn build_limiter(
     std::sync::Arc::new(RateLimiter::new(options))
 }
 
-async fn build_limiter_with_prefix(
-    url: &str,
-    window_size_seconds: u64,
-    rate_group_size_ms: u64,
-    prefix: RedisKey,
-) -> std::sync::Arc<RateLimiter> {
-    let client = redis::Client::open(url).unwrap();
-    let cm = client.get_connection_manager().await.unwrap();
-
-    let options = RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager: cm,
-            prefix: Some(prefix),
-            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-            sync_interval_ms: SyncIntervalMs::default(),
-        },
-    };
-
-    std::sync::Arc::new(RateLimiter::new(options))
-}
-
 #[test]
 fn rejects_at_exact_window_limit() {
     let Some(url) = redis_url() else { return };
