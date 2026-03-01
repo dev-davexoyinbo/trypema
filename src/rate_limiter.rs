@@ -55,13 +55,13 @@
 //! let decision = rl.local().absolute().inc("user_123", &rate, 1);
 //! ```
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
+
+#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
+use std::time::Duration;
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use crate::hybrid::HybridRateLimiterProvider;
