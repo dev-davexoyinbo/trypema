@@ -13,6 +13,29 @@ fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
     ((window_size_seconds as f64) * **rate_limit) as u64
 }
 
+fn record_decision(
+    decision: RateLimitDecision,
+    count: u64,
+    accepted_volume: &mut u64,
+    rejected_volume: &mut u64,
+    allowed_ops: &mut u64,
+    rejected_ops: &mut u64,
+) {
+    match decision {
+        RateLimitDecision::Allowed => {
+            *accepted_volume += count;
+            *allowed_ops += 1;
+        }
+        RateLimitDecision::Rejected { .. } => {
+            *rejected_volume += count;
+            *rejected_ops += 1;
+        }
+        RateLimitDecision::Suppressed { .. } => {
+            panic!("suppressed decision is not expected in absolute strategy")
+        }
+    }
+}
+
 fn redis_url() -> String {
     env::var("REDIS_URL").unwrap_or_else(|_| {
         panic!(
@@ -687,5 +710,259 @@ fn hybrid_absolute_concurrent_smol_smoke_does_not_panic() {
         for t in tasks {
             t.await;
         }
+    });
+}
+
+#[test]
+fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 1_u64;
+        let rate_group_size_ms = 1000_u64;
+        let sync_interval_ms = 25_u64;
+
+        let rl = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            sync_interval_ms,
+            prefix,
+        )
+        .await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(50f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 50);
+
+        let mut accepted_volume = 0_u64;
+        let mut rejected_volume = 0_u64;
+        let mut allowed_ops = 0_u64;
+        let mut rejected_ops = 0_u64;
+
+        for _ in 0..80_u64 {
+            let decision = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            record_decision(
+                decision,
+                1,
+                &mut accepted_volume,
+                &mut rejected_volume,
+                &mut allowed_ops,
+                &mut rejected_ops,
+            );
+        }
+
+        assert_eq!(accepted_volume, capacity);
+        assert_eq!(rejected_volume, 80 - capacity);
+        assert_eq!(allowed_ops, capacity);
+        assert_eq!(rejected_ops, 80 - capacity);
+    });
+}
+
+#[test]
+fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 1_u64;
+        let rate_group_size_ms = 1000_u64;
+        let sync_interval_ms = 25_u64;
+
+        let rl = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            sync_interval_ms,
+            prefix,
+        )
+        .await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(10f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 10);
+
+        let mut accepted_volume = 0_u64;
+        let mut rejected_volume = 0_u64;
+        let mut allowed_ops = 0_u64;
+        let mut rejected_ops = 0_u64;
+
+        // Allowed: consumes 9 of 10.
+        let d1 = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 9)
+            .await
+            .unwrap();
+        record_decision(
+            d1,
+            9,
+            &mut accepted_volume,
+            &mut rejected_volume,
+            &mut allowed_ops,
+            &mut rejected_ops,
+        );
+
+        // Rejected: would push total to 11.
+        let d2 = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 2)
+            .await
+            .unwrap();
+        assert!(matches!(d2, RateLimitDecision::Rejected { .. }), "d2: {d2:?}");
+        record_decision(
+            d2,
+            2,
+            &mut accepted_volume,
+            &mut rejected_volume,
+            &mut allowed_ops,
+            &mut rejected_ops,
+        );
+
+        // Allowed: proves the rejected batch did not consume capacity.
+        let d3 = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        record_decision(
+            d3,
+            1,
+            &mut accepted_volume,
+            &mut rejected_volume,
+            &mut allowed_ops,
+            &mut rejected_ops,
+        );
+
+        assert_eq!(accepted_volume, capacity);
+        assert_eq!(rejected_volume, 2);
+        assert_eq!(allowed_ops, 2);
+        assert_eq!(rejected_ops, 1);
+    });
+}
+
+#[test]
+fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 1_u64;
+        let rate_group_size_ms = 1000_u64;
+        let sync_interval_ms = 25_u64;
+
+        let rl = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            sync_interval_ms,
+            prefix,
+        )
+        .await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 2);
+
+        // Fill capacity.
+        for _ in 0..capacity {
+            let decision = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(decision, RateLimitDecision::Allowed), "decision: {decision:?}");
+        }
+
+        // Many rejected attempts should not change what we can do after the window expires.
+        let mut rejected_ops = 0_u64;
+        for _ in 0..20_u64 {
+            let decision = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(
+                matches!(decision, RateLimitDecision::Rejected { .. }),
+                "decision: {decision:?}"
+            );
+            rejected_ops += 1;
+        }
+        assert_eq!(rejected_ops, 20);
+
+        runtime::async_sleep(Duration::from_millis(1100)).await;
+
+        let mut accepted_after_expiry = 0_u64;
+        for _ in 0..capacity {
+            let decision = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(decision, RateLimitDecision::Allowed), "decision: {decision:?}");
+            accepted_after_expiry += 1;
+        }
+        assert_eq!(accepted_after_expiry, capacity);
+    });
+}
+
+#[test]
+fn volume_non_integer_rate_uses_truncating_capacity() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 1_u64;
+        let rate_group_size_ms = 1000_u64;
+        let sync_interval_ms = 25_u64;
+
+        let rl = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            sync_interval_ms,
+            prefix,
+        )
+        .await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(2.9f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 2);
+
+        for _ in 0..capacity {
+            let decision = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(decision, RateLimitDecision::Allowed), "decision: {decision:?}");
+        }
+
+        let decision = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(decision, RateLimitDecision::Rejected { .. }),
+            "decision: {decision:?}"
+        );
     });
 }

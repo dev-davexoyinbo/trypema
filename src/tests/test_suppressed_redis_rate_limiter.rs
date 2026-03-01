@@ -374,3 +374,90 @@ fn verify_hard_limit_rejects() {
         );
     });
 }
+
+#[test]
+fn suppressed_is_deterministically_allowed_until_base_capacity_boundary_redis() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 10_u64;
+        let hard_limit_factor = 2f64;
+        let rl = build_limiter(&url, window_size_seconds, 1000, hard_limit_factor).await;
+
+        let k = key("k_base");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        // Base capacity = 10s * 1 req/s = 10.
+        let base_capacity = window_size_seconds;
+
+        // Pre-increment total is below base capacity.
+        let d1 = rl
+            .redis()
+            .suppressed()
+            .inc(&k, &rate_limit, base_capacity - 1)
+            .await
+            .unwrap();
+        assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {d1:?}");
+
+        // Still below base capacity pre-increment, so suppression must not start.
+        let d2 = rl
+            .redis()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(matches!(d2, RateLimitDecision::Allowed), "d2: {d2:?}");
+    });
+}
+
+#[test]
+fn suppressed_is_fully_denied_after_hard_limit_observed_redis() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 10_u64;
+        let hard_limit_factor = 2f64;
+
+        // Use a tiny cache to deterministically observe suppression-factor recompute.
+        let rl = build_limiter_with_cache_ms(&url, window_size_seconds, 1000, hard_limit_factor, 1)
+            .await;
+
+        let k = key("k_hard");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        let hard_capacity = window_size_seconds * 2;
+
+        // Drive observed count to the hard limit in one call. This call itself is Allowed
+        // because suppression_factor is computed from pre-increment state.
+        let d1 = rl
+            .redis()
+            .suppressed()
+            .inc(&k, &rate_limit, hard_capacity)
+            .await
+            .unwrap();
+        assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {d1:?}");
+
+        // Ensure cached suppression factor expires before the next call.
+        runtime::async_sleep(Duration::from_millis(5)).await;
+
+        for i in 0..5u64 {
+            let d = rl
+                .redis()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(
+                    d,
+                    RateLimitDecision::Suppressed {
+                        suppression_factor,
+                        is_allowed: false,
+                    } if (suppression_factor - 1.0).abs() < 1e-12
+                ),
+                "i={i} d={d:?}"
+            );
+        }
+    });
+}
