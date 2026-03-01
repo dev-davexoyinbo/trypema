@@ -459,3 +459,62 @@ fn suppression_property_values_do_not_panic_and_follow_basic_contract() {
         }
     }
 }
+
+#[test]
+fn suppressed_is_deterministically_allowed_until_base_capacity_boundary() {
+    // Deterministic regime: suppression does not start until the *base* window capacity is met.
+    // We assert decisions remain Allowed right up to the boundary.
+    let window_size_seconds = 10_u64;
+    let hard_limit_factor = 2f64;
+    let limiter = limiter(window_size_seconds, 1000, hard_limit_factor);
+
+    let key = "k";
+    let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+    let base_capacity = window_size_seconds; // 10s * 1 req/s
+
+    // Pre-increment total is below base capacity.
+    let d1 = limiter.inc(key, &rate_limit, base_capacity - 1);
+    assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {d1:?}");
+
+    // Still below base capacity pre-increment (total = 9), so suppression must not start.
+    let d2 = limiter.inc(key, &rate_limit, 1);
+    assert!(matches!(d2, RateLimitDecision::Allowed), "d2: {d2:?}");
+}
+
+#[test]
+fn suppressed_is_fully_denied_after_hard_limit_observed() {
+    // Deterministic regime: once the observed count reaches the hard cutoff,
+    // suppression_factor becomes 1.0 and requests are denied (is_allowed=false).
+    let window_size_seconds = 10_u64;
+    let hard_limit_factor = 2f64;
+
+    // Use a tiny cache so we can deterministically observe recomputation after state changes.
+    let limiter = limiter_with_cache_ms(window_size_seconds, 1000, hard_limit_factor, 1);
+
+    let key = "k_hard";
+    let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+    let hard_capacity = window_size_seconds * 2; // 10s * 1 req/s * 2.0
+
+    // First call: pre-increment total is 0 (< base capacity), so it's Allowed.
+    let d1 = limiter.inc(key, &rate_limit, hard_capacity);
+    assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {d1:?}");
+
+    // Ensure the cached suppression factor expires so the next call recomputes from updated totals.
+    std::thread::sleep(Duration::from_millis(5));
+
+    for i in 0..5u64 {
+        let d = limiter.inc(key, &rate_limit, 1);
+        assert!(
+            matches!(
+                d,
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: false
+                } if (suppression_factor - 1.0).abs() < 1e-12
+            ),
+            "i={i} d={d:?}"
+        );
+    }
+}

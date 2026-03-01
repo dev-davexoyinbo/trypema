@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{atomic::AtomicU64, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -10,6 +10,33 @@ use crate::common::{
     SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};
+
+fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
+    ((window_size_seconds as f64) * **rate_limit) as u64
+}
+
+fn record_decision(
+    decision: RateLimitDecision,
+    count: u64,
+    accepted_volume: &mut u64,
+    rejected_volume: &mut u64,
+    allowed_ops: &mut u64,
+    rejected_ops: &mut u64,
+) {
+    match decision {
+        RateLimitDecision::Allowed => {
+            *accepted_volume += count;
+            *allowed_ops += 1;
+        }
+        RateLimitDecision::Rejected { .. } => {
+            *rejected_volume += count;
+            *rejected_ops += 1;
+        }
+        RateLimitDecision::Suppressed { .. } => {
+            panic!("suppressed decision is not expected in absolute strategy")
+        }
+    }
+}
 
 fn limiter(window_size_seconds: u64, rate_group_size_ms: u64) -> AbsoluteLocalRateLimiter {
     AbsoluteLocalRateLimiter::new(LocalRateLimiterOptions {
@@ -438,8 +465,10 @@ fn rate_grouping_separates_beyond_group() {
     let key = "k";
     let rate_limit = RateLimit::try_from(3f64).unwrap();
 
-    // Keep the first bucket below the limit so the second increment is applied.
-    limiter.inc(key, &rate_limit, 1);
+    // Create an initial bucket without consuming capacity. This ensures we can
+    // later create a second bucket at the exact limit (3) and still have two buckets
+    // so eviction behavior is observable.
+    limiter.inc(key, &rate_limit, 0);
 
     // Ensure the second increment is beyond the grouping threshold but still within the
     // 1s window, so we end up with two buckets.
@@ -645,4 +674,169 @@ fn cleanup_concurrent_is_allowed_smoke_does_not_panic() {
 
     reader.join().expect("reader thread panicked");
     cleaner.join().expect("cleaner thread panicked");
+}
+
+#[test]
+fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
+    let window_size_seconds = 1_u64;
+    let limiter = limiter(window_size_seconds, 1000);
+
+    let k = "k";
+    let rate_limit = RateLimit::try_from(50f64).unwrap();
+    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    assert_eq!(capacity, 50);
+
+    let mut accepted_volume = 0_u64;
+    let mut rejected_volume = 0_u64;
+    let mut allowed_ops = 0_u64;
+    let mut rejected_ops = 0_u64;
+
+    for _ in 0..80_u64 {
+        let decision = limiter.inc(k, &rate_limit, 1);
+        record_decision(
+            decision,
+            1,
+            &mut accepted_volume,
+            &mut rejected_volume,
+            &mut allowed_ops,
+            &mut rejected_ops,
+        );
+    }
+
+    assert_eq!(accepted_volume, capacity);
+    assert_eq!(rejected_volume, 80 - capacity);
+    assert_eq!(allowed_ops, capacity);
+    assert_eq!(rejected_ops, 80 - capacity);
+}
+
+#[test]
+fn volume_batch_increment_matches_expected_volumes_under_local_semantics() {
+    let window_size_seconds = 1_u64;
+    let limiter = limiter(window_size_seconds, 1000);
+
+    let k = "k";
+    let rate_limit = RateLimit::try_from(10f64).unwrap();
+    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    assert_eq!(capacity, 10);
+
+    let mut accepted_volume = 0_u64;
+    let mut rejected_volume = 0_u64;
+    let mut allowed_ops = 0_u64;
+    let mut rejected_ops = 0_u64;
+
+    // Allowed: consumes 9 of 10.
+    let d1 = limiter.inc(k, &rate_limit, 9);
+    record_decision(
+        d1,
+        9,
+        &mut accepted_volume,
+        &mut rejected_volume,
+        &mut allowed_ops,
+        &mut rejected_ops,
+    );
+
+    // NOTE: The local absolute limiter admission check does not take a `count` parameter,
+    // so batch increments can overshoot capacity. This test asserts accounting invariants
+    // of the decisions that are returned.
+    let d2 = limiter.inc(k, &rate_limit, 2);
+    record_decision(
+        d2,
+        2,
+        &mut accepted_volume,
+        &mut rejected_volume,
+        &mut allowed_ops,
+        &mut rejected_ops,
+    );
+
+    // Next increment should be rejected once capacity is exceeded.
+    let d3 = limiter.inc(k, &rate_limit, 1);
+    record_decision(
+        d3,
+        1,
+        &mut accepted_volume,
+        &mut rejected_volume,
+        &mut allowed_ops,
+        &mut rejected_ops,
+    );
+
+    assert!(
+        accepted_volume >= capacity,
+        "accepted_volume={accepted_volume} capacity={capacity}"
+    );
+    assert!(
+        accepted_volume <= capacity + 2,
+        "accepted_volume={accepted_volume} capacity={capacity}"
+    );
+    assert_eq!(accepted_volume + rejected_volume, 12);
+    assert_eq!(allowed_ops + rejected_ops, 3);
+}
+
+#[test]
+fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
+    let window_size_seconds = 1_u64;
+    let limiter = limiter(window_size_seconds, 1000);
+
+    let k = "k";
+    let rate_limit = RateLimit::try_from(2f64).unwrap();
+    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    assert_eq!(capacity, 2);
+
+    // Fill capacity.
+    for _ in 0..capacity {
+        let decision = limiter.inc(k, &rate_limit, 1);
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "decision: {decision:?}"
+        );
+    }
+
+    // Many rejected attempts should not change what we can do after the window expires.
+    let mut rejected_ops = 0_u64;
+    for _ in 0..20_u64 {
+        let decision = limiter.inc(k, &rate_limit, 1);
+        assert!(
+            matches!(decision, RateLimitDecision::Rejected { .. }),
+            "decision: {decision:?}"
+        );
+        rejected_ops += 1;
+    }
+    assert_eq!(rejected_ops, 20);
+
+    thread::sleep(Duration::from_millis(1100));
+
+    let mut accepted_after_expiry = 0_u64;
+    for _ in 0..capacity {
+        let decision = limiter.inc(k, &rate_limit, 1);
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "decision: {decision:?}"
+        );
+        accepted_after_expiry += 1;
+    }
+    assert_eq!(accepted_after_expiry, capacity);
+}
+
+#[test]
+fn volume_non_integer_rate_uses_truncating_capacity() {
+    let window_size_seconds = 1_u64;
+    let limiter = limiter(window_size_seconds, 1000);
+
+    let k = "k";
+    let rate_limit = RateLimit::try_from(2.9f64).unwrap();
+    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    assert_eq!(capacity, 2);
+
+    for _ in 0..capacity {
+        let decision = limiter.inc(k, &rate_limit, 1);
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "decision: {decision:?}"
+        );
+    }
+
+    let decision = limiter.inc(k, &rate_limit, 1);
+    assert!(
+        matches!(decision, RateLimitDecision::Rejected { .. }),
+        "decision: {decision:?}"
+    );
 }
