@@ -42,3 +42,13 @@ pub(crate) async fn tick(interval: &mut Interval) {
     use futures::StreamExt;
     interval.next().await;
 }
+
+#[cfg(all(feature = "redis-tokio", not(feature = "redis-smol")))]
+pub(crate) async fn _sleep(d: Duration) {
+    tokio::time::sleep(d).await;
+}
+
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+pub(crate) async fn _sleep(d: Duration) {
+    smol::Timer::after(d).await;
+}

@@ -3,6 +3,9 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "redis-tokio", feature = "redis-smol"))]
+compile_error!("Features `redis-tokio` and `redis-smol` are mutually exclusive");
+
 mod rate_limiter;
 pub use rate_limiter::*;
 

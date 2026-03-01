@@ -55,13 +55,13 @@
 //! let decision = rl.local().absolute().inc("user_123", &rate, 1);
 //! ```
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
-
-#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-use std::time::Duration;
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use crate::hybrid::HybridRateLimiterProvider;
@@ -324,14 +324,19 @@ impl RateLimiter {
             return;
         }
 
-        // Always spawn local cleanup (sync, no runtime needed)
         #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
         {
             let rl = Arc::downgrade(self);
             std::thread::spawn(move || {
                 let interval = Duration::from_millis(cleanup_interval_ms);
+
+                // Run after first interval tick.
+                std::thread::sleep(interval);
+
                 loop {
-                    let Some(rl) = rl.upgrade() else { break };
+                    let Some(rl) = rl.upgrade() else {
+                        break;
+                    };
 
                     if !rl.is_loop_running.load(Ordering::SeqCst) {
                         break;
@@ -343,22 +348,22 @@ impl RateLimiter {
             });
         }
 
-        // Redis cleanup depends on feature and runtime availability
-        #[cfg(feature = "redis-tokio")]
+        #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
         {
             let rl = Arc::downgrade(self);
+            crate::runtime::spawn_task(async move {
+                let interval = Duration::from_millis(cleanup_interval_ms);
+                let mut interval = crate::runtime::new_interval(interval);
 
-            tokio::spawn(async move {
-                use std::time::Duration;
-
-                use tokio::time::interval;
-
-                let mut interval = interval(Duration::from_millis(cleanup_interval_ms));
-                interval.tick().await;
+                // Run after first interval tick.
+                crate::runtime::tick(&mut interval).await;
 
                 loop {
-                    interval.tick().await;
-                    let Some(rl) = rl.upgrade() else { break };
+                    crate::runtime::tick(&mut interval).await;
+
+                    let Some(rl) = rl.upgrade() else {
+                        break;
+                    };
 
                     if !rl.is_loop_running.load(Ordering::SeqCst) {
                         break;
@@ -367,58 +372,14 @@ impl RateLimiter {
                     rl.local.cleanup(stale_after_ms);
 
                     if let Err(e) = rl.redis.cleanup(stale_after_ms).await {
-                        tracing::warn!(
-                            error = ?e,
-                            "Redis cleanup failed, will retry"
-                        );
+                        tracing::warn!(error = ?e, "Redis cleanup failed, will retry");
                     }
 
                     if let Err(e) = rl.hybrid.cleanup(stale_after_ms).await {
-                        tracing::warn!(
-                            error = ?e,
-                            "Hybrid cleanup failed, will retry"
-                        );
+                        tracing::warn!(error = ?e, "Hybrid cleanup failed, will retry");
                     }
                 }
             });
-        }
-
-        #[cfg(feature = "redis-smol")]
-        {
-            use smol::Timer;
-            use smol::stream::StreamExt;
-            use std::time::Duration;
-
-            let rl = Arc::downgrade(self);
-            smol::spawn(async move {
-                let mut interval = Timer::interval(Duration::from_millis(cleanup_interval_ms));
-                loop {
-                    interval.next().await;
-
-                    let Some(rl) = rl.upgrade() else { break };
-
-                    if !rl.is_loop_running.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    rl.local.cleanup(stale_after_ms);
-
-                    if let Err(e) = rl.redis.cleanup(stale_after_ms).await {
-                        tracing::warn!(
-                            error = ?e,
-                            "Redis cleanup failed, will retry"
-                        );
-                    }
-
-                    if let Err(e) = rl.hybrid.cleanup(stale_after_ms).await {
-                        tracing::warn!(
-                            error = ?e,
-                            "Hybrid cleanup failed, will retry"
-                        );
-                    }
-                }
-            })
-            .detach();
         }
     } // end method run_cleanup_loop_with_config
 
