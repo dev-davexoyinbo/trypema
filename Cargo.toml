@@ -46,12 +46,7 @@ strum = "0.28.0"
 strum_macros = "0.28.0"
 thiserror = "2.0.18"
 tracing = "0.1.44"
-tokio = { version = "1.49.0", optional = true, features = [
-  "rt",
-  "time",
-  "macros",
-  "rt-multi-thread",
-] }
+tokio = { version = "1.49.0", optional = true, default-features = false }
 smol = { version = "2.0.2", optional = true }
 ahash = "0.8.12"
 
@@ -62,6 +57,11 @@ redis-tokio = [
   "redis/aio",
   "redis/connection-manager",
   "dep:tokio",
+  "tokio/sync",
+  "tokio/rt",
+  "tokio/time",
+  "tokio/macros",
+  "tokio/rt-multi-thread",
 ]
 redis-smol = [
   "redis",
@@ -69,6 +69,8 @@ redis-smol = [
   "redis/aio",
   "redis/connection-manager",
   "dep:smol",
+  "dep:tokio",
+  "tokio/sync",
 ]
 
 [dev-dependencies]
