@@ -36,8 +36,12 @@ fn record_decision(
     }
 }
 
-fn redis_url() -> Option<String> {
-    env::var("REDIS_URL").ok()
+fn redis_url() -> String {
+    env::var("REDIS_URL").unwrap_or_else(|_| {
+        panic!(
+            "REDIS_URL env var must be set for Redis-backed tests (e.g. REDIS_URL=redis://127.0.0.1:16379/)"
+        )
+    })
 }
 
 fn unique_prefix() -> RedisKey {
@@ -81,7 +85,7 @@ async fn build_limiter(
 
 #[test]
 fn rejects_at_exact_window_limit() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 1, 1000).await;
@@ -107,7 +111,7 @@ fn rejects_at_exact_window_limit() {
 
 #[test]
 fn per_key_state_is_independent() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 1, 1000).await;
@@ -137,7 +141,7 @@ fn per_key_state_is_independent() {
 
 #[test]
 fn rate_grouping_merges_within_group_affects_remaining_after_waiting() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 6, 300).await;
@@ -172,7 +176,7 @@ fn rate_grouping_merges_within_group_affects_remaining_after_waiting() {
 
 #[test]
 fn unblocks_after_window_expires() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 1, 1000).await;
@@ -210,7 +214,7 @@ fn unblocks_after_window_expires() {
 
 #[test]
 fn rejected_includes_retry_after_and_remaining_after_waiting() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 6, 200).await;
@@ -250,7 +254,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
 
 #[test]
 fn is_allowed_unknown_key_is_allowed() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 1, 50).await;
@@ -263,7 +267,7 @@ fn is_allowed_unknown_key_is_allowed() {
 
 #[test]
 fn rejected_inc_does_not_consume_capacity() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 1, 1000).await;
@@ -294,7 +298,7 @@ fn rejected_inc_does_not_consume_capacity() {
 
 #[test]
 fn is_allowed_evicts_old_buckets_and_updates_total_count() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 2, 200).await;
@@ -328,7 +332,7 @@ fn is_allowed_evicts_old_buckets_and_updates_total_count() {
 
 #[test]
 fn inc_evicts_expired_buckets_and_total_matches_hash_sum() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 1, 200).await;
@@ -354,7 +358,7 @@ fn inc_evicts_expired_buckets_and_total_matches_hash_sum() {
 
 #[test]
 fn is_allowed_reflects_rejected_after_hitting_limit_then_allows_after_expiry() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 1, 1000).await;
@@ -374,7 +378,7 @@ fn is_allowed_reflects_rejected_after_hitting_limit_then_allows_after_expiry() {
 
 #[test]
 fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 6, 200).await;
@@ -413,7 +417,7 @@ fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
 
 #[test]
 fn is_allowed_returns_allowed_when_below_limit() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 6, 200).await;
@@ -432,7 +436,7 @@ fn is_allowed_returns_allowed_when_below_limit() {
 
 #[test]
 fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let window_size_seconds = 1_u64;
@@ -469,7 +473,7 @@ fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
 
 #[test]
 fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let window_size_seconds = 1_u64;
@@ -531,7 +535,7 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
 
 #[test]
 fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let window_size_seconds = 1_u64;
@@ -580,7 +584,7 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
 
 #[test]
 fn volume_non_integer_rate_uses_truncating_capacity() {
-    let Some(url) = redis_url() else { return };
+    let url = redis_url();
 
     runtime::block_on(async {
         let window_size_seconds = 1_u64;
