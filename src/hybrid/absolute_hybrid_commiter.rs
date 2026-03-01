@@ -106,7 +106,9 @@ impl AbsoluteHybridCommitter {
             let end = (processed + max_batch_size).min(batch.len());
             let chunk = &batch[processed..end];
 
-            redis_proxy.batch_commit_state(chunk).await?;
+            redis_proxy.batch_commit_state(chunk).await.map_err(|err| {
+                TrypemaError::CustomError(format!("Failed to commit state: {err:?}"))
+            })?;
 
             processed = end;
         }

@@ -1,12 +1,13 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use clap::{Parser, ValueEnum};
+use dashmap::DashMap;
 use hdrhistogram::Histogram;
 
 use trypema::local::LocalRateLimiterOptions;
@@ -14,6 +15,72 @@ use trypema::{
     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter,
     RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
 };
+
+#[derive(Default)]
+pub(crate) struct ErrorStats {
+    by_message: DashMap<String, u64>,
+    samples: Mutex<Vec<String>>,
+}
+
+impl ErrorStats {
+    const MAX_SAMPLES: usize = 10;
+
+    pub(crate) fn record(&self, message: String, sample: Option<String>) {
+        self.by_message
+            .entry(message)
+            .and_modify(|c| *c = c.saturating_add(1))
+            .or_insert(1);
+
+        if let Some(sample) = sample {
+            let mut guard = self.samples.lock().expect("error samples mutex poisoned");
+            if guard.len() < Self::MAX_SAMPLES {
+                guard.push(sample);
+            }
+        }
+    }
+
+    pub(crate) fn top_by_message(&self, n: usize) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = self
+            .by_message
+            .iter()
+            .map(|kv| (kv.key().clone(), *kv.value()))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(n);
+        v
+    }
+
+    pub(crate) fn samples(&self) -> Vec<String> {
+        self.samples
+            .lock()
+            .expect("error samples mutex poisoned")
+            .clone()
+    }
+}
+
+pub(crate) fn print_error_stats(errors: u64, stats: &ErrorStats) {
+    if errors == 0 {
+        return;
+    }
+
+    println!("errors_total={errors}");
+
+    let top = stats.top_by_message(10);
+    if !top.is_empty() {
+        println!("errors_by_message_top10:");
+        for (msg, c) in top {
+            println!("error_count={c} error=\"{msg}\"");
+        }
+    }
+
+    let samples = stats.samples();
+    if !samples.is_empty() {
+        println!("errors_samples_first{}:", samples.len());
+        for s in samples {
+            println!("error_sample=\"{s}\"");
+        }
+    }
+}
 
 #[cfg(feature = "redis-tokio")]
 mod redis_compare;
@@ -430,6 +497,8 @@ fn run_redis(args: &Args) {
         .unwrap();
 
     rt.block_on(async move {
+        let error_stats = Arc::new(ErrorStats::default());
+
         if args2.redis_limiter != RedisLimiter::Trypema {
             let limiter = match args2.redis_limiter {
                 RedisLimiter::Cell => redis_compare::RedisLimiter::Cell,
@@ -478,6 +547,7 @@ fn run_redis(args: &Args) {
             let stop = Arc::clone(&stop);
             let counts = Arc::clone(&counts);
             let total_ops = Arc::clone(&total_ops);
+            let error_stats = Arc::clone(&error_stats);
             let args = args2.clone();
             let keys = keys.clone();
 
@@ -557,7 +627,11 @@ fn run_redis(args: &Args) {
                                 counts.suppressed_denied.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        Err(_) => {
+                        Err(err) => {
+                            error_stats.record(
+                                err.to_string(),
+                                Some(format!("provider=redis key={k:?} err={err:?}")),
+                            );
                             counts.errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -580,6 +654,8 @@ fn run_redis(args: &Args) {
         let ops = total_ops.load(Ordering::Relaxed);
         let ops_s = ops as f64 / elapsed.as_secs_f64();
         print_results(&args2, elapsed, ops, ops_s, &merged, &counts);
+
+        print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
     });
 }
 
@@ -600,6 +676,8 @@ fn run_hybrid(args: &Args) {
         .unwrap();
 
     rt.block_on(async move {
+        let error_stats = Arc::new(ErrorStats::default());
+
         let keys = build_keys(&args2);
         let client = redis::Client::open(args2.redis_url.as_str()).unwrap();
         let connection_manager = client.get_connection_manager().await.unwrap();
@@ -635,6 +713,7 @@ fn run_hybrid(args: &Args) {
             let stop = Arc::clone(&stop);
             let counts = Arc::clone(&counts);
             let total_ops = Arc::clone(&total_ops);
+            let error_stats = Arc::clone(&error_stats);
             let args = args2.clone();
             let keys = keys.clone();
 
@@ -706,9 +785,19 @@ fn run_hybrid(args: &Args) {
                         }
                         Ok(RateLimitDecision::Suppressed { .. }) => {
                             // hybrid absolute should not return suppressed
+                            error_stats.record(
+                                "unexpected suppressed decision".to_string(),
+                                Some(format!(
+                                    "provider=hybrid key={k:?} err=unexpected_suppressed"
+                                )),
+                            );
                             counts.errors.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(_) => {
+                        Err(err) => {
+                            error_stats.record(
+                                err.to_string(),
+                                Some(format!("provider=hybrid key={k:?} err={err:?}")),
+                            );
                             counts.errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -731,6 +820,8 @@ fn run_hybrid(args: &Args) {
         let ops = total_ops.load(Ordering::Relaxed);
         let ops_s = ops as f64 / elapsed.as_secs_f64();
         print_results(&args2, elapsed, ops, ops_s, &merged, &counts);
+
+        print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
     });
 }
 

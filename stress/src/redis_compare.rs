@@ -8,7 +8,9 @@ use hdrhistogram::Histogram;
 
 use redis::aio::ConnectionManager;
 
-use crate::{Args, Counts, KeyDist, Mode, qps_for_now, should_sample};
+use crate::{
+    Args, Counts, ErrorStats, KeyDist, Mode, print_error_stats, qps_for_now, should_sample,
+};
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub(crate) enum RedisLimiter {
@@ -35,6 +37,7 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
     let stop = Arc::new(AtomicBool::new(false));
     let counts = Arc::new(Counts::default());
     let total_ops = Arc::new(AtomicU64::new(0));
+    let error_stats = Arc::new(ErrorStats::default());
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(args2.duration_s);
@@ -44,6 +47,7 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
         let stop = Arc::clone(&stop);
         let counts = Arc::clone(&counts);
         let total_ops = Arc::clone(&total_ops);
+        let error_stats = Arc::clone(&error_stats);
         let args = args2.clone();
         let redis_keys = redis_keys.clone();
         let cm = Arc::clone(&cm);
@@ -115,7 +119,7 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
                         let full_key = format!("{}:{}", args.redis_prefix, key);
                         let res: redis::RedisResult<(i64, i64, i64, i64, i64)> =
                             redis::cmd("CL.THROTTLE")
-                                .arg(full_key)
+                                .arg(&full_key)
                                 .arg(max_burst)
                                 .arg(count_per_period)
                                 .arg(period_s)
@@ -131,7 +135,15 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
                                 }
                                 true
                             }
-                            Err(_) => false,
+                            Err(err) => {
+                                error_stats.record(
+                                    err.to_string(),
+                                    Some(format!(
+                                        "provider=redis_compare limiter=cell key={full_key} err={err:?}"
+                                    )),
+                                );
+                                false
+                            }
                         }
                     }
                     RedisLimiter::Gcra => {
@@ -144,7 +156,7 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
                         let cost: u64 = 1;
                         let full_key = format!("{}:{}", args.redis_prefix, key);
                         let res: redis::RedisResult<(i64, f64, String, String)> = gcra_script
-                            .key(full_key)
+                            .key(&full_key)
                             .arg(burst)
                             .arg(rate)
                             .arg(period)
@@ -160,7 +172,15 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
                                 }
                                 true
                             }
-                            Err(_) => false,
+                            Err(err) => {
+                                error_stats.record(
+                                    err.to_string(),
+                                    Some(format!(
+                                        "provider=redis_compare limiter=gcra key={full_key} err={err:?}"
+                                    )),
+                                );
+                                false
+                            }
                         }
                     }
                 };
@@ -195,6 +215,8 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
 
     println!("redis_limiter={:?}", limiter);
     crate::print_results(&args2, elapsed, ops, ops_s, &merged, &counts);
+
+    print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
 }
 
 async fn warmup(args: &Args, cm: &Arc<ConnectionManager>, limiter: RedisLimiter, keys: &[String]) {

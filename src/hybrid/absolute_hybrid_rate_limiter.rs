@@ -121,7 +121,7 @@ impl AbsoluteHybridRateLimiter {
         let commiter_sender = AbsoluteHybridCommitter::run(AbsoluteHybridCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
             channel_capacity: 8192,
-            max_batch_size: 128,
+            max_batch_size: 4,
             limiter_sender: tx,
             redis_proxy: redis_proxy.clone(),
         });
@@ -204,7 +204,8 @@ impl AbsoluteHybridRateLimiter {
         let read_state_result = self
             .redis_proxy
             .read_state(key, *self.window_size_seconds as u128 * 1000)
-            .await?;
+            .await
+            .map_err(|err| TrypemaError::CustomError(format!("Failed to read state: {err:?}")))?;
 
         self.reset_single_state_from_read_result(
             read_state_result,
