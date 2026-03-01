@@ -1,4 +1,7 @@
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+mod runtime;
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 mod test_absolute_hybrid_rate_limiter;
 mod test_absolute_local_rate_limiter;
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]

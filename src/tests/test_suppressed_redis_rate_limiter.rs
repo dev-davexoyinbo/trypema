@@ -1,4 +1,6 @@
-use std::{env, future::Future, time::Duration};
+use std::{env, time::Duration};
+
+use super::runtime;
 
 use crate::common::SuppressionFactorCacheMs;
 use crate::hybrid::SyncIntervalMs;
@@ -6,32 +8,6 @@ use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
     RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
 };
-
-#[cfg(feature = "redis-tokio")]
-fn block_on<F, T>(f: F) -> T
-where
-    F: Future<Output = T>,
-{
-    tokio::runtime::Runtime::new().unwrap().block_on(f)
-}
-
-#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-fn block_on<F, T>(f: F) -> T
-where
-    F: Future<Output = T>,
-{
-    smol::block_on(f)
-}
-
-#[cfg(feature = "redis-tokio")]
-async fn async_sleep(d: Duration) {
-    tokio::time::sleep(d).await;
-}
-
-#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-async fn async_sleep(d: Duration) {
-    smol::Timer::after(d).await;
-}
 
 fn redis_url() -> Option<String> {
     env::var("REDIS_URL").ok()
@@ -104,7 +80,7 @@ async fn build_limiter_with_cache_ms(
 fn get_suppression_factor_fresh_key_returns_zero_and_sets_cache_ttl() {
     let Some(url) = redis_url() else { return };
 
-    block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter_with_cache_ms(&url, 10, 100, 2f64, 500).await;
         let k = key("k");
 
@@ -123,7 +99,7 @@ fn get_suppression_factor_fresh_key_returns_zero_and_sets_cache_ttl() {
 fn get_suppression_factor_computed_uses_last_second_peak_rate_at_threshold_boundary() {
     let Some(url) = redis_url() else { return };
 
-    block_on(async {
+    runtime::block_on(async {
         // window_size=10s, hard_limit_factor=2 => window_limit=20 and threshold is 10.
         // We drive total_count to exactly 10 with a burst in < 1s so perceived_rate uses
         // last-second peak (10 req/s) instead of average (1 req/s).
@@ -164,7 +140,7 @@ fn get_suppression_factor_computed_uses_last_second_peak_rate_at_threshold_bound
 fn get_suppression_factor_evicts_out_of_window_usage_and_resets_admission() {
     let Some(url) = redis_url() else { return };
 
-    block_on(async {
+    runtime::block_on(async {
         let window_size_seconds = 1_u64;
         let cache_ms = 50_u64;
         let rl = build_limiter_with_cache_ms(&url, window_size_seconds, 1000, 2f64, cache_ms).await;
@@ -210,7 +186,7 @@ fn get_suppression_factor_evicts_out_of_window_usage_and_resets_admission() {
 fn suppression_factor_gt_one_is_invalid_and_is_recomputed() {
     let Some(url) = redis_url() else { return };
 
-    block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter(&url, 1, 1000, 10f64).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
@@ -233,7 +209,7 @@ fn suppression_factor_gt_one_is_invalid_and_is_recomputed() {
 fn suppression_factor_negative_is_invalid_and_is_recomputed() {
     let Some(url) = redis_url() else { return };
 
-    block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter(&url, 1, 1000, 10f64).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
@@ -255,7 +231,7 @@ fn suppression_factor_negative_is_invalid_and_is_recomputed() {
 fn verify_suppression_factor_calculation_spread_redis() {
     let Some(url) = redis_url() else { return };
 
-    block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter(&url, 10, 100, 10f64).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
@@ -268,11 +244,11 @@ fn verify_suppression_factor_calculation_spread_redis() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            async_sleep(Duration::from_millis(3000 / 20)).await;
+            runtime::async_sleep(Duration::from_millis(3000 / 20)).await;
         }
 
         // wait for 1.5 seconds
-        async_sleep(Duration::from_millis(1200)).await;
+        runtime::async_sleep(Duration::from_millis(1200)).await;
 
         let expected_suppression_factor = 1f64 - (1f64 / 2f64);
 
@@ -303,7 +279,7 @@ fn verify_suppression_factor_calculation_spread_redis() {
 fn verify_suppression_factor_calculation_last_second_redis() {
     let Some(url) = redis_url() else { return };
 
-    block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter(&url, 10, 100, 10f64).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
@@ -315,7 +291,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
             .await
             .unwrap();
         // wait for 1s to pass
-        async_sleep(Duration::from_millis(1001)).await;
+        runtime::async_sleep(Duration::from_millis(1001)).await;
 
         let _ = rl
             .redis()
@@ -324,7 +300,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
             .await
             .unwrap();
         // Allow time for the suppression_factor to expire
-        async_sleep(Duration::from_millis(101)).await;
+        runtime::async_sleep(Duration::from_millis(101)).await;
 
         let expected_suppression_factor = 1f64 - (1f64 / 20f64);
 
@@ -353,7 +329,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
 fn verify_hard_limit_rejects() {
     let Some(url) = redis_url() else { return };
 
-    block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter(&url, 10, 100, 10f64).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
@@ -365,7 +341,7 @@ fn verify_hard_limit_rejects() {
             .await
             .unwrap();
         // wait for 1s to pass
-        async_sleep(Duration::from_millis(1001)).await;
+        runtime::async_sleep(Duration::from_millis(1001)).await;
 
         let _ = rl
             .redis()

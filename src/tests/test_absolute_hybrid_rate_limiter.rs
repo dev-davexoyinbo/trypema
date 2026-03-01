@@ -1,4 +1,6 @@
-use std::{env, future::Future, thread, time::Duration};
+use std::{env, thread, time::Duration};
+
+use super::runtime;
 
 use crate::common::SuppressionFactorCacheMs;
 use crate::hybrid::SyncIntervalMs;
@@ -9,22 +11,6 @@ use crate::{
 
 fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
     ((window_size_seconds as f64) * **rate_limit) as u64
-}
-
-#[cfg(feature = "redis-tokio")]
-fn block_on<F, T>(f: F) -> T
-where
-    F: Future<Output = T>,
-{
-    tokio::runtime::Runtime::new().unwrap().block_on(f)
-}
-
-#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-fn block_on<F, T>(f: F) -> T
-where
-    F: Future<Output = T>,
-{
-    smol::block_on(f)
 }
 
 fn redis_url() -> String {
@@ -79,7 +65,7 @@ async fn build_limiter_with_prefix(
 fn hybrid_allows_until_capacity_then_rejects() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         let prefix = unique_prefix();
         let window_size_seconds = 1_u64;
         let rate_group_size_ms = 1_000_u64;
@@ -122,7 +108,7 @@ fn hybrid_allows_until_capacity_then_rejects() {
 fn hybrid_absolute_never_returns_suppressed() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 1, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
@@ -146,7 +132,7 @@ fn hybrid_absolute_never_returns_suppressed() {
 fn hybrid_absolute_retry_after_is_bounded_by_min_sync_or_group_when_ttl_unknown() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         let prefix = unique_prefix();
         let window_size_seconds = 1_u64;
         let rate_group_size_ms = 1_000_u64;
@@ -197,7 +183,7 @@ fn hybrid_absolute_retry_after_is_bounded_by_min_sync_or_group_when_ttl_unknown(
 fn hybrid_usage_is_committed_to_redis_on_flush_and_then_visible_to_others() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         // Use a shared prefix so both instances address the same Redis keys.
         let prefix = unique_prefix();
 
@@ -274,7 +260,7 @@ fn hybrid_usage_is_committed_to_redis_on_flush_and_then_visible_to_others() {
 fn hybrid_absolute_does_not_touch_redis_until_commit() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         let prefix = unique_prefix();
 
         let window_size_seconds = 1_u64;
@@ -323,7 +309,7 @@ fn hybrid_absolute_does_not_touch_redis_until_commit() {
 fn hybrid_absolute_unblocks_after_window_expires() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         let prefix = unique_prefix();
 
         let window_size_seconds = 1_u64;
@@ -385,7 +371,7 @@ fn hybrid_absolute_unblocks_after_window_expires() {
 fn hybrid_absolute_per_key_state_is_independent() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 1, 1000, 25, unique_prefix()).await;
 
         let a = key("a");
@@ -427,7 +413,7 @@ fn hybrid_absolute_per_key_state_is_independent() {
 fn hybrid_absolute_prefix_isolation() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         let window_size_seconds = 1_u64;
         let rate_group_size_ms = 1_000_u64;
         let sync_interval_ms = 25_u64;
@@ -486,7 +472,7 @@ fn hybrid_absolute_prefix_isolation() {
 fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_from_redis() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         let prefix = unique_prefix();
 
         let window_size_seconds = 6_u64;
@@ -561,7 +547,7 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
 fn hybrid_absolute_remaining_after_waiting_differs_when_buckets_are_separate() {
     let url = redis_url();
 
-    block_on(async {
+    runtime::block_on(async {
         let prefix = unique_prefix();
 
         let window_size_seconds = 6_u64;
@@ -635,8 +621,7 @@ fn hybrid_absolute_remaining_after_waiting_differs_when_buckets_are_separate() {
 fn hybrid_absolute_concurrent_tokio_smoke_does_not_panic() {
     let url = redis_url();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 1, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
@@ -673,7 +658,7 @@ fn hybrid_absolute_concurrent_tokio_smoke_does_not_panic() {
 fn hybrid_absolute_concurrent_smol_smoke_does_not_panic() {
     let url = redis_url();
 
-    smol::block_on(async {
+    runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 1, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
