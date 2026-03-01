@@ -23,6 +23,16 @@ where
     smol::block_on(f)
 }
 
+#[cfg(feature = "redis-tokio")]
+async fn async_sleep(d: Duration) {
+    tokio::time::sleep(d).await;
+}
+
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+async fn async_sleep(d: Duration) {
+    smol::Timer::after(d).await;
+}
+
 fn redis_url() -> Option<String> {
     env::var("REDIS_URL").ok()
 }
@@ -258,11 +268,11 @@ fn verify_suppression_factor_calculation_spread_redis() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(3000 / 20)).await;
+            async_sleep(Duration::from_millis(3000 / 20)).await;
         }
 
         // wait for 1.5 seconds
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        async_sleep(Duration::from_millis(1200)).await;
 
         let expected_suppression_factor = 1f64 - (1f64 / 2f64);
 
@@ -305,7 +315,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
             .await
             .unwrap();
         // wait for 1s to pass
-        tokio::time::sleep(Duration::from_millis(1001)).await;
+        async_sleep(Duration::from_millis(1001)).await;
 
         let _ = rl
             .redis()
@@ -314,7 +324,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
             .await
             .unwrap();
         // Allow time for the suppression_factor to expire
-        tokio::time::sleep(Duration::from_millis(101)).await;
+        async_sleep(Duration::from_millis(101)).await;
 
         let expected_suppression_factor = 1f64 - (1f64 / 20f64);
 
@@ -355,7 +365,7 @@ fn verify_hard_limit_rejects() {
             .await
             .unwrap();
         // wait for 1s to pass
-        tokio::time::sleep(Duration::from_millis(1001)).await;
+        async_sleep(Duration::from_millis(1001)).await;
 
         let _ = rl
             .redis()

@@ -102,7 +102,7 @@ pub(crate) fn run(args2: Args) {
     // Shared limiter state
     let trypema_rl = if args.local_limiter == LocalLimiter::Trypema {
         Some({
-            #[cfg(not(feature = "redis-tokio"))]
+            #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
             {
                 Arc::new(trypema::RateLimiter::new(trypema::RateLimiterOptions {
                     local: crate::build_local_options(&args),
@@ -112,22 +112,34 @@ pub(crate) fn run(args2: Args) {
             // When built with redis support, RateLimiterOptions requires a Redis config.
             // Local comparisons still run against the local provider, but we satisfy the
             // struct shape by opening a connection manager (same approach as stress/src/main.rs).
-            #[cfg(feature = "redis-tokio")]
+            #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
             {
                 use trypema::redis::{RedisKey, RedisRateLimiterOptions};
                 use trypema::{
                     HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds,
                 };
 
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
+                #[cfg(feature = "redis-tokio")]
+                let connection_manager = {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        let client = redis::Client::open(args.redis_url.as_str()).unwrap();
+                        client.get_connection_manager().await.unwrap()
+                    })
+                };
 
-                rt.block_on(async {
-                    let client = redis::Client::open(args.redis_url.as_str()).unwrap();
-                    let connection_manager = client.get_connection_manager().await.unwrap();
+                #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+                let connection_manager = {
+                    smol::block_on(async {
+                        let client = redis::Client::open(args.redis_url.as_str()).unwrap();
+                        client.get_connection_manager().await.unwrap()
+                    })
+                };
 
+                {
                     Arc::new(trypema::RateLimiter::new(trypema::RateLimiterOptions {
                         local: crate::build_local_options(&args),
                         redis: RedisRateLimiterOptions {
@@ -145,7 +157,7 @@ pub(crate) fn run(args2: Args) {
                             sync_interval_ms: trypema::hybrid::SyncIntervalMs::default(),
                         },
                     }))
-                })
+                }
             }
         })
     } else {

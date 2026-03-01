@@ -1,6 +1,6 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion};
 
-#[cfg(feature = "redis-tokio")]
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 mod enabled {
     use std::{env, sync::Arc, time::Duration};
 
@@ -10,9 +10,23 @@ mod enabled {
     use trypema::local::LocalRateLimiterOptions;
     use trypema::redis::{RedisKey, RedisRateLimiterOptions};
     use trypema::{
-        HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions,
-        SuppressionFactorCacheMs, WindowSizeSeconds,
+        hybrid::SyncIntervalMs, HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter,
+        RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
     };
+
+    #[cfg(feature = "redis-tokio")]
+    macro_rules! block_on {
+        ($rt:expr, $fut:expr) => {
+            $rt.block_on($fut)
+        };
+    }
+
+    #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+    macro_rules! block_on {
+        ($rt:expr, $fut:expr) => {
+            smol::block_on($fut)
+        };
+    }
 
     fn redis_url() -> String {
         env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379/".to_string())
@@ -22,13 +36,17 @@ mod enabled {
         let mut group = c.benchmark_group("redis_absolute");
         group.sample_size(50);
 
+        #[cfg(feature = "redis-tokio")]
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
             .build()
             .unwrap();
 
-        let rl = rt.block_on(async {
+        #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+        let rt = ();
+
+        let rl = block_on!(rt, async {
             let client = redis::Client::open(redis_url()).unwrap();
             let connection_manager = client.get_connection_manager().await.unwrap();
 
@@ -46,6 +64,7 @@ mod enabled {
                     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
                     hard_limit_factor: HardLimitFactor::default(),
                     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                    sync_interval_ms: SyncIntervalMs::default(),
                 },
             }))
         });
@@ -54,13 +73,13 @@ mod enabled {
         let rate = RateLimit::max();
 
         // Ensure connection is warm.
-        rt.block_on(async {
+        block_on!(rt, async {
             let _ = rl.redis().absolute().inc(&key, &rate, 1).await.unwrap();
         });
 
         group.bench_function("inc/hot_key", |b| {
             b.iter(|| {
-                let _ = rt.block_on(async {
+                let _ = block_on!(rt, async {
                     let res = rl
                         .redis()
                         .absolute()
@@ -73,7 +92,7 @@ mod enabled {
 
         group.bench_function("is_allowed/hot_key", |b| {
             b.iter(|| {
-                let _ = rt.block_on(async {
+                let _ = block_on!(rt, async {
                     let res = rl.redis().absolute().is_allowed(black_box(&key)).await;
                     black_box(res)
                 });
@@ -86,12 +105,12 @@ mod enabled {
     }
 }
 
-#[cfg(feature = "redis-tokio")]
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 fn bench_inc(c: &mut Criterion) {
     enabled::bench_inc(c)
 }
 
-#[cfg(not(feature = "redis-tokio"))]
+#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 fn bench_inc(_: &mut Criterion) {}
 
 criterion_group!(benches, bench_inc);

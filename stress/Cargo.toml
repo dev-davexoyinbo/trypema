@@ -15,12 +15,13 @@ dashmap = "6.1.0"
 governor = "0.10.4"
 
 tokio = { version = "1.49.0", optional = true, features = ["rt-multi-thread", "time"] }
+smol = { version = "2.0.2", optional = true }
 redis = { version = "1.0.4", optional = true, default-features = false, features = [
   "aio",
-  "tokio-comp",
   "connection-manager",
 ] }
 
 [features]
 default = []
-redis-tokio = ["dep:tokio", "dep:redis", "trypema/redis-tokio"]
+redis-tokio = ["dep:tokio", "dep:redis", "redis/tokio-comp", "trypema/redis-tokio"]
+redis-smol = ["dep:smol", "dep:redis", "redis/smol-comp", "trypema/redis-smol"]
