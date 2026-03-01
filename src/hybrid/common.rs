@@ -13,9 +13,9 @@ pub enum RedisRateLimiterSignal {
 pub struct SyncIntervalMs(u64);
 
 impl Default for SyncIntervalMs {
-    /// Returns a sync interval of 10 ms.
+    /// Returns a sync interval of 50 ms.
     fn default() -> Self {
-        Self(10)
+        Self(50)
     }
 }
 

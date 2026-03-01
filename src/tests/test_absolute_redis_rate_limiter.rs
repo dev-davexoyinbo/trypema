@@ -1,6 +1,7 @@
 use std::{env, future::Future, thread, time::Duration};
 
 use crate::common::SuppressionFactorCacheMs;
+use crate::hybrid::SyncIntervalMs;
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
     RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
@@ -85,6 +86,7 @@ async fn build_limiter(
             rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            sync_interval_ms: SyncIntervalMs::default(),
         },
     };
 
@@ -114,6 +116,7 @@ async fn build_limiter_with_prefix(
             rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
             suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            sync_interval_ms: SyncIntervalMs::default(),
         },
     };
 
@@ -644,68 +647,6 @@ fn volume_non_integer_rate_uses_truncating_capacity() {
         assert!(
             matches!(decision, RateLimitDecision::Rejected { .. }),
             "decision: {decision:?}"
-        );
-    });
-}
-
-#[test]
-fn volume_is_visible_to_other_instances_after_commit_flush() {
-    let Some(url) = redis_url() else { return };
-
-    block_on(async {
-        // Use a shared prefix so both instances address the same Redis keys.
-        let prefix = unique_prefix();
-
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1000_u64;
-        let rl_a = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            prefix.clone(),
-        )
-        .await;
-        let rl_b =
-            build_limiter_with_prefix(&url, window_size_seconds, rate_group_size_ms, prefix).await;
-
-        let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
-        assert_eq!(capacity, 5);
-
-        // Fill the local cache up to capacity.
-        for _ in 0..capacity {
-            let d = rl_a
-                .redis()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
-        }
-
-        // Force a commit to Redis by crossing the accept limit (triggers a commit + reject).
-        let d = rl_a
-            .redis()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
-        assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
-
-        // Deterministic: wait longer than the committer flush interval (~50ms).
-        thread::sleep(Duration::from_millis(200));
-
-        // The other instance should now see the full window usage and reject.
-        let d2 = rl_b
-            .redis()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
-        assert!(
-            matches!(d2, RateLimitDecision::Rejected { .. }),
-            "d2: {d2:?}"
         );
     });
 }

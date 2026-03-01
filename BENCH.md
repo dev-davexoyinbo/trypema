@@ -107,6 +107,7 @@ cargo run --release -p trypema-stress --features redis-tokio -- \
 This suite benchmarks three Redis-backed limiters using the same harness:
 
 - `trypema` Redis provider (Lua scripts)
+- `trypema` hybrid provider (local counters + Redis sync)
 - `redis-cell` module (`CL.THROTTLE`)
 - GCRA Lua script (equivalent to go-redis/redis_rate `allowN`)
 

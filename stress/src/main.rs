@@ -24,6 +24,7 @@ mod local_compare;
 enum Provider {
     Local,
     Redis,
+    Hybrid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
@@ -312,6 +313,7 @@ fn run_local(args: &Args) {
                         args.suppression_cache_ms,
                     )
                     .unwrap(),
+                    sync_interval_ms: trypema::hybrid::SyncIntervalMs::default(),
                 },
             }))
         })
@@ -459,6 +461,7 @@ fn run_redis(args: &Args) {
                     args2.suppression_cache_ms,
                 )
                 .unwrap(),
+                sync_interval_ms: trypema::hybrid::SyncIntervalMs::default(),
             },
         }));
 
@@ -580,6 +583,165 @@ fn run_redis(args: &Args) {
     });
 }
 
+#[cfg(feature = "redis-tokio")]
+fn run_hybrid(args: &Args) {
+    use trypema::redis::{RedisKey, RedisRateLimiterOptions};
+
+    if args.strategy != Strategy::Absolute {
+        eprintln!("hybrid provider currently supports: --strategy absolute");
+        std::process::exit(2);
+    }
+
+    let args2 = args.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(args2.threads.max(2))
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        let keys = build_keys(&args2);
+        let client = redis::Client::open(args2.redis_url.as_str()).unwrap();
+        let connection_manager = client.get_connection_manager().await.unwrap();
+
+        let rate = RateLimit::try_from(args2.rate_limit_per_s).unwrap();
+
+        let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
+            local: build_local_options(&args2),
+            redis: RedisRateLimiterOptions {
+                connection_manager,
+                prefix: Some(RedisKey::try_from(args2.redis_prefix.clone()).unwrap()),
+                window_size_seconds: WindowSizeSeconds::try_from(args2.window_s).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(args2.group_ms).unwrap(),
+                hard_limit_factor: HardLimitFactor::try_from(args2.hard_limit_factor).unwrap(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
+                    args2.suppression_cache_ms,
+                )
+                .unwrap(),
+                sync_interval_ms: trypema::hybrid::SyncIntervalMs::default(),
+            },
+        }));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let counts = Arc::new(Counts::default());
+        let total_ops = Arc::new(AtomicU64::new(0));
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(args2.duration_s);
+
+        let mut join = Vec::with_capacity(args2.threads);
+        for t in 0..args2.threads {
+            let rl = Arc::clone(&rl);
+            let stop = Arc::clone(&stop);
+            let counts = Arc::clone(&counts);
+            let total_ops = Arc::clone(&total_ops);
+            let args = args2.clone();
+            let keys = keys.clone();
+
+            join.push(tokio::spawn(async move {
+                let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+                let mut i = 0_u64;
+                let mut seed = (t as u64 + 1) * 0xD134_2543_DE82_EF95;
+                let mut next_deadline = Instant::now();
+
+                let mut rng_u64 = || {
+                    seed ^= seed >> 12;
+                    seed ^= seed << 25;
+                    seed ^= seed >> 27;
+                    seed = seed.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                    seed
+                };
+
+                let redis_keys: Vec<RedisKey> = keys
+                    .iter()
+                    .map(|k| RedisKey::try_from(k.to_string()).unwrap())
+                    .collect();
+
+                while !stop.load(Ordering::Relaxed) {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+
+                    if let Some(qps) = qps_for_now(&args, started) {
+                        let per_op_ns = 1_000_000_000u64 / qps.max(1);
+                        let now = Instant::now();
+                        if now < next_deadline {
+                            tokio::time::sleep(next_deadline - now).await;
+                        }
+                        next_deadline += Duration::from_nanos(per_op_ns);
+                    }
+
+                    i = i.wrapping_add(1);
+                    let idx = match args.key_dist {
+                        KeyDist::Hot => 0,
+                        KeyDist::Uniform => (rng_u64() as usize) % redis_keys.len(),
+                        KeyDist::Skewed => {
+                            let r = (rng_u64() % 10_000) as f64 / 10_000.0;
+                            if r < args.hot_fraction {
+                                0
+                            } else {
+                                let tail = redis_keys.len().saturating_sub(1).max(1);
+                                1 + ((rng_u64() as usize) % tail)
+                            }
+                        }
+                    };
+                    let k = &redis_keys[idx % redis_keys.len()];
+                    let sample = should_sample(i, args.sample_every);
+                    let t0 = if sample { Some(Instant::now()) } else { None };
+
+                    let res = rl.hybrid().absolute().inc(k, &rate, 1).await;
+
+                    if let Some(t0) = t0 {
+                        let us = t0.elapsed().as_micros() as u64;
+                        let _ = hist.record(us.max(1));
+                    }
+
+                    total_ops.fetch_add(1, Ordering::Relaxed);
+                    match res {
+                        Ok(RateLimitDecision::Allowed) => {
+                            counts.allowed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(RateLimitDecision::Rejected { .. }) => {
+                            counts.rejected.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(RateLimitDecision::Suppressed { .. }) => {
+                            // hybrid absolute should not return suppressed
+                            counts.errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            counts.errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+
+                hist
+            }));
+        }
+
+        tokio::time::sleep(Duration::from_secs(args2.duration_s)).await;
+        stop.store(true, Ordering::Relaxed);
+
+        let mut merged = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+        for j in join {
+            let hist = j.await.unwrap();
+            merged.add(&hist).unwrap();
+        }
+
+        let elapsed = started.elapsed();
+        let ops = total_ops.load(Ordering::Relaxed);
+        let ops_s = ops as f64 / elapsed.as_secs_f64();
+        print_results(&args2, elapsed, ops, ops_s, &merged, &counts);
+    });
+}
+
+#[cfg(not(feature = "redis-tokio"))]
+fn run_hybrid(_: &Args) {
+    eprintln!(
+        "hybrid provider requires: cargo run -p trypema-stress --features redis-tokio -- ..."
+    );
+    std::process::exit(2);
+}
+
 #[cfg(not(feature = "redis-tokio"))]
 fn run_redis(_: &Args) {
     eprintln!("redis provider requires: cargo run -p trypema-stress --features redis-tokio -- ...");
@@ -591,5 +753,6 @@ fn main() {
     match args.provider {
         Provider::Local => run_local(&args),
         Provider::Redis => run_redis(&args),
+        Provider::Hybrid => run_hybrid(&args),
     }
 }

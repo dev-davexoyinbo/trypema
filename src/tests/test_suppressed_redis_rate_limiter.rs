@@ -1,6 +1,7 @@
 use std::{env, future::Future, time::Duration};
 
 use crate::common::SuppressionFactorCacheMs;
+use crate::hybrid::SyncIntervalMs;
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
     RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
@@ -82,6 +83,7 @@ async fn build_limiter_with_cache_ms(
                 suppression_factor_cache_ms,
             )
             .unwrap(),
+            sync_interval_ms: SyncIntervalMs::default(),
         },
     };
 

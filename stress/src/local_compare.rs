@@ -142,6 +142,7 @@ pub(crate) fn run(args2: Args) {
                                 args.suppression_cache_ms,
                             )
                             .unwrap(),
+                            sync_interval_ms: trypema::hybrid::SyncIntervalMs::default(),
                         },
                     }))
                 })

@@ -17,7 +17,7 @@ use crate::{
     common::RateType,
     hybrid::{
         AbsoluteHybridCommit, AbsoluteHybridCommitter, AbsoluteHybridCommitterOptions,
-        AbsoluteHybridCommitterSignal,
+        AbsoluteHybridCommitterSignal, SyncIntervalMs,
         absolute_hybrid_redis_proxy::{
             AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyReadStateResult,
         },
@@ -106,6 +106,7 @@ pub struct AbsoluteHybridRateLimiter {
 
     // ...
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
+    sync_interval_ms: SyncIntervalMs,
 }
 
 impl AbsoluteHybridRateLimiter {
@@ -135,6 +136,7 @@ impl AbsoluteHybridRateLimiter {
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::new(),
+            sync_interval_ms: options.sync_interval_ms,
         };
 
         let limiter = Arc::new(limiter);
@@ -307,7 +309,8 @@ impl AbsoluteHybridRateLimiter {
         if current_total_count.saturating_add(check_count) > new_window_limit {
             let new_ttl_ms = read_state_result
                 .last_rate_group_ttl
-                .unwrap_or(self.window_size_ms as u64);
+                .unwrap_or((*self.sync_interval_ms).min(*self.rate_group_size_ms));
+
             let new_count_after_release = read_state_result.current_total_count;
 
             if let AbsoluteRedisLimitingState::Rejecting {
@@ -469,7 +472,7 @@ impl AbsoluteHybridRateLimiter {
                 let last_rate_group_ttl: u128 =
                     (*lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")?)
                         .map(|el| el as u128)
-                        .unwrap_or(self.window_size_ms);
+                        .unwrap_or((*self.sync_interval_ms).min(*self.rate_group_size_ms) as u128);
                 let elapsed = lock(time_instant, "accepting.time_instant")?
                     .elapsed()
                     .as_millis();

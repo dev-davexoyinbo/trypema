@@ -2,12 +2,13 @@
 	test-redis test redis-up redis-down \
 	bench-local bench-redis bench \
 	stress \
-	stress-local stress-redis \
+	stress-local stress-redis stress-hybrid \
 	stress-local-hot stress-local-uniform stress-local-burst \
 	stress-local-uniform-matrix \
 	stress-redis-hot stress-redis-skew \
+	stress-hybrid-hot stress-hybrid-skew \
 	stress-redis-compare \
-	stress-local-compare
+	stress-local-compare \
 	stress-help
 
 REDIS_PORT ?= 16379
@@ -55,7 +56,9 @@ stress-local: stress-local-hot stress-local-uniform stress-local-burst
 
 stress-redis: stress-redis-hot stress-redis-skew
 
-stress: stress-local stress-redis
+stress-hybrid: stress-hybrid-hot stress-hybrid-skew
+
+stress: stress-local stress-redis stress-hybrid
 
 stress-local-hot:
 	@cargo run --release -p trypema-stress -- \
@@ -143,34 +146,75 @@ stress-redis-skew:
 		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
 		--duration-s 120 --redis-url "$(REDIS_URL)" --redis-prefix stress
 
-stress-redis-compare:
+stress-hybrid-hot:
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
 	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider hybrid --strategy absolute --threads 16 \
+		--key-dist hot --duration-s 60 --redis-url "$(REDIS_URL)" --redis-prefix stresshybrid
+
+stress-hybrid-skew:
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider hybrid --strategy absolute --threads 16 \
+		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
+		--duration-s 120 --redis-url "$(REDIS_URL)" --redis-prefix stresshybrid
+
+stress-redis-compare:
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	printf "\n\n== redis compare: trypema (redis provider) hot absolute rate=1000 ==\n"; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema; \
+	printf "\n\n== redis compare: trypema (hybrid provider) hot absolute rate=1000 ==\n"; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider hybrid --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000; \
+	printf "\n\n== redis compare: trypema (redis provider) hot suppressed rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema; \
+	printf "\n\n== redis compare: redis-cell hot absolute rate=1000 burst=15 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter cell --cell-burst 15; \
+	printf "\n\n== redis compare: gcra hot absolute rate=1000 burst=15 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter gcra --gcra-burst 15; \
+	printf "\n\n== redis compare: trypema (redis provider) uniform(key_space=100000) absolute rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema; \
+	printf "\n\n== redis compare: trypema (hybrid provider) uniform(key_space=100000) absolute rate=1e9 ==\n"; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider hybrid --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000; \
+	printf "\n\n== redis compare: trypema (redis provider) uniform(key_space=100000) suppressed rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema; \
+	printf "\n\n== redis compare: redis-cell uniform(key_space=100000) absolute rate=1e9 burst=1e6 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter cell --cell-burst 1000000; \
+	printf "\n\n== redis compare: gcra uniform(key_space=100000) absolute rate=1e9 burst=1e6 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter gcra --gcra-burst 1000000
+
+stress-redis-xxx:
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+		--provider hybrid --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000
 
 stress-local-compare:
 	@set -e; \

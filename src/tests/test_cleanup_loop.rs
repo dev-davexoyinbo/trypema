@@ -1,5 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
+#[cfg(feature = "redis-tokio")]
+use crate::hybrid::SyncIntervalMs;
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimiter,
     RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
@@ -195,6 +197,7 @@ fn test_redis_cleanup_loop_with_tokio() {
                 rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
                 suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                sync_interval_ms: SyncIntervalMs::default(),
             },
         };
 
@@ -253,6 +256,7 @@ fn test_redis_stop_cleanup_loop_prevents_cleanup() {
                 rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
                 suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                sync_interval_ms: SyncIntervalMs::default(),
             },
         };
 
