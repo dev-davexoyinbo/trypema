@@ -208,14 +208,6 @@ stress-redis-compare:
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
 		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter gcra --gcra-burst 1000000
 
-stress-redis-xxx:
-	@set -e; \
-	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
-	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider hybrid --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000
-
 stress-local-compare:
 	@set -e; \
 	cargo run --release -p trypema-stress -- \

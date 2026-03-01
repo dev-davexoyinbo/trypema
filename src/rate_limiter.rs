@@ -325,6 +325,7 @@ impl RateLimiter {
         }
 
         // Always spawn local cleanup (sync, no runtime needed)
+        #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
         {
             let rl = Arc::downgrade(self);
             std::thread::spawn(move || {
@@ -363,6 +364,8 @@ impl RateLimiter {
                         break;
                     }
 
+                    rl.local.cleanup(stale_after_ms);
+
                     if let Err(e) = rl.redis.cleanup(stale_after_ms).await {
                         tracing::warn!(
                             error = ?e,
@@ -397,6 +400,8 @@ impl RateLimiter {
                     if !rl.is_loop_running.load(Ordering::SeqCst) {
                         break;
                     }
+
+                    rl.local.cleanup(stale_after_ms);
 
                     if let Err(e) = rl.redis.cleanup(stale_after_ms).await {
                         tracing::warn!(
