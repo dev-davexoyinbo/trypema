@@ -3,9 +3,18 @@ use redis::{Script, aio::ConnectionManager};
 use crate::{
     TrypemaError,
     common::RateType,
-    hybrid::SuppressedHybridCommit,
-    redis::{RedisKey, RedisKeyGenerator, RedisProxyCommitter},
+    hybrid::RedisProxyCommitter,
+    redis::{RedisKey, RedisKeyGenerator},
 };
+
+#[derive(Debug)]
+pub(crate) struct SuppressedHybridCommit {
+    pub key: RedisKey,
+    pub window_size_seconds: u64,
+    pub window_limit: u64,
+    pub rate_group_size_ms: u64,
+    pub count: u64,
+}
 
 const COMMIT_STATE_SCRIPT: &str = r#"
     local time_array = redis.call("TIME")

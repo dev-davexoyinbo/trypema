@@ -1,7 +1,7 @@
-mod absolute_hybrid_commiter;
 mod absolute_hybrid_rate_limiter;
 mod absolute_hybrid_redis_proxy;
-pub(crate) use absolute_hybrid_commiter::*;
+mod redis_commiter;
+pub(crate) use redis_commiter::*;
 
 mod common;
 pub use common::*;

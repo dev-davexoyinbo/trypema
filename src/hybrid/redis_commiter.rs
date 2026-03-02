@@ -2,30 +2,12 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::redis::{RedisProxyCommitter, tick};
+use crate::redis::tick;
 use crate::{
     TrypemaError,
     hybrid::common::RedisRateLimiterSignal,
-    redis::{RedisKey, new_interval, spawn_task},
+    redis::{new_interval, spawn_task},
 };
-
-#[derive(Debug)]
-pub(crate) struct AbsoluteHybridCommit {
-    pub key: RedisKey,
-    pub window_size_seconds: u64,
-    pub window_limit: u64,
-    pub rate_group_size_ms: u64,
-    pub count: u64,
-}
-
-#[derive(Debug)]
-pub(crate) struct SuppressedHybridCommit {
-    pub key: RedisKey,
-    pub window_size_seconds: u64,
-    pub window_limit: u64,
-    pub rate_group_size_ms: u64,
-    pub count: u64,
-}
 
 pub(crate) struct AbsoluteHybridCommitterOptions<T> {
     pub sync_interval: Duration,
@@ -45,9 +27,17 @@ impl<T> From<T> for AbsoluteHybridCommitterSignal<T> {
     }
 }
 
-pub(crate) struct AbsoluteHybridCommitter;
+#[async_trait::async_trait]
+pub(crate) trait RedisProxyCommitter<CommitType>
+where
+    CommitType: Send + Sync,
+{
+    async fn batch_commit_state(&self, commits: &[CommitType]) -> Result<(), TrypemaError>;
+}
 
-impl AbsoluteHybridCommitter {
+pub(crate) struct RedisCommitter;
+
+impl RedisCommitter {
     pub fn run<T>(
         options: AbsoluteHybridCommitterOptions<T>,
     ) -> mpsc::Sender<AbsoluteHybridCommitterSignal<T>>

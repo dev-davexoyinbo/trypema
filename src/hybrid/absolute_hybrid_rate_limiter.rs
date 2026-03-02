@@ -16,10 +16,10 @@ use crate::{
     RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
     common::RateType,
     hybrid::{
-        AbsoluteHybridCommit, AbsoluteHybridCommitter, AbsoluteHybridCommitterOptions,
-        AbsoluteHybridCommitterSignal, SyncIntervalMs,
+        AbsoluteHybridCommitterOptions, AbsoluteHybridCommitterSignal, RedisCommitter,
+        SyncIntervalMs,
         absolute_hybrid_redis_proxy::{
-            AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyReadStateResult,
+            AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyReadStateResult,
         },
         common::RedisRateLimiterSignal,
     },
@@ -119,7 +119,7 @@ impl AbsoluteHybridRateLimiter {
         let redis_proxy =
             AbsoluteHybridRedisProxy::new(prefix.clone(), options.connection_manager.clone());
 
-        let commiter_sender = AbsoluteHybridCommitter::run(AbsoluteHybridCommitterOptions {
+        let commiter_sender = RedisCommitter::run(AbsoluteHybridCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
             channel_capacity: 8192,
             max_batch_size: 4,

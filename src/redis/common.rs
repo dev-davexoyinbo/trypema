@@ -2,14 +2,6 @@ use std::ops::{Deref, DerefMut};
 
 use crate::{TrypemaError, common::RateType};
 
-#[async_trait::async_trait]
-pub(crate) trait RedisProxyCommitter<CommitType>
-where
-    CommitType: Send + Sync,
-{
-    async fn batch_commit_state(&self, commits: &[CommitType]) -> Result<(), TrypemaError>;
-}
-
 /// A validated newtype for Redis keys.
 ///
 /// This is a string with the following constraints:
