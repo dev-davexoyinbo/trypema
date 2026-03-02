@@ -3,7 +3,7 @@ use redis::{Script, aio::ConnectionManager};
 use crate::{
     TrypemaError,
     common::RateType,
-    hybrid::AbsoluteHybridCommit,
+    hybrid::SuppressedHybridCommit,
     redis::{RedisKey, RedisKeyGenerator, RedisProxyCommitter},
 };
 
@@ -119,7 +119,7 @@ const READ_STATE_SCRIPT: &str = r#"
 "#;
 
 #[derive(Debug)]
-pub(crate) struct AbsoluteHybridRedisProxyReadStateResult {
+pub(crate) struct SuppressedHybridRedisProxyReadStateResult {
     pub key: RedisKey,
     pub current_total_count: u64,
     pub window_limit: Option<u64>,
@@ -128,7 +128,7 @@ pub(crate) struct AbsoluteHybridRedisProxyReadStateResult {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AbsoluteHybridRedisProxy {
+pub(crate) struct SuppressedHybridRedisProxy {
     key_generator: RedisKeyGenerator,
     read_state_script: Script,
     commit_state_script: Script,
@@ -136,10 +136,10 @@ pub(crate) struct AbsoluteHybridRedisProxy {
 }
 
 #[async_trait::async_trait]
-impl RedisProxyCommitter<AbsoluteHybridCommit> for AbsoluteHybridRedisProxy {
+impl RedisProxyCommitter<SuppressedHybridCommit> for SuppressedHybridRedisProxy {
     async fn batch_commit_state(
-        self: &AbsoluteHybridRedisProxy,
-        commits: &[AbsoluteHybridCommit],
+        self: &SuppressedHybridRedisProxy,
+        commits: &[SuppressedHybridCommit],
     ) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
@@ -169,10 +169,10 @@ impl RedisProxyCommitter<AbsoluteHybridCommit> for AbsoluteHybridRedisProxy {
     } // end method batch_commit_state
 }
 
-impl AbsoluteHybridRedisProxy {
+impl SuppressedHybridRedisProxy {
     pub(crate) fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
-            key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
+            key_generator: RedisKeyGenerator::new(prefix, RateType::Suppressed),
             read_state_script: Script::new(READ_STATE_SCRIPT),
             commit_state_script: Script::new(COMMIT_STATE_SCRIPT),
             connection_manager,
@@ -180,10 +180,10 @@ impl AbsoluteHybridRedisProxy {
     }
 
     pub(crate) async fn read_state(
-        self: &AbsoluteHybridRedisProxy,
+        self: &SuppressedHybridRedisProxy,
         key: &RedisKey,
         window_size_ms: u128,
-    ) -> Result<AbsoluteHybridRedisProxyReadStateResult, TrypemaError> {
+    ) -> Result<SuppressedHybridRedisProxyReadStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
         let res: (String, u64, i64, i64, i64) = self
@@ -203,7 +203,7 @@ impl AbsoluteHybridRedisProxy {
     #[inline]
     fn build_commit_pipeline(
         &self,
-        commits: &[AbsoluteHybridCommit],
+        commits: &[SuppressedHybridCommit],
         should_load_script: bool,
     ) -> redis::Pipeline {
         let mut pipe = redis::Pipeline::new();
@@ -231,10 +231,10 @@ impl AbsoluteHybridRedisProxy {
     }
 
     pub(crate) async fn batch_read_state(
-        self: &AbsoluteHybridRedisProxy,
+        self: &SuppressedHybridRedisProxy,
         keys: &Vec<RedisKey>,
         window_size_ms: u128,
-    ) -> Result<Vec<AbsoluteHybridRedisProxyReadStateResult>, TrypemaError> {
+    ) -> Result<Vec<SuppressedHybridRedisProxyReadStateResult>, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
         let pipe = self.build_read_pipeline(keys, window_size_ms, false);
@@ -265,7 +265,7 @@ impl AbsoluteHybridRedisProxy {
             }
         };
 
-        let results: Vec<AbsoluteHybridRedisProxyReadStateResult> = results
+        let results: Vec<SuppressedHybridRedisProxyReadStateResult> = results
             .into_iter()
             .map(map_redis_read_result_to_state)
             .collect();
@@ -303,12 +303,12 @@ impl AbsoluteHybridRedisProxy {
 
 fn map_redis_read_result_to_state(
     (entity, total_count, window_limit, oldest_ttl, oldest_count): (String, u64, i64, i64, i64),
-) -> AbsoluteHybridRedisProxyReadStateResult {
+) -> SuppressedHybridRedisProxyReadStateResult {
     fn map_negative_to_none(value: i64) -> Option<u64> {
         if value < 0 { None } else { Some(value as u64) }
     }
 
-    AbsoluteHybridRedisProxyReadStateResult {
+    SuppressedHybridRedisProxyReadStateResult {
         key: RedisKey::from(entity),
         current_total_count: total_count,
         window_limit: map_negative_to_none(window_limit),

@@ -2,12 +2,10 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::redis::tick;
+use crate::redis::{RedisProxyCommitter, tick};
 use crate::{
     TrypemaError,
-    hybrid::{
-        absolute_hybrid_redis_proxy::AbsoluteHybridRedisProxy, common::RedisRateLimiterSignal,
-    },
+    hybrid::common::RedisRateLimiterSignal,
     redis::{RedisKey, new_interval, spawn_task},
 };
 
@@ -20,30 +18,42 @@ pub(crate) struct AbsoluteHybridCommit {
     pub count: u64,
 }
 
-pub(crate) struct AbsoluteHybridCommitterOptions {
+#[derive(Debug)]
+pub(crate) struct SuppressedHybridCommit {
+    pub key: RedisKey,
+    pub window_size_seconds: u64,
+    pub window_limit: u64,
+    pub rate_group_size_ms: u64,
+    pub count: u64,
+}
+
+pub(crate) struct AbsoluteHybridCommitterOptions<T> {
     pub sync_interval: Duration,
     pub channel_capacity: usize,
     pub max_batch_size: usize,
     pub limiter_sender: mpsc::Sender<RedisRateLimiterSignal>,
-    pub redis_proxy: AbsoluteHybridRedisProxy,
+    pub redis_proxy: Box<dyn RedisProxyCommitter<T> + Send + Sync>,
 }
 
-pub(crate) enum AbsoluteHybridCommitterSignal {
-    Commit(AbsoluteHybridCommit),
+pub(crate) enum AbsoluteHybridCommitterSignal<T> {
+    Commit(T),
 }
 
-impl From<AbsoluteHybridCommit> for AbsoluteHybridCommitterSignal {
-    fn from(commit: AbsoluteHybridCommit) -> Self {
+impl<T> From<T> for AbsoluteHybridCommitterSignal<T> {
+    fn from(commit: T) -> Self {
         Self::Commit(commit)
     }
 }
 
-pub(crate) struct AbsoluteHybridCommitter; // end struct AbsoluteRedisCommitter
+pub(crate) struct AbsoluteHybridCommitter;
 
 impl AbsoluteHybridCommitter {
-    pub fn run(
-        options: AbsoluteHybridCommitterOptions,
-    ) -> mpsc::Sender<AbsoluteHybridCommitterSignal> {
+    pub fn run<T>(
+        options: AbsoluteHybridCommitterOptions<T>,
+    ) -> mpsc::Sender<AbsoluteHybridCommitterSignal<T>>
+    where
+        T: Send + Sync + 'static,
+    {
         let AbsoluteHybridCommitterOptions {
             sync_interval,
             channel_capacity,
@@ -52,11 +62,11 @@ impl AbsoluteHybridCommitter {
             redis_proxy,
         } = options;
 
-        let (tx, mut rx) = mpsc::channel::<AbsoluteHybridCommitterSignal>(channel_capacity);
+        let (tx, mut rx) = mpsc::channel::<AbsoluteHybridCommitterSignal<T>>(channel_capacity);
 
         spawn_task(async move {
             let mut flush_interval = new_interval(sync_interval);
-            let mut batch: Vec<AbsoluteHybridCommit> = Vec::new();
+            let mut batch: Vec<T> = Vec::new();
 
             // Tokio's interval ticks immediately on first await; discard that so we flush
             // after `sync_interval`. Smol's interval already waits for the duration.
@@ -109,11 +119,14 @@ impl AbsoluteHybridCommitter {
         tx
     } // end method run
 
-    async fn flush_to_redis(
-        redis_proxy: &AbsoluteHybridRedisProxy,
-        batch: &mut Vec<AbsoluteHybridCommit>,
+    async fn flush_to_redis<T>(
+        redis_proxy: &Box<dyn RedisProxyCommitter<T> + Send + Sync>,
+        batch: &mut Vec<T>,
         max_batch_size: usize,
-    ) -> Result<(), TrypemaError> {
+    ) -> Result<(), TrypemaError>
+    where
+        T: Send + Sync,
+    {
         if batch.is_empty() {
             return Ok(());
         }

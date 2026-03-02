@@ -10,3 +10,5 @@ mod hybrid_rate_limiter_provider;
 pub use hybrid_rate_limiter_provider::*;
 
 mod suppressed_hybrid_rate_limiter;
+mod suppressed_hybrid_redis_proxy;
+pub(crate) use suppressed_hybrid_redis_proxy::*;

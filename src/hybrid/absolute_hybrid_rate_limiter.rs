@@ -102,7 +102,7 @@ pub struct AbsoluteHybridRateLimiter {
     rate_group_size_ms: RateGroupSizeMs,
     key_generator: RedisKeyGenerator,
     cleanup_script: Script,
-    commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal>,
+    commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
 
     // ...
@@ -124,7 +124,7 @@ impl AbsoluteHybridRateLimiter {
             channel_capacity: 8192,
             max_batch_size: 4,
             limiter_sender: tx,
-            redis_proxy: redis_proxy.clone(),
+            redis_proxy: Box::new(redis_proxy.clone()),
         });
 
         let limiter = Self {
