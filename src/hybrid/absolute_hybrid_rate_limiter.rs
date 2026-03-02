@@ -23,7 +23,7 @@ use crate::{
         },
         common::RedisRateLimiterSignal,
     },
-    redis::spawn_task,
+    redis::{mutex_lock, spawn_task},
 };
 
 const ABSOLUTE_CLEANUP_LUA: &str = r#"
@@ -83,14 +83,6 @@ enum AbsoluteRedisLimitingState {
         ttl_ms: Mutex<u64>,
         count_after_release: Mutex<u64>,
     },
-}
-
-fn lock<'a, T>(
-    m: &'a Mutex<T>,
-    what: &'static str,
-) -> Result<std::sync::MutexGuard<'a, T>, TrypemaError> {
-    m.lock()
-        .map_err(|_| TrypemaError::CustomError(format!("mutex poisoned: {what}")))
 }
 
 /// A rate limiter backed by Redis.
@@ -259,7 +251,8 @@ impl AbsoluteHybridRateLimiter {
                 let count = count.load(Ordering::Relaxed);
 
                 if current_window_limit.is_none() {
-                    current_window_limit = Some(*lock(window_limit, "accepting.window_limit")?);
+                    current_window_limit =
+                        Some(*mutex_lock(window_limit, "accepting.window_limit")?);
                 }
 
                 if count > 0 {
@@ -321,9 +314,9 @@ impl AbsoluteHybridRateLimiter {
                 count_after_release,
             } = state.deref()
             {
-                *lock(time_instant, "rejecting.time_instant")? = new_time_instant;
-                *lock(ttl_ms, "rejecting.ttl_ms")? = new_ttl_ms;
-                *lock(count_after_release, "rejecting.count_after_release")? =
+                *mutex_lock(time_instant, "rejecting.time_instant")? = new_time_instant;
+                *mutex_lock(ttl_ms, "rejecting.ttl_ms")? = new_ttl_ms;
+                *mutex_lock(count_after_release, "rejecting.count_after_release")? =
                     new_count_after_release;
             } else {
                 drop(state);
@@ -357,13 +350,13 @@ impl AbsoluteHybridRateLimiter {
             last_rate_group_count,
         } = state.deref()
         {
-            *lock(window_limit, "accepting.window_limit")? = new_window_limit;
-            *lock(accept_limit, "accepting.accept_limit")? = new_accept_limit;
+            *mutex_lock(window_limit, "accepting.window_limit")? = new_window_limit;
+            *mutex_lock(accept_limit, "accepting.accept_limit")? = new_accept_limit;
             count.store(increment, Ordering::Relaxed);
-            *lock(time_instant, "accepting.time_instant")? = new_time_instant;
-            *lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")? =
+            *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
+            *mutex_lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")? =
                 read_state_result.last_rate_group_ttl;
-            *lock(last_rate_group_count, "accepting.last_rate_group_count")? =
+            *mutex_lock(last_rate_group_count, "accepting.last_rate_group_count")? =
                 read_state_result.last_rate_group_count;
         } else {
             drop(state);
@@ -409,14 +402,14 @@ impl AbsoluteHybridRateLimiter {
             count_after_release,
         } = state_entry.deref()
         {
-            let elapsed_ms = lock(time_instant, "rejecting.time_instant")?
+            let elapsed_ms = mutex_lock(time_instant, "rejecting.time_instant")?
                 .elapsed()
                 .as_millis();
-            let ttl_ms = *lock(ttl_ms, "rejecting.ttl_ms")? as u128;
+            let ttl_ms = *mutex_lock(ttl_ms, "rejecting.ttl_ms")? as u128;
 
             if elapsed_ms < ttl_ms {
                 let remaining_after_waiting =
-                    *lock(count_after_release, "rejecting.count_after_release")?;
+                    *mutex_lock(count_after_release, "rejecting.count_after_release")?;
                 return Ok(RateLimitDecision::Rejected {
                     window_size_seconds: *self.window_size_seconds,
                     retry_after_ms: ttl_ms.saturating_sub(elapsed_ms),
@@ -431,7 +424,7 @@ impl AbsoluteHybridRateLimiter {
             ..
         } = state_entry.deref()
         {
-            let accept_limit = *lock(accept_limit, "accepting.accept_limit")?;
+            let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
             if count.load(Ordering::Relaxed) + check_count <= accept_limit {
                 count.fetch_add(increment, Ordering::Relaxed);
                 return Ok(RateLimitDecision::Allowed);
@@ -457,7 +450,7 @@ impl AbsoluteHybridRateLimiter {
             } = state_entry.deref()
             {
                 let current_total_count = count.load(Ordering::Relaxed);
-                let window_limit = *lock(window_limit, "accepting.window_limit")?;
+                let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
 
                 if current_total_count > 0 {
                     let commit = AbsoluteHybridCommit {
@@ -472,15 +465,15 @@ impl AbsoluteHybridRateLimiter {
                 }
 
                 let last_rate_group_ttl: u128 =
-                    (*lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")?)
+                    (*mutex_lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")?)
                         .map(|el| el as u128)
                         .unwrap_or((*self.sync_interval_ms).min(*self.rate_group_size_ms) as u128);
-                let elapsed = lock(time_instant, "accepting.time_instant")?
+                let elapsed = mutex_lock(time_instant, "accepting.time_instant")?
                     .elapsed()
                     .as_millis();
                 let retry_after_ms = last_rate_group_ttl.saturating_sub(elapsed);
                 let remaining_after_waiting =
-                    (*lock(last_rate_group_count, "accepting.last_rate_group_count")?)
+                    (*mutex_lock(last_rate_group_count, "accepting.last_rate_group_count")?)
                         .unwrap_or(current_total_count);
 
                 // If we can still increment by at least one, then we don't set the state to
