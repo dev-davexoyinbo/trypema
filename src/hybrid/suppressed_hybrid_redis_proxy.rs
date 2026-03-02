@@ -16,6 +16,90 @@ pub(crate) struct SuppressedHybridCommit {
     pub count: u64,
 }
 
+const LUA_HELPERS: &str = r#"
+    local function now_ms()
+        local time_array = redis.call("TIME")
+        return tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+    end
+
+    local function cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
+        local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
+
+        if #to_remove_keys == 0 then
+            return
+        end
+
+        local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+        redis.call("HDEL", hash_key, unpack(to_remove_keys))
+
+        local remove_sum = 0
+        local decline_sum = 0
+
+        for i = 1, #to_remove do
+            local value = cjson.decode(to_remove[i])
+
+            if value ~= nil then
+                local sum_count = tonumber(value.count)
+                local sum_declined = tonumber(value.declined)
+
+                if sum_count then
+                    remove_sum = remove_sum + sum_count
+                end
+
+                if sum_declined then
+                    decline_sum = decline_sum + sum_declined
+                end
+            end
+        end
+
+        local count_delta = math.floor(remove_sum) == 0 and 0 or -1 * math.floor(remove_sum)
+        local declined_delta = math.floor(decline_sum) == 0 and 0 or -1 * math.floor(decline_sum)
+
+        redis.call("HINCRBY", total_count_key, "count", count_delta)
+        redis.call("HINCRBY", total_count_key, "declined", declined_delta)
+        redis.call("ZREM", active_keys, unpack(to_remove_keys))
+    end
+
+    local function calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+        if window_limit == nil then
+            return 0
+        end
+
+        if total_count >= window_limit then
+            return 1
+        elseif total_count < window_limit / hard_limit_factor then
+            return 0
+        end
+
+        local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
+        local total_in_last_second = 0
+
+        if #active_keys_in_1s > 0 then
+            local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
+            for i = 1, #values do
+                local value = cjson.decode(values[i])
+                if value ~= nil then
+                    local count_inc = tonumber(value.count)
+                    if count_inc then
+                        total_in_last_second = total_in_last_second + count_inc
+                    end
+                end
+            end
+        end
+
+        local average_rate_in_window = total_count / window_size_seconds
+        local perceived_rate_limit = average_rate_in_window
+
+        if total_in_last_second > average_rate_in_window then
+            perceived_rate_limit = total_in_last_second
+        end
+
+        local rate_limit = window_limit / window_size_seconds / hard_limit_factor
+
+        return 1 - (rate_limit / perceived_rate_limit)
+    end
+"#;
+
 const CLEANUP_LUA: &str = r#"
     local time_array = redis.call("TIME")
     local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
@@ -124,54 +208,45 @@ const COMMIT_STATE_SCRIPT: &str = r#"
 "#;
 
 const READ_STATE_SCRIPT: &str = r#"
-    local time_array = redis.call("TIME")
-    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+    local timestamp_ms = now_ms()
 
     local hash_key = KEYS[1]
     local active_keys = KEYS[2]
     local window_limit_key = KEYS[3]
     local total_count_key = KEYS[4]
+    local get_active_entities_key = KEYS[5]
+    local suppression_factor_key = KEYS[6]
 
     local entity = ARGV[1]
-    local window_size_ms = tonumber(ARGV[2])
+    local window_size_seconds = tonumber(ARGV[2])
+    local rate_group_size_ms = tonumber(ARGV[4])
+    local suppression_factor_cache_ms = tonumber(ARGV[5])
+    local hard_limit_factor = tonumber(ARGV[6])
 
-    local res = redis.call("MGET", window_limit_key, total_count_key)
+    local window_limit = tonumber(redis.call("GET", window_limit_key))
 
-    local window_limit = tonumber(res[1])
-    local total_count = tonumber(res[2]) or 0
+    redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
-    -- evict expired buckets
-    local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_ms, "BYSCORE")
-    if #to_remove_keys > 0 then
-        local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
-        redis.call("HDEL", hash_key, unpack(to_remove_keys))
+    cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
 
-        local remove_sum = 0
+    local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
 
-        for i = 1, #to_remove do
-            remove_sum = remove_sum + (tonumber(to_remove[i]) or 0)
-        end
+    local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
-        total_count = redis.call("DECRBY", total_count_key, remove_sum)
-        redis.call("ZREM", active_keys, unpack(to_remove_keys))
+    if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
+        suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+
+        redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
     end
 
-    local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
-    local oldest_ttl = nil
-    local oldest_count = nil
-
-    if #oldest_hash_fields > 0 then
-        oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_fields[1])) or 0
-        oldest_ttl = window_size_ms - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
-    end
-
-    return {entity, total_count, window_limit or -1, oldest_ttl or -1, oldest_count or -1}
+    return {entity, tostring(suppression_factor), total_count, window_limit or -1 }
 "#;
 
 #[derive(Debug)]
 pub(crate) struct SuppressedHybridRedisProxyReadStateResult {
     pub key: RedisKey,
     pub current_total_count: u64,
+    pub suppression_factor: f64,
     pub window_limit: Option<u64>,
     pub last_rate_group_ttl: Option<u64>,
     pub last_rate_group_count: Option<u64>,

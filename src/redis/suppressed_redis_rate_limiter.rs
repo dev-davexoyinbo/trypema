@@ -52,6 +52,10 @@ local function cleanup_expired_keys(hash_key, active_keys, total_count_key, time
 end
 
 local function calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+    if window_limit == nil then
+        return 0
+    end
+
     if total_count >= window_limit then
         return 1
     elseif total_count < window_limit / hard_limit_factor then
