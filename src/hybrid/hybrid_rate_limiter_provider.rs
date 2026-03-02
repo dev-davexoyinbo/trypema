@@ -13,7 +13,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct HybridRateLimiterProvider {
     absolute: Arc<AbsoluteHybridRateLimiter>,
-    suppressed: SuppressedHybridRateLimiter,
+    suppressed: Arc<SuppressedHybridRateLimiter>,
 }
 
 impl HybridRateLimiterProvider {

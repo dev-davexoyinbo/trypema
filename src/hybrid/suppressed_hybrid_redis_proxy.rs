@@ -16,6 +16,47 @@ pub(crate) struct SuppressedHybridCommit {
     pub count: u64,
 }
 
+const CLEANUP_LUA: &str = r#"
+    local time_array = redis.call("TIME")
+    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+
+    local prefix = KEYS[1]
+    local rate_type = KEYS[2]
+    local active_entities_key = KEYS[3]
+
+    local stale_after_ms = tonumber(ARGV[1]) or 0
+    local hash_suffix = ARGV[2]
+    local window_limit_suffix = ARGV[3]
+    local total_count_suffix = ARGV[4]
+    local active_keys_suffix = ARGV[5]
+    local suppression_factor_key_suffix = ARGV[6]
+
+
+    local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
+
+    if #active_entities == 0 then
+        return 
+    end
+
+    local remove_keys = {}
+
+    local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
+    for i = 1, #active_entities do
+        local entity = active_entities[i]
+
+        for i = 1, #suffixes do
+            table.insert(remove_keys, prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
+        end
+    end
+
+    if #remove_keys > 0 then
+        redis.call("DEL", unpack(remove_keys))
+        redis.call("ZREM", active_entities_key, unpack(active_entities))
+    end
+
+    return
+"#;
+
 const COMMIT_STATE_SCRIPT: &str = r#"
     local time_array = redis.call("TIME")
     local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
@@ -141,6 +182,7 @@ pub(crate) struct SuppressedHybridRedisProxy {
     key_generator: RedisKeyGenerator,
     read_state_script: Script,
     commit_state_script: Script,
+    cleanup_script: Script,
     connection_manager: ConnectionManager,
 }
 
@@ -184,6 +226,7 @@ impl SuppressedHybridRedisProxy {
             key_generator: RedisKeyGenerator::new(prefix, RateType::Suppressed),
             read_state_script: Script::new(READ_STATE_SCRIPT),
             commit_state_script: Script::new(COMMIT_STATE_SCRIPT),
+            cleanup_script: Script::new(CLEANUP_LUA),
             connection_manager,
         }
     }
@@ -307,6 +350,27 @@ impl SuppressedHybridRedisProxy {
         }
 
         pipe
+    }
+
+    /// Evict expired buckets and update the total count.
+    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let _: () = self
+            .cleanup_script
+            .key(self.key_generator.prefix.to_string())
+            .key(self.key_generator.rate_type.to_string())
+            .key(self.key_generator.get_active_entities_key())
+            .arg(stale_after_ms)
+            .arg(self.key_generator.hash_key_suffix.to_string())
+            .arg(self.key_generator.window_limit_key_suffix.to_string())
+            .arg(self.key_generator.total_count_key_suffix.to_string())
+            .arg(self.key_generator.active_keys_key_suffix.to_string())
+            .arg(self.key_generator.suppression_factor_key_suffix.to_string())
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(())
     }
 }
 

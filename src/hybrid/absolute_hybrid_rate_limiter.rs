@@ -8,16 +8,13 @@ use std::{
 };
 
 use dashmap::DashMap;
-use redis::{Script, aio::ConnectionManager};
 use tokio::sync::mpsc;
 
 use crate::{
-    RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisKeyGenerator,
-    RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
-    common::RateType,
+    RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError,
+    WindowSizeSeconds,
     hybrid::{
-        AbsoluteHybridCommitterOptions, AbsoluteHybridCommitterSignal, RedisCommitter,
-        SyncIntervalMs,
+        AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, SyncIntervalMs,
         absolute_hybrid_redis_proxy::{
             AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyReadStateResult,
         },
@@ -25,47 +22,6 @@ use crate::{
     },
     redis::{mutex_lock, spawn_task},
 };
-
-const ABSOLUTE_CLEANUP_LUA: &str = r#"
-    local time_array = redis.call("TIME")
-    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-
-    local prefix = KEYS[1]
-    local rate_type = KEYS[2]
-    local active_entities_key = KEYS[3]
-
-    local stale_after_ms = tonumber(ARGV[1]) or 0
-    local hash_suffix = ARGV[2]
-    local window_limit_suffix = ARGV[3]
-    local total_count_suffix = ARGV[4]
-    local active_keys_suffix = ARGV[5]
-    local suppression_factor_key_suffix = ARGV[6]
-
-
-    local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
-
-    if #active_entities == 0 then
-        return 
-    end
-
-    local remove_keys = {}
-
-    local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
-    for i = 1, #active_entities do
-        local entity = active_entities[i]
-
-        for i = 1, #suffixes do
-            table.insert(remove_keys, prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
-        end
-    end
-
-    if #remove_keys > 0 then
-        redis.call("DEL", unpack(remove_keys))
-        redis.call("ZREM", active_entities_key, unpack(active_entities))
-    end
-
-    return
-"#;
 
 #[derive(Debug)]
 enum AbsoluteRedisLimitingState {
@@ -88,16 +44,11 @@ enum AbsoluteRedisLimitingState {
 /// A rate limiter backed by Redis.
 #[derive(Debug)]
 pub struct AbsoluteHybridRateLimiter {
-    connection_manager: ConnectionManager,
     window_size_seconds: WindowSizeSeconds,
     window_size_ms: u128,
     rate_group_size_ms: RateGroupSizeMs,
-    key_generator: RedisKeyGenerator,
-    cleanup_script: Script,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
-
-    // ...
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
     sync_interval_ms: SyncIntervalMs,
 }
@@ -108,10 +59,9 @@ impl AbsoluteHybridRateLimiter {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(1);
 
-        let redis_proxy =
-            AbsoluteHybridRedisProxy::new(prefix.clone(), options.connection_manager.clone());
+        let redis_proxy = AbsoluteHybridRedisProxy::new(prefix.clone(), options.connection_manager);
 
-        let commiter_sender = RedisCommitter::run(AbsoluteHybridCommitterOptions {
+        let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
             channel_capacity: 8192,
             max_batch_size: 4,
@@ -120,12 +70,9 @@ impl AbsoluteHybridRateLimiter {
         });
 
         let limiter = Self {
-            connection_manager: options.connection_manager,
             window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
-            key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
-            cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::new(),
@@ -509,23 +456,7 @@ impl AbsoluteHybridRateLimiter {
 
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        let mut connection_manager = self.connection_manager.clone();
-
-        let _: () = self
-            .cleanup_script
-            .key(self.key_generator.prefix.to_string())
-            .key(self.key_generator.rate_type.to_string())
-            .key(self.key_generator.get_active_entities_key())
-            .arg(stale_after_ms)
-            .arg(self.key_generator.hash_key_suffix.to_string())
-            .arg(self.key_generator.window_limit_key_suffix.to_string())
-            .arg(self.key_generator.total_count_key_suffix.to_string())
-            .arg(self.key_generator.active_keys_key_suffix.to_string())
-            .arg(self.key_generator.suppression_factor_key_suffix.to_string())
-            .invoke_async(&mut connection_manager)
-            .await?;
-
-        Ok(())
+        self.redis_proxy.cleanup(stale_after_ms).await
     }
 
     async fn flush(&self) -> Result<(), TrypemaError> {

@@ -9,7 +9,7 @@ use crate::{
     redis::{new_interval, spawn_task},
 };
 
-pub(crate) struct AbsoluteHybridCommitterOptions<T> {
+pub(crate) struct RedisCommitterOptions<T> {
     pub sync_interval: Duration,
     pub channel_capacity: usize,
     pub max_batch_size: usize,
@@ -39,12 +39,12 @@ pub(crate) struct RedisCommitter;
 
 impl RedisCommitter {
     pub fn run<T>(
-        options: AbsoluteHybridCommitterOptions<T>,
+        options: RedisCommitterOptions<T>,
     ) -> mpsc::Sender<AbsoluteHybridCommitterSignal<T>>
     where
         T: Send + Sync + 'static,
     {
-        let AbsoluteHybridCommitterOptions {
+        let RedisCommitterOptions {
             sync_interval,
             channel_capacity,
             max_batch_size,
