@@ -219,7 +219,6 @@ const READ_STATE_SCRIPT: &str = r#"
 
     local entity = ARGV[1]
     local window_size_seconds = tonumber(ARGV[2])
-    local rate_group_size_ms = tonumber(ARGV[4])
     local suppression_factor_cache_ms = tonumber(ARGV[5])
     local hard_limit_factor = tonumber(ARGV[6])
 
@@ -248,8 +247,6 @@ pub(crate) struct SuppressedHybridRedisProxyReadStateResult {
     pub current_total_count: u64,
     pub suppression_factor: f64,
     pub window_limit: Option<u64>,
-    pub last_rate_group_ttl: Option<u64>,
-    pub last_rate_group_count: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -261,45 +258,11 @@ pub(crate) struct SuppressedHybridRedisProxy {
     connection_manager: ConnectionManager,
 }
 
-#[async_trait::async_trait]
-impl RedisProxyCommitter<SuppressedHybridCommit> for SuppressedHybridRedisProxy {
-    async fn batch_commit_state(
-        self: &SuppressedHybridRedisProxy,
-        commits: &[SuppressedHybridCommit],
-    ) -> Result<(), TrypemaError> {
-        let mut connection_manager = self.connection_manager.clone();
-
-        let pipe = self.build_commit_pipeline(commits, false);
-
-        let _: () = match pipe.query_async(&mut connection_manager).await {
-            Ok(results) => results,
-            Err(err) => {
-                if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
-                    tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
-                    return Err(TrypemaError::RedisError(err));
-                }
-
-                let pipe = self.build_commit_pipeline(commits, true);
-
-                match pipe.query_async::<()>(&mut connection_manager).await {
-                    Ok(results) => results,
-                    Err(err) => {
-                        tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
-                        return Err(TrypemaError::RedisError(err));
-                    }
-                }
-            }
-        };
-
-        Ok(())
-    } // end method batch_commit_state
-}
-
 impl SuppressedHybridRedisProxy {
     pub(crate) fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
             key_generator: RedisKeyGenerator::new(prefix, RateType::Suppressed),
-            read_state_script: Script::new(READ_STATE_SCRIPT),
+            read_state_script: Script::new(&format!("{}\n{}", LUA_HELPERS, READ_STATE_SCRIPT)),
             commit_state_script: Script::new(COMMIT_STATE_SCRIPT),
             cleanup_script: Script::new(CLEANUP_LUA),
             connection_manager,
@@ -313,7 +276,7 @@ impl SuppressedHybridRedisProxy {
     ) -> Result<SuppressedHybridRedisProxyReadStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let res: (String, u64, i64, i64, i64) = self
+        let res: (String, f64, u64, i64) = self
             .read_state_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
@@ -367,7 +330,7 @@ impl SuppressedHybridRedisProxy {
         let pipe = self.build_read_pipeline(keys, window_size_ms, false);
 
         let results = match pipe
-            .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
+            .query_async::<Vec<(String, f64, u64, i64)>>(&mut connection_manager)
             .await
         {
             Ok(results) => results,
@@ -380,7 +343,7 @@ impl SuppressedHybridRedisProxy {
                 let pipe = self.build_read_pipeline(keys, window_size_ms, true);
 
                 match pipe
-                    .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
+                    .query_async::<Vec<(String, f64, u64, i64)>>(&mut connection_manager)
                     .await
                 {
                     Ok(results) => results,
@@ -449,18 +412,51 @@ impl SuppressedHybridRedisProxy {
     }
 }
 
-fn map_redis_read_result_to_state(
-    (entity, total_count, window_limit, oldest_ttl, oldest_count): (String, u64, i64, i64, i64),
-) -> SuppressedHybridRedisProxyReadStateResult {
-    fn map_negative_to_none(value: i64) -> Option<u64> {
-        if value < 0 { None } else { Some(value as u64) }
-    }
+#[async_trait::async_trait]
+impl RedisProxyCommitter<SuppressedHybridCommit> for SuppressedHybridRedisProxy {
+    async fn batch_commit_state(
+        self: &SuppressedHybridRedisProxy,
+        commits: &[SuppressedHybridCommit],
+    ) -> Result<(), TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
 
+        let pipe = self.build_commit_pipeline(commits, false);
+
+        let _: () = match pipe.query_async(&mut connection_manager).await {
+            Ok(results) => results,
+            Err(err) => {
+                if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
+                    tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                    return Err(TrypemaError::RedisError(err));
+                }
+
+                let pipe = self.build_commit_pipeline(commits, true);
+
+                match pipe.query_async::<()>(&mut connection_manager).await {
+                    Ok(results) => results,
+                    Err(err) => {
+                        tracing::error!("redis.commit.error, error executing pipeline: {:?}", err);
+                        return Err(TrypemaError::RedisError(err));
+                    }
+                }
+            }
+        };
+
+        Ok(())
+    } // end method batch_commit_state
+}
+
+fn map_redis_read_result_to_state(
+    (entity, suppression_factor, current_total_count, window_limit): (String, f64, u64, i64),
+) -> SuppressedHybridRedisProxyReadStateResult {
     SuppressedHybridRedisProxyReadStateResult {
         key: RedisKey::from(entity),
-        current_total_count: total_count,
-        window_limit: map_negative_to_none(window_limit),
-        last_rate_group_ttl: map_negative_to_none(oldest_ttl),
-        last_rate_group_count: map_negative_to_none(oldest_count),
+        current_total_count,
+        suppression_factor,
+        window_limit: if window_limit < 0 {
+            None
+        } else {
+            Some(window_limit as u64)
+        },
     }
 }
