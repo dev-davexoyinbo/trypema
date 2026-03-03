@@ -110,6 +110,54 @@ impl SuppressedHybridRateLimiter {
         });
     } // end method listen_for_committer_signals
 
+    /// Determine whether `key` is currently allowed.
+    ///
+    /// Returns [`RateLimitDecision::Allowed`] if the current sliding window total
+    /// is below the window limit, otherwise returns [`RateLimitDecision::Rejected`]
+    /// with a best-effort `retry_after_ms`.
+    ///
+    /// This method performs lazy eviction of expired buckets for the key.
+    pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
+        let state_entry = match self.limiting_state.get(key) {
+            Some(state) => state,
+            None => {
+                self.limiting_state
+                    .entry(key.clone())
+                    .or_insert_with(|| SuppressedRedisLimitingState::Undefined);
+
+                self.limiting_state.get(key).expect("Key should be present")
+            }
+        };
+
+        if let SuppressedRedisLimitingState::Suppressing {
+            suppression_factor, ..
+        } = state_entry.deref()
+        {
+            let suppression_factor =
+                *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
+
+            return Ok(suppression_factor);
+        }
+
+        if let SuppressedRedisLimitingState::Accepting { .. } = state_entry.deref() {
+            return Ok(0f64);
+        }
+
+        let decision = self
+            .reset_state_from_redis_read_result_and_get_decision(key, 0, 0, None)
+            .await?;
+
+        match decision {
+            RateLimitDecision::Allowed => Ok(0f64),
+            RateLimitDecision::Rejected { .. } => {
+                unreachable!("rejected should not be possible when using the suppressed strategy")
+            }
+            RateLimitDecision::Suppressed {
+                suppression_factor, ..
+            } => Ok(suppression_factor),
+        }
+    } // end method get_suppression_factor
+
     /// Check admission and, if allowed, increment the observed count for `key`.
     pub async fn inc(
         &self,
@@ -247,24 +295,16 @@ impl SuppressedHybridRateLimiter {
             drop(state_entry);
         }
 
-        self.reset_state_from_redis_read_result_and_get_decision(key, increment, rate_limit)
-            .await
+        self.reset_state_from_redis_read_result_and_get_decision(
+            key, increment, increment, rate_limit,
+        )
+        .await
     } // end method is_allowed_with_count_increment
-
-    /// Determine whether `key` is currently allowed.
-    ///
-    /// Returns [`RateLimitDecision::Allowed`] if the current sliding window total
-    /// is below the window limit, otherwise returns [`RateLimitDecision::Rejected`]
-    /// with a best-effort `retry_after_ms`.
-    ///
-    /// This method performs lazy eviction of expired buckets for the key.
-    pub async fn get_suppression_factor(&self, _key: &RedisKey) -> Result<f64, TrypemaError> {
-        todo!()
-    } // end method get_suppression_factor
 
     async fn reset_state_from_redis_read_result_and_get_decision(
         &self,
         key: &RedisKey,
+        check_count: u64,
         increment: u64,
         rate_limit: Option<&RateLimit>,
     ) -> Result<RateLimitDecision, TrypemaError> {
@@ -274,8 +314,13 @@ impl SuppressedHybridRateLimiter {
             .await
             .map_err(|err| TrypemaError::CustomError(format!("Failed to read state: {err:?}")))?;
 
-        self.reset_single_state_from_read_result(read_state_result, increment, rate_limit)
-            .await
+        self.reset_single_state_from_read_result(
+            read_state_result,
+            check_count,
+            increment,
+            rate_limit,
+        )
+        .await
     } // end method reset_state_from_redis_read_result
 
     async fn send_commit(&self, commit: SuppressedHybridCommit) -> Result<(), TrypemaError> {
@@ -290,6 +335,7 @@ impl SuppressedHybridRateLimiter {
     async fn reset_single_state_from_read_result(
         &self,
         read_state_result: SuppressedHybridRedisProxyReadStateResult,
+        check_count: u64,
         increment: u64,
         rate_limit: Option<&RateLimit>,
     ) -> Result<RateLimitDecision, TrypemaError> {
@@ -390,7 +436,7 @@ impl SuppressedHybridRateLimiter {
 
         let new_time_instant = Instant::now();
 
-        if current_total_count.saturating_add(increment) > soft_window_limit {
+        if current_total_count.saturating_add(check_count) > soft_window_limit {
             if let SuppressedRedisLimitingState::Suppressing {
                 time_instant,
                 suppression_factor,
@@ -473,4 +519,25 @@ impl SuppressedHybridRateLimiter {
 
         Ok(())
     } // end method flush
+
+    fn calculate_suppression_factor(
+        &self,
+        hard_window_limit: u64,
+        count: u64,
+        last_second_count: u64,
+    ) -> f64 {
+        if count < (hard_window_limit as f64 / *self.hard_limit_factor) as u64 {
+            return 0f64;
+        } else if count > hard_window_limit {
+            return 1f64;
+        }
+
+        let average_rate_in_window = count as f64 / *self.window_size_seconds as f64;
+        let perceived_rate_limit = average_rate_in_window.max(last_second_count as f64);
+
+        let rate_limit =
+            hard_window_limit as f64 / *self.window_size_seconds as f64 / *self.hard_limit_factor;
+
+        1f64 - (rate_limit / perceived_rate_limit)
+    }
 }
