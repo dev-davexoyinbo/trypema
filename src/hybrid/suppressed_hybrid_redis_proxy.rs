@@ -194,7 +194,13 @@ const READ_STATE_SCRIPT: &str = r#"
         redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
     end
 
-    return {entity, tostring(suppression_factor), total_count, total_in_last_second, window_limit or -1 }
+    local suppression_factor_ttl_ms = redis.call("PTTL", suppression_factor_key)
+
+    if suppression_factor_ttl_ms < 0 then
+        suppression_factor_ttl_ms = -1
+    end
+
+    return {entity, tostring(suppression_factor), total_count, total_in_last_second, window_limit or -1, suppression_factor_ttl_ms }
 "#;
 
 #[derive(Debug)]
@@ -212,6 +218,7 @@ pub(crate) struct SuppressedHybridRedisProxyReadStateResult {
     pub current_total_count: u64,
     pub last_second_count: u64,
     pub suppression_factor: f64,
+    pub suppression_factor_ttl_ms: Option<u64>,
     pub window_limit: Option<u64>,
 }
 
@@ -242,7 +249,7 @@ impl SuppressedHybridRedisProxy {
     ) -> Result<SuppressedHybridRedisProxyReadStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let res: (String, f64, u64, u64, i64) = self
+        let res: (String, f64, u64, u64, i64, i64) = self
             .read_state_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
@@ -296,7 +303,7 @@ impl SuppressedHybridRedisProxy {
         let pipe = self.build_read_pipeline(keys, window_size_ms, false);
 
         let results = match pipe
-            .query_async::<Vec<(String, f64, u64, u64, i64)>>(&mut connection_manager)
+            .query_async::<Vec<(String, f64, u64, u64, i64, i64)>>(&mut connection_manager)
             .await
         {
             Ok(results) => results,
@@ -309,7 +316,7 @@ impl SuppressedHybridRedisProxy {
                 let pipe = self.build_read_pipeline(keys, window_size_ms, true);
 
                 match pipe
-                    .query_async::<Vec<(String, f64, u64, u64, i64)>>(&mut connection_manager)
+                    .query_async::<Vec<(String, f64, u64, u64, i64, i64)>>(&mut connection_manager)
                     .await
                 {
                     Ok(results) => results,
@@ -413,13 +420,14 @@ impl RedisProxyCommitter<SuppressedHybridCommit> for SuppressedHybridRedisProxy 
 }
 
 fn map_redis_read_result_to_state(
-    (entity, suppression_factor, current_total_count, last_second_count, window_limit): (
-        String,
-        f64,
-        u64,
-        u64,
-        i64,
-    ),
+    (
+        entity,
+        suppression_factor,
+        current_total_count,
+        last_second_count,
+        window_limit,
+        suppression_factor_ttl_ms,
+    ): (String, f64, u64, u64, i64, i64),
 ) -> SuppressedHybridRedisProxyReadStateResult {
     SuppressedHybridRedisProxyReadStateResult {
         key: RedisKey::from(entity),
@@ -430,6 +438,11 @@ fn map_redis_read_result_to_state(
             None
         } else {
             Some(window_limit as u64)
+        },
+        suppression_factor_ttl_ms: if suppression_factor_ttl_ms < 0 {
+            None
+        } else {
+            Some(suppression_factor_ttl_ms as u64)
         },
     }
 }
