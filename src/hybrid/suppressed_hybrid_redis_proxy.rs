@@ -7,15 +7,6 @@ use crate::{
     redis::{RedisKey, RedisKeyGenerator},
 };
 
-#[derive(Debug)]
-pub(crate) struct SuppressedHybridCommit {
-    pub key: RedisKey,
-    pub window_size_seconds: u64,
-    pub window_limit: u64,
-    pub rate_group_size_ms: u64,
-    pub count: u64,
-}
-
 const CLEANUP_LUA: &str = r#"
     local time_array = redis.call("TIME")
     local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
@@ -83,7 +74,22 @@ const LUA_HELPERS: &str = r#"
         redis.call("ZREM", active_keys, unpack(to_remove_keys))
     end
 
-    local function calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+    local function calculate_total_in_last_second(hash_key, active_keys, timestamp_ms)
+        local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
+
+        local total_in_last_second = 0
+
+        if #active_keys_in_1s > 0 then
+            local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
+            for i = 1, #values do
+                total_in_last_second = total_in_last_second + (tonumber(values[i]) or 0)
+            end
+        end
+
+        return total_in_last_second
+    end
+
+    local function calculate_suppression_factor(hash_key, active_keys, total_count, total_in_last_second, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
         if window_limit == nil then
             return 0
         end
@@ -92,16 +98,6 @@ const LUA_HELPERS: &str = r#"
             return 1
         elseif total_count < window_limit / hard_limit_factor then
             return 0
-        end
-
-        local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
-        local total_in_last_second = 0
-
-        if #active_keys_in_1s > 0 then
-            local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
-            for i = 1, #values do
-                total_in_last_second = total_in_last_second + (tonumber(values[i]) or 0)
-            end
         end
 
         local average_rate_in_window = total_count / window_size_seconds
@@ -190,19 +186,31 @@ const READ_STATE_SCRIPT: &str = r#"
 
     local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
+    local total_in_last_second = calculate_total_in_last_second(hash_key, active_keys, timestamp_ms);
+
     if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
-        suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+        suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, total_in_last_second, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
 
         redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
     end
 
-    return {entity, tostring(suppression_factor), total_count, window_limit or -1 }
+    return {entity, tostring(suppression_factor), total_count, total_in_last_second, window_limit or -1 }
 "#;
+
+#[derive(Debug)]
+pub(crate) struct SuppressedHybridCommit {
+    pub key: RedisKey,
+    pub window_size_seconds: u64,
+    pub window_limit: u64,
+    pub rate_group_size_ms: u64,
+    pub count: u64,
+}
 
 #[derive(Debug)]
 pub(crate) struct SuppressedHybridRedisProxyReadStateResult {
     pub key: RedisKey,
     pub current_total_count: u64,
+    pub last_second_count: u64,
     pub suppression_factor: f64,
     pub window_limit: Option<u64>,
 }
@@ -234,7 +242,7 @@ impl SuppressedHybridRedisProxy {
     ) -> Result<SuppressedHybridRedisProxyReadStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let res: (String, f64, u64, i64) = self
+        let res: (String, f64, u64, u64, i64) = self
             .read_state_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
@@ -288,7 +296,7 @@ impl SuppressedHybridRedisProxy {
         let pipe = self.build_read_pipeline(keys, window_size_ms, false);
 
         let results = match pipe
-            .query_async::<Vec<(String, f64, u64, i64)>>(&mut connection_manager)
+            .query_async::<Vec<(String, f64, u64, u64, i64)>>(&mut connection_manager)
             .await
         {
             Ok(results) => results,
@@ -301,7 +309,7 @@ impl SuppressedHybridRedisProxy {
                 let pipe = self.build_read_pipeline(keys, window_size_ms, true);
 
                 match pipe
-                    .query_async::<Vec<(String, f64, u64, i64)>>(&mut connection_manager)
+                    .query_async::<Vec<(String, f64, u64, u64, i64)>>(&mut connection_manager)
                     .await
                 {
                     Ok(results) => results,
@@ -405,11 +413,18 @@ impl RedisProxyCommitter<SuppressedHybridCommit> for SuppressedHybridRedisProxy 
 }
 
 fn map_redis_read_result_to_state(
-    (entity, suppression_factor, current_total_count, window_limit): (String, f64, u64, i64),
+    (entity, suppression_factor, current_total_count, last_second_count, window_limit): (
+        String,
+        f64,
+        u64,
+        u64,
+        i64,
+    ),
 ) -> SuppressedHybridRedisProxyReadStateResult {
     SuppressedHybridRedisProxyReadStateResult {
         key: RedisKey::from(entity),
         current_total_count,
+        last_second_count,
         suppression_factor,
         window_limit: if window_limit < 0 {
             None
