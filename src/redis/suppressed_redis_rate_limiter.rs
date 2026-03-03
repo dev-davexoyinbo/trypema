@@ -7,64 +7,105 @@ use crate::{
     redis::RedisKeyGenerator,
 };
 
-const LUA_HELPERS: &str = r#"
-local function now_ms()
+const CLEANUP_LUA: &str = r#"
     local time_array = redis.call("TIME")
-    return tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-end
+    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
 
-local function cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
-    local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
+    local prefix = KEYS[1]
+    local rate_type = KEYS[2]
+    local active_entities_key = KEYS[3]
 
-    if #to_remove_keys == 0 then
-        return
+    local stale_after_ms = tonumber(ARGV[1]) or 0
+    local hash_suffix = ARGV[2]
+    local window_limit_suffix = ARGV[3]
+    local total_count_suffix = ARGV[4]
+    local active_keys_suffix = ARGV[5]
+    local suppression_factor_key_suffix = ARGV[6]
+
+
+    local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
+
+    if #active_entities == 0 then
+        return 
     end
 
-    local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
-    redis.call("HDEL", hash_key, unpack(to_remove_keys))
+    local remove_keys = {}
 
-    local remove_sum = 0
+    local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
+    for i = 1, #active_entities do
+        local entity = active_entities[i]
 
-    for i = 1, #to_remove do
-        remove_sum = remove_sum + (tonumber(to_remove[i]) or 0)
-    end
-
-    redis.call("DECRBY", total_count_key, remove_sum)
-    redis.call("ZREM", active_keys, unpack(to_remove_keys))
-end
-
-local function calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
-    if window_limit == nil then
-        return 0
-    end
-
-    if total_count >= window_limit then
-        return 1
-    elseif total_count < window_limit / hard_limit_factor then
-        return 0
-    end
-
-    local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
-    local total_in_last_second = 0
-
-    if #active_keys_in_1s > 0 then
-        local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
-        for i = 1, #values do
-            total_in_last_second = total_in_last_second + (tonumber(values[i]) or 0)
+        for i = 1, #suffixes do
+            table.insert(remove_keys, prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
         end
     end
 
-    local average_rate_in_window = total_count / window_size_seconds
-    local perceived_rate_limit = average_rate_in_window
-
-    if total_in_last_second > average_rate_in_window then
-        perceived_rate_limit = total_in_last_second
+    if #remove_keys > 0 then
+        redis.call("DEL", unpack(remove_keys))
+        redis.call("ZREM", active_entities_key, unpack(active_entities))
     end
 
-    local rate_limit = window_limit / window_size_seconds / hard_limit_factor
+    return
+"#;
 
-    return 1 - (rate_limit / perceived_rate_limit)
-end
+const LUA_HELPERS: &str = r#"
+    local function now_ms()
+        local time_array = redis.call("TIME")
+        return tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
+    end
+
+    local function cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
+        local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
+
+        if #to_remove_keys == 0 then
+            return
+        end
+
+        local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+        redis.call("HDEL", hash_key, unpack(to_remove_keys))
+
+        local remove_sum = 0
+
+        for i = 1, #to_remove do
+            remove_sum = remove_sum + (tonumber(to_remove[i]) or 0)
+        end
+
+        redis.call("DECRBY", total_count_key, remove_sum)
+        redis.call("ZREM", active_keys, unpack(to_remove_keys))
+    end
+
+    local function calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+        if window_limit == nil then
+            return 0
+        end
+
+        if total_count >= window_limit then
+            return 1
+        elseif total_count < window_limit / hard_limit_factor then
+            return 0
+        end
+
+        local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
+        local total_in_last_second = 0
+
+        if #active_keys_in_1s > 0 then
+            local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
+            for i = 1, #values do
+                total_in_last_second = total_in_last_second + (tonumber(values[i]) or 0)
+            end
+        end
+
+        local average_rate_in_window = total_count / window_size_seconds
+        local perceived_rate_limit = average_rate_in_window
+
+        if total_in_last_second > average_rate_in_window then
+            perceived_rate_limit = total_in_last_second
+        end
+
+        local rate_limit = window_limit / window_size_seconds / hard_limit_factor
+
+        return 1 - (rate_limit / perceived_rate_limit)
+    end
 "#;
 
 const SUPPRESSED_INC_LUA: &str = r#"
@@ -190,7 +231,8 @@ pub struct SuppressedRedisRateLimiter {
     window_size_seconds: WindowSizeSeconds,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
     inc_script: Script,
-    get_suppression_factor_script: Script,
+    cleanup_script: Script,
+    suppression_factor_script: Script,
 }
 
 impl SuppressedRedisRateLimiter {
@@ -206,7 +248,8 @@ impl SuppressedRedisRateLimiter {
             suppression_factor_cache_ms: options.suppression_factor_cache_ms,
             key_generator,
             inc_script: Script::new(&format!("{}\n{}", LUA_HELPERS, SUPPRESSED_INC_LUA)),
-            get_suppression_factor_script: Script::new(&format!(
+            cleanup_script: Script::new(CLEANUP_LUA),
+            suppression_factor_script: Script::new(&format!(
                 "{}\n{}",
                 LUA_HELPERS, SUPPRESSED_GET_FACTOR_LUA
             )),
@@ -271,7 +314,7 @@ impl SuppressedRedisRateLimiter {
         let mut connection_manager = self.connection_manager.clone();
 
         let suppression_factor: f64 = self
-            .get_suppression_factor_script
+            .suppression_factor_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))
@@ -290,52 +333,10 @@ impl SuppressedRedisRateLimiter {
     } // end method calculate_suppression_factor
 
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        let script = redis::Script::new(
-            r#"
-            local time_array = redis.call("TIME")
-            local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-
-            local prefix = KEYS[1]
-            local rate_type = KEYS[2]
-            local active_entities_key = KEYS[3]
-
-            local stale_after_ms = tonumber(ARGV[1]) or 0
-            local hash_suffix = ARGV[2]
-            local window_limit_suffix = ARGV[3]
-            local total_count_suffix = ARGV[4]
-            local active_keys_suffix = ARGV[5]
-            local suppression_factor_key_suffix = ARGV[6]
-
-
-            local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
-
-            if #active_entities == 0 then
-                return 
-            end
-
-            local remove_keys = {}
-
-            local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
-            for i = 1, #active_entities do
-                local entity = active_entities[i]
-
-                for i = 1, #suffixes do
-                    table.insert(remove_keys, prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
-                end
-            end
-
-            if #remove_keys > 0 then
-                redis.call("DEL", unpack(remove_keys))
-                redis.call("ZREM", active_entities_key, unpack(active_entities))
-            end
-
-            return
-        "#,
-        );
-
         let mut connection_manager = self.connection_manager.clone();
 
-        let _: () = script
+        let _: () = self
+            .cleanup_script
             .key(self.key_generator.prefix.to_string())
             .key(self.key_generator.rate_type.to_string())
             .key(self.key_generator.get_active_entities_key())
