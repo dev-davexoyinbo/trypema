@@ -143,8 +143,9 @@ impl SuppressedHybridRateLimiter {
             return Ok(0f64);
         }
 
+        let mut rng = |p: f64| rand::random_bool(p);
         let decision = self
-            .reset_state_from_redis_read_result_and_get_decision(key, 0, 0, None)
+            .reset_state_from_redis_read_result_and_get_decision(key, 0, 0, None, &mut rng)
             .await?;
 
         match decision {
@@ -296,10 +297,14 @@ impl SuppressedHybridRateLimiter {
         }
 
         self.reset_state_from_redis_read_result_and_get_decision(
-            key, increment, increment, rate_limit,
+            key,
+            increment,
+            increment,
+            rate_limit,
+            random_bool,
         )
         .await
-    } // end method is_allowed_with_count_increment
+    } // end method 
 
     async fn reset_state_from_redis_read_result_and_get_decision(
         &self,
@@ -307,6 +312,7 @@ impl SuppressedHybridRateLimiter {
         check_count: u64,
         increment: u64,
         rate_limit: Option<&RateLimit>,
+        random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<RateLimitDecision, TrypemaError> {
         let read_state_result = self
             .redis_proxy
@@ -319,6 +325,7 @@ impl SuppressedHybridRateLimiter {
             check_count,
             increment,
             rate_limit,
+            random_bool,
         )
         .await
     } // end method reset_state_from_redis_read_result
@@ -338,6 +345,7 @@ impl SuppressedHybridRateLimiter {
         check_count: u64,
         increment: u64,
         rate_limit: Option<&RateLimit>,
+        random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<RateLimitDecision, TrypemaError> {
         let mut current_total_count = read_state_result.current_total_count;
         let mut total_in_last_second = read_state_result.last_second_count;
@@ -449,10 +457,30 @@ impl SuppressedHybridRateLimiter {
                     current_suppression_factor;
             } else {
                 drop(state);
-                todo!();
+                let mut state = self
+                    .limiting_state
+                    .get_mut(key)
+                    .expect("Key should be present");
+
+                *state = SuppressedRedisLimitingState::Suppressing {
+                    time_instant: Mutex::new(new_time_instant),
+                    suppression_factor: Mutex::new(current_suppression_factor),
+                    suppression_factor_ttl_ms: Mutex::new(new_ttl_ms),
+                };
             }
 
-            todo!();
+            let should_allow = if current_suppression_factor == 0f64 {
+                true
+            } else if current_suppression_factor == 1f64 {
+                false
+            } else {
+                random_bool(1f64 - current_suppression_factor)
+            };
+
+            return Ok(RateLimitDecision::Suppressed {
+                suppression_factor: current_suppression_factor,
+                is_allowed: should_allow,
+            });
         }
 
         if let SuppressedRedisLimitingState::Accepting {
@@ -507,9 +535,11 @@ impl SuppressedHybridRateLimiter {
             .batch_read_state(&resets, self.window_size_ms)
             .await?;
 
+        let mut rng = |p: f64| rand::random_bool(p);
+
         for result in read_state_results {
             if let Err(err) = self
-                .reset_single_state_from_read_result(result, 0, None)
+                .reset_single_state_from_read_result(result, 0, 0, None, &mut rng)
                 .await
             {
                 tracing::error!(error = ?err, "Failed to reset state from redis read result");
