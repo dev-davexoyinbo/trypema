@@ -46,7 +46,6 @@ pub struct SuppressedHybridRateLimiter {
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<SuppressedHybridCommit>>,
     redis_proxy: SuppressedHybridRedisProxy,
     limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState>,
-    sync_interval_ms: SyncIntervalMs,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
 }
@@ -75,7 +74,6 @@ impl SuppressedHybridRateLimiter {
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::new(),
-            sync_interval_ms: options.sync_interval_ms,
             hard_limit_factor: options.hard_limit_factor,
             suppression_factor_cache_ms: options.suppression_factor_cache_ms,
         };
@@ -550,7 +548,7 @@ impl SuppressedHybridRateLimiter {
         Ok(())
     } // end method flush
 
-    fn calculate_suppression_factor(
+    fn _calculate_suppression_factor(
         &self,
         hard_window_limit: u64,
         count: u64,
