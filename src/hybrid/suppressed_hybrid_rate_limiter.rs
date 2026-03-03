@@ -11,12 +11,12 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 
 use crate::{
-    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey,
-    RedisRateLimiterOptions, SuppressionFactorCacheMs, TrypemaError, WindowSizeSeconds,
+    HardLimitFactor, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions,
+    SuppressionFactorCacheMs, TrypemaError, WindowSizeSeconds,
     hybrid::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions,
-        SuppressedHybridCommit, SuppressedHybridRedisProxy,
-        SuppressedHybridRedisProxyReadStateResult, SyncIntervalMs, common::RedisRateLimiterSignal,
+        SuppressedHybridCommit, SuppressedHybridRedisProxy, SuppressedHybridRedisProxyOptions,
+        SuppressedHybridRedisProxyReadStateResult, common::RedisRateLimiterSignal,
     },
     redis::{mutex_lock, spawn_task},
 };
@@ -25,7 +25,6 @@ use crate::{
 enum SuppressedRedisLimitingState {
     Accepting {
         window_limit: Mutex<u64>,
-        last_second_count: AtomicU64,
         count: AtomicU64,
         time_instant: Mutex<Instant>,
     },
@@ -41,8 +40,6 @@ enum SuppressedRedisLimitingState {
 #[derive(Debug)]
 pub struct SuppressedHybridRateLimiter {
     window_size_seconds: WindowSizeSeconds,
-    window_size_ms: u128,
-    rate_group_size_ms: RateGroupSizeMs,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<SuppressedHybridCommit>>,
     redis_proxy: SuppressedHybridRedisProxy,
     limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState>,
@@ -55,9 +52,19 @@ impl SuppressedHybridRateLimiter {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(1);
+        let hard_limit_factor = options.hard_limit_factor;
+        let suppression_factor_cache_ms = options.suppression_factor_cache_ms;
+        let window_size_seconds = options.window_size_seconds;
+        let rate_group_size_ms = options.rate_group_size_ms;
 
-        let redis_proxy =
-            SuppressedHybridRedisProxy::new(prefix.clone(), options.connection_manager);
+        let redis_proxy = SuppressedHybridRedisProxy::new(SuppressedHybridRedisProxyOptions {
+            prefix: prefix.clone(),
+            connection_manager: options.connection_manager,
+            hard_limit_factor,
+            suppression_factor_cache_ms,
+            rate_group_size_ms,
+            window_size_seconds,
+        });
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
@@ -68,14 +75,12 @@ impl SuppressedHybridRateLimiter {
         });
 
         let limiter = Self {
-            window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
-            window_size_seconds: options.window_size_seconds,
-            rate_group_size_ms: options.rate_group_size_ms,
+            window_size_seconds,
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::new(),
-            hard_limit_factor: options.hard_limit_factor,
-            suppression_factor_cache_ms: options.suppression_factor_cache_ms,
+            hard_limit_factor,
+            suppression_factor_cache_ms,
         };
 
         let limiter = Arc::new(limiter);
@@ -264,9 +269,7 @@ impl SuppressedHybridRateLimiter {
                 if current_total_count > 0 {
                     let commit = SuppressedHybridCommit {
                         key: key.clone(),
-                        window_size_seconds: *self.window_size_seconds,
                         window_limit,
-                        rate_group_size_ms: *self.rate_group_size_ms,
                         count: current_total_count,
                     };
 
@@ -312,11 +315,10 @@ impl SuppressedHybridRateLimiter {
         rate_limit: Option<&RateLimit>,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let read_state_result = self
-            .redis_proxy
-            .read_state(key, *self.window_size_seconds as u128 * 1000)
-            .await
-            .map_err(|err| TrypemaError::CustomError(format!("Failed to read state: {err:?}")))?;
+        let read_state_result =
+            self.redis_proxy.read_state(key).await.map_err(|err| {
+                TrypemaError::CustomError(format!("Failed to read state: {err:?}"))
+            })?;
 
         self.reset_single_state_from_read_result(
             read_state_result,
@@ -346,7 +348,6 @@ impl SuppressedHybridRateLimiter {
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<RateLimitDecision, TrypemaError> {
         let mut current_total_count = read_state_result.current_total_count;
-        let mut total_in_last_second = read_state_result.last_second_count;
         let mut current_suppression_factor_ttl_ms = read_state_result.suppression_factor_ttl_ms;
         let current_suppression_factor = read_state_result.suppression_factor;
 
@@ -393,13 +394,10 @@ impl SuppressedHybridRateLimiter {
 
                 if count > 0 {
                     current_total_count = count.max(current_total_count);
-                    total_in_last_second = count.max(total_in_last_second);
 
                     let commit = SuppressedHybridCommit {
                         key: key.clone(),
-                        window_size_seconds: *self.window_size_seconds,
                         window_limit: hard_window_limit.expect("Window limit should be set"),
-                        rate_group_size_ms: *self.rate_group_size_ms,
                         count,
                     };
 
@@ -505,7 +503,6 @@ impl SuppressedHybridRateLimiter {
                 window_limit: Mutex::new(hard_window_limit),
                 count: AtomicU64::new(current_total_count.saturating_add(increment)),
                 time_instant: Mutex::new(new_time_instant),
-                last_second_count: AtomicU64::new(total_in_last_second),
             };
         }
 
@@ -528,10 +525,7 @@ impl SuppressedHybridRateLimiter {
             }
         }
 
-        let read_state_results = self
-            .redis_proxy
-            .batch_read_state(&resets, self.window_size_ms)
-            .await?;
+        let read_state_results = self.redis_proxy.batch_read_state(&resets).await?;
 
         let mut rng = |p: f64| rand::random_bool(p);
 
