@@ -230,7 +230,7 @@ impl AbsoluteHybridRateLimiter {
                     let is_undefined =
                         matches!(state.deref(), AbsoluteRedisLimitingState::Undefined);
 
-                    if is_undefined {
+                    if !is_undefined {
                         drop(state);
                         *self
                             .limiting_state
