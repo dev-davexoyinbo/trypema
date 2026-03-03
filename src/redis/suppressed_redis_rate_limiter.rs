@@ -24,30 +24,12 @@ local function cleanup_expired_keys(hash_key, active_keys, total_count_key, time
     redis.call("HDEL", hash_key, unpack(to_remove_keys))
 
     local remove_sum = 0
-    local decline_sum = 0
 
     for i = 1, #to_remove do
-        local value = cjson.decode(to_remove[i])
-
-        if value ~= nil then
-            local sum_count = tonumber(value.count)
-            local sum_declined = tonumber(value.declined)
-
-            if sum_count then
-                remove_sum = remove_sum + sum_count
-            end
-
-            if sum_declined then
-                decline_sum = decline_sum + sum_declined
-            end
-        end
+        remove_sum = remove_sum + (tonumber(to_remove[i]) or 0)
     end
 
-    local count_delta = math.floor(remove_sum) == 0 and 0 or -1 * math.floor(remove_sum)
-    local declined_delta = math.floor(decline_sum) == 0 and 0 or -1 * math.floor(decline_sum)
-
-    redis.call("HINCRBY", total_count_key, "count", count_delta)
-    redis.call("HINCRBY", total_count_key, "declined", declined_delta)
+    redis.call("DECRBY", total_count_key, remove_sum)
     redis.call("ZREM", active_keys, unpack(to_remove_keys))
 end
 
@@ -68,13 +50,7 @@ local function calculate_suppression_factor(hash_key, active_keys, total_count, 
     if #active_keys_in_1s > 0 then
         local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
         for i = 1, #values do
-            local value = cjson.decode(values[i])
-            if value ~= nil then
-                local count_inc = tonumber(value.count)
-                if count_inc then
-                    total_in_last_second = total_in_last_second + count_inc
-                end
-            end
+            total_in_last_second = total_in_last_second + (tonumber(values[i]) or 0)
         end
     end
 
@@ -115,7 +91,7 @@ const SUPPRESSED_INC_LUA: &str = r#"
 
     cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
 
-    local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
+    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
 
     local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
@@ -149,25 +125,12 @@ const SUPPRESSED_INC_LUA: &str = r#"
 
     local hash_field = tostring(timestamp_ms)
 
-    local raw_prev = redis.call("HGET", hash_key, hash_field)
-    local prev_value = raw_prev and cjson.decode(raw_prev) or {count = 0, declined = 0}
-
-    local new_count = (tonumber(prev_value.count) or 0) + count
-    local new_declined = tonumber(prev_value.declined) or 0
-
-    if not should_allow then
-        new_declined = new_declined + count
-    end
-
-    redis.call("HSET", hash_key, hash_field, cjson.encode({count = new_count, declined = new_declined}))
-    redis.call("HINCRBY", total_count_key, "count", count)
-    if not should_allow then
-        redis.call("HINCRBY", total_count_key, "declined", count)
-    end
+    local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
+    redis.call("INCRBY", total_count_key, count)
 
     if new_count == count then
-    redis.call("ZADD", active_keys, timestamp_ms, hash_field)
-    redis.call("SET", window_limit_key, window_limit)
+        redis.call("ZADD", active_keys, timestamp_ms, hash_field)
+        redis.call("SET", window_limit_key, window_limit)
     end
 
     redis.call("EXPIRE", window_limit_key, window_size_seconds)
@@ -199,7 +162,7 @@ const SUPPRESSED_GET_FACTOR_LUA: &str = r#"
 
     cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
 
-    local total_count = tonumber(redis.call("HGET", total_count_key, "count")) or 0
+    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
 
     local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
