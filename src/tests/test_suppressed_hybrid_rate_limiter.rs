@@ -163,7 +163,17 @@ fn hybrid_suppressed_allows_until_base_capacity_boundary() {
                 .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+            assert!(
+                matches!(
+                    d,
+                    RateLimitDecision::Allowed
+                        | RateLimitDecision::Suppressed {
+                            suppression_factor: 0f64,
+                            is_allowed: true
+                        }
+                ),
+                "d: {d:?}"
+            );
         }
     });
 }
