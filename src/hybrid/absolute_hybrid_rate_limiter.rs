@@ -253,7 +253,7 @@ impl AbsoluteHybridRateLimiter {
                 .last_rate_group_ttl
                 .unwrap_or((*self.sync_interval_ms).min(*self.rate_group_size_ms));
 
-            let new_count_after_release = read_state_result.current_total_count;
+            let new_count_after_release = read_state_result.last_rate_group_count.unwrap_or(0);
 
             if let AbsoluteRedisLimitingState::Rejecting {
                 time_instant,
