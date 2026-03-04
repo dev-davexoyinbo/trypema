@@ -884,9 +884,8 @@ fn hybrid_suppressed_usage_is_committed_to_redis_and_visible_to_others() {
     });
 }
 
-#[cfg(feature = "redis-tokio")]
 #[test]
-fn hybrid_suppressed_concurrent_tokio_smoke_does_not_panic() {
+fn hybrid_suppressed_concurrent_smoke_does_not_panic() {
     let url = redis_url();
 
     runtime::block_on(async {
@@ -900,7 +899,7 @@ fn hybrid_suppressed_concurrent_tokio_smoke_does_not_panic() {
             let rl = rl.clone();
             let k = k.clone();
             let rate_limit = rate_limit.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(runtime::spawn(async move {
                 for _ in 0..50 {
                     let d = rl
                         .hybrid()
@@ -920,48 +919,7 @@ fn hybrid_suppressed_concurrent_tokio_smoke_does_not_panic() {
         }
 
         for t in tasks {
-            t.await.unwrap();
-        }
-    });
-}
-
-#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-#[test]
-fn hybrid_suppressed_concurrent_smol_smoke_does_not_panic() {
-    let url = redis_url();
-
-    runtime::block_on(async {
-        let rl = build_limiter_with_prefix(&url, 1, 1000, 2.0, 25, 25, unique_prefix()).await;
-
-        let k = key("k");
-        let rate_limit = RateLimit::try_from(10f64).unwrap();
-
-        let mut tasks = Vec::new();
-        for _ in 0..16 {
-            let rl = rl.clone();
-            let k = k.clone();
-            let rate_limit = rate_limit.clone();
-            tasks.push(smol::spawn(async move {
-                for _ in 0..50 {
-                    let d = rl
-                        .hybrid()
-                        .suppressed()
-                        .inc(&k, &rate_limit, 1)
-                        .await
-                        .unwrap();
-                    assert!(
-                        matches!(
-                            d,
-                            RateLimitDecision::Allowed | RateLimitDecision::Suppressed { .. }
-                        ),
-                        "d: {d:?}"
-                    );
-                }
-            }));
-        }
-
-        for t in tasks {
-            t.await;
+            runtime::join(t).await;
         }
     });
 }

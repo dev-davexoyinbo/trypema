@@ -578,9 +578,8 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
     });
 }
 
-#[cfg(feature = "redis-tokio")]
 #[test]
-fn hybrid_absolute_concurrent_tokio_smoke_does_not_panic() {
+fn hybrid_absolute_concurrent_smoke_does_not_panic() {
     let url = redis_url();
 
     runtime::block_on(async {
@@ -594,7 +593,7 @@ fn hybrid_absolute_concurrent_tokio_smoke_does_not_panic() {
             let rl = rl.clone();
             let k = k.clone();
             let rate_limit = rate_limit.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(runtime::spawn(async move {
                 for _ in 0..50 {
                     let d = rl
                         .hybrid()
@@ -610,44 +609,7 @@ fn hybrid_absolute_concurrent_tokio_smoke_does_not_panic() {
         }
 
         for t in tasks {
-            t.await.unwrap();
-        }
-    });
-}
-
-#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-#[test]
-fn hybrid_absolute_concurrent_smol_smoke_does_not_panic() {
-    let url = redis_url();
-
-    runtime::block_on(async {
-        let rl = build_limiter_with_prefix(&url, 1, 1000, 25, unique_prefix()).await;
-
-        let k = key("k");
-        let rate_limit = RateLimit::try_from(10f64).unwrap();
-
-        let mut tasks = Vec::new();
-        for _ in 0..16 {
-            let rl = rl.clone();
-            let k = k.clone();
-            let rate_limit = rate_limit.clone();
-            tasks.push(smol::spawn(async move {
-                for _ in 0..50 {
-                    let d = rl
-                        .hybrid()
-                        .absolute()
-                        .inc(&k, &rate_limit, 1)
-                        .await
-                        .unwrap();
-                    if matches!(d, RateLimitDecision::Suppressed { .. }) {
-                        panic!("unexpected suppressed decision in hybrid absolute");
-                    }
-                }
-            }));
-        }
-
-        for t in tasks {
-            t.await;
+            runtime::join(t).await;
         }
     });
 }
