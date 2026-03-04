@@ -280,12 +280,17 @@ impl SuppressedHybridRateLimiter {
             } = state_entry.deref()
             {
                 let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
-                let count_value = count.load(Ordering::Relaxed);
-                let current_total_count = starting_count.saturating_add(count_value);
                 let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
                 let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
 
-                if current_total_count.saturating_add(increment) > soft_window_limit {
+                if starting_count
+                    .saturating_add(count.load(Ordering::Relaxed))
+                    .saturating_add(increment)
+                    > soft_window_limit
+                {
+                    let count_value = count.swap(0, Ordering::Relaxed);
+                    let current_total_count = starting_count.saturating_add(count_value);
+
                     drop(state_entry);
 
                     if count_value > 0 {
@@ -312,7 +317,7 @@ impl SuppressedHybridRateLimiter {
                         window_limit: Mutex::new(window_limit),
                         suppression_factor_ttl_ms: Mutex::new(*self.suppression_factor_cache_ms),
                         starting_count: Mutex::new(current_total_count),
-                        count: AtomicU64::new(count_value.saturating_add(increment)),
+                        count: AtomicU64::new(increment),
                     };
 
                     return Ok(RateLimitDecision::Suppressed {
