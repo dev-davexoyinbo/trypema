@@ -618,6 +618,10 @@ impl SuppressedHybridRateLimiter {
             }
         }
 
+        if resets.is_empty() {
+            return Ok(());
+        }
+
         let read_state_results = self.redis_proxy.batch_read_state(&resets).await?;
 
         let mut rng = |p: f64| rand::random_bool(p);

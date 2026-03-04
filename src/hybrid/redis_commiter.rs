@@ -81,13 +81,11 @@ impl RedisCommitter {
                                 Self::flush_to_redis(&redis_proxy, &mut batch, max_batch_size).await
                             {
                                 tracing::error!(error = ?err, "Failed to flush to Redis");
-                                continue;
                             };
 
                             if let Err(err) = limiter_sender.try_send(RedisRateLimiterSignal::Flush)
                             {
-                                tracing::debug!(error = ?err, "Failed to send flush signal to Redis rate limiter");
-                                continue;
+                                tracing::trace!(error = ?err, "Failed to send flush signal to Redis rate limiter");
                             }
                         }
                         futures::future::Either::Right((commit, _tick_fut)) => {
