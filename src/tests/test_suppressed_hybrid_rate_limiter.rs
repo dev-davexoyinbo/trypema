@@ -233,9 +233,9 @@ fn hybrid_suppressed_crossing_base_capacity_does_not_call_rng_when_sf_is_zero() 
             matches!(
                 d1,
                 RateLimitDecision::Suppressed {
-                    suppression_factor,
-                    is_allowed: true
-                } if (suppression_factor - 0.0).abs() < 1e-12
+                    suppression_factor: 1f64,
+                    is_allowed: false
+                }
             ),
             "d1: {d1:?}"
         );
@@ -584,9 +584,9 @@ fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_zero() {
             matches!(
                 d1,
                 RateLimitDecision::Suppressed {
-                    suppression_factor,
-                    is_allowed: true
-                } if (suppression_factor - 0.0).abs() < 1e-12
+                    suppression_factor: 1f64,
+                    is_allowed: false
+                }
             ),
             "d1: {d1:?}"
         );
@@ -603,9 +603,9 @@ fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_zero() {
             matches!(
                 d2,
                 RateLimitDecision::Suppressed {
-                    suppression_factor,
-                    is_allowed: true
-                } if (suppression_factor - 0.0).abs() < 1e-12
+                    suppression_factor: 1f64,
+                    is_allowed: false
+                }
             ),
             "d2: {d2:?}"
         );
@@ -860,9 +860,9 @@ fn hybrid_suppressed_suppressing_hard_cap_guard_forces_full_denial_without_rng()
             matches!(
                 d0,
                 RateLimitDecision::Suppressed {
-                    suppression_factor,
-                    is_allowed: true
-                } if (suppression_factor - 0.0).abs() < 1e-12
+                    suppression_factor: 1f64,
+                    is_allowed: false
+                }
             ),
             "d0: {d0:?}"
         );
@@ -880,9 +880,9 @@ fn hybrid_suppressed_suppressing_hard_cap_guard_forces_full_denial_without_rng()
             matches!(
                 d1,
                 RateLimitDecision::Suppressed {
-                    suppression_factor,
+                    suppression_factor: 1f64,
                     is_allowed: false
-                } if (suppression_factor - 1.0).abs() < 1e-12
+                }
             ),
             "d1: {d1:?}"
         );

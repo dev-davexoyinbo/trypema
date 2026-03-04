@@ -286,7 +286,7 @@ impl SuppressedHybridRateLimiter {
                 if starting_count
                     .saturating_add(count.load(Ordering::Relaxed))
                     .saturating_add(increment)
-                    >= soft_window_limit
+                    > soft_window_limit
                 {
                     let count_value = count.swap(0, Ordering::Relaxed);
                     let current_total_count = starting_count.saturating_add(count_value);
