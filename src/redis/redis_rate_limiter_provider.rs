@@ -99,9 +99,13 @@ pub struct RedisRateLimiterOptions {
     /// Same semantics as local provider.
     pub suppression_factor_cache_ms: SuppressionFactorCacheMs,
 
-    /// Sync interval (milliseconds) for flushing local cache.
+    /// Sync interval (milliseconds) for the hybrid provider's background flush.
     ///
-    /// Same semantics as local provider.
+    /// This option is used by the hybrid provider (`rl.hybrid()`) to determine how often local
+    /// increments are committed to Redis.
+    ///
+    /// The pure Redis provider (`rl.redis()`) does not maintain a local fast-path and therefore
+    /// does not use this value.
     pub sync_interval_ms: SyncIntervalMs,
 }
 

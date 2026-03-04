@@ -8,7 +8,13 @@ pub enum RedisRateLimiterSignal {
     Flush,
 }
 
-///. It is suggested that the sync interval be lesser than the rate group size.
+/// Sync interval (milliseconds) for the hybrid provider's background flush.
+///
+/// The hybrid provider batches local increments and periodically commits them to Redis.
+/// Smaller values reduce sync lag (but increase Redis write frequency); larger values reduce Redis
+/// write frequency (but increase how stale Redis state can be between flushes).
+///
+/// It is generally recommended to keep `sync_interval_ms` <= `rate_group_size_ms`.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct SyncIntervalMs(u64);
 

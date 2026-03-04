@@ -842,8 +842,10 @@ fn run_redis(args: &Args) {
 fn run_hybrid(args: &Args) {
     use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 
+    // Note: the library supports hybrid absolute + hybrid suppressed.
+    // The stress harness currently exercises hybrid absolute only.
     if args.strategy != Strategy::Absolute {
-        eprintln!("hybrid provider currently supports: --strategy absolute");
+        eprintln!("hybrid stress runner currently supports: --strategy absolute");
         std::process::exit(2);
     }
 
@@ -1008,8 +1010,10 @@ fn run_hybrid(args: &Args) {
 fn run_hybrid(args: &Args) {
     use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 
+    // Note: the library supports hybrid absolute + hybrid suppressed.
+    // The stress harness currently exercises hybrid absolute only.
     if args.strategy != Strategy::Absolute {
-        eprintln!("hybrid provider currently supports: --strategy absolute");
+        eprintln!("hybrid stress runner currently supports: --strategy absolute");
         std::process::exit(2);
     }
 

@@ -21,6 +21,7 @@ Benchmarks and comparisons:
 
 - **Local provider** (`local`): In-process rate limiting with per-key state
 - **Redis provider** (`redis`): Distributed rate limiting backed by Redis 6.2+
+- **Hybrid provider** (`hybrid`): Redis-backed limiter with a local fast-path and periodic Redis sync
 
 **Strategies:**
 
@@ -45,6 +46,17 @@ This crate is **not** designed for:
 Rate limiting is best-effort: concurrent requests may temporarily overshoot limits.
 
 ## Quick Start
+
+## Running Redis-backed Tests
+
+The Redis and hybrid providers have integration tests that require a running Redis instance.
+Set `REDIS_URL` to enable them.
+
+Example (local Redis):
+
+```bash
+REDIS_URL=redis://127.0.0.1:6379/ cargo test --features redis-tokio
+```
 
 ### Local Provider (In-Process)
 
@@ -325,7 +337,8 @@ let rate = RateLimit::try_from(10.0)?;
 
 let _decision = rl.hybrid().absolute().inc(&key, &rate, 1).await?;
 
-// Note: the hybrid suppressed strategy is not implemented yet.
+// The hybrid provider also supports the suppressed strategy.
+let _decision = rl.hybrid().suppressed().inc(&key, &rate, 1).await?;
 # }
 # Ok(())
 # }
@@ -377,7 +390,7 @@ Additional fields for Redis provider:
 | `connection_manager` | `ConnectionManager` | Redis connection manager from `redis` crate               |
 | `prefix`             | `Option<RedisKey>`  | Optional prefix for all Redis keys (default: `"trypema"`) |
 | `suppression_factor_cache_ms` | `SuppressionFactorCacheMs` | Cache duration for per-key suppression factor recomputation |
-| `sync_interval_ms`   | `SyncIntervalMs`    | Flush interval for the hybrid provider's local fast-path   |
+| `sync_interval_ms`   | `SyncIntervalMs`    | Hybrid provider flush cadence for its local fast-path (Redis provider ignores) |
 
 Plus the same `window_size_seconds`, `rate_group_size_ms`, and `hard_limit_factor` fields.
 
@@ -657,6 +670,8 @@ src/
 ```
 
 ## Redis Provider Details
+
+This section applies to both the Redis provider and the hybrid provider.
 
 ### Requirements
 

@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 mod enabled {
@@ -10,8 +10,8 @@ mod enabled {
     use trypema::local::LocalRateLimiterOptions;
     use trypema::redis::{RedisKey, RedisRateLimiterOptions};
     use trypema::{
-        hybrid::SyncIntervalMs, HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter,
-        RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
+        HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions,
+        SuppressionFactorCacheMs, WindowSizeSeconds, hybrid::SyncIntervalMs,
     };
 
     #[cfg(feature = "redis-tokio")]

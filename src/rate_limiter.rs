@@ -4,6 +4,7 @@
 //! It coordinates multiple providers:
 //! - [`LocalRateLimiterProvider`]: In-process rate limiting
 //! - [`RedisRateLimiterProvider`]: Distributed rate limiting (requires Redis 6.2+)
+//! - [`HybridRateLimiterProvider`]: Redis-backed limiting with a local fast-path and periodic Redis sync
 //!
 //! # Examples
 //!
@@ -500,7 +501,30 @@ impl RateLimiter {
         &self.redis
     }
 
-    ///...
+    /// Access the hybrid provider for Redis-backed limiting with a local fast-path.
+    ///
+    /// The hybrid provider keeps a local in-memory fast-path for low-latency admission checks and
+    /// periodically flushes local increments to Redis in batches. This can reduce Redis round trips
+    /// compared to using [`RateLimiter::redis`], at the cost of some additional approximation due to
+    /// sync lag.
+    ///
+    /// Requires Redis 6.2+ and one of the Redis features (`redis-tokio` or `redis-smol`).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn example() -> Result<(), trypema::TrypemaError> {
+    /// use trypema::{RateLimit, RateLimiter};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let rl: RateLimiter = todo!("construct RateLimiter with RedisRateLimiterOptions");
+    /// let key = RedisKey::try_from("user_123".to_string())?;
+    /// let rate = RateLimit::try_from(10.0)?;
+    ///
+    /// let _ = rl.hybrid().absolute().inc(&key, &rate, 1).await?;
+    /// let _ = rl.hybrid().suppressed().inc(&key, &rate, 1).await?;
+    /// # Ok(()) }
+    /// ```
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     pub fn hybrid(&self) -> &HybridRateLimiterProvider {
