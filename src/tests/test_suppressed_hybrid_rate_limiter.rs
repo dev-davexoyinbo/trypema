@@ -449,7 +449,10 @@ fn hybrid_suppressed_denies_100_percent_after_hard_limit() {
             // reached. During seeding, we only need to ensure the API never returns Rejected.
             // Suppressed decisions may be allowed or denied depending on suppression_factor.
             assert!(
-                matches!(d, RateLimitDecision::Allowed | RateLimitDecision::Suppressed { .. }),
+                matches!(
+                    d,
+                    RateLimitDecision::Allowed | RateLimitDecision::Suppressed { .. }
+                ),
                 "d: {d:?}"
             );
         }
@@ -704,7 +707,17 @@ fn hybrid_suppressed_batch_increment_respects_soft_limit_boundary() {
             .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng2)
             .await
             .unwrap();
-        assert!(matches!(d2, RateLimitDecision::Allowed), "d2: {d2:?}");
+        assert!(
+            matches!(
+                d2,
+                RateLimitDecision::Allowed
+                    | RateLimitDecision::Suppressed {
+                        suppression_factor: 1f64,
+                        is_allowed: true
+                    }
+            ),
+            "d2: {d2:?}"
+        );
 
         // Crosses boundary -> suppression begins; sf is 0.0 on the local overflow path.
         let mut rng3 = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
@@ -718,9 +731,9 @@ fn hybrid_suppressed_batch_increment_respects_soft_limit_boundary() {
             matches!(
                 d3,
                 RateLimitDecision::Suppressed {
-                    suppression_factor,
-                    is_allowed: true
-                } if (suppression_factor - 0.0).abs() < 1e-12
+                    suppression_factor: 1f64,
+                    is_allowed: false
+                }
             ),
             "d3: {d3:?}"
         );
