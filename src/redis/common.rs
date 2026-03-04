@@ -1,4 +1,7 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::Mutex,
+};
 
 use crate::{TrypemaError, common::RateType};
 
@@ -14,6 +17,10 @@ impl RedisKey {
     /// Create a new default prefix.
     pub fn default_prefix() -> Self {
         Self("trypema".to_string())
+    }
+
+    pub(crate) fn from(value: String) -> Self {
+        Self(value)
     }
 }
 
@@ -106,4 +113,12 @@ impl RedisKeyGenerator {
     pub(crate) fn get_suppression_factor_key(&self, key: &RedisKey) -> String {
         self.get_key_with_suffix(key, &self.suppression_factor_key_suffix)
     }
+}
+
+pub(crate) fn mutex_lock<'a, T>(
+    m: &'a Mutex<T>,
+    what: &'static str,
+) -> Result<std::sync::MutexGuard<'a, T>, TrypemaError> {
+    m.lock()
+        .map_err(|_| TrypemaError::CustomError(format!("mutex poisoned: {what}")))
 }

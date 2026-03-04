@@ -9,6 +9,7 @@ Notes:
 
 - Use `--release` for anything you want to compare.
 - Redis benchmarks require Redis 6.2+.
+- Redis- and hybrid-backed unit tests require `REDIS_URL` to be set.
 - The stress harness is a separate workspace crate and does not require a crate feature.
 
 ## Quick Start
@@ -90,6 +91,10 @@ Redis examples:
 # Start Redis
 docker compose up -d redis
 
+# (Optional) run Redis/hybrid unit tests
+export REDIS_URL=redis://127.0.0.1:16379/
+cargo test --features redis-tokio
+
 # Redis: worst-case contention
 cargo run --release -p trypema-stress --features redis-tokio -- \
   --provider redis --strategy absolute --threads 256 \
@@ -107,6 +112,7 @@ cargo run --release -p trypema-stress --features redis-tokio -- \
 This suite benchmarks three Redis-backed limiters using the same harness:
 
 - `trypema` Redis provider (Lua scripts)
+- `trypema` hybrid provider (local counters + Redis sync)
 - `redis-cell` module (`CL.THROTTLE`)
 - GCRA Lua script (equivalent to go-redis/redis_rate `allowN`)
 

@@ -7,5 +7,7 @@ pub use absolute_redis_rate_limiter::*;
 mod suppressed_redis_rate_limiter;
 pub use suppressed_redis_rate_limiter::*;
 
-mod common;
+pub(crate) mod common;
 pub use common::*;
+
+pub(crate) use crate::runtime::{new_interval, spawn_task, tick};

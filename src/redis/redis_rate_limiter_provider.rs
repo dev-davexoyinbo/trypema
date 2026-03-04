@@ -3,6 +3,7 @@ use redis::aio::ConnectionManager;
 use crate::{
     AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RedisKey,
     SuppressedRedisRateLimiter, TrypemaError, WindowSizeSeconds, common::SuppressionFactorCacheMs,
+    hybrid::SyncIntervalMs,
 };
 
 /// Configuration for Redis-backed rate limiters.
@@ -20,8 +21,10 @@ use crate::{
 /// # async fn example() -> Result<(), trypema::TrypemaError> {
 /// use trypema::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds};
 /// use trypema::SuppressionFactorCacheMs;
+/// use trypema::hybrid::SyncIntervalMs;
 /// use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 ///
+/// let sync_interval_ms = SyncIntervalMs::default();
 /// let options = RedisRateLimiterOptions {
 ///     connection_manager: todo!("create redis::aio::ConnectionManager"),
 ///     prefix: Some(RedisKey::try_from("myapp".to_string())?),
@@ -29,6 +32,7 @@ use crate::{
 ///     rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
 ///     hard_limit_factor: HardLimitFactor::try_from(1.5)?,
 ///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+///     sync_interval_ms,
 /// };
 /// let _ = options;
 /// # Ok(()) }
@@ -94,6 +98,15 @@ pub struct RedisRateLimiterOptions {
     ///
     /// Same semantics as local provider.
     pub suppression_factor_cache_ms: SuppressionFactorCacheMs,
+
+    /// Sync interval (milliseconds) for the hybrid provider's background flush.
+    ///
+    /// This option is used by the hybrid provider (`rl.hybrid()`) to determine how often local
+    /// increments are committed to Redis.
+    ///
+    /// The pure Redis provider (`rl.redis()`) does not maintain a local fast-path and therefore
+    /// does not use this value.
+    pub sync_interval_ms: SyncIntervalMs,
 }
 
 /// Provider for Redis-backed distributed rate limiting.
@@ -127,23 +140,31 @@ pub struct RedisRateLimiterOptions {
 ///     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter,
 ///     RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
 /// };
+/// use trypema::hybrid::SyncIntervalMs;
 /// use trypema::local::LocalRateLimiterOptions;
 /// use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 ///
+/// let window_size_seconds = WindowSizeSeconds::try_from(60)?;
+/// let rate_group_size_ms = RateGroupSizeMs::try_from(10)?;
+/// let hard_limit_factor = HardLimitFactor::default();
+/// let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
+/// let sync_interval_ms = SyncIntervalMs::default();
+///
 /// let rl = RateLimiter::new(RateLimiterOptions {
 ///     local: LocalRateLimiterOptions {
-///         window_size_seconds: WindowSizeSeconds::try_from(60)?,
-///         rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
-///         hard_limit_factor: HardLimitFactor::default(),
-///         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+///         window_size_seconds,
+///         rate_group_size_ms,
+///         hard_limit_factor,
+///         suppression_factor_cache_ms,
 ///     },
 ///     redis: RedisRateLimiterOptions {
 ///         connection_manager: todo!("create redis::aio::ConnectionManager"),
 ///         prefix: None,
-///         window_size_seconds: WindowSizeSeconds::try_from(60)?,
-///         rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
-///         hard_limit_factor: HardLimitFactor::default(),
-///         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+///         window_size_seconds,
+///         rate_group_size_ms,
+///         hard_limit_factor,
+///         suppression_factor_cache_ms,
+///         sync_interval_ms,
 ///     },
 /// });
 ///

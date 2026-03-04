@@ -8,7 +8,19 @@ use hdrhistogram::Histogram;
 
 use redis::aio::ConnectionManager;
 
-use crate::{Args, Counts, KeyDist, Mode, qps_for_now, should_sample};
+use crate::{
+    Args, Counts, ErrorStats, KeyDist, Mode, print_error_stats, qps_for_now, should_sample,
+};
+
+#[cfg(feature = "redis-tokio")]
+async fn async_sleep(d: Duration) {
+    tokio::time::sleep(d).await;
+}
+
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+async fn async_sleep(d: Duration) {
+    smol::Timer::after(d).await;
+}
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub(crate) enum RedisLimiter {
@@ -35,6 +47,7 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
     let stop = Arc::new(AtomicBool::new(false));
     let counts = Arc::new(Counts::default());
     let total_ops = Arc::new(AtomicU64::new(0));
+    let error_stats = Arc::new(ErrorStats::default());
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(args2.duration_s);
@@ -44,11 +57,12 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
         let stop = Arc::clone(&stop);
         let counts = Arc::clone(&counts);
         let total_ops = Arc::clone(&total_ops);
+        let error_stats = Arc::clone(&error_stats);
         let args = args2.clone();
         let redis_keys = redis_keys.clone();
         let cm = Arc::clone(&cm);
 
-        join.push(tokio::spawn(async move {
+        join.push(spawn_task(async move {
             let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
             let mut i = 0_u64;
             let mut seed = (t as u64 + 1) * 0xD134_2543_DE82_EF95;
@@ -79,7 +93,7 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
                     let per_op_ns = 1_000_000_000u64 / qps.max(1);
                     let now = Instant::now();
                     if now < next_deadline {
-                        tokio::time::sleep(next_deadline - now).await;
+                        async_sleep(next_deadline - now).await;
                     }
                     next_deadline += Duration::from_nanos(per_op_ns);
                 }
@@ -115,7 +129,7 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
                         let full_key = format!("{}:{}", args.redis_prefix, key);
                         let res: redis::RedisResult<(i64, i64, i64, i64, i64)> =
                             redis::cmd("CL.THROTTLE")
-                                .arg(full_key)
+                                .arg(&full_key)
                                 .arg(max_burst)
                                 .arg(count_per_period)
                                 .arg(period_s)
@@ -131,7 +145,15 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
                                 }
                                 true
                             }
-                            Err(_) => false,
+                            Err(err) => {
+                                error_stats.record(
+                                    err.to_string(),
+                                    Some(format!(
+                                        "provider=redis_compare limiter=cell key={full_key} err={err:?}"
+                                    )),
+                                );
+                                false
+                            }
                         }
                     }
                     RedisLimiter::Gcra => {
@@ -144,7 +166,7 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
                         let cost: u64 = 1;
                         let full_key = format!("{}:{}", args.redis_prefix, key);
                         let res: redis::RedisResult<(i64, f64, String, String)> = gcra_script
-                            .key(full_key)
+                            .key(&full_key)
                             .arg(burst)
                             .arg(rate)
                             .arg(period)
@@ -160,7 +182,15 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
                                 }
                                 true
                             }
-                            Err(_) => false,
+                            Err(err) => {
+                                error_stats.record(
+                                    err.to_string(),
+                                    Some(format!(
+                                        "provider=redis_compare limiter=gcra key={full_key} err={err:?}"
+                                    )),
+                                );
+                                false
+                            }
                         }
                     }
                 };
@@ -180,12 +210,12 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
         }));
     }
 
-    tokio::time::sleep(Duration::from_secs(args2.duration_s)).await;
+    async_sleep(Duration::from_secs(args2.duration_s)).await;
     stop.store(true, Ordering::Relaxed);
 
     let mut merged = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
     for j in join {
-        let hist = j.await.unwrap();
+        let hist = join_task(j).await;
         merged.add(&hist).unwrap();
     }
 
@@ -195,6 +225,34 @@ pub(crate) async fn run(args2: Args, limiter: RedisLimiter) {
 
     println!("redis_limiter={:?}", limiter);
     crate::print_results(&args2, elapsed, ops, ops_s, &merged, &counts);
+
+    print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
+}
+
+#[cfg(feature = "redis-tokio")]
+fn spawn_task<F>(f: F) -> tokio::task::JoinHandle<Histogram<u64>>
+where
+    F: std::future::Future<Output = Histogram<u64>> + Send + 'static,
+{
+    tokio::spawn(f)
+}
+
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+fn spawn_task<F>(f: F) -> smol::Task<Histogram<u64>>
+where
+    F: std::future::Future<Output = Histogram<u64>> + Send + 'static,
+{
+    smol::spawn(f)
+}
+
+#[cfg(feature = "redis-tokio")]
+async fn join_task(j: tokio::task::JoinHandle<Histogram<u64>>) -> Histogram<u64> {
+    j.await.unwrap()
+}
+
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+async fn join_task(j: smol::Task<Histogram<u64>>) -> Histogram<u64> {
+    j.await
 }
 
 async fn warmup(args: &Args, cm: &Arc<ConnectionManager>, limiter: RedisLimiter, keys: &[String]) {

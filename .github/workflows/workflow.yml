@@ -46,7 +46,17 @@ jobs:
           docker logs "${{ job.services.redis.id }}" || true
           exit 1
 
-      - name: Run tests
+      - name: Run tests (no runtime)
         env:
           REDIS_URL: redis://127.0.0.1:6379
-        run: cargo test --features redis-tokio
+        run: cargo test --no-default-features -- --show-output
+
+      - name: Run tests (tokio)
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+        run: cargo test --features redis-tokio -- --show-output
+
+      - name: Run tests (smol)
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+        run: cargo test --features redis-smol -- --show-output
