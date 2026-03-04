@@ -385,7 +385,7 @@ fn run_local(args: &Args) {
                 local: build_local_options(&args),
                 redis: RedisRateLimiterOptions {
                     connection_manager,
-                    prefix: Some(RedisKey::try_from(args.redis_prefix.clone()).unwrap()),
+                    prefix: Some(RedisKey::try_from(args.redis_prefix.replace(':', "_")).unwrap()),
                     window_size_seconds: WindowSizeSeconds::try_from(args.window_s).unwrap(),
                     rate_group_size_ms: RateGroupSizeMs::try_from(args.group_ms).unwrap(),
                     hard_limit_factor: HardLimitFactor::try_from(args.hard_limit_factor).unwrap(),
@@ -535,7 +535,7 @@ fn run_redis(args: &Args) {
             local: build_local_options(&args2),
             redis: RedisRateLimiterOptions {
                 connection_manager,
-                prefix: Some(RedisKey::try_from(args2.redis_prefix.clone()).unwrap()),
+                prefix: Some(RedisKey::try_from(args2.redis_prefix.replace(':', "_")).unwrap()),
                 window_size_seconds: WindowSizeSeconds::try_from(args2.window_s).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(args2.group_ms).unwrap(),
                 hard_limit_factor: HardLimitFactor::try_from(args2.hard_limit_factor).unwrap(),
@@ -701,7 +701,7 @@ fn run_redis(args: &Args) {
             local: build_local_options(&args2),
             redis: RedisRateLimiterOptions {
                 connection_manager,
-                prefix: Some(RedisKey::try_from(args2.redis_prefix.clone()).unwrap()),
+                prefix: Some(RedisKey::try_from(args2.redis_prefix.replace(':', "_")).unwrap()),
                 window_size_seconds: WindowSizeSeconds::try_from(args2.window_s).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(args2.group_ms).unwrap(),
                 hard_limit_factor: HardLimitFactor::try_from(args2.hard_limit_factor).unwrap(),
@@ -843,11 +843,6 @@ fn run_hybrid(args: &Args) {
     use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 
     // Note: the library supports hybrid absolute + hybrid suppressed.
-    // The stress harness currently exercises hybrid absolute only.
-    if args.strategy != Strategy::Absolute {
-        eprintln!("hybrid stress runner currently supports: --strategy absolute");
-        std::process::exit(2);
-    }
 
     let args2 = args.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -869,7 +864,7 @@ fn run_hybrid(args: &Args) {
             local: build_local_options(&args2),
             redis: RedisRateLimiterOptions {
                 connection_manager,
-                prefix: Some(RedisKey::try_from(args2.redis_prefix.clone()).unwrap()),
+                prefix: Some(RedisKey::try_from(args2.redis_prefix.replace(':', "_")).unwrap()),
                 window_size_seconds: WindowSizeSeconds::try_from(args2.window_s).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(args2.group_ms).unwrap(),
                 hard_limit_factor: HardLimitFactor::try_from(args2.hard_limit_factor).unwrap(),
@@ -949,7 +944,10 @@ fn run_hybrid(args: &Args) {
                     let sample = should_sample(i, args.sample_every);
                     let t0 = if sample { Some(Instant::now()) } else { None };
 
-                    let res = rl.hybrid().absolute().inc(k, &rate, 1).await;
+                    let res = match args.strategy {
+                        Strategy::Absolute => rl.hybrid().absolute().inc(k, &rate, 1).await,
+                        Strategy::Suppressed => rl.hybrid().suppressed().inc(k, &rate, 1).await,
+                    };
 
                     if let Some(t0) = t0 {
                         let us = t0.elapsed().as_micros() as u64;
@@ -964,15 +962,23 @@ fn run_hybrid(args: &Args) {
                         Ok(RateLimitDecision::Rejected { .. }) => {
                             counts.rejected.fetch_add(1, Ordering::Relaxed);
                         }
-                        Ok(RateLimitDecision::Suppressed { .. }) => {
-                            // hybrid absolute should not return suppressed
-                            error_stats.record(
-                                "unexpected suppressed decision".to_string(),
-                                Some(format!(
-                                    "provider=hybrid key={k:?} err=unexpected_suppressed"
-                                )),
-                            );
-                            counts.errors.fetch_add(1, Ordering::Relaxed);
+                        Ok(RateLimitDecision::Suppressed { is_allowed, .. }) => {
+                            if args.strategy == Strategy::Absolute {
+                                // hybrid absolute should not return suppressed
+                                error_stats.record(
+                                    "unexpected suppressed decision".to_string(),
+                                    Some(format!(
+                                        "provider=hybrid key={k:?} err=unexpected_suppressed"
+                                    )),
+                                );
+                                counts.errors.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                if is_allowed {
+                                    counts.suppressed_allowed.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    counts.suppressed_denied.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                         }
                         Err(err) => {
                             error_stats.record(
@@ -1011,11 +1017,6 @@ fn run_hybrid(args: &Args) {
     use trypema::redis::{RedisKey, RedisRateLimiterOptions};
 
     // Note: the library supports hybrid absolute + hybrid suppressed.
-    // The stress harness currently exercises hybrid absolute only.
-    if args.strategy != Strategy::Absolute {
-        eprintln!("hybrid stress runner currently supports: --strategy absolute");
-        std::process::exit(2);
-    }
 
     let args2 = args.clone();
 
@@ -1032,7 +1033,7 @@ fn run_hybrid(args: &Args) {
             local: build_local_options(&args2),
             redis: RedisRateLimiterOptions {
                 connection_manager,
-                prefix: Some(RedisKey::try_from(args2.redis_prefix.clone()).unwrap()),
+                prefix: Some(RedisKey::try_from(args2.redis_prefix.replace(':', "_")).unwrap()),
                 window_size_seconds: WindowSizeSeconds::try_from(args2.window_s).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(args2.group_ms).unwrap(),
                 hard_limit_factor: HardLimitFactor::try_from(args2.hard_limit_factor).unwrap(),
@@ -1112,7 +1113,10 @@ fn run_hybrid(args: &Args) {
                     let sample = should_sample(i, args.sample_every);
                     let t0 = if sample { Some(Instant::now()) } else { None };
 
-                    let res = rl.hybrid().absolute().inc(k, &rate, 1).await;
+                    let res = match args.strategy {
+                        Strategy::Absolute => rl.hybrid().absolute().inc(k, &rate, 1).await,
+                        Strategy::Suppressed => rl.hybrid().suppressed().inc(k, &rate, 1).await,
+                    };
 
                     if let Some(t0) = t0 {
                         let us = t0.elapsed().as_micros() as u64;
@@ -1127,14 +1131,22 @@ fn run_hybrid(args: &Args) {
                         Ok(RateLimitDecision::Rejected { .. }) => {
                             counts.rejected.fetch_add(1, Ordering::Relaxed);
                         }
-                        Ok(RateLimitDecision::Suppressed { .. }) => {
-                            error_stats.record(
-                                "unexpected suppressed decision".to_string(),
-                                Some(format!(
-                                    "provider=hybrid key={k:?} err=unexpected_suppressed"
-                                )),
-                            );
-                            counts.errors.fetch_add(1, Ordering::Relaxed);
+                        Ok(RateLimitDecision::Suppressed { is_allowed, .. }) => {
+                            if args.strategy == Strategy::Absolute {
+                                error_stats.record(
+                                    "unexpected suppressed decision".to_string(),
+                                    Some(format!(
+                                        "provider=hybrid key={k:?} err=unexpected_suppressed"
+                                    )),
+                                );
+                                counts.errors.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                if is_allowed {
+                                    counts.suppressed_allowed.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    counts.suppressed_denied.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                         }
                         Err(err) => {
                             error_stats.record(

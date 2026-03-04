@@ -144,7 +144,9 @@ pub(crate) fn run(args2: Args) {
                         local: crate::build_local_options(&args),
                         redis: RedisRateLimiterOptions {
                             connection_manager,
-                            prefix: Some(RedisKey::try_from(args.redis_prefix.clone()).unwrap()),
+                            prefix: Some(
+                                RedisKey::try_from(args.redis_prefix.replace(':', "_")).unwrap(),
+                            ),
                             window_size_seconds: WindowSizeSeconds::try_from(args.window_s)
                                 .unwrap(),
                             rate_group_size_ms: RateGroupSizeMs::try_from(args.group_ms).unwrap(),

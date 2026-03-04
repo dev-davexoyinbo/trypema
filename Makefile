@@ -291,19 +291,19 @@ stress-redis-compare-tokio: ## Compare Redis provider implementations (tokio)
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) hot absolute rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema-redis; \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema; \
 	printf "\n\n== redis compare: trypema (hybrid provider) hot absolute rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema-hybrid; \
+		--provider hybrid --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000; \
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) hot suppressed rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema-redis; \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema; \
 	printf "\n\n== redis compare: trypema (hybrid provider) hot suppressed rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema-hybrid; \
+		--provider hybrid --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000; \
 	printf "\n\n== redis compare: redis-cell hot absolute rate=1000 burst=15 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
@@ -315,19 +315,19 @@ stress-redis-compare-tokio: ## Compare Redis provider implementations (tokio)
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) uniform(key_space=100000) absolute rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema-redis; \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema; \
 	printf "\n\n== redis compare: trypema (hybrid provider) uniform(key_space=100000) absolute rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema-hybrid; \
+		--provider hybrid --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000; \
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) uniform(key_space=100000) suppressed rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema-redis; \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema; \
 	printf "\n\n== redis compare: trypema (hybrid provider) uniform(key_space=100000) suppressed rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
-		--provider redis --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema-hybrid; \
+		--provider hybrid --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000; \
 	printf "\n\n== redis compare: redis-cell uniform(key_space=100000) absolute rate=1e9 burst=1e6 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
@@ -344,19 +344,19 @@ stress-redis-compare-smol: ## Compare Redis provider implementations (smol)
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) hot absolute rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema-redis; \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema; \
 	printf "\n\n== redis compare: trypema (hybrid provider) hot absolute rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
-		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema-hybrid; \
+		--provider hybrid --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000; \
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) hot suppressed rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider redis --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema-redis; \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema; \
 	printf "\n\n== redis compare: trypema (hybrid provider) hot suppressed rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
-		--provider redis --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000 --redis-limiter trypema-hybrid; \
+		--provider hybrid --strategy suppressed --threads 16 --key-dist hot --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000; \
 	printf "\n\n== redis compare: redis-cell hot absolute rate=1000 burst=15 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
@@ -368,19 +368,19 @@ stress-redis-compare-smol: ## Compare Redis provider implementations (smol)
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) uniform(key_space=100000) absolute rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema-redis; \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema; \
 	printf "\n\n== redis compare: trypema (hybrid provider) uniform(key_space=100000) absolute rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
-		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema-hybrid; \
+		--provider hybrid --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000; \
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) uniform(key_space=100000) suppressed rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider redis --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema-redis; \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema; \
 	printf "\n\n== redis compare: trypema (hybrid provider) uniform(key_space=100000) suppressed rate=1e9 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
-		--provider redis --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
-		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000 --redis-limiter trypema-hybrid; \
+		--provider hybrid --strategy suppressed --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
+		--redis-url "$(REDIS_URL)" --redis-prefix cmp --rate-limit-per-s 1000000000; \
 	printf "\n\n== redis compare: redis-cell uniform(key_space=100000) absolute rate=1e9 burst=1e6 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider redis --strategy absolute --threads 16 --key-dist uniform --key-space 100000 --duration-s 30 \
