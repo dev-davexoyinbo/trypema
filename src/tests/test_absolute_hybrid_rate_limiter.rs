@@ -84,6 +84,12 @@ async fn build_limiter_with_prefix(
     std::sync::Arc::new(RateLimiter::new(options))
 }
 
+async fn wait_for_hybrid_sync(sync_interval_ms: u64) {
+    // Commits are flushed on interval ticks. The limiter's flush handler can enqueue follow-up
+    // commits for accepting keys, which then require a second tick to be written.
+    runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+}
+
 #[test]
 fn hybrid_allows_until_capacity_then_rejects() {
     let url = redis_url();
@@ -227,7 +233,7 @@ fn hybrid_usage_is_committed_to_redis_on_flush_and_then_visible_to_others() {
             window_size_seconds,
             rate_group_size_ms,
             sync_interval_ms,
-            prefix,
+            prefix.clone(),
         )
         .await;
 
@@ -245,8 +251,8 @@ fn hybrid_usage_is_committed_to_redis_on_flush_and_then_visible_to_others() {
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
-        // Other instances checking Redis directly should still see no limit state.
-        let d0 = rl_b.redis().absolute().is_allowed(&k).await.unwrap();
+        // Other instances should still see no limit state in the hybrid keyspace.
+        let d0 = rl_b.hybrid().absolute().is_allowed(&k).await.unwrap();
         assert!(matches!(d0, RateLimitDecision::Allowed), "d0: {d0:?}");
 
         // Crossing the accept limit queues a commit (and rejects).
@@ -265,7 +271,7 @@ fn hybrid_usage_is_committed_to_redis_on_flush_and_then_visible_to_others() {
         // We poll because timing depends on the interval tick schedule.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let d2 = rl_b.redis().absolute().is_allowed(&k).await.unwrap();
+            let d2 = rl_b.hybrid().absolute().is_allowed(&k).await.unwrap();
             if matches!(d2, RateLimitDecision::Rejected { .. }) {
                 break;
             }
@@ -303,7 +309,7 @@ fn hybrid_absolute_does_not_touch_redis_until_commit() {
             window_size_seconds,
             rate_group_size_ms,
             sync_interval_ms,
-            prefix,
+            prefix.clone(),
         )
         .await;
 
@@ -322,8 +328,8 @@ fn hybrid_absolute_does_not_touch_redis_until_commit() {
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
-        // Redis should still have no state for this key.
-        let d0 = rl_b.redis().absolute().is_allowed(&k).await.unwrap();
+        // Other instances should not observe a limit until a commit is flushed.
+        let d0 = rl_b.hybrid().absolute().is_allowed(&k).await.unwrap();
         assert!(matches!(d0, RateLimitDecision::Allowed), "d0: {d0:?}");
     });
 }
@@ -499,10 +505,16 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
         let prefix = unique_prefix();
 
         let window_size_seconds = 6_u64;
-        let rate_group_size_ms = 300_u64;
-        let sync_interval_ms = 25_u64;
+        // Make grouping easy to satisfy: commits separated by ~2*sync_interval_ms must be < group.
+        let rate_group_size_ms = 1_000_u64;
+        let sync_interval_ms = 200_u64;
 
-        // Seed Redis with a single merged bucket: 2 + 4 within the same group.
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        // Seed Redis state through the hybrid public API (no direct Redis commands).
+        // We write 2, wait for it to be committed, then write 4; the commit times are close enough
+        // that Redis groups them into one bucket.
         let rl_seed = build_limiter_with_prefix(
             &url,
             window_size_seconds,
@@ -511,23 +523,20 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
             prefix.clone(),
         )
         .await;
-
-        let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
-
-        rl_seed
-            .redis()
+        let _ = rl_seed
+            .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 2)
             .await
             .unwrap();
-        thread::sleep(Duration::from_millis(50));
-        rl_seed
-            .redis()
+        wait_for_hybrid_sync(sync_interval_ms).await;
+        let _ = rl_seed
+            .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 4)
             .await
             .unwrap();
+        wait_for_hybrid_sync(sync_interval_ms).await;
 
         // Create a hybrid limiter that will read the current Redis state.
         let rl = build_limiter_with_prefix(
@@ -539,16 +548,21 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
         )
         .await;
 
-        // Load Redis state into the hybrid cache without adding local usage.
-        let _ = rl
+        // Prime local state into Accepting so we take the accept_limit overflow path.
+        // This ensures remaining_after_waiting is sourced from the oldest bucket count.
+        let d_prime = rl
             .hybrid()
             .absolute()
-            .inc(&k, &rate_limit, 0)
+            .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(
+            matches!(d_prime, RateLimitDecision::Allowed),
+            "d_prime: {d_prime:?}"
+        );
 
-        // At capacity (6 * 1 = 6). Next increment should be rejected and remaining_after_waiting
-        // should reflect the oldest bucket count (which is the full 6 when merged).
+        // At capacity (2 + 4). Next increment should be rejected and remaining_after_waiting
+        // should reflect the oldest bucket count (6 when grouped).
         let d = rl
             .hybrid()
             .absolute()
@@ -574,10 +588,13 @@ fn hybrid_absolute_remaining_after_waiting_differs_when_buckets_are_separate() {
         let prefix = unique_prefix();
 
         let window_size_seconds = 6_u64;
-        let rate_group_size_ms = 300_u64;
-        let sync_interval_ms = 25_u64;
+        let rate_group_size_ms = 200_u64;
+        // Ensure consecutive commit flushes are separated by > rate_group_size_ms.
+        let sync_interval_ms = 350_u64;
 
-        // Seed Redis with two separate buckets: sleep > group size.
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
         let rl_seed = build_limiter_with_prefix(
             &url,
             window_size_seconds,
@@ -587,22 +604,22 @@ fn hybrid_absolute_remaining_after_waiting_differs_when_buckets_are_separate() {
         )
         .await;
 
-        let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
-
-        rl_seed
-            .redis()
-            .absolute()
-            .inc(&k, &rate_limit, 2)
-            .await
-            .unwrap();
-        thread::sleep(Duration::from_millis(350));
-        rl_seed
-            .redis()
+        // Write 4, wait for it to be committed, then write 2; the commit times are far enough
+        // apart that Redis will store them as separate buckets.
+        let _ = rl_seed
+            .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 4)
             .await
             .unwrap();
+        wait_for_hybrid_sync(sync_interval_ms).await;
+        let _ = rl_seed
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 2)
+            .await
+            .unwrap();
+        wait_for_hybrid_sync(sync_interval_ms).await;
 
         let rl = build_limiter_with_prefix(
             &url,
@@ -613,12 +630,29 @@ fn hybrid_absolute_remaining_after_waiting_differs_when_buckets_are_separate() {
         )
         .await;
 
-        let _ = rl
+        // Prime local state into Accepting so we take the accept_limit overflow path
+        // (which uses last_rate_group_count / oldest bucket) rather than the Undefined path
+        // (which uses current_total_count).
+        let d_prime = rl
             .hybrid()
             .absolute()
-            .inc(&k, &rate_limit, 0)
+            .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(
+            matches!(d_prime, RateLimitDecision::Allowed),
+            "d_prime: {d_prime:?}"
+        );
+        let d_prime2 = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(d_prime2, RateLimitDecision::Allowed),
+            "d_prime2: {d_prime2:?}"
+        );
 
         let d = rl
             .hybrid()
@@ -634,8 +668,8 @@ fn hybrid_absolute_remaining_after_waiting_differs_when_buckets_are_separate() {
             panic!("expected rejected decision, got: {d:?}");
         };
 
-        // Oldest bucket is the first bucket with count=2.
-        assert_eq!(remaining_after_waiting, 2, "d: {d:?}");
+        // Oldest bucket is the first committed bucket with count=4.
+        assert_eq!(remaining_after_waiting, 4, "d: {d:?}");
     });
 }
 
@@ -818,7 +852,10 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
             .inc(&k, &rate_limit, 2)
             .await
             .unwrap();
-        assert!(matches!(d2, RateLimitDecision::Rejected { .. }), "d2: {d2:?}");
+        assert!(
+            matches!(d2, RateLimitDecision::Rejected { .. }),
+            "d2: {d2:?}"
+        );
         record_decision(
             d2,
             2,
@@ -883,7 +920,10 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(matches!(decision, RateLimitDecision::Allowed), "decision: {decision:?}");
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "decision: {decision:?}"
+            );
         }
 
         // Many rejected attempts should not change what we can do after the window expires.
@@ -913,7 +953,10 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(matches!(decision, RateLimitDecision::Allowed), "decision: {decision:?}");
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "decision: {decision:?}"
+            );
             accepted_after_expiry += 1;
         }
         assert_eq!(accepted_after_expiry, capacity);
@@ -951,7 +994,10 @@ fn volume_non_integer_rate_uses_truncating_capacity() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(matches!(decision, RateLimitDecision::Allowed), "decision: {decision:?}");
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "decision: {decision:?}"
+            );
         }
 
         let decision = rl
