@@ -104,6 +104,10 @@ impl RedisCommitter {
                     batch.push(commit);
                 }
             }
+
+            if let Err(err) = Self::flush_to_redis(&redis_proxy, &mut batch, max_batch_size).await {
+                tracing::error!(error = ?err, "Failed to flush to Redis");
+            };
         });
 
         tx
