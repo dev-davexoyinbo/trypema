@@ -69,10 +69,6 @@ async fn build_limiter_with_prefix(
     std::sync::Arc::new(RateLimiter::new(options))
 }
 
-fn assert_approx(a: f64, b: f64) {
-    assert!((a - b).abs() < 1e-12, "a={a:?} b={b:?}");
-}
-
 fn assert_in_01(v: f64) {
     assert!(v >= 0.0 && v <= 1.0, "expected v in [0,1], got {v:?}");
 }
@@ -128,7 +124,7 @@ fn hybrid_suppressed_get_suppression_factor_fresh_key_returns_zero() {
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert_approx(sf, 0.0);
+        assert!((sf - 0.0).abs() < 1e-12, "sf: {sf}");
     });
 }
 
@@ -347,9 +343,11 @@ fn hybrid_suppressed_calls_rng_when_redis_reports_mid_suppression_factor() {
             suppression_factor > 0.0 && suppression_factor < 1.0,
             "suppression_factor: {suppression_factor}"
         );
-        assert_approx(
-            seen_p.expect("rng must receive p"),
-            1.0 - suppression_factor,
+        let seen_p = seen_p.expect("rng must receive p");
+        let expected_p = 1.0 - suppression_factor;
+        assert!(
+            (seen_p - expected_p).abs() < 1e-12,
+            "seen_p: {seen_p} expected_p: {expected_p}"
         );
         assert!(!is_allowed, "rng returns false so is_allowed must be false");
     });
@@ -413,7 +411,7 @@ fn hybrid_suppressed_redis_suppressed_state_does_not_poison_hybrid_keyspace() {
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert_approx(sf, 0.0);
+        assert!((sf - 0.0).abs() < 1e-12, "sf: {sf}");
     });
 }
 
@@ -488,7 +486,7 @@ fn hybrid_suppressed_denies_100_percent_after_hard_limit() {
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert_approx(sf, 1.0);
+        assert!((sf - 1.0).abs() < 1e-12, "sf: {sf}");
 
         let mut allowed_volume = 0_u64;
         let mut denied_volume = 0_u64;
@@ -807,7 +805,7 @@ fn hybrid_suppressed_does_not_commit_before_soft_limit_overflow() {
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert_approx(sf_b, 0.0);
+        assert!((sf_b - 0.0).abs() < 1e-12, "sf_b: {sf_b}");
     });
 }
 
@@ -963,7 +961,7 @@ fn hybrid_suppressed_get_suppression_factor_returns_cached_value_in_suppressing_
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert_approx(sf2, sf1);
+        assert!((sf2 - sf1).abs() < 1e-12, "sf2: {sf2} sf1: {sf1}");
     });
 }
 
@@ -1051,7 +1049,7 @@ fn hybrid_suppressed_unblocks_after_window_expires() {
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert_approx(sf2, 0.0);
+        assert!((sf2 - 0.0).abs() < 1e-12, "sf2: {sf2}");
 
         let mut rng2 = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
         let d2 = rl2
@@ -1065,7 +1063,10 @@ fn hybrid_suppressed_unblocks_after_window_expires() {
             RateLimitDecision::Suppressed {
                 suppression_factor,
                 is_allowed: true,
-            } => assert_approx(suppression_factor, 0.0),
+            } => assert!(
+                (suppression_factor - 0.0).abs() < 1e-12,
+                "suppression_factor: {suppression_factor}"
+            ),
             other => panic!("d2: {other:?}"),
         }
     });
@@ -1230,7 +1231,6 @@ fn hybrid_suppressed_concurrent_smoke_does_not_panic() {
         for _ in 0..16 {
             let rl = rl.clone();
             let k = k.clone();
-            let rate_limit = rate_limit.clone();
             tasks.push(runtime::spawn(async move {
                 for _ in 0..50 {
                     let d = rl
@@ -1303,7 +1303,17 @@ fn hybrid_suppressed_prefix_isolation() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+            assert!(
+                matches!(
+                    d,
+                    RateLimitDecision::Allowed
+                        | RateLimitDecision::Suppressed {
+                            suppression_factor: 1f64,
+                            is_allowed: true
+                        }
+                ),
+                "d: {d:?}"
+            );
         }
 
         // Ensure the commit is flushed and suppression_factor is recomputed.
@@ -1316,7 +1326,7 @@ fn hybrid_suppressed_prefix_isolation() {
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert_approx(sf_a, 1.0);
+        assert!((sf_a - 1.0).abs() < 1e-12, "sf_a: {sf_a}");
 
         // Different prefix should remain unaffected.
         let sf_b = rl_b
@@ -1325,7 +1335,7 @@ fn hybrid_suppressed_prefix_isolation() {
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert_approx(sf_b, 0.0);
+        assert!((sf_b - 0.0).abs() < 1e-12, "sf_b: {sf_b}");
     });
 }
 

@@ -125,37 +125,9 @@ impl SuppressedHybridRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
-        let state_entry = match self.limiting_state.get(key) {
-            Some(state) => state,
-            None => {
-                self.limiting_state
-                    .entry(key.clone())
-                    .or_insert_with(|| SuppressedRedisLimitingState::Undefined);
-
-                self.limiting_state.get(key).expect("Key should be present")
-            }
-        };
-
-        if let SuppressedRedisLimitingState::Suppressing {
-            suppression_factor, ..
-        } = state_entry.deref()
-        {
-            let suppression_factor =
-                *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
-
-            return Ok(suppression_factor);
-        }
-
-        if let SuppressedRedisLimitingState::Accepting { .. } = state_entry.deref() {
-            return Ok(0f64);
-        }
-
-        drop(state_entry);
-
         let mut rng = |p: f64| rand::random_bool(p);
-        let decision = self
-            .reset_state_from_redis_read_result_and_get_decision(key, 0, 0, None, &mut rng)
-            .await?;
+
+        let decision = self.inc_with_rng(key, 0, None, &mut rng).await?;
 
         match decision {
             RateLimitDecision::Allowed => Ok(0f64),
@@ -166,6 +138,72 @@ impl SuppressedHybridRateLimiter {
                 suppression_factor, ..
             } => Ok(suppression_factor),
         }
+    }
+
+    async fn get_suppression_factor2(&self, _key: &RedisKey) -> Result<f64, TrypemaError> {
+        todo!()
+        // let state_entry = match self.limiting_state.get(key) {
+        //     Some(state) => state,
+        //     None => {
+        //         self.limiting_state
+        //             .entry(key.clone())
+        //             .or_insert_with(|| SuppressedRedisLimitingState::Undefined);
+        //
+        //         self.limiting_state.get(key).expect("Key should be present")
+        //     }
+        // };
+        //
+        // if let SuppressedRedisLimitingState::Suppressing {
+        //     suppression_factor, ..
+        // } = state_entry.deref()
+        // {
+        //     let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
+        //     let mut suppression_factor =
+        //         *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
+        //     let elapsed_ms = mutex_lock(time_instant, "suppressing.time_instant")?
+        //         .elapsed()
+        //         .as_millis();
+        //     let ttl_ms = *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? as u128;
+        //     let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
+        //
+        //     // Guard hard limit
+        //     if starting_count.saturating_add(count.load(Ordering::Relaxed)) > window_limit {
+        //         suppression_factor = 1f64;
+        //     }
+        //
+        //     let should_allow = if suppression_factor == 0f64 {
+        //         true
+        //     } else if suppression_factor == 1f64 {
+        //         false
+        //     } else {
+        //         random_bool(1f64 - suppression_factor)
+        //     };
+        //
+        //     if elapsed_ms < ttl_ms {
+        //         return Ok(suppression_factor);
+        //     }
+        //
+        //     return Ok(suppression_factor);
+        // } else if let SuppressedRedisLimitingState::Accepting { .. } = state_entry.deref() {
+        //     return Ok(0f64);
+        // }
+        //
+        // drop(state_entry);
+        //
+        // let mut rng = |p: f64| rand::random_bool(p);
+        // let decision = self
+        //     .reset_state_from_redis_read_result_and_get_decision(key, 0, 0, None, &mut rng)
+        //     .await?;
+        //
+        // match decision {
+        //     RateLimitDecision::Allowed => Ok(0f64),
+        //     RateLimitDecision::Rejected { .. } => {
+        //         unreachable!("rejected should not be possible when using the suppressed strategy")
+        //     }
+        //     RateLimitDecision::Suppressed {
+        //         suppression_factor, ..
+        //     } => Ok(suppression_factor),
+        // }
     } // end method get_suppression_factor
 
     /// Check admission and, if allowed, increment the observed count for `key`.
@@ -201,6 +239,10 @@ impl SuppressedHybridRateLimiter {
                 self.limiting_state.get(key).expect("Key should be present")
             }
         };
+
+        // eprintln!("================================");
+        // eprintln!("state_entry: {:?}", state_entry.deref());
+        // eprintln!("================================");
 
         if let SuppressedRedisLimitingState::Suppressing {
             time_instant,
@@ -255,7 +297,7 @@ impl SuppressedHybridRateLimiter {
             if starting_count
                 .saturating_add(count.load(Ordering::Relaxed))
                 .saturating_add(increment)
-                <= soft_window_limit
+                < soft_window_limit
             {
                 count.fetch_add(increment, Ordering::Relaxed);
                 return Ok(RateLimitDecision::Allowed);
@@ -286,7 +328,7 @@ impl SuppressedHybridRateLimiter {
                 if starting_count
                     .saturating_add(count.load(Ordering::Relaxed))
                     .saturating_add(increment)
-                    > soft_window_limit
+                    >= soft_window_limit
                 {
                     let count_value = count.swap(0, Ordering::Relaxed);
                     let current_total_count = starting_count.saturating_add(count_value);
