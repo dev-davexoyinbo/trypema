@@ -1,6 +1,6 @@
 [package]
 name = "trypema"
-version = "0.1.0-rc.13"
+version = "0.1.0-rc.14"
 edition = "2024"
 readme = "README.md"
 description = "High-performance rate limiting primitives in Rust, designed for concurrency safety, low overhead, and predictable latency."
@@ -46,10 +46,10 @@ strum = "0.28.0"
 strum_macros = "0.28.0"
 thiserror = "2.0.18"
 tracing = "0.1.44"
-tokio = { version = "1.49.0", optional = true, default-features = false }
+tokio = { version = "1.50.0", optional = true, default-features = false }
 smol = { version = "2.0.2", optional = true }
 ahash = "0.8.12"
-futures = "0.3.32"
+futures = { version = "0.3.32", optional = true }
 async-trait = { version = "0.1.89", optional = true }
 
 [features]
@@ -65,6 +65,7 @@ redis-tokio = [
   "tokio/macros",
   "tokio/rt-multi-thread",
   "dep:async-trait",
+  "dep:futures",
 ]
 redis-smol = [
   "redis",
@@ -75,6 +76,7 @@ redis-smol = [
   "dep:tokio",
   "tokio/sync",
   "dep:async-trait",
+  "dep:futures",
 ]
 
 [dev-dependencies]
