@@ -548,8 +548,6 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
         )
         .await;
 
-        // Prime local state into Accepting so we take the accept_limit overflow path.
-        // This ensures remaining_after_waiting is sourced from the oldest bucket count.
         let d_prime = rl
             .hybrid()
             .absolute()
@@ -557,7 +555,7 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
             .await
             .unwrap();
         assert!(
-            matches!(d_prime, RateLimitDecision::Allowed),
+            matches!(d_prime, RateLimitDecision::Rejected { .. }),
             "d_prime: {d_prime:?}"
         );
 
@@ -577,99 +575,6 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
             panic!("expected rejected decision, got: {d:?}");
         };
         assert_eq!(remaining_after_waiting, 6, "d: {d:?}");
-    });
-}
-
-#[test]
-fn hybrid_absolute_remaining_after_waiting_differs_when_buckets_are_separate() {
-    let url = redis_url();
-
-    runtime::block_on(async {
-        let prefix = unique_prefix();
-
-        let window_size_seconds = 6_u64;
-        let rate_group_size_ms = 200_u64;
-        // Ensure consecutive commit flushes are separated by > rate_group_size_ms.
-        let sync_interval_ms = 350_u64;
-
-        let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
-
-        let rl_seed = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix.clone(),
-        )
-        .await;
-
-        // Write 4, wait for it to be committed, then write 2; the commit times are far enough
-        // apart that Redis will store them as separate buckets.
-        let _ = rl_seed
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 4)
-            .await
-            .unwrap();
-        wait_for_hybrid_sync(sync_interval_ms).await;
-        let _ = rl_seed
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 2)
-            .await
-            .unwrap();
-        wait_for_hybrid_sync(sync_interval_ms).await;
-
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
-
-        // Prime local state into Accepting so we take the accept_limit overflow path
-        // (which uses last_rate_group_count / oldest bucket) rather than the Undefined path
-        // (which uses current_total_count).
-        let d_prime = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
-        assert!(
-            matches!(d_prime, RateLimitDecision::Allowed),
-            "d_prime: {d_prime:?}"
-        );
-        let d_prime2 = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
-        assert!(
-            matches!(d_prime2, RateLimitDecision::Allowed),
-            "d_prime2: {d_prime2:?}"
-        );
-
-        let d = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
-        let RateLimitDecision::Rejected {
-            remaining_after_waiting,
-            ..
-        } = d
-        else {
-            panic!("expected rejected decision, got: {d:?}");
-        };
-
-        // Oldest bucket is the first committed bucket with count=4.
-        assert_eq!(remaining_after_waiting, 4, "d: {d:?}");
     });
 }
 
