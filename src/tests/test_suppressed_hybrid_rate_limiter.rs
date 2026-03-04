@@ -444,7 +444,14 @@ fn hybrid_suppressed_denies_100_percent_after_hard_limit() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+
+            // Suppressed strategy starts returning Suppressed decisions once the soft limit is
+            // reached. During seeding, we only need to ensure the API never returns Rejected.
+            // Suppressed decisions may be allowed or denied depending on suppression_factor.
+            assert!(
+                matches!(d, RateLimitDecision::Allowed | RateLimitDecision::Suppressed { .. }),
+                "d: {d:?}"
+            );
         }
 
         wait_for_hybrid_sync(sync_interval_ms).await;
