@@ -307,9 +307,13 @@ impl SuppressedHybridRateLimiter {
                         unreachable!("Key should be present");
                     };
 
-                    // since we are not in the Suppressed state, we can just set the suppression factor to 0f64
-                    let suppression_factor = 0f64;
-                    let should_allow = true;
+                    // We need this check in case the soft and hard limits are the same
+                    let (suppression_factor, should_allow) =
+                        if current_total_count.saturating_add(increment) >= window_limit {
+                            (1f64, false)
+                        } else {
+                            (0f64, true)
+                        };
 
                     *state_entry = SuppressedRedisLimitingState::Suppressing {
                         time_instant: Mutex::new(Instant::now()),
