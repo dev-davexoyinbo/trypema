@@ -80,7 +80,7 @@ redis-smol = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread"] }
 criterion = { version = "0.8", default-features = false, features = [
   "cargo_bench_support",
   "rayon",
