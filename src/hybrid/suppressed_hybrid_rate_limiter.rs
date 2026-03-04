@@ -286,7 +286,7 @@ impl SuppressedHybridRateLimiter {
                 if starting_count
                     .saturating_add(count.load(Ordering::Relaxed))
                     .saturating_add(increment)
-                    > soft_window_limit
+                    >= soft_window_limit
                 {
                     let count_value = count.swap(0, Ordering::Relaxed);
                     let current_total_count = starting_count.saturating_add(count_value);
@@ -307,13 +307,19 @@ impl SuppressedHybridRateLimiter {
                         unreachable!("Key should be present");
                     };
 
-                    // We need this check in case the soft and hard limits are the same
-                    let (suppression_factor, should_allow) =
-                        if current_total_count.saturating_add(increment) >= window_limit {
-                            (1f64, false)
-                        } else {
-                            (0f64, true)
-                        };
+                    let forcasted_total_count = current_total_count.saturating_add(increment);
+
+                    let (suppression_factor, should_allow) = if forcasted_total_count > window_limit
+                    {
+                        (1f64, false)
+                    } else if forcasted_total_count >= soft_window_limit
+                        && soft_window_limit < window_limit
+                        && forcasted_total_count < window_limit
+                    {
+                        (0f64, true)
+                    } else {
+                        (1f64, true)
+                    };
 
                     *state_entry = SuppressedRedisLimitingState::Suppressing {
                         time_instant: Mutex::new(Instant::now()),
