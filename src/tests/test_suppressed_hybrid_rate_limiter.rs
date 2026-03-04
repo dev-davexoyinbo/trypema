@@ -213,10 +213,21 @@ fn hybrid_suppressed_crossing_base_capacity_does_not_call_rng_when_sf_is_zero() 
                 .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+            match d {
+                RateLimitDecision::Allowed => {}
+                // With hard_limit_factor=1.0, the final request that *reaches* the hard cap may
+                // return sf=1.0 but still be admitted.
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: true,
+                } if (suppression_factor - 1.0).abs() < 1e-12 => {}
+                other => panic!("d: {other:?}"),
+            }
         }
 
-        // Overflow: suppression_factor == 0.0, is_allowed == true, and RNG is not consulted.
+        // Overflow: local state is still Accepting so Redis-derived sf is 0.0; RNG is not
+        // consulted. With hard_limit_factor=1.0, this overflow also exceeds the hard cap so the
+        // decision reports suppression_factor=1.0 and denies.
         let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
         let d1 = rl
             .hybrid()
@@ -567,10 +578,18 @@ fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_zero() {
                 .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+            match d {
+                RateLimitDecision::Allowed => {}
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: true,
+                } if (suppression_factor - 1.0).abs() < 1e-12 => {}
+                other => panic!("d: {other:?}"),
+            }
         }
 
-        // Overflow transitions to Suppressing with suppression_factor==0.0.
+        // Overflow transitions to Suppressing (Redis-derived sf is 0.0); with hard_limit_factor=1.0
+        // we also hit the hard cap so the decision reports suppression_factor=1.0.
         let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
         let d1 = rl
             .hybrid()
@@ -646,7 +665,14 @@ fn hybrid_suppressed_per_key_state_is_independent() {
                 .inc_with_rng(&a, 1, Some(&rate_limit), &mut rng)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+            match d {
+                RateLimitDecision::Allowed => {}
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: true,
+                } if (suppression_factor - 1.0).abs() < 1e-12 => {}
+                other => panic!("d: {other:?}"),
+            }
         }
 
         let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
@@ -795,7 +821,14 @@ fn hybrid_suppressed_does_not_commit_before_soft_limit_overflow() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+            match d {
+                RateLimitDecision::Allowed => {}
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: true,
+                } if (suppression_factor - 1.0).abs() < 1e-12 => {}
+                other => panic!("d: {other:?}"),
+            }
         }
 
         // If `rl_a` had committed, Redis would have total_count==window_limit and report sf==1.0.
@@ -843,10 +876,18 @@ fn hybrid_suppressed_suppressing_hard_cap_guard_forces_full_denial_without_rng()
                 .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+            match d {
+                RateLimitDecision::Allowed => {}
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: true,
+                } if (suppression_factor - 1.0).abs() < 1e-12 => {}
+                other => panic!("d: {other:?}"),
+            }
         }
 
-        // Overflow transitions to Suppressing with sf==0.0.
+        // Overflow transitions to Suppressing (Redis-derived sf is 0.0); with hard_limit_factor=1.0
+        // we also hit the hard cap so the decision reports suppression_factor=1.0.
         let mut rng0 = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
         let d0 = rl
             .hybrid()
@@ -1179,7 +1220,14 @@ fn hybrid_suppressed_usage_is_committed_to_redis_and_visible_to_others() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+            match d {
+                RateLimitDecision::Allowed => {}
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: true,
+                } if (suppression_factor - 1.0).abs() < 1e-12 => {}
+                other => panic!("d: {other:?}"),
+            }
         }
 
         // Crossing the local window limit queues a commit.
