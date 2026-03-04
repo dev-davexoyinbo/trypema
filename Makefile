@@ -11,6 +11,7 @@
 	stress-hybrid-hot stress-hybrid-hot-tokio stress-hybrid-hot-smol \
 	stress-hybrid-skew stress-hybrid-skew-tokio stress-hybrid-skew-smol \
 	stress-redis-compare stress-redis-compare-tokio stress-redis-compare-smol \
+	stress-redis-uniform-matrix stress-redis-uniform-matrix-tokio stress-redis-uniform-matrix-smol \
 	stress-local-compare \
 	stress-help help
 
@@ -185,6 +186,144 @@ stress-local-uniform-matrix: ## Sweep (key_space, rate_limit_per_s) locally
 	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
 	      --mode max \
 	      --duration-s $(STRESS_UNIFORM_DURATION_S); \
+	  done; \
+	done
+
+# Uniform distribution sweep across (key_space, rate_limit_per_s) for Redis-backed limiters.
+#
+# Notes:
+# - Runs in max-throughput mode (no pacing).
+# - `redis-cell`/GCRA do not match trypema sliding-window semantics; treat results as backend cost comparisons.
+# - Each run uses a distinct --redis-prefix (includes limiter + key_space + rate_limit_per_s) to avoid key collisions.
+#
+# Override any of these from your shell, e.g.
+#   STRESS_REDIS_UNIFORM_KEY_SPACES='1 10 100' STRESS_REDIS_UNIFORM_RATES='1000 10000' make stress-redis-uniform-matrix
+STRESS_REDIS_UNIFORM_DURATION_S ?= 30
+STRESS_REDIS_UNIFORM_THREADS ?= 16
+STRESS_REDIS_UNIFORM_WINDOW_S ?= 10
+STRESS_REDIS_UNIFORM_GROUP_MS ?= 10
+STRESS_REDIS_UNIFORM_KEY_SPACES ?= 10000
+STRESS_REDIS_UNIFORM_RATES ?= 1
+
+# Bursts used for redis-cell and GCRA when sweeping small rates.
+STRESS_REDIS_UNIFORM_CELL_BURST ?= 1000000
+STRESS_REDIS_UNIFORM_GCRA_BURST ?= 1000000
+
+stress-redis-uniform-matrix: ## Sweep (key_space, rate_limit_per_s) with Redis (tokio + smol)
+	@$(MAKE) -s stress-redis-uniform-matrix-tokio
+	@$(MAKE) -s stress-redis-uniform-matrix-smol
+
+stress-redis-uniform-matrix-tokio: ## Sweep (key_space, rate_limit_per_s) with Redis (tokio)
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	for ks in $(STRESS_REDIS_UNIFORM_KEY_SPACES); do \
+	  for r in $(STRESS_REDIS_UNIFORM_RATES); do \
+	    echo "== redis-cell: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+	      --provider redis --strategy absolute --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_cell_ks$${ks}_r$${r}" --redis-limiter cell --cell-burst $(STRESS_REDIS_UNIFORM_CELL_BURST); \
+	    echo "== gcra: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+	      --provider redis --strategy absolute --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_gcra_ks$${ks}_r$${r}" --redis-limiter gcra --gcra-burst $(STRESS_REDIS_UNIFORM_GCRA_BURST); \
+	    echo "== trypema redis absolute: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+	      --provider redis --strategy absolute --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_tr_redis_abs_ks$${ks}_r$${r}" --redis-limiter trypema; \
+	    echo "== trypema redis suppressed: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+	      --provider redis --strategy suppressed --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_tr_redis_sup_ks$${ks}_r$${r}" --redis-limiter trypema; \
+	    echo "== trypema hybrid absolute: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+	      --provider hybrid --strategy absolute --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_tr_hybrid_abs_ks$${ks}_r$${r}"; \
+	    echo "== trypema hybrid suppressed: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
+	      --provider hybrid --strategy suppressed --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_tr_hybrid_sup_ks$${ks}_r$${r}"; \
+	  done; \
+	done
+
+stress-redis-uniform-matrix-smol: ## Sweep (key_space, rate_limit_per_s) with Redis (smol)
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	for ks in $(STRESS_REDIS_UNIFORM_KEY_SPACES); do \
+	  for r in $(STRESS_REDIS_UNIFORM_RATES); do \
+	    echo "== redis-cell: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
+	      --provider redis --strategy absolute --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_cell_ks$${ks}_r$${r}" --redis-limiter cell --cell-burst $(STRESS_REDIS_UNIFORM_CELL_BURST); \
+	    echo "== gcra: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
+	      --provider redis --strategy absolute --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_gcra_ks$${ks}_r$${r}" --redis-limiter gcra --gcra-burst $(STRESS_REDIS_UNIFORM_GCRA_BURST); \
+	    echo "== trypema redis absolute: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
+	      --provider redis --strategy absolute --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_tr_redis_abs_ks$${ks}_r$${r}" --redis-limiter trypema; \
+	    echo "== trypema redis suppressed: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
+	      --provider redis --strategy suppressed --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_tr_redis_sup_ks$${ks}_r$${r}" --redis-limiter trypema; \
+	    echo "== trypema hybrid absolute: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
+	      --provider hybrid --strategy absolute --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_tr_hybrid_abs_ks$${ks}_r$${r}"; \
+	    echo "== trypema hybrid suppressed: key_space=$$ks rate_limit_per_s=$$r =="; \
+	    REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
+	      --provider hybrid --strategy suppressed --threads $(STRESS_REDIS_UNIFORM_THREADS) \
+	      --window-s $(STRESS_REDIS_UNIFORM_WINDOW_S) --group-ms $(STRESS_REDIS_UNIFORM_GROUP_MS) \
+	      --key-dist uniform --key-space $$ks --rate-limit-per-s $$r \
+	      --mode max \
+	      --duration-s $(STRESS_REDIS_UNIFORM_DURATION_S) --redis-url "$(REDIS_URL)" \
+	      --redis-prefix "mx_tr_hybrid_sup_ks$${ks}_r$${r}"; \
 	  done; \
 	done
 
