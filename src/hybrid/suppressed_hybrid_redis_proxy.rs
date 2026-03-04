@@ -329,6 +329,10 @@ impl SuppressedHybridRedisProxy {
         self: &SuppressedHybridRedisProxy,
         keys: &Vec<RedisKey>,
     ) -> Result<Vec<SuppressedHybridRedisProxyReadStateResult>, TrypemaError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut connection_manager = self.connection_manager.clone();
 
         let pipe = self.build_read_pipeline(keys, false);
