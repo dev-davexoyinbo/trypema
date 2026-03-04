@@ -274,7 +274,20 @@ fn hybrid_suppressed_calls_rng_when_redis_reports_mid_suppression_factor() {
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+            // Seeding may cross the soft limit and return a suppressed decision with
+            // suppression_factor == 0.0 (deterministic allow). For this test we only care that
+            // the observed volume is committed so that a fresh instance reads a mid-range factor.
+            assert!(
+                matches!(
+                    d,
+                    RateLimitDecision::Allowed
+                        | RateLimitDecision::Suppressed {
+                            is_allowed: true,
+                            ..
+                        }
+                ),
+                "d: {d:?}"
+            );
         }
 
         wait_for_hybrid_sync(sync_interval_ms).await;
