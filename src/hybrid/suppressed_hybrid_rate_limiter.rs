@@ -174,10 +174,6 @@ impl SuppressedHybridRateLimiter {
             }
         };
 
-        // eprintln!("================================");
-        // eprintln!("state_entry: {:?}", state_entry.deref());
-        // eprintln!("================================");
-
         if let SuppressedRedisLimitingState::Suppressing {
             time_instant,
             suppression_factor_ttl_ms,
