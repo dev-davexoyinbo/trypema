@@ -223,7 +223,7 @@ impl RedisProxyCommitter<AbsoluteHybridCommit> for AbsoluteHybridRedisProxy {
 impl AbsoluteHybridRedisProxy {
     pub(crate) fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
         Self {
-            key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
+            key_generator: RedisKeyGenerator::new(prefix, RateType::HybridAbsolute),
             read_state_script: Script::new(READ_STATE_SCRIPT),
             commit_state_script: Script::new(COMMIT_STATE_SCRIPT),
             cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),

@@ -146,6 +146,8 @@ impl SuppressedHybridRateLimiter {
             return Ok(0f64);
         }
 
+        drop(state_entry);
+
         let mut rng = |p: f64| rand::random_bool(p);
         let decision = self
             .reset_state_from_redis_read_result_and_get_decision(key, 0, 0, None, &mut rng)

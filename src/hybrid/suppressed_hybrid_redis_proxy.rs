@@ -254,7 +254,7 @@ impl SuppressedHybridRedisProxy {
     ) -> Self {
         let window_size_ms = (*window_size_seconds).saturating_mul(1000);
         Self {
-            key_generator: RedisKeyGenerator::new(prefix, RateType::Suppressed),
+            key_generator: RedisKeyGenerator::new(prefix, RateType::HybridSuppressed),
             read_state_script: Script::new(&format!("{}\n{}", LUA_HELPERS, READ_STATE_SCRIPT)),
             commit_state_script: Script::new(&format!("{}\n{}", LUA_HELPERS, COMMIT_STATE_SCRIPT)),
             cleanup_script: Script::new(CLEANUP_LUA),
