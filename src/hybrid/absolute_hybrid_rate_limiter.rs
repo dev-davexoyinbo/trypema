@@ -8,7 +8,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError,
@@ -51,6 +51,7 @@ pub struct AbsoluteHybridRateLimiter {
     redis_proxy: AbsoluteHybridRedisProxy,
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
     sync_interval_ms: SyncIntervalMs,
+    is_active_sender: broadcast::Sender<()>,
 }
 
 impl AbsoluteHybridRateLimiter {
@@ -61,12 +62,15 @@ impl AbsoluteHybridRateLimiter {
 
         let redis_proxy = AbsoluteHybridRedisProxy::new(prefix.clone(), options.connection_manager);
 
+        let (is_active_sender, _) = broadcast::channel(16);
+
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
             channel_capacity: 8192,
             max_batch_size: 4,
             limiter_sender: tx,
             redis_proxy: Box::new(redis_proxy.clone()),
+            is_active_sender: is_active_sender.clone(),
         });
 
         let limiter = Self {
@@ -77,6 +81,7 @@ impl AbsoluteHybridRateLimiter {
             redis_proxy,
             limiting_state: DashMap::new(),
             sync_interval_ms: options.sync_interval_ms,
+            is_active_sender,
         };
 
         let limiter = Arc::new(limiter);
@@ -116,6 +121,8 @@ impl AbsoluteHybridRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
+        let _ = self.is_active_sender.send(());
+
         let decision = self
             .is_allowed_with_count_increment(key, count, count, Some(rate_limit))
             .await?;
@@ -131,6 +138,8 @@ impl AbsoluteHybridRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
+        let _ = self.is_active_sender.send(());
+
         self.is_allowed_with_count_increment(key, 1, 0, None).await
     } // end method is_allowed
 
@@ -235,7 +244,8 @@ impl AbsoluteHybridRateLimiter {
                         *self
                             .limiting_state
                             .get_mut(key)
-                            .expect("key should be present") = AbsoluteRedisLimitingState::Undefined;
+                            .expect("key should be present") =
+                            AbsoluteRedisLimitingState::Undefined;
                     }
 
                     return Ok(RateLimitDecision::Allowed);

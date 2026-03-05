@@ -8,7 +8,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::{
     HardLimitFactor, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions,
@@ -49,6 +49,7 @@ pub struct SuppressedHybridRateLimiter {
     limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState>,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
+    is_active_sender: broadcast::Sender<()>,
 }
 
 impl SuppressedHybridRateLimiter {
@@ -70,12 +71,15 @@ impl SuppressedHybridRateLimiter {
             window_size_seconds,
         });
 
+        let (is_active_sender, _) = broadcast::channel(16);
+
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
             channel_capacity: 8192,
             max_batch_size: 4,
             limiter_sender: tx,
             redis_proxy: Box::new(redis_proxy.clone()),
+            is_active_sender: is_active_sender.clone(),
         });
 
         let limiter = Self {
@@ -85,6 +89,7 @@ impl SuppressedHybridRateLimiter {
             limiting_state: DashMap::new(),
             hard_limit_factor,
             suppression_factor_cache_ms,
+            is_active_sender,
         };
 
         let limiter = Arc::new(limiter);
@@ -125,6 +130,8 @@ impl SuppressedHybridRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
+        let _ = self.is_active_sender.send(());
+
         let state = match self.limiting_state.get(key) {
             Some(state) => state,
             None => {
@@ -230,6 +237,8 @@ impl SuppressedHybridRateLimiter {
         rate_limit: Option<&RateLimit>,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<RateLimitDecision, TrypemaError> {
+        let _ = self.is_active_sender.send(());
+
         let state_entry = match self.limiting_state.get(key) {
             Some(state) => state,
             None => {

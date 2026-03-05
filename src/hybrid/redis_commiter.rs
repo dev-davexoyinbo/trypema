@@ -1,8 +1,12 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use futures::FutureExt;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::redis::tick;
+use crate::runtime::{TaskHandle, sleep, spawn_task_handle};
 use crate::{
     TrypemaError,
     hybrid::common::RedisRateLimiterSignal,
@@ -14,6 +18,7 @@ pub(crate) struct RedisCommitterOptions<T> {
     pub channel_capacity: usize,
     pub max_batch_size: usize,
     pub limiter_sender: mpsc::Sender<RedisRateLimiterSignal>,
+    pub is_active_sender: broadcast::Sender<()>,
     pub redis_proxy: Box<dyn RedisProxyCommitter<T> + Send + Sync>,
 }
 
@@ -50,6 +55,7 @@ impl RedisCommitter {
             max_batch_size,
             limiter_sender,
             redis_proxy,
+            is_active_sender,
         } = options;
 
         let (tx, mut rx) = mpsc::channel::<AbsoluteHybridCommitterSignal<T>>(channel_capacity);
@@ -57,6 +63,42 @@ impl RedisCommitter {
         spawn_task(async move {
             let mut flush_interval = new_interval(sync_interval);
             let mut batch: Vec<T> = Vec::new();
+            let is_active = Arc::new(AtomicBool::new(false));
+            let mut is_active_receiver = is_active_sender.subscribe();
+
+            let is_active_cancel_task: TaskHandle = spawn_task_handle({
+                let is_active = is_active.clone();
+                let is_active_sender = is_active_sender.clone();
+                let mut is_active_receiver = is_active_sender.subscribe();
+                let sleep_interval =
+                    Duration::from_millis(1000.max(sync_interval.as_millis() as u64 * 10));
+
+                async move {
+                    loop {
+                        futures::select! {
+                            val = is_active_receiver.recv().fuse() => {
+                                match val {
+                                    Ok(_) => {}
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                                        is_active_receiver = is_active_sender.subscribe();
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        break;
+                                    }
+                                }
+
+                                while let Ok(_) = is_active_receiver.try_recv() {
+                                }
+
+                                is_active.store(true, Ordering::Release);
+                            }
+                            _ = sleep(sleep_interval).fuse() => {
+                                is_active.store(false, Ordering::Release);
+                            }
+                        }
+                    }
+                }
+            });
 
             // Tokio's interval ticks immediately on first await; discard that so we flush
             // after `sync_interval`. Smol's interval already waits for the duration.
@@ -64,6 +106,30 @@ impl RedisCommitter {
             tick(&mut flush_interval).await;
 
             loop {
+                if !is_active.load(Ordering::Acquire) {
+                    match is_active_receiver.recv().await {
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+
+                    // Drain the channel to make sure we don't miss any signals
+                    loop {
+                        match is_active_receiver.try_recv() {
+                            Ok(_) => {}
+                            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                                is_active_receiver = is_active_sender.subscribe();
+                                break;
+                            }
+                            Err(_) => {
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 {
                     let tick_fut = tick(&mut flush_interval);
                     let recv_fut = rx.recv();
@@ -102,6 +168,11 @@ impl RedisCommitter {
                     batch.push(commit);
                 }
             }
+
+            #[cfg(feature = "redis-tokio")]
+            is_active_cancel_task.abort();
+
+            drop(is_active_cancel_task);
 
             if let Err(err) = Self::flush_to_redis(&redis_proxy, &mut batch, max_batch_size).await {
                 tracing::error!(error = ?err, "Failed to flush to Redis");

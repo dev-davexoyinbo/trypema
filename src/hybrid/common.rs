@@ -3,7 +3,8 @@ use std::ops::{Deref, DerefMut};
 use crate::TrypemaError;
 
 /// A signal to the Redis rate limiter to flush its local cache.
-pub enum RedisRateLimiterSignal {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum RedisRateLimiterSignal {
     /// Flush the local cache.
     Flush,
 }
