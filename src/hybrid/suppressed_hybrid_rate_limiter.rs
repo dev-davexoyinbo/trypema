@@ -103,9 +103,6 @@ impl SuppressedHybridRateLimiter {
         spawn_task(async move {
             while let Some(signal) = rx.recv().await {
                 let Some(limiter) = limitter.upgrade() else {
-                    eprintln!(
-                        "limiter arc does not exist anymore, breaking the committer signals loop"
-                    );
                     break;
                 };
 
@@ -113,8 +110,6 @@ impl SuppressedHybridRateLimiter {
                     RedisRateLimiterSignal::Flush => {
                         if let Err(err) = limiter.flush().await {
                             tracing::error!(error = ?err, "Failed to flush redis rate limiter");
-                            eprintln!("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx flush failed");
-                            eprintln!("Failed to flush redis rate limiter: {err:?}");
                         }
                     }
                 }
@@ -130,9 +125,67 @@ impl SuppressedHybridRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
+        let state = match self.limiting_state.get(key) {
+            Some(state) => state,
+            None => {
+                self.limiting_state
+                    .entry(key.clone())
+                    .or_insert_with(|| SuppressedRedisLimitingState::Undefined);
+                self.limiting_state.get(key).expect("Key should be present")
+            }
+        };
+
+        if let SuppressedRedisLimitingState::Suppressing {
+            time_instant,
+            suppression_factor_ttl_ms,
+            suppression_factor,
+            count,
+            starting_count,
+            window_limit,
+            ..
+        } = state.deref()
+        {
+            let window_limit = *mutex_lock(window_limit, "suppressing.window_limit")?;
+            let mut suppression_factor =
+                *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
+            let elapsed_ms = mutex_lock(time_instant, "suppressing.time_instant")?
+                .elapsed()
+                .as_millis();
+            let ttl_ms = *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? as u128;
+            let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
+
+            // Guard hard limit
+            if starting_count.saturating_add(count.load(Ordering::Relaxed)) > window_limit {
+                suppression_factor = 1f64;
+            }
+
+            if elapsed_ms < ttl_ms {
+                return Ok(suppression_factor);
+            }
+        } else if let SuppressedRedisLimitingState::Accepting {
+            window_limit,
+            count,
+            starting_count,
+            ..
+        } = state.deref()
+        {
+            let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
+            let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
+            let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
+            let current_total_count = starting_count.saturating_add(count.load(Ordering::Relaxed));
+            // Guard hard limit
+            if current_total_count > window_limit {
+                return Ok(1f64);
+            } else if current_total_count < soft_window_limit {
+                return Ok(0f64);
+            }
+        }
+
         let mut rng = |p: f64| rand::random_bool(p);
 
-        let decision = self.inc_with_rng(key, 0, None, &mut rng).await?;
+        let decision = self
+            .reset_state_from_redis_read_result_and_get_decision(key, 0, 0, None, &mut rng)
+            .await?;
 
         match decision {
             RateLimitDecision::Allowed => Ok(0f64),
@@ -240,11 +293,9 @@ impl SuppressedHybridRateLimiter {
 
             drop(state_entry);
 
-            eprintln!("trying to reserve commiter sender .....");
             let permit = self.commiter_sender.reserve().await.map_err(|_| {
                 TrypemaError::CustomError("Failed to reserve commiter sender".to_string())
             })?;
-            eprintln!("reserved commiter sender ..... <<<<<<<");
 
             // since the permit can take some time, we need to check again if the key is still in the map
             let Some(state_entry) = self.limiting_state.get(key) else {
@@ -282,22 +333,18 @@ impl SuppressedHybridRateLimiter {
                         permit.send(commit.into());
                     }
 
+                    let suppression_factor = self.get_suppression_factor(key).await?;
+
                     let Some(mut state_entry) = self.limiting_state.get_mut(key) else {
                         unreachable!("Key should be present");
                     };
 
-                    let forcasted_total_count = current_total_count.saturating_add(increment);
-
-                    let (suppression_factor, should_allow) = if forcasted_total_count > window_limit
-                    {
-                        (1f64, false)
-                    } else if forcasted_total_count >= soft_window_limit
-                        && soft_window_limit < window_limit
-                        && forcasted_total_count < window_limit
-                    {
-                        (0f64, true)
+                    let should_allow = if suppression_factor == 0f64 {
+                        true
+                    } else if suppression_factor == 1f64 {
+                        false
                     } else {
-                        (1f64, true)
+                        random_bool(1f64 - suppression_factor)
                     };
 
                     *state_entry = SuppressedRedisLimitingState::Suppressing {
@@ -398,12 +445,10 @@ impl SuppressedHybridRateLimiter {
     } // end method reset_state_from_redis_read_result
 
     async fn send_commit(&self, commit: SuppressedHybridCommit) -> Result<(), TrypemaError> {
-        eprintln!("xxxx -> sending commit");
         self.commiter_sender
             .send(commit.into())
             .await
             .map_err(|err| TrypemaError::CustomError(format!("Failed to send commit: {err:?}")))?;
-        eprintln!("<<<<<< commit sent successfully");
 
         Ok(())
     } // end method send_commit
@@ -423,7 +468,6 @@ impl SuppressedHybridRateLimiter {
         let mut hard_window_limit = read_state_result.window_limit;
         let key = &read_state_result.key;
 
-        eprintln!("rs 11..................");
         let state = match self.limiting_state.get(key) {
             Some(state) => state,
             None => {
@@ -434,8 +478,6 @@ impl SuppressedHybridRateLimiter {
                 self.limiting_state.get(key).expect("Key should be present")
             }
         };
-
-        eprintln!("rs 22..................");
 
         let state = match state.deref() {
             SuppressedRedisLimitingState::Undefined => state,
@@ -506,8 +548,6 @@ impl SuppressedHybridRateLimiter {
             }
         };
 
-        eprintln!("rs 33..................");
-
         let hard_window_limit = match hard_window_limit {
             Some(window_limit) => window_limit,
             None => {
@@ -531,8 +571,6 @@ impl SuppressedHybridRateLimiter {
             }
         };
 
-        eprintln!("rs 44..................");
-
         let soft_window_limit = (hard_window_limit as f64 / *self.hard_limit_factor) as u64;
         let new_ttl_ms =
             current_suppression_factor_ttl_ms.unwrap_or(*self.suppression_factor_cache_ms);
@@ -540,7 +578,6 @@ impl SuppressedHybridRateLimiter {
         let new_time_instant = Instant::now();
 
         if current_total_count.saturating_add(check_count) > soft_window_limit {
-            eprintln!("rs 45..................");
             if let SuppressedRedisLimitingState::Suppressing {
                 time_instant,
                 suppression_factor,
@@ -587,8 +624,6 @@ impl SuppressedHybridRateLimiter {
             });
         }
 
-        eprintln!("rs 46..................");
-
         if let SuppressedRedisLimitingState::Accepting {
             window_limit,
             count,
@@ -597,15 +632,12 @@ impl SuppressedHybridRateLimiter {
             ..
         } = state.deref()
         {
-            eprintln!("rs 47..................");
             *mutex_lock(window_limit, "accepting.window_limit")? = hard_window_limit;
             *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
             *mutex_lock(starting_count, "accepting.starting_count")? = current_total_count;
             count.store(increment, Ordering::Relaxed);
         } else {
-            eprintln!("rs 48..................");
             drop(state);
-            eprintln!("rs 49..................");
             let mut state = self
                 .limiting_state
                 .get_mut(key)
@@ -619,8 +651,6 @@ impl SuppressedHybridRateLimiter {
             };
         }
 
-        eprintln!("rs 55..................");
-
         Ok(RateLimitDecision::Allowed)
     }
 
@@ -631,7 +661,6 @@ impl SuppressedHybridRateLimiter {
 
     async fn flush(&self) -> Result<(), TrypemaError> {
         let mut resets: Vec<RedisKey> = Vec::new();
-        eprintln!("flushing <<<<<<<<<<<<<<<<<<<<<<<<<<<<");
 
         for state in self.limiting_state.iter() {
             let key = state.key();
@@ -643,20 +672,11 @@ impl SuppressedHybridRateLimiter {
             }
         }
 
-        eprintln!("111111 ....................................................");
-
         if resets.is_empty() {
-            eprintln!("flushed complete >>>>>>>>>>>>>>>>>>>>>>>>>>>>");
             return Ok(());
         }
 
-        eprintln!("reset size {}", resets.len());
-
-        eprintln!("22222 ....................................................");
-
         let read_state_results = self.redis_proxy.batch_read_state(&resets).await?;
-
-        eprintln!("33333 ....................................................");
 
         let mut rng = |p: f64| rand::random_bool(p);
 
@@ -666,14 +686,9 @@ impl SuppressedHybridRateLimiter {
                 .await
             {
                 tracing::error!(error = ?err, "Failed to reset state from redis read result");
-                eprintln!("Failed to reset state from redis read result: {err:?}");
                 continue;
             }
         }
-
-        eprintln!("44444 ....................................................");
-
-        eprintln!("flushed complete >>>>>>>>>>>>>>>>>>>>>>>>>>>>");
 
         Ok(())
     } // end method flush
