@@ -20,7 +20,7 @@ use crate::{
         },
         common::RedisRateLimiterSignal,
     },
-    redis::{mutex_lock, spawn_task, try_get_mut_async},
+    redis::{mutex_lock, spawn_task, try_get_mut_async_with_timeout, GET_MUT_TIMEOUT_MS},
 };
 
 #[derive(Debug)]
@@ -232,9 +232,17 @@ impl AbsoluteHybridRateLimiter {
 
                     if !is_undefined {
                         drop(state);
-                        let mut state = try_get_mut_async(&self.limiting_state, key)
-                            .await
-                            .expect("Key should be present");
+                        let Some(mut state) = try_get_mut_async_with_timeout(
+                            &self.limiting_state,
+                            key,
+                            GET_MUT_TIMEOUT_MS,
+                        )
+                        .await
+                        else {
+                            return Err(TrypemaError::CustomError(
+                                "timed out waiting for limiting_state lock".to_string(),
+                            ));
+                        };
                         *state = AbsoluteRedisLimitingState::Undefined;
                     }
 
@@ -266,9 +274,17 @@ impl AbsoluteHybridRateLimiter {
                     new_count_after_release;
             } else {
                 drop(state);
-                let mut state = try_get_mut_async(&self.limiting_state, key)
-                    .await
-                    .expect("Key should be present");
+                let Some(mut state) = try_get_mut_async_with_timeout(
+                    &self.limiting_state,
+                    key,
+                    GET_MUT_TIMEOUT_MS,
+                )
+                .await
+                else {
+                    return Err(TrypemaError::CustomError(
+                        "timed out waiting for limiting_state lock".to_string(),
+                    ));
+                };
 
                 *state = AbsoluteRedisLimitingState::Rejecting {
                     time_instant: Mutex::new(new_time_instant),
@@ -305,9 +321,17 @@ impl AbsoluteHybridRateLimiter {
                 read_state_result.last_rate_group_count;
         } else {
             drop(state);
-            let mut state = try_get_mut_async(&self.limiting_state, key)
-                .await
-                .expect("Key should be present");
+            let Some(mut state) = try_get_mut_async_with_timeout(
+                &self.limiting_state,
+                key,
+                GET_MUT_TIMEOUT_MS,
+            )
+            .await
+            else {
+                return Err(TrypemaError::CustomError(
+                    "timed out waiting for limiting_state lock".to_string(),
+                ));
+            };
 
             *state = AbsoluteRedisLimitingState::Accepting {
                 window_limit: Mutex::new(new_window_limit),
@@ -380,8 +404,16 @@ impl AbsoluteHybridRateLimiter {
                 TrypemaError::CustomError("Failed to reserve commiter sender".to_string())
             })?;
 
-            let Some(mut state_entry) = try_get_mut_async(&self.limiting_state, key).await else {
-                unreachable!("Key should be present");
+            let Some(mut state_entry) = try_get_mut_async_with_timeout(
+                &self.limiting_state,
+                key,
+                GET_MUT_TIMEOUT_MS,
+            )
+            .await
+            else {
+                return Err(TrypemaError::CustomError(
+                    "timed out waiting for limiting_state lock".to_string(),
+                ));
             };
 
             if let AbsoluteRedisLimitingState::Accepting {

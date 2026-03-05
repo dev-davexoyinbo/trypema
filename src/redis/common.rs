@@ -126,18 +126,27 @@ pub(crate) fn mutex_lock<'a, T>(
         .map_err(|_| TrypemaError::CustomError(format!("mutex poisoned: {what}")))
 }
 
-pub(crate) async fn try_get_mut_async<'a, K, V>(
+pub(crate) const GET_MUT_TIMEOUT_MS: u64 = 3;
+
+pub(crate) async fn try_get_mut_async_with_timeout<'a, K, V>(
     map: &'a DashMap<K, V>,
     key: &K,
+    timeout_ms: u64,
 ) -> Option<RefMut<'a, K, V>>
 where
     K: Eq + Hash,
 {
+    let start = std::time::Instant::now();
     loop {
         match map.try_get_mut(key) {
             TryResult::Present(v) => return Some(v),
             TryResult::Absent => return None,
-            TryResult::Locked => crate::runtime::yield_now().await,
+            TryResult::Locked => {
+                if start.elapsed().as_millis() >= timeout_ms as u128 {
+                    return None;
+                }
+                crate::runtime::yield_now().await;
+            }
         }
     }
 }
