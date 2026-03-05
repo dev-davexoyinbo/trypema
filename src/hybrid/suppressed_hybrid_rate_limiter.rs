@@ -18,7 +18,7 @@ use crate::{
         SuppressedHybridCommit, SuppressedHybridRedisProxy, SuppressedHybridRedisProxyOptions,
         SuppressedHybridRedisProxyReadStateResult, common::RedisRateLimiterSignal,
     },
-    redis::{GET_MUT_TIMEOUT_MS, mutex_lock, spawn_task, try_get_mut_async_with_timeout},
+    redis::{mutex_lock, spawn_task},
 };
 
 #[derive(Debug)]
@@ -289,6 +289,8 @@ impl SuppressedHybridRateLimiter {
                     is_allowed: should_allow,
                 });
             }
+
+            drop(state_entry);
         } else if let SuppressedRedisLimitingState::Accepting {
             window_limit,
             starting_count,
@@ -316,7 +318,7 @@ impl SuppressedHybridRateLimiter {
             })?;
 
             // since the permit can take some time, we need to check again if the key is still in the map
-            let Some(state_entry) = self.limiting_state.get(key) else {
+            let Some(mut state_entry) = self.limiting_state.get_mut(key) else {
                 unreachable!("Key should be present");
             };
 
@@ -361,20 +363,6 @@ impl SuppressedHybridRateLimiter {
                         } else {
                             (1f64, true)
                         };
-
-                    drop(state_entry);
-
-                    let Some(mut state_entry) = try_get_mut_async_with_timeout(
-                        &self.limiting_state,
-                        key,
-                        GET_MUT_TIMEOUT_MS,
-                    )
-                    .await
-                    else {
-                        return Err(TrypemaError::CustomError(
-                            "timed out waiting for limiting_state lock".to_string(),
-                        ));
-                    };
 
                     *state_entry = SuppressedRedisLimitingState::Suppressing {
                         time_instant: Mutex::new(Instant::now()),
@@ -584,19 +572,13 @@ impl SuppressedHybridRateLimiter {
                     let is_undefined =
                         matches!(state.deref(), SuppressedRedisLimitingState::Undefined);
 
+                    drop(state);
+
                     if !is_undefined {
-                        drop(state);
-                        let Some(mut state) = try_get_mut_async_with_timeout(
-                            &self.limiting_state,
-                            key,
-                            GET_MUT_TIMEOUT_MS,
-                        )
-                        .await
-                        else {
-                            return Err(TrypemaError::CustomError(
-                                "timed out waiting for limiting_state lock".to_string(),
-                            ));
-                        };
+                        let mut state = self
+                            .limiting_state
+                            .get_mut(key)
+                            .expect("Key should be present");
                         *state = SuppressedRedisLimitingState::Undefined;
                     }
 
@@ -629,16 +611,13 @@ impl SuppressedHybridRateLimiter {
                     current_suppression_factor;
                 *mutex_lock(starting_count, "suppressing.starting_count")? = current_total_count;
                 count.store(increment, Ordering::Relaxed);
+                drop(state);
             } else {
                 drop(state);
-                let Some(mut state) =
-                    try_get_mut_async_with_timeout(&self.limiting_state, key, GET_MUT_TIMEOUT_MS)
-                        .await
-                else {
-                    return Err(TrypemaError::CustomError(
-                        "timed out waiting for limiting_state lock".to_string(),
-                    ));
-                };
+                let mut state = self
+                    .limiting_state
+                    .get_mut(key)
+                    .expect("Key should be present");
 
                 *state = SuppressedRedisLimitingState::Suppressing {
                     time_instant: Mutex::new(new_time_instant),
@@ -676,15 +655,13 @@ impl SuppressedHybridRateLimiter {
             *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
             *mutex_lock(starting_count, "accepting.starting_count")? = current_total_count;
             count.store(increment, Ordering::Relaxed);
+            drop(state);
         } else {
             drop(state);
-            let Some(mut state) =
-                try_get_mut_async_with_timeout(&self.limiting_state, key, GET_MUT_TIMEOUT_MS).await
-            else {
-                return Err(TrypemaError::CustomError(
-                    "timed out waiting for limiting_state lock".to_string(),
-                ));
-            };
+            let mut state = self
+                .limiting_state
+                .get_mut(key)
+                .expect("Key should be present");
 
             *state = SuppressedRedisLimitingState::Accepting {
                 window_limit: Mutex::new(hard_window_limit),

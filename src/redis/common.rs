@@ -4,9 +4,9 @@ use std::{
     sync::Mutex,
 };
 
-use dashmap::{mapref::one::RefMut, try_result::TryResult, DashMap};
+use dashmap::{DashMap, mapref::one::RefMut, try_result::TryResult};
 
-use crate::{common::RateType, TrypemaError};
+use crate::{TrypemaError, common::RateType};
 
 /// A validated newtype for Redis keys.
 ///
@@ -126,9 +126,9 @@ pub(crate) fn mutex_lock<'a, T>(
         .map_err(|_| TrypemaError::CustomError(format!("mutex poisoned: {what}")))
 }
 
-pub(crate) const GET_MUT_TIMEOUT_MS: u64 = 3;
+pub(crate) const _GET_MUT_TIMEOUT_MS: u64 = 3;
 
-pub(crate) async fn try_get_mut_async_with_timeout<'a, K, V>(
+pub(crate) async fn _try_get_mut_async_with_timeout<'a, K, V>(
     map: &'a DashMap<K, V>,
     key: &K,
     timeout_ms: u64,
@@ -145,7 +145,7 @@ where
                 if start.elapsed().as_millis() >= timeout_ms as u128 {
                     return None;
                 }
-                crate::runtime::yield_now().await;
+                crate::runtime::_yield_now().await;
             }
         }
     }
