@@ -20,7 +20,7 @@ use crate::{
         },
         common::RedisRateLimiterSignal,
     },
-    redis::{mutex_lock, spawn_task, try_get_mut_async_with_timeout, GET_MUT_TIMEOUT_MS},
+    redis::{mutex_lock, spawn_task},
 };
 
 #[derive(Debug)]
@@ -232,18 +232,10 @@ impl AbsoluteHybridRateLimiter {
 
                     if !is_undefined {
                         drop(state);
-                        let Some(mut state) = try_get_mut_async_with_timeout(
-                            &self.limiting_state,
-                            key,
-                            GET_MUT_TIMEOUT_MS,
-                        )
-                        .await
-                        else {
-                            return Err(TrypemaError::CustomError(
-                                "timed out waiting for limiting_state lock".to_string(),
-                            ));
-                        };
-                        *state = AbsoluteRedisLimitingState::Undefined;
+                        *self
+                            .limiting_state
+                            .get_mut(key)
+                            .expect("key should be present") = AbsoluteRedisLimitingState::Undefined;
                     }
 
                     return Ok(RateLimitDecision::Allowed);
@@ -274,19 +266,10 @@ impl AbsoluteHybridRateLimiter {
                     new_count_after_release;
             } else {
                 drop(state);
-                let Some(mut state) = try_get_mut_async_with_timeout(
-                    &self.limiting_state,
-                    key,
-                    GET_MUT_TIMEOUT_MS,
-                )
-                .await
-                else {
-                    return Err(TrypemaError::CustomError(
-                        "timed out waiting for limiting_state lock".to_string(),
-                    ));
-                };
-
-                *state = AbsoluteRedisLimitingState::Rejecting {
+                *self
+                    .limiting_state
+                    .get_mut(key)
+                    .expect("key should be present") = AbsoluteRedisLimitingState::Rejecting {
                     time_instant: Mutex::new(new_time_instant),
                     ttl_ms: Mutex::new(new_ttl_ms),
                     count_after_release: Mutex::new(new_count_after_release),
@@ -321,19 +304,10 @@ impl AbsoluteHybridRateLimiter {
                 read_state_result.last_rate_group_count;
         } else {
             drop(state);
-            let Some(mut state) = try_get_mut_async_with_timeout(
-                &self.limiting_state,
-                key,
-                GET_MUT_TIMEOUT_MS,
-            )
-            .await
-            else {
-                return Err(TrypemaError::CustomError(
-                    "timed out waiting for limiting_state lock".to_string(),
-                ));
-            };
-
-            *state = AbsoluteRedisLimitingState::Accepting {
+            *self
+                .limiting_state
+                .get_mut(key)
+                .expect("key should be present") = AbsoluteRedisLimitingState::Accepting {
                 window_limit: Mutex::new(new_window_limit),
                 accept_limit: Mutex::new(new_accept_limit),
                 count: AtomicU64::new(increment),
@@ -404,17 +378,10 @@ impl AbsoluteHybridRateLimiter {
                 TrypemaError::CustomError("Failed to reserve commiter sender".to_string())
             })?;
 
-            let Some(mut state_entry) = try_get_mut_async_with_timeout(
-                &self.limiting_state,
-                key,
-                GET_MUT_TIMEOUT_MS,
-            )
-            .await
-            else {
-                return Err(TrypemaError::CustomError(
-                    "timed out waiting for limiting_state lock".to_string(),
-                ));
-            };
+            let mut state_entry = self
+                .limiting_state
+                .get_mut(key)
+                .expect("key should be present after drop");
 
             if let AbsoluteRedisLimitingState::Accepting {
                 window_limit,
