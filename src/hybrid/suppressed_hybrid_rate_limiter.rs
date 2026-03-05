@@ -18,7 +18,7 @@ use crate::{
         SuppressedHybridCommit, SuppressedHybridRedisProxy, SuppressedHybridRedisProxyOptions,
         SuppressedHybridRedisProxyReadStateResult, common::RedisRateLimiterSignal,
     },
-    redis::{mutex_lock, spawn_task, try_get_mut_async_with_timeout, GET_MUT_TIMEOUT_MS},
+    redis::{GET_MUT_TIMEOUT_MS, mutex_lock, spawn_task, try_get_mut_async_with_timeout},
 };
 
 #[derive(Debug)]
@@ -173,12 +173,19 @@ impl SuppressedHybridRateLimiter {
             let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
             let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
             let current_total_count = starting_count.saturating_add(count.load(Ordering::Relaxed));
-            // Guard hard limit
-            if current_total_count > window_limit {
-                return Ok(1f64);
-            } else if current_total_count < soft_window_limit {
-                return Ok(0f64);
-            }
+
+            let suppression_factor = if current_total_count > window_limit {
+                1f64
+            } else if current_total_count >= soft_window_limit
+                && soft_window_limit < window_limit
+                && current_total_count < window_limit
+            {
+                0f64
+            } else {
+                // soft == hard or current == hard: full suppression.
+                1f64
+            };
+            return Ok(suppression_factor);
         }
 
         drop(state);
@@ -333,8 +340,20 @@ impl SuppressedHybridRateLimiter {
                         permit.send(commit.into());
                     }
 
+                    let forecasted_total_count = current_total_count.saturating_add(increment);
+                    let (suppression_factor, should_allow) =
+                        if forecasted_total_count > window_limit {
+                            (1f64, false)
+                        } else if forecasted_total_count >= soft_window_limit
+                            && soft_window_limit < window_limit
+                            && forecasted_total_count < window_limit
+                        {
+                            (0f64, true)
+                        } else {
+                            (1f64, true)
+                        };
+
                     drop(state_entry);
-                    let suppression_factor = self.get_suppression_factor(key).await?;
 
                     let Some(mut state_entry) = try_get_mut_async_with_timeout(
                         &self.limiting_state,
@@ -346,14 +365,6 @@ impl SuppressedHybridRateLimiter {
                         return Err(TrypemaError::CustomError(
                             "timed out waiting for limiting_state lock".to_string(),
                         ));
-                    };
-
-                    let should_allow = if suppression_factor == 0f64 {
-                        true
-                    } else if suppression_factor == 1f64 {
-                        false
-                    } else {
-                        random_bool(1f64 - suppression_factor)
                     };
 
                     *state_entry = SuppressedRedisLimitingState::Suppressing {
@@ -611,12 +622,9 @@ impl SuppressedHybridRateLimiter {
                 count.store(increment, Ordering::Relaxed);
             } else {
                 drop(state);
-                let Some(mut state) = try_get_mut_async_with_timeout(
-                    &self.limiting_state,
-                    key,
-                    GET_MUT_TIMEOUT_MS,
-                )
-                .await
+                let Some(mut state) =
+                    try_get_mut_async_with_timeout(&self.limiting_state, key, GET_MUT_TIMEOUT_MS)
+                        .await
                 else {
                     return Err(TrypemaError::CustomError(
                         "timed out waiting for limiting_state lock".to_string(),
@@ -661,12 +669,8 @@ impl SuppressedHybridRateLimiter {
             count.store(increment, Ordering::Relaxed);
         } else {
             drop(state);
-            let Some(mut state) = try_get_mut_async_with_timeout(
-                &self.limiting_state,
-                key,
-                GET_MUT_TIMEOUT_MS,
-            )
-            .await
+            let Some(mut state) =
+                try_get_mut_async_with_timeout(&self.limiting_state, key, GET_MUT_TIMEOUT_MS).await
             else {
                 return Err(TrypemaError::CustomError(
                     "timed out waiting for limiting_state lock".to_string(),

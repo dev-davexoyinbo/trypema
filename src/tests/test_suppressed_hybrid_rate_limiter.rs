@@ -1420,3 +1420,213 @@ fn hybrid_suppressed_redis_key_validation_rejects_empty_and_colons() {
     assert!(RedisKey::try_from("".to_string()).is_err());
     assert!(RedisKey::try_from("has:colon".to_string()).is_err());
 }
+
+/// After the window elapses, previously committed usage must be evicted from Redis so that
+/// a fresh burst is admitted at the full rate again.
+///
+/// This test catches the bug where `read_state` passes `window_size_ms` (e.g. 1 000) to the
+/// Lua script instead of `window_size_seconds` (e.g. 1).  With the wrong value the eviction
+/// threshold is ~16 minutes into the past, so old buckets are never removed and
+/// `total_count` accumulates indefinitely — suppression stays at 1.0 even after the window
+/// has expired.
+#[test]
+fn hybrid_suppressed_window_eviction_allows_fresh_burst_after_expiry() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 1_u64;
+        let rate_group_size_ms = 100_u64;
+        let sync_interval_ms = 25_u64;
+        // Use hard_limit_factor=2.0: soft_limit=5, hard_limit=10.
+        // We fill to hard_limit (10) and then sync, guaranteeing Redis sees total_count=hard_limit
+        // and computes suppression_factor=1.0.
+        let hard_limit_factor = 2.0_f64;
+        let cache_ms = 5_u64;
+
+        let prefix = unique_prefix();
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        // soft_limit=5, hard_limit=10
+        let soft_limit = window_capacity(window_size_seconds, &rate_limit);
+        let hard_limit = (soft_limit as f64 * hard_limit_factor) as u64;
+
+        let rl = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+
+        // Fill past the hard limit: the overflow request commits everything to Redis and sets
+        // suppression_factor = 1.0 in the Redis cache.
+        for _ in 0..=hard_limit {
+            let _ = rl
+                .hybrid()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+        }
+        // Wait for the committer to flush all queued counts to Redis (two ticks).
+        wait_for_hybrid_sync(sync_interval_ms).await;
+        // Let the suppression_factor Redis cache expire so the next read recomputes.
+        runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+
+        // Confirm that a fresh limiter instance sees full suppression before the window expires.
+        let rl_check = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+        let sf_before = rl_check
+            .hybrid()
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+        assert!(
+            (sf_before - 1.0).abs() < 1e-12,
+            "expected sf=1.0 before window expiry, got {sf_before}"
+        );
+
+        // Wait for the full window to expire, then let the suppression cache expire again.
+        runtime::async_sleep(Duration::from_millis(window_size_seconds * 1_000 + 50)).await;
+        runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+
+        // Use a fresh limiter instance so no stale local state can mask the Redis result.
+        let rl2 = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix,
+        )
+        .await;
+
+        // After the window has expired, Redis must have evicted the old buckets and the
+        // suppression factor must be back to 0.
+        let sf_after = rl2
+            .hybrid()
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+        assert!(
+            (sf_after - 0.0).abs() < 1e-12,
+            "expected sf=0.0 after window expiry but got {sf_after} — \
+             old buckets were not evicted (window_size_ms passed instead of window_size_seconds?)"
+        );
+
+        // And a new request must be admitted.
+        let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
+        let d = rl2
+            .hybrid()
+            .suppressed()
+            .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                d,
+                RateLimitDecision::Allowed
+                    | RateLimitDecision::Suppressed {
+                        suppression_factor: 0f64,
+                        is_allowed: true
+                    }
+            ),
+            "expected Allowed after window expiry, got {d:?}"
+        );
+    });
+}
+
+/// Run for three consecutive windows at well above the rate limit and assert that the total
+/// admitted volume across all windows is close to `rate * num_windows`.
+///
+/// If window eviction is broken (buckets accumulate), the hard limit is hit after the first
+/// window and every subsequent request is suppressed, so total_allowed ≈ window_limit rather
+/// than ≈ rate * num_windows.
+#[test]
+fn hybrid_suppressed_throughput_over_multiple_windows_stays_at_rate_limit() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 1_u64;
+        let rate_group_size_ms = 100_u64;
+        let sync_interval_ms = 25_u64;
+        let hard_limit_factor = 1.5_f64;
+        let cache_ms = 5_u64;
+        let num_windows = 3_u64;
+
+        let prefix = unique_prefix();
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(10f64).unwrap();
+        // soft_window_limit = window_size * rate = 10
+        // hard_window_limit = soft * hard_limit_factor = 15
+        let soft_limit = window_capacity(window_size_seconds, &rate_limit); // 10
+
+        let rl = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix,
+        )
+        .await;
+
+        let mut total_allowed: u64 = 0;
+
+        for _window in 0..num_windows {
+            // Within each window, hammer at 10× the rate limit to ensure we hit the ceiling.
+            // The limiter should admit ≈ soft_limit requests and suppress the rest.
+            let burst = soft_limit * 10;
+            for _ in 0..burst {
+                let d = rl
+                    .hybrid()
+                    .suppressed()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap();
+                match d {
+                    RateLimitDecision::Allowed => total_allowed += 1,
+                    RateLimitDecision::Suppressed { is_allowed, .. } => {
+                        if is_allowed {
+                            total_allowed += 1;
+                        }
+                    }
+                    RateLimitDecision::Rejected { .. } => {
+                        panic!("suppressed strategy must never return Rejected")
+                    }
+                }
+            }
+
+            // Flush committed state and wait for the window to fully expire before next window.
+            wait_for_hybrid_sync(sync_interval_ms).await;
+            runtime::async_sleep(Duration::from_millis(window_size_seconds * 1_000 + 50)).await;
+            runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+        }
+
+        // Each window should admit at most hard_window_limit requests and at least soft_limit.
+        // Over num_windows windows the total must be at least soft_limit * num_windows.
+        // If eviction is broken, total_allowed ≈ hard_window_limit (15) instead of ≈ 30+.
+        let hard_limit = (soft_limit as f64 * hard_limit_factor) as u64; // 15
+        let expected_min = soft_limit * num_windows; // 30
+        assert!(
+            total_allowed >= expected_min,
+            "total_allowed={total_allowed} but expected >= {expected_min} over {num_windows} windows \
+             (hard_limit={hard_limit}) — window eviction is likely broken"
+        );
+    });
+}
