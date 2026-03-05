@@ -184,6 +184,7 @@ pub(crate) struct AbsoluteHybridRedisProxy {
     commit_state_script: Script,
     cleanup_script: Script,
     connection_manager: ConnectionManager,
+    read_chunk_size: usize,
 }
 
 #[async_trait::async_trait]
@@ -228,6 +229,7 @@ impl AbsoluteHybridRedisProxy {
             commit_state_script: Script::new(COMMIT_STATE_SCRIPT),
             cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
             connection_manager,
+            read_chunk_size: 100,
         }
     }
 
@@ -284,51 +286,61 @@ impl AbsoluteHybridRedisProxy {
 
     pub(crate) async fn batch_read_state(
         self: &AbsoluteHybridRedisProxy,
-        keys: &Vec<RedisKey>,
+        keys: &[RedisKey],
         window_size_ms: u128,
     ) -> Result<Vec<AbsoluteHybridRedisProxyReadStateResult>, TrypemaError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut connection_manager = self.connection_manager.clone();
 
-        let pipe = self.build_read_pipeline(keys, window_size_ms, false);
+        let chunk_size = self.read_chunk_size.max(1);
+        let mut all_results: Vec<AbsoluteHybridRedisProxyReadStateResult> =
+            Vec::with_capacity(keys.len());
 
-        let results = match pipe
-            .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
-            .await
-        {
-            Ok(results) => results,
-            Err(err) => {
-                if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
-                    tracing::error!("redis.read.error, error executing pipeline: {:?}", err);
-                    return Err(TrypemaError::RedisError(err));
-                }
+        for chunk in keys.chunks(chunk_size) {
+            let pipe = self.build_read_pipeline(chunk, window_size_ms, false);
 
-                let pipe = self.build_read_pipeline(keys, window_size_ms, true);
-
-                match pipe
-                    .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
-                    .await
-                {
-                    Ok(results) => results,
-                    Err(err) => {
+            let results = match pipe
+                .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
+                .await
+            {
+                Ok(results) => results,
+                Err(err) => {
+                    if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
                         tracing::error!("redis.read.error, error executing pipeline: {:?}", err);
                         return Err(TrypemaError::RedisError(err));
                     }
+
+                    let pipe = self.build_read_pipeline(chunk, window_size_ms, true);
+
+                    match pipe
+                        .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
+                        .await
+                    {
+                        Ok(results) => results,
+                        Err(err) => {
+                            tracing::error!(
+                                "redis.read.error, error executing pipeline: {:?}",
+                                err
+                            );
+                            return Err(TrypemaError::RedisError(err));
+                        }
+                    }
                 }
-            }
-        };
+            };
 
-        let results: Vec<AbsoluteHybridRedisProxyReadStateResult> = results
-            .into_iter()
-            .map(map_redis_read_result_to_state)
-            .collect();
+            all_results.extend(results.into_iter().map(map_redis_read_result_to_state));
+        }
 
-        Ok(results)
+        Ok(all_results)
     } // end method batch_commit_state
 
     #[inline]
     fn build_read_pipeline(
         &self,
-        keys: &Vec<RedisKey>,
+        keys: &[RedisKey],
         window_size_ms: u128,
         should_load_script: bool,
     ) -> redis::Pipeline {
