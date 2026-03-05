@@ -52,3 +52,13 @@ pub(crate) async fn _sleep(d: Duration) {
 pub(crate) async fn _sleep(d: Duration) {
     smol::Timer::after(d).await;
 }
+
+#[cfg(all(feature = "redis-tokio", not(feature = "redis-smol")))]
+pub(crate) async fn yield_now() {
+    tokio::task::yield_now().await;
+}
+
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+pub(crate) async fn yield_now() {
+    smol::future::yield_now().await;
+}

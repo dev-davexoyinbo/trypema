@@ -20,7 +20,7 @@ use crate::{
         },
         common::RedisRateLimiterSignal,
     },
-    redis::{mutex_lock, spawn_task},
+    redis::{mutex_lock, spawn_task, try_get_mut_async},
 };
 
 #[derive(Debug)]
@@ -232,11 +232,10 @@ impl AbsoluteHybridRateLimiter {
 
                     if !is_undefined {
                         drop(state);
-                        *self
-                            .limiting_state
-                            .get_mut(key)
-                            .expect("Key should be present") =
-                            AbsoluteRedisLimitingState::Undefined;
+                        let mut state = try_get_mut_async(&self.limiting_state, key)
+                            .await
+                            .expect("Key should be present");
+                        *state = AbsoluteRedisLimitingState::Undefined;
                     }
 
                     return Ok(RateLimitDecision::Allowed);
@@ -267,9 +266,8 @@ impl AbsoluteHybridRateLimiter {
                     new_count_after_release;
             } else {
                 drop(state);
-                let mut state = self
-                    .limiting_state
-                    .get_mut(key)
+                let mut state = try_get_mut_async(&self.limiting_state, key)
+                    .await
                     .expect("Key should be present");
 
                 *state = AbsoluteRedisLimitingState::Rejecting {
@@ -307,9 +305,8 @@ impl AbsoluteHybridRateLimiter {
                 read_state_result.last_rate_group_count;
         } else {
             drop(state);
-            let mut state = self
-                .limiting_state
-                .get_mut(key)
+            let mut state = try_get_mut_async(&self.limiting_state, key)
+                .await
                 .expect("Key should be present");
 
             *state = AbsoluteRedisLimitingState::Accepting {
@@ -383,7 +380,7 @@ impl AbsoluteHybridRateLimiter {
                 TrypemaError::CustomError("Failed to reserve commiter sender".to_string())
             })?;
 
-            let Some(mut state_entry) = self.limiting_state.get_mut(key) else {
+            let Some(mut state_entry) = try_get_mut_async(&self.limiting_state, key).await else {
                 unreachable!("Key should be present");
             };
 

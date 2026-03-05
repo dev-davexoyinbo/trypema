@@ -1,9 +1,12 @@
 use std::{
+    hash::Hash,
     ops::{Deref, DerefMut},
     sync::Mutex,
 };
 
-use crate::{TrypemaError, common::RateType};
+use dashmap::{mapref::one::RefMut, try_result::TryResult, DashMap};
+
+use crate::{common::RateType, TrypemaError};
 
 /// A validated newtype for Redis keys.
 ///
@@ -121,4 +124,20 @@ pub(crate) fn mutex_lock<'a, T>(
 ) -> Result<std::sync::MutexGuard<'a, T>, TrypemaError> {
     m.lock()
         .map_err(|_| TrypemaError::CustomError(format!("mutex poisoned: {what}")))
+}
+
+pub(crate) async fn try_get_mut_async<'a, K, V>(
+    map: &'a DashMap<K, V>,
+    key: &K,
+) -> Option<RefMut<'a, K, V>>
+where
+    K: Eq + Hash,
+{
+    loop {
+        match map.try_get_mut(key) {
+            TryResult::Present(v) => return Some(v),
+            TryResult::Absent => return None,
+            TryResult::Locked => crate::runtime::yield_now().await,
+        }
+    }
 }

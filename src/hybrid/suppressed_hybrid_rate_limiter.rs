@@ -18,7 +18,7 @@ use crate::{
         SuppressedHybridCommit, SuppressedHybridRedisProxy, SuppressedHybridRedisProxyOptions,
         SuppressedHybridRedisProxyReadStateResult, common::RedisRateLimiterSignal,
     },
-    redis::{mutex_lock, spawn_task},
+    redis::{mutex_lock, spawn_task, try_get_mut_async},
 };
 
 #[derive(Debug)]
@@ -314,13 +314,13 @@ impl SuppressedHybridRateLimiter {
                 let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
                 let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
                 let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
+                let count_value = count.load(Ordering::Relaxed);
 
                 if starting_count
-                    .saturating_add(count.load(Ordering::Relaxed))
+                    .saturating_add(count_value)
                     .saturating_add(increment)
                     >= soft_window_limit
                 {
-                    let count_value = count.swap(0, Ordering::Relaxed);
                     let current_total_count = starting_count.saturating_add(count_value);
 
                     if count_value > 0 {
@@ -336,7 +336,7 @@ impl SuppressedHybridRateLimiter {
                     drop(state_entry);
                     let suppression_factor = self.get_suppression_factor(key).await?;
 
-                    let Some(mut state_entry) = self.limiting_state.get_mut(key) else {
+                    let Some(mut state_entry) = try_get_mut_async(&self.limiting_state, key).await else {
                         unreachable!("Key should be present");
                     };
 
@@ -558,11 +558,10 @@ impl SuppressedHybridRateLimiter {
 
                     if !is_undefined {
                         drop(state);
-                        *self
-                            .limiting_state
-                            .get_mut(key)
-                            .expect("Key should be present") =
-                            SuppressedRedisLimitingState::Undefined;
+                        let mut state = try_get_mut_async(&self.limiting_state, key)
+                            .await
+                            .expect("Key should be present");
+                        *state = SuppressedRedisLimitingState::Undefined;
                     }
 
                     return Ok(RateLimitDecision::Allowed);
@@ -596,9 +595,8 @@ impl SuppressedHybridRateLimiter {
                 count.store(increment, Ordering::Relaxed);
             } else {
                 drop(state);
-                let mut state = self
-                    .limiting_state
-                    .get_mut(key)
+                let mut state = try_get_mut_async(&self.limiting_state, key)
+                    .await
                     .expect("Key should be present");
 
                 *state = SuppressedRedisLimitingState::Suppressing {
@@ -639,9 +637,8 @@ impl SuppressedHybridRateLimiter {
             count.store(increment, Ordering::Relaxed);
         } else {
             drop(state);
-            let mut state = self
-                .limiting_state
-                .get_mut(key)
+            let mut state = try_get_mut_async(&self.limiting_state, key)
+                .await
                 .expect("Key should be present");
 
             *state = SuppressedRedisLimitingState::Accepting {
