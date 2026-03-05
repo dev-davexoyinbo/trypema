@@ -55,7 +55,7 @@ const LUA_HELPERS: &str = r#"
     end
 
     local function cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
-        local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
+        local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - (window_size_seconds * 1000), "BYSCORE")
 
         if #to_remove_keys == 0 then
             return
@@ -229,7 +229,6 @@ pub(crate) struct SuppressedHybridRedisProxy {
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
     rate_group_size_ms: RateGroupSizeMs,
     window_size_seconds: WindowSizeSeconds,
-    window_size_ms: u64,
     read_chunk_size: usize,
 }
 
@@ -253,7 +252,6 @@ impl SuppressedHybridRedisProxy {
             window_size_seconds,
         }: SuppressedHybridRedisProxyOptions,
     ) -> Self {
-        let window_size_ms = (*window_size_seconds).saturating_mul(1000);
         Self {
             key_generator: RedisKeyGenerator::new(prefix, RateType::HybridSuppressed),
             read_state_script: Script::new(&format!("{}\n{}", LUA_HELPERS, READ_STATE_SCRIPT)),
@@ -262,7 +260,6 @@ impl SuppressedHybridRedisProxy {
             hard_limit_factor,
             suppression_factor_cache_ms,
             connection_manager,
-            window_size_ms,
             rate_group_size_ms,
             window_size_seconds,
             read_chunk_size: 100,
@@ -284,7 +281,7 @@ impl SuppressedHybridRedisProxy {
             .key(self.key_generator.get_active_entities_key())
             .key(self.key_generator.get_suppression_factor_key(key))
             .arg(key.as_str())
-            .arg(self.window_size_ms)
+            .arg(*self.window_size_seconds)
             .arg(*self.suppression_factor_cache_ms)
             .arg(*self.hard_limit_factor)
             .invoke_async(&mut connection_manager)
@@ -398,7 +395,7 @@ impl SuppressedHybridRedisProxy {
                     .key(self.key_generator.get_active_entities_key())
                     .key(self.key_generator.get_suppression_factor_key(key))
                     .arg(key.as_str())
-                    .arg(self.window_size_ms)
+                    .arg(*self.window_size_seconds)
                     .arg(*self.suppression_factor_cache_ms)
                     .arg(*self.hard_limit_factor),
             );
