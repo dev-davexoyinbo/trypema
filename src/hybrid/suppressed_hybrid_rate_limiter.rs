@@ -181,6 +181,8 @@ impl SuppressedHybridRateLimiter {
             }
         }
 
+        drop(state);
+
         let mut rng = |p: f64| rand::random_bool(p);
 
         let decision = self
@@ -256,15 +258,15 @@ impl SuppressedHybridRateLimiter {
                 suppression_factor = 1f64;
             }
 
-            let should_allow = if suppression_factor == 0f64 {
-                true
-            } else if suppression_factor == 1f64 {
-                false
-            } else {
-                random_bool(1f64 - suppression_factor)
-            };
-
             if elapsed_ms < ttl_ms {
+                let should_allow = if suppression_factor == 0f64 {
+                    true
+                } else if suppression_factor == 1f64 {
+                    false
+                } else {
+                    random_bool(1f64 - suppression_factor)
+                };
+
                 count.fetch_add(increment, Ordering::Relaxed);
                 return Ok(RateLimitDecision::Suppressed {
                     suppression_factor,
@@ -321,8 +323,6 @@ impl SuppressedHybridRateLimiter {
                     let count_value = count.swap(0, Ordering::Relaxed);
                     let current_total_count = starting_count.saturating_add(count_value);
 
-                    drop(state_entry);
-
                     if count_value > 0 {
                         let commit = SuppressedHybridCommit {
                             key: key.clone(),
@@ -333,6 +333,7 @@ impl SuppressedHybridRateLimiter {
                         permit.send(commit.into());
                     }
 
+                    drop(state_entry);
                     let suppression_factor = self.get_suppression_factor(key).await?;
 
                     let Some(mut state_entry) = self.limiting_state.get_mut(key) else {
