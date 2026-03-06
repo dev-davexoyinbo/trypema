@@ -157,6 +157,17 @@ impl AbsoluteHybridRateLimiter {
         }
     }
 
+    /// Acquire (or create) the per-key reset lock and return an `Arc` to it.
+    fn get_or_create_reset_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(lock) = self.reset_locks.get(key) {
+            return Arc::clone(&lock);
+        }
+        self.reset_locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Check admission and, if allowed, increment the observed count for `key`.
     pub async fn inc(
         &self,
@@ -186,17 +197,6 @@ impl AbsoluteHybridRateLimiter {
         self.is_allowed_with_count_increment(key, 1, 0, None).await
     } // end method is_allowed
 
-    /// Acquire (or create) the per-key reset lock and return an `Arc` to it.
-    fn get_or_create_reset_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
-        if let Some(lock) = self.reset_locks.get(key) {
-            return Arc::clone(&lock);
-        }
-        self.reset_locks
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-
     async fn reset_state_from_redis_read_result_and_get_decision(
         &self,
         key: &RedisKey,
@@ -216,7 +216,7 @@ impl AbsoluteHybridRateLimiter {
         // read.
         {
             let state_entry = self.limiting_state.get(key);
-            if let Some(state_entry) = state_entry
+            if let Some(ref state_entry) = state_entry
                 && let AbsoluteRedisLimitingState::Accepting {
                     accept_limit,
                     count,
@@ -231,6 +231,30 @@ impl AbsoluteHybridRateLimiter {
                     return Ok(RateLimitDecision::Allowed);
                 }
                 // Still over limit after lock — fall through to Redis read.
+            } else if let Some(state_entry) = state_entry
+                && let AbsoluteRedisLimitingState::Rejecting {
+                    time_instant,
+                    ttl_ms,
+                    count_after_release,
+                    ..
+                } = state_entry.deref()
+            {
+                let elapsed_ms = mutex_lock(time_instant, "rejecting.time_instant")?
+                    .elapsed()
+                    .as_millis();
+                let ttl_ms_val = *mutex_lock(ttl_ms, "rejecting.ttl_ms")? as u128;
+
+                if elapsed_ms < ttl_ms_val {
+                    let remaining_after_waiting =
+                        *mutex_lock(count_after_release, "rejecting.count_after_release")?;
+                    return Ok(RateLimitDecision::Rejected {
+                        window_size_seconds: *self.window_size_seconds,
+                        retry_after_ms: ttl_ms_val.saturating_sub(elapsed_ms),
+                        remaining_after_waiting,
+                    });
+                }
+
+                // Rejection has expired - fail through to Redis read.
             }
         }
 
