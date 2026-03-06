@@ -382,51 +382,49 @@ impl SuppressedHybridRateLimiter {
                 if starting_count
                     .saturating_add(count_value)
                     .saturating_add(increment)
-                    >= soft_window_limit
+                    <= soft_window_limit
                 {
-                    let current_total_count = starting_count.saturating_add(count_value);
-
-                    if count_value > 0 {
-                        let commit = SuppressedHybridCommit {
-                            key: key.clone(),
-                            window_limit,
-                            count: count_value,
-                        };
-
-                        permit.send(commit.into());
-                    }
-
-                    let forecasted_total_count = current_total_count.saturating_add(increment);
-                    let (suppression_factor, should_allow) =
-                        if forecasted_total_count > window_limit {
-                            (1f64, false)
-                        } else if forecasted_total_count >= soft_window_limit
-                            && soft_window_limit < window_limit
-                            && forecasted_total_count < window_limit
-                        {
-                            (0f64, true)
-                        } else {
-                            (1f64, true)
-                        };
-
-                    *state_entry = SuppressedRedisLimitingState::Suppressing {
-                        time_instant: Mutex::new(Instant::now()),
-                        suppression_factor: Mutex::new(suppression_factor),
-                        window_limit: Mutex::new(window_limit),
-                        suppression_factor_ttl_ms: Mutex::new(*self.suppression_factor_cache_ms),
-                        starting_count: Mutex::new(current_total_count),
-                        count: AtomicU64::new(increment),
-                    };
-
-                    return Ok(RateLimitDecision::Suppressed {
-                        suppression_factor,
-                        is_allowed: should_allow,
-                    });
-                } else {
-                    // we are still in the accepting state, so we need to set the starting_count to the current total count
                     count.fetch_add(increment, Ordering::AcqRel);
                     return Ok(RateLimitDecision::Allowed);
                 }
+
+                let current_total_count = starting_count.saturating_add(count_value);
+
+                if count_value > 0 {
+                    let commit = SuppressedHybridCommit {
+                        key: key.clone(),
+                        window_limit,
+                        count: count_value,
+                    };
+
+                    permit.send(commit.into());
+                }
+
+                let forecasted_total_count = current_total_count.saturating_add(increment);
+                let (suppression_factor, should_allow) = if forecasted_total_count > window_limit {
+                    (1f64, false)
+                } else if forecasted_total_count >= soft_window_limit
+                    && soft_window_limit < window_limit
+                    && forecasted_total_count < window_limit
+                {
+                    (0f64, true)
+                } else {
+                    (1f64, true)
+                };
+
+                *state_entry = SuppressedRedisLimitingState::Suppressing {
+                    time_instant: Mutex::new(Instant::now()),
+                    suppression_factor: Mutex::new(suppression_factor),
+                    window_limit: Mutex::new(window_limit),
+                    suppression_factor_ttl_ms: Mutex::new(*self.suppression_factor_cache_ms),
+                    starting_count: Mutex::new(current_total_count),
+                    count: AtomicU64::new(increment),
+                };
+
+                return Ok(RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: should_allow,
+                });
             } else if let SuppressedRedisLimitingState::Suppressing {
                 time_instant,
                 suppression_factor_ttl_ms,
