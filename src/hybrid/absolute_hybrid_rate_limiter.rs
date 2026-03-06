@@ -204,7 +204,7 @@ impl AbsoluteHybridRateLimiter {
                 count,
                 ..
             } => {
-                let count = count.load(Ordering::Relaxed);
+                let count = count.load(Ordering::Acquire);
 
                 if current_window_limit.is_none() {
                     current_window_limit =
@@ -306,12 +306,12 @@ impl AbsoluteHybridRateLimiter {
         {
             *mutex_lock(window_limit, "accepting.window_limit")? = new_window_limit;
             *mutex_lock(accept_limit, "accepting.accept_limit")? = new_accept_limit;
-            count.store(increment, Ordering::Relaxed);
             *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
             *mutex_lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")? =
                 read_state_result.last_rate_group_ttl;
             *mutex_lock(last_rate_group_count, "accepting.last_rate_group_count")? =
                 read_state_result.last_rate_group_count;
+            count.store(increment, Ordering::Release);
         } else {
             drop(state);
             *self
@@ -377,8 +377,8 @@ impl AbsoluteHybridRateLimiter {
         } = state_entry.deref()
         {
             let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
-            if count.load(Ordering::Relaxed) + check_count <= accept_limit {
-                count.fetch_add(increment, Ordering::Relaxed);
+            if count.load(Ordering::Acquire) + check_count <= accept_limit {
+                count.fetch_add(increment, Ordering::AcqRel);
                 return Ok(RateLimitDecision::Allowed);
             }
 
@@ -402,7 +402,7 @@ impl AbsoluteHybridRateLimiter {
                 ..
             } = state_entry.deref()
             {
-                let current_total_count = count.load(Ordering::Relaxed);
+                let current_total_count = count.load(Ordering::Acquire);
                 let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
 
                 if current_total_count > 0 {
