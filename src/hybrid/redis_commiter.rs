@@ -69,10 +69,12 @@ impl RedisCommitter {
                 let is_active = is_active.clone();
                 let is_active_notify = is_active_notify.clone();
                 let sleep_interval =
-                    Duration::from_millis(1000.max(sync_interval.as_millis() as u64 * 10));
+                    Duration::from_millis(30_000.max(sync_interval.as_millis() as u64 * 10)) / 2;
 
                 async move {
                     loop {
+                        sleep(sleep_interval).await;
+
                         futures::select! {
                             _ = is_active_notify.notified().fuse() => {
                                 is_active.store(true, Ordering::Release);
