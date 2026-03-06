@@ -16,7 +16,8 @@ use crate::{
     hybrid::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions,
         SuppressedHybridCommit, SuppressedHybridRedisProxy, SuppressedHybridRedisProxyOptions,
-        SuppressedHybridRedisProxyReadStateResult, common::RedisRateLimiterSignal,
+        SuppressedHybridRedisProxyReadStateResult,
+        common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal},
     },
     redis::{mutex_lock, spawn_task},
     runtime,
@@ -134,7 +135,7 @@ impl SuppressedHybridRateLimiter {
 
         spawn_task(async move {
             loop {
-                runtime::sleep(Duration::from_secs(15)).await;
+                runtime::sleep(EPOCH_CHANGE_INTERVAL).await;
                 let Some(limiter) = limiter.upgrade() else {
                     break;
                 };

@@ -9,7 +9,7 @@ use crate::redis::tick;
 use crate::runtime::{TaskHandle, sleep, spawn_task_handle};
 use crate::{
     TrypemaError,
-    hybrid::common::RedisRateLimiterSignal,
+    hybrid::common::{RedisRateLimiterSignal, committer_inactivity_sleep},
     redis::{new_interval, spawn_task},
 };
 
@@ -68,8 +68,7 @@ impl RedisCommitter {
             let is_active_cancel_task: TaskHandle = spawn_task_handle({
                 let is_active = is_active.clone();
                 let mut is_active_watch = is_active_watch.clone();
-                let sleep_interval =
-                    Duration::from_millis(30_000.max(sync_interval.as_millis() as u64 * 10)) / 2;
+                let sleep_interval = committer_inactivity_sleep(sync_interval);
 
                 async move {
                     loop {
