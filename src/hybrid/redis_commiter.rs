@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, watch};
 
 use crate::redis::tick;
 use crate::runtime::{TaskHandle, sleep, spawn_task_handle};
@@ -18,7 +18,7 @@ pub(crate) struct RedisCommitterOptions<T> {
     pub channel_capacity: usize,
     pub max_batch_size: usize,
     pub limiter_sender: mpsc::Sender<RedisRateLimiterSignal>,
-    pub is_active_notify: Arc<Notify>,
+    pub is_active_watch: watch::Receiver<u64>,
     pub redis_proxy: Box<dyn RedisProxyCommitter<T> + Send + Sync>,
 }
 
@@ -55,7 +55,7 @@ impl RedisCommitter {
             max_batch_size,
             limiter_sender,
             redis_proxy,
-            is_active_notify,
+            mut is_active_watch,
         } = options;
 
         let (tx, mut rx) = mpsc::channel::<AbsoluteHybridCommitterSignal<T>>(channel_capacity);
@@ -67,7 +67,7 @@ impl RedisCommitter {
 
             let is_active_cancel_task: TaskHandle = spawn_task_handle({
                 let is_active = is_active.clone();
-                let is_active_notify = is_active_notify.clone();
+                let mut is_active_watch = is_active_watch.clone();
                 let sleep_interval =
                     Duration::from_millis(30_000.max(sync_interval.as_millis() as u64 * 10)) / 2;
 
@@ -76,7 +76,11 @@ impl RedisCommitter {
                         sleep(sleep_interval).await;
 
                         futures::select! {
-                            _ = is_active_notify.notified().fuse() => {
+                            val = is_active_watch.changed().fuse() => {
+                                if val.is_err() {
+                                    break;
+                                }
+
                                 is_active.store(true, Ordering::Release);
                             }
                             _ = sleep(sleep_interval).fuse() => {
@@ -94,7 +98,10 @@ impl RedisCommitter {
 
             loop {
                 if !is_active.load(Ordering::Acquire) {
-                    is_active_notify.notified().await;
+                    if is_active_watch.changed().await.is_err() {
+                        break;
+                    }
+
                     is_active.store(true, Ordering::Release);
                 }
 

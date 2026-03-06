@@ -8,7 +8,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError,
@@ -22,6 +22,7 @@ use crate::{
         common::RedisRateLimiterSignal,
     },
     redis::{mutex_lock, spawn_task},
+    runtime,
 };
 
 #[derive(Debug)]
@@ -51,7 +52,9 @@ pub struct AbsoluteHybridRateLimiter {
     redis_proxy: AbsoluteHybridRedisProxy,
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
     sync_interval_ms: SyncIntervalMs,
-    is_active_notify: Arc<Notify>,
+    epoch: AtomicU64,
+    last_commited_epoch: AtomicU64,
+    is_active_watch: watch::Sender<u64>,
 }
 
 impl AbsoluteHybridRateLimiter {
@@ -67,7 +70,7 @@ impl AbsoluteHybridRateLimiter {
             rate_group_size_ms: options.rate_group_size_ms,
         });
 
-        let is_active_notify = Arc::new(Notify::new());
+        let is_active_watch = watch::Sender::new(0u64);
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
@@ -75,7 +78,7 @@ impl AbsoluteHybridRateLimiter {
             max_batch_size: 4,
             limiter_sender: tx,
             redis_proxy: Box::new(redis_proxy.clone()),
-            is_active_notify: is_active_notify.clone(),
+            is_active_watch: is_active_watch.subscribe(),
         });
 
         let limiter = Self {
@@ -85,15 +88,33 @@ impl AbsoluteHybridRateLimiter {
             redis_proxy,
             limiting_state: DashMap::new(),
             sync_interval_ms: options.sync_interval_ms,
-            is_active_notify,
+            epoch: AtomicU64::new(0),
+            last_commited_epoch: AtomicU64::new(0),
+            is_active_watch,
         };
 
         let limiter = Arc::new(limiter);
 
         limiter.listen_for_committer_signals(rx);
+        limiter.epoch_change_task();
 
         limiter
     } // end method with_rate_type
+
+    fn epoch_change_task(self: &Arc<Self>) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        let limiter = Arc::downgrade(self);
+
+        spawn_task(async move {
+            loop {
+                runtime::sleep(Duration::from_secs(15)).await;
+                let Some(limiter) = limiter.upgrade() else {
+                    break;
+                };
+                limiter.epoch.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
 
     fn listen_for_committer_signals(
         self: &Arc<Self>,
@@ -118,6 +139,16 @@ impl AbsoluteHybridRateLimiter {
         });
     } // end method listen_for_committer_signals
 
+    #[inline(always)]
+    fn send_epoch_change_if_needed(&self) {
+        let epoch = self.epoch.load(Ordering::Relaxed);
+
+        if self.last_commited_epoch.load(Ordering::Relaxed) < epoch {
+            let _ = self.is_active_watch.send(epoch);
+            self.last_commited_epoch.store(epoch, Ordering::Relaxed);
+        }
+    }
+
     /// Check admission and, if allowed, increment the observed count for `key`.
     pub async fn inc(
         &self,
@@ -125,7 +156,7 @@ impl AbsoluteHybridRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        self.is_active_notify.notify_waiters();
+        self.send_epoch_change_if_needed();
 
         let decision = self
             .is_allowed_with_count_increment(key, count, count, Some(rate_limit))
@@ -142,7 +173,7 @@ impl AbsoluteHybridRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
-        self.is_active_notify.notify_waiters();
+        self.send_epoch_change_if_needed();
 
         self.is_allowed_with_count_increment(key, 1, 0, None).await
     } // end method is_allowed

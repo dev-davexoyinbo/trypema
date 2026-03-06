@@ -8,7 +8,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     HardLimitFactor, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions,
@@ -19,6 +19,7 @@ use crate::{
         SuppressedHybridRedisProxyReadStateResult, common::RedisRateLimiterSignal,
     },
     redis::{mutex_lock, spawn_task},
+    runtime,
 };
 
 #[derive(Debug)]
@@ -49,7 +50,9 @@ pub struct SuppressedHybridRateLimiter {
     limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState>,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
-    is_active_notify: Arc<Notify>,
+    epoch: AtomicU64,
+    last_commited_epoch: AtomicU64,
+    is_active_watch: watch::Sender<u64>,
 }
 
 impl SuppressedHybridRateLimiter {
@@ -71,7 +74,7 @@ impl SuppressedHybridRateLimiter {
             window_size_seconds,
         });
 
-        let is_active_notify = Arc::new(Notify::new());
+        let is_active_watch = watch::Sender::new(0u64);
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
@@ -79,7 +82,7 @@ impl SuppressedHybridRateLimiter {
             max_batch_size: 4,
             limiter_sender: tx,
             redis_proxy: Box::new(redis_proxy.clone()),
-            is_active_notify: is_active_notify.clone(),
+            is_active_watch: is_active_watch.subscribe(),
         });
 
         let limiter = Self {
@@ -89,12 +92,15 @@ impl SuppressedHybridRateLimiter {
             limiting_state: DashMap::new(),
             hard_limit_factor,
             suppression_factor_cache_ms,
-            is_active_notify,
+            is_active_watch,
+            epoch: AtomicU64::new(0),
+            last_commited_epoch: AtomicU64::new(0),
         };
 
         let limiter = Arc::new(limiter);
 
         limiter.listen_for_committer_signals(rx);
+        limiter.epoch_change_task();
 
         limiter
     } // end method with_rate_type
@@ -122,6 +128,31 @@ impl SuppressedHybridRateLimiter {
         });
     } // end method listen_for_committer_signals
 
+    fn epoch_change_task(self: &Arc<Self>) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        let limiter = Arc::downgrade(self);
+
+        spawn_task(async move {
+            loop {
+                runtime::sleep(Duration::from_secs(15)).await;
+                let Some(limiter) = limiter.upgrade() else {
+                    break;
+                };
+                limiter.epoch.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    #[inline(always)]
+    fn send_epoch_change_if_needed(&self) {
+        let epoch = self.epoch.load(Ordering::Relaxed);
+
+        if self.last_commited_epoch.load(Ordering::Relaxed) < epoch {
+            let _ = self.is_active_watch.send(epoch);
+            self.last_commited_epoch.store(epoch, Ordering::Relaxed);
+        }
+    }
+
     /// Determine whether `key` is currently allowed.
     ///
     /// Returns [`RateLimitDecision::Allowed`] if the current sliding window total
@@ -130,7 +161,7 @@ impl SuppressedHybridRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
-        self.is_active_notify.notify_waiters();
+        self.send_epoch_change_if_needed();
 
         let state = match self.limiting_state.get(key) {
             Some(state) => state,
@@ -237,7 +268,7 @@ impl SuppressedHybridRateLimiter {
         rate_limit: Option<&RateLimit>,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        self.is_active_notify.notify_waiters();
+        self.send_epoch_change_if_needed();
 
         let state_entry = match self.limiting_state.get(key) {
             Some(state) => state,
