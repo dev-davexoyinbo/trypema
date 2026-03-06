@@ -572,9 +572,8 @@ impl SuppressedHybridRateLimiter {
                     let is_undefined =
                         matches!(state.deref(), SuppressedRedisLimitingState::Undefined);
 
-                    drop(state);
-
                     if !is_undefined {
+                        drop(state);
                         let mut state = self
                             .limiting_state
                             .get_mut(key)

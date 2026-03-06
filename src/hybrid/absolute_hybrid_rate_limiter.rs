@@ -277,10 +277,12 @@ impl AbsoluteHybridRateLimiter {
                     new_count_after_release;
             } else {
                 drop(state);
-                *self
+                let mut state = self
                     .limiting_state
                     .get_mut(key)
-                    .expect("key should be present") = AbsoluteRedisLimitingState::Rejecting {
+                    .expect("key should be present");
+
+                *state = AbsoluteRedisLimitingState::Rejecting {
                     time_instant: Mutex::new(new_time_instant),
                     ttl_ms: Mutex::new(new_ttl_ms),
                     count_after_release: Mutex::new(new_count_after_release),
@@ -315,10 +317,12 @@ impl AbsoluteHybridRateLimiter {
             count.store(increment, Ordering::Release);
         } else {
             drop(state);
-            *self
+            let mut state = self
                 .limiting_state
                 .get_mut(key)
-                .expect("key should be present") = AbsoluteRedisLimitingState::Accepting {
+                .expect("key should be present");
+
+            *state = AbsoluteRedisLimitingState::Accepting {
                 window_limit: Mutex::new(new_window_limit),
                 accept_limit: Mutex::new(new_accept_limit),
                 count: AtomicU64::new(increment),
@@ -408,7 +412,7 @@ impl AbsoluteHybridRateLimiter {
                 let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
                 let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
 
-                if count.load(Ordering::Acquire) + check_count <= accept_limit {
+                if current_total_count + check_count <= accept_limit {
                     count.fetch_add(increment, Ordering::AcqRel);
                     return Ok(RateLimitDecision::Allowed);
                 }

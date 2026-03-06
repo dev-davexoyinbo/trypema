@@ -93,7 +93,7 @@ const COMMIT_STATE_SCRIPT: &str = r#"
 
     local hash_field = tostring(timestamp_ms)
     local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
-    local total_count = redis.call("INCRBY", total_count_key, count)
+    redis.call("INCRBY", total_count_key, count)
 
     if new_count == count then
         redis.call("ZADD", active_keys, timestamp_ms, hash_field)
