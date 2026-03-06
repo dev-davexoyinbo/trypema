@@ -378,12 +378,11 @@ impl SuppressedHybridRateLimiter {
                 let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
                 let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
                 let count_value = count.load(Ordering::Acquire);
-
-                if starting_count
+                let forecasted_total_count = starting_count
                     .saturating_add(count_value)
-                    .saturating_add(increment)
-                    <= soft_window_limit
-                {
+                    .saturating_add(increment);
+
+                if forecasted_total_count <= soft_window_limit {
                     count.fetch_add(increment, Ordering::AcqRel);
                     return Ok(RateLimitDecision::Allowed);
                 }
@@ -400,15 +399,15 @@ impl SuppressedHybridRateLimiter {
                     permit.send(commit.into());
                 }
 
-                let forecasted_total_count = current_total_count.saturating_add(increment);
                 let (suppression_factor, should_allow) = if forecasted_total_count > window_limit {
                     (1f64, false)
-                } else if forecasted_total_count >= soft_window_limit
+                } else if forecasted_total_count > soft_window_limit
                     && soft_window_limit < window_limit
                     && forecasted_total_count < window_limit
                 {
                     (0f64, true)
                 } else {
+                    // if forcasted would be == window_limit, we are in the accepting state, so we need to set the starting_count to the current total count
                     (1f64, true)
                 };
 
@@ -425,45 +424,6 @@ impl SuppressedHybridRateLimiter {
                     suppression_factor,
                     is_allowed: should_allow,
                 });
-            } else if let SuppressedRedisLimitingState::Suppressing {
-                time_instant,
-                suppression_factor_ttl_ms,
-                suppression_factor,
-                count,
-                starting_count,
-                window_limit,
-                ..
-            } = state_entry.deref()
-            {
-                let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
-                let mut suppression_factor =
-                    *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
-                let elapsed_ms = mutex_lock(time_instant, "suppressing.time_instant")?
-                    .elapsed()
-                    .as_millis();
-                let ttl_ms = *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? as u128;
-                let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
-
-                // Guard hard limit
-                if starting_count.saturating_add(count.load(Ordering::Acquire)) > window_limit {
-                    suppression_factor = 1f64;
-                }
-
-                let should_allow = if suppression_factor == 0f64 {
-                    true
-                } else if suppression_factor == 1f64 {
-                    false
-                } else {
-                    random_bool(1f64 - suppression_factor)
-                };
-
-                if elapsed_ms < ttl_ms {
-                    count.fetch_add(increment, Ordering::AcqRel);
-                    return Ok(RateLimitDecision::Suppressed {
-                        suppression_factor,
-                        is_allowed: should_allow,
-                    });
-                }
             }
 
             drop(state_entry);
