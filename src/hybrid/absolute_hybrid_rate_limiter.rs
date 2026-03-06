@@ -16,7 +16,8 @@ use crate::{
     hybrid::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, SyncIntervalMs,
         absolute_hybrid_redis_proxy::{
-            AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyReadStateResult,
+            AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyOptions,
+            AbsoluteHybridRedisProxyReadStateResult,
         },
         common::RedisRateLimiterSignal,
     },
@@ -45,7 +46,6 @@ enum AbsoluteRedisLimitingState {
 #[derive(Debug)]
 pub struct AbsoluteHybridRateLimiter {
     window_size_seconds: WindowSizeSeconds,
-    window_size_ms: u128,
     rate_group_size_ms: RateGroupSizeMs,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
@@ -60,7 +60,12 @@ impl AbsoluteHybridRateLimiter {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(1);
 
-        let redis_proxy = AbsoluteHybridRedisProxy::new(prefix.clone(), options.connection_manager);
+        let redis_proxy = AbsoluteHybridRedisProxy::new(AbsoluteHybridRedisProxyOptions {
+            prefix: prefix.clone(),
+            connection_manager: options.connection_manager,
+            window_size_seconds: options.window_size_seconds,
+            rate_group_size_ms: options.rate_group_size_ms,
+        });
 
         let (is_active_sender, _) = broadcast::channel(16);
 
@@ -74,7 +79,6 @@ impl AbsoluteHybridRateLimiter {
         });
 
         let limiter = Self {
-            window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
             window_size_seconds: options.window_size_seconds,
             rate_group_size_ms: options.rate_group_size_ms,
             commiter_sender,
@@ -150,11 +154,10 @@ impl AbsoluteHybridRateLimiter {
         increment: u64,
         rate_limit: Option<&RateLimit>,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let read_state_result = self
-            .redis_proxy
-            .read_state(key, *self.window_size_seconds as u128 * 1000)
-            .await
-            .map_err(|err| TrypemaError::CustomError(format!("Failed to read state: {err:?}")))?;
+        let read_state_result =
+            self.redis_proxy.read_state(key).await.map_err(|err| {
+                TrypemaError::CustomError(format!("Failed to read state: {err:?}"))
+            })?;
 
         self.reset_single_state_from_read_result(
             read_state_result,
@@ -216,9 +219,7 @@ impl AbsoluteHybridRateLimiter {
 
                     let commit = AbsoluteHybridCommit {
                         key: key.clone(),
-                        window_size_seconds: *self.window_size_seconds,
                         window_limit: current_window_limit.expect("Window limit should be set"),
-                        rate_group_size_ms: *self.rate_group_size_ms,
                         count,
                     };
 
@@ -368,9 +369,9 @@ impl AbsoluteHybridRateLimiter {
                     remaining_after_waiting,
                 });
             }
-        }
 
-        if let AbsoluteRedisLimitingState::Accepting {
+            drop(state_entry);
+        } else if let AbsoluteRedisLimitingState::Accepting {
             accept_limit,
             count,
             ..
@@ -399,22 +400,17 @@ impl AbsoluteHybridRateLimiter {
                 time_instant,
                 last_rate_group_ttl,
                 last_rate_group_count,
+                accept_limit,
                 ..
             } = state_entry.deref()
             {
                 let current_total_count = count.load(Ordering::Acquire);
                 let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
+                let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
 
-                if current_total_count > 0 {
-                    let commit = AbsoluteHybridCommit {
-                        key: key.clone(),
-                        window_size_seconds: *self.window_size_seconds,
-                        window_limit,
-                        rate_group_size_ms: *self.rate_group_size_ms,
-                        count: current_total_count,
-                    };
-
-                    permit.send(commit.into());
+                if count.load(Ordering::Acquire) + check_count <= accept_limit {
+                    count.fetch_add(increment, Ordering::AcqRel);
+                    return Ok(RateLimitDecision::Allowed);
                 }
 
                 let last_rate_group_ttl: u128 =
@@ -431,7 +427,17 @@ impl AbsoluteHybridRateLimiter {
 
                 // If we can still increment by at least one, then we don't set the state to
                 // rejecting
-                if current_total_count >= window_limit {
+                if current_total_count >= accept_limit {
+                    if current_total_count > 0 {
+                        let commit = AbsoluteHybridCommit {
+                            key: key.clone(),
+                            window_limit,
+                            count: current_total_count,
+                        };
+
+                        permit.send(commit.into());
+                    }
+
                     *state_entry = AbsoluteRedisLimitingState::Rejecting {
                         time_instant: Mutex::new(Instant::now()),
                         ttl_ms: Mutex::new(retry_after_ms as u64),
@@ -444,6 +450,26 @@ impl AbsoluteHybridRateLimiter {
                     retry_after_ms,
                     remaining_after_waiting,
                 });
+            } else if let AbsoluteRedisLimitingState::Rejecting {
+                time_instant,
+                ttl_ms,
+                count_after_release,
+            } = state_entry.deref()
+            {
+                let elapsed_ms = mutex_lock(time_instant, "rejecting.time_instant")?
+                    .elapsed()
+                    .as_millis();
+                let ttl_ms = *mutex_lock(ttl_ms, "rejecting.ttl_ms")? as u128;
+
+                if elapsed_ms < ttl_ms {
+                    let remaining_after_waiting =
+                        *mutex_lock(count_after_release, "rejecting.count_after_release")?;
+                    return Ok(RateLimitDecision::Rejected {
+                        window_size_seconds: *self.window_size_seconds,
+                        retry_after_ms: ttl_ms.saturating_sub(elapsed_ms),
+                        remaining_after_waiting,
+                    });
+                }
             }
 
             drop(state_entry);
@@ -476,10 +502,7 @@ impl AbsoluteHybridRateLimiter {
             }
         }
 
-        let read_state_results = self
-            .redis_proxy
-            .batch_read_state(&resets, self.window_size_ms)
-            .await?;
+        let read_state_results = self.redis_proxy.batch_read_state(&resets).await?;
 
         for result in read_state_results {
             if let Err(err) = self
