@@ -30,6 +30,7 @@ enum AbsoluteRedisLimitingState {
     Accepting {
         window_limit: Mutex<u64>,
         accept_limit: Mutex<u64>,
+        starting_count: Mutex<u64>,
         count: AtomicU64,
         time_instant: Mutex<Instant>,
         last_rate_group_ttl: Mutex<Option<u64>>,
@@ -40,8 +41,8 @@ enum AbsoluteRedisLimitingState {
         time_instant: Mutex<Instant>,
         ttl_ms: Mutex<u64>,
         count_after_release: Mutex<u64>,
-        in_flight_count: u64,
-        in_flight_committed_at: Instant,
+        committed_count: u64,
+        committed_at: Instant,
     },
 }
 
@@ -254,7 +255,8 @@ impl AbsoluteHybridRateLimiter {
         increment: u64,
         rate_limit: Option<&RateLimit>,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let mut current_total_count = read_state_result.current_total_count;
+        let redis_total = read_state_result.current_total_count;
+        let mut current_total_count = redis_total;
         let mut current_window_limit = read_state_result.window_limit;
         let key = &read_state_result.key;
 
@@ -272,20 +274,20 @@ impl AbsoluteHybridRateLimiter {
         let state = match state.deref() {
             AbsoluteRedisLimitingState::Undefined => state,
             AbsoluteRedisLimitingState::Rejecting {
-                in_flight_count,
-                in_flight_committed_at,
+                committed_count,
+                committed_at,
                 ..
             } => {
                 let window_size_ms = (*self.window_size_seconds as u128).saturating_mul(1_000);
-                let age_ms = in_flight_committed_at.elapsed().as_millis();
+                let age_ms = committed_at.elapsed().as_millis();
 
-                let effective_in_flight = if age_ms < window_size_ms {
-                    *in_flight_count
+                let effective_committed = if age_ms < window_size_ms {
+                    *committed_count
                 } else {
                     0
                 };
 
-                current_total_count = current_total_count.max(effective_in_flight);
+                current_total_count = current_total_count.max(effective_committed);
 
                 state
             }
@@ -364,8 +366,8 @@ impl AbsoluteHybridRateLimiter {
                     time_instant: Mutex::new(new_time_instant),
                     ttl_ms: Mutex::new(new_ttl_ms),
                     count_after_release: Mutex::new(new_count_after_release),
-                    in_flight_count: 0,
-                    in_flight_committed_at: new_time_instant,
+                    committed_count: current_total_count,
+                    committed_at: new_time_instant,
                 };
             }
 
@@ -381,6 +383,7 @@ impl AbsoluteHybridRateLimiter {
         if let AbsoluteRedisLimitingState::Accepting {
             window_limit,
             accept_limit,
+            starting_count,
             count,
             time_instant,
             last_rate_group_ttl,
@@ -389,12 +392,13 @@ impl AbsoluteHybridRateLimiter {
         {
             *mutex_lock(window_limit, "accepting.window_limit")? = new_window_limit;
             *mutex_lock(accept_limit, "accepting.accept_limit")? = new_accept_limit;
+            *mutex_lock(starting_count, "accepting.starting_count")? = redis_total;
             *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
             *mutex_lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")? =
                 read_state_result.last_rate_group_ttl;
             *mutex_lock(last_rate_group_count, "accepting.last_rate_group_count")? =
                 read_state_result.last_rate_group_count;
-            count.fetch_add(increment, Ordering::AcqRel);
+            count.store(increment, Ordering::Release);
         } else {
             drop(state);
             let mut state = self
@@ -405,6 +409,7 @@ impl AbsoluteHybridRateLimiter {
             *state = AbsoluteRedisLimitingState::Accepting {
                 window_limit: Mutex::new(new_window_limit),
                 accept_limit: Mutex::new(new_accept_limit),
+                starting_count: Mutex::new(redis_total),
                 count: AtomicU64::new(increment),
                 time_instant: Mutex::new(new_time_instant),
                 last_rate_group_ttl: Mutex::new(read_state_result.last_rate_group_ttl),
@@ -481,6 +486,7 @@ impl AbsoluteHybridRateLimiter {
 
             if let AbsoluteRedisLimitingState::Accepting {
                 window_limit,
+                starting_count,
                 count,
                 time_instant,
                 last_rate_group_ttl,
@@ -489,14 +495,18 @@ impl AbsoluteHybridRateLimiter {
                 ..
             } = state_entry.deref()
             {
-                let current_total_count = count.load(Ordering::Acquire);
+                let local_count = count.load(Ordering::Acquire);
+                let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
                 let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
                 let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
 
-                if current_total_count + check_count <= accept_limit {
+                if local_count + check_count <= accept_limit {
                     count.fetch_add(increment, Ordering::AcqRel);
                     return Ok(RateLimitDecision::Allowed);
                 }
+
+                // True expected Redis total once the commit we're about to send lands.
+                let expected_redis_total = starting_count.saturating_add(local_count);
 
                 let last_rate_group_ttl: u128 =
                     (*mutex_lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")?)
@@ -510,14 +520,14 @@ impl AbsoluteHybridRateLimiter {
                     .max(*self.sync_interval_ms as u128);
                 let remaining_after_waiting =
                     (*mutex_lock(last_rate_group_count, "accepting.last_rate_group_count")?)
-                        .unwrap_or(current_total_count);
+                        .unwrap_or(expected_redis_total);
 
-                if current_total_count >= accept_limit {
-                    if current_total_count > 0 {
+                if local_count >= accept_limit {
+                    if local_count > 0 {
                         let commit = AbsoluteHybridCommit {
                             key: key.clone(),
                             window_limit,
-                            count: current_total_count,
+                            count: local_count,
                         };
 
                         permit.send(commit.into());
@@ -527,8 +537,9 @@ impl AbsoluteHybridRateLimiter {
                         time_instant: Mutex::new(Instant::now()),
                         ttl_ms: Mutex::new(retry_after_ms as u64),
                         count_after_release: Mutex::new(remaining_after_waiting),
-                        in_flight_count: current_total_count,
-                        in_flight_committed_at: Instant::now(),
+                        // Use the full expected Redis total, not just the local count.
+                        committed_count: expected_redis_total,
+                        committed_at: Instant::now(),
                     };
                 }
 
