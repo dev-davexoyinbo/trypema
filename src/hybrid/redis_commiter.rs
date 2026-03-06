@@ -87,7 +87,7 @@ impl RedisCommitter {
                                     }
                                 }
 
-                                while let Ok(_) = is_active_receiver.try_recv() {
+                                while is_active_receiver.try_recv().is_ok() {
                                 }
 
                                 is_active.store(true, Ordering::Release);
@@ -131,18 +131,8 @@ impl RedisCommitter {
                 }
 
                 {
-                    let tick_fut = tick(&mut flush_interval);
-                    let recv_fut = rx.recv();
-
-                    futures::pin_mut!(tick_fut);
-                    futures::pin_mut!(recv_fut);
-
-                    match futures::future::select(tick_fut, recv_fut).await {
-                        futures::future::Either::Left((_tick, _recv_fut)) => {
-                            // Make sure to only flush to redis on tick. This is because flushes
-                            // are time consuming and if we flush on every commit in recv_fut, it
-                            // would hinder the read commands from being able to complete since the
-                            // commits take time to complete.
+                    futures::select! {
+                        _ = tick(&mut flush_interval).fuse() => {
                             if let Err(err) =
                                 Self::flush_to_redis(&redis_proxy, &mut batch, max_batch_size).await
                             {
@@ -154,13 +144,14 @@ impl RedisCommitter {
                                 tracing::trace!(error = ?err, "Failed to send flush signal to Redis rate limiter");
                             }
                         }
-                        futures::future::Either::Right((commit, _tick_fut)) => {
+                        commit = rx.recv().fuse() => {
                             let Some(AbsoluteHybridCommitterSignal::Commit(commit)) = commit else {
                                 break;
                             };
 
                             batch.push(commit);
                         }
+
                     }
                 }
 
