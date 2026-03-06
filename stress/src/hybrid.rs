@@ -13,7 +13,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
-use trypema::{RateLimit, RateLimiter, RateLimiterOptions, RateLimitDecision, redis::RedisKey};
+use trypema::{RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, redis::RedisKey};
 
 use crate::args::{Args, Strategy, build_keys};
 use crate::runner::{Counts, ErrorStats, WorkerLoop, print_error_stats, print_results};
@@ -75,7 +75,6 @@ async fn run_async(args: Args) {
         let args = args.clone();
         let keys = keys.clone();
         let rl = Arc::clone(&rl);
-        let rate = rate.clone();
 
         let redis_keys: Vec<RedisKey> = keys
             .iter()
@@ -96,15 +95,15 @@ async fn run_async(args: Args) {
 
             while !stop.load(Ordering::Relaxed) && wl.should_continue() {
                 // Async QPS pacing.
-                if args.mode != crate::args::Mode::Max {
-                    if let Some(qps) = crate::runner::qps_for_now(&args, started) {
-                        let per_op_ns = 1_000_000_000u64 / qps.max(1);
-                        let now = Instant::now();
-                        if now < wl.next_deadline {
-                            async_sleep(wl.next_deadline - now).await;
-                        }
-                        wl.next_deadline += Duration::from_nanos(per_op_ns);
+                if args.mode != crate::args::Mode::Max
+                    && let Some(qps) = crate::runner::qps_for_now(&args, started)
+                {
+                    let per_op_ns = 1_000_000_000u64 / qps.max(1);
+                    let now = Instant::now();
+                    if now < wl.next_deadline {
+                        async_sleep(wl.next_deadline - now).await;
                     }
+                    wl.next_deadline += Duration::from_nanos(per_op_ns);
                 }
 
                 let idx = wl.pick_idx();
@@ -155,6 +154,13 @@ async fn run_async(args: Args) {
 
     let elapsed = started.elapsed();
     let ops = total_ops.load(Ordering::Relaxed);
-    print_results(&args, elapsed, ops, ops as f64 / elapsed.as_secs_f64(), &merged, &counts);
+    print_results(
+        &args,
+        elapsed,
+        ops,
+        ops as f64 / elapsed.as_secs_f64(),
+        &merged,
+        &counts,
+    );
     print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
 }
