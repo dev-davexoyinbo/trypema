@@ -8,7 +8,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, mpsc};
 
 use crate::{
     HardLimitFactor, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions,
@@ -49,7 +49,7 @@ pub struct SuppressedHybridRateLimiter {
     limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState>,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
-    is_active_sender: broadcast::Sender<()>,
+    is_active_notify: Arc<Notify>,
 }
 
 impl SuppressedHybridRateLimiter {
@@ -71,7 +71,7 @@ impl SuppressedHybridRateLimiter {
             window_size_seconds,
         });
 
-        let (is_active_sender, _) = broadcast::channel(16);
+        let is_active_notify = Arc::new(Notify::new());
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
@@ -79,7 +79,7 @@ impl SuppressedHybridRateLimiter {
             max_batch_size: 4,
             limiter_sender: tx,
             redis_proxy: Box::new(redis_proxy.clone()),
-            is_active_sender: is_active_sender.clone(),
+            is_active_notify: is_active_notify.clone(),
         });
 
         let limiter = Self {
@@ -89,7 +89,7 @@ impl SuppressedHybridRateLimiter {
             limiting_state: DashMap::new(),
             hard_limit_factor,
             suppression_factor_cache_ms,
-            is_active_sender,
+            is_active_notify,
         };
 
         let limiter = Arc::new(limiter);
@@ -130,7 +130,7 @@ impl SuppressedHybridRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
-        let _ = self.is_active_sender.send(());
+        self.is_active_notify.notify_waiters();
 
         let state = match self.limiting_state.get(key) {
             Some(state) => state,
@@ -237,7 +237,7 @@ impl SuppressedHybridRateLimiter {
         rate_limit: Option<&RateLimit>,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let _ = self.is_active_sender.send(());
+        self.is_active_notify.notify_waiters();
 
         let state_entry = match self.limiting_state.get(key) {
             Some(state) => state,

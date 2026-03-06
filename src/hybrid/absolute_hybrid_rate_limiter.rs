@@ -8,7 +8,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, mpsc};
 
 use crate::{
     RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError,
@@ -51,14 +51,14 @@ pub struct AbsoluteHybridRateLimiter {
     redis_proxy: AbsoluteHybridRedisProxy,
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
     sync_interval_ms: SyncIntervalMs,
-    is_active_sender: broadcast::Sender<()>,
+    is_active_notify: Arc<Notify>,
 }
 
 impl AbsoluteHybridRateLimiter {
     pub(crate) fn new(options: RedisRateLimiterOptions) -> Arc<Self> {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(1);
+        let (tx, rx) = mpsc::channel::<RedisRateLimiterSignal>(1);
 
         let redis_proxy = AbsoluteHybridRedisProxy::new(AbsoluteHybridRedisProxyOptions {
             prefix: prefix.clone(),
@@ -67,7 +67,7 @@ impl AbsoluteHybridRateLimiter {
             rate_group_size_ms: options.rate_group_size_ms,
         });
 
-        let (is_active_sender, _) = broadcast::channel(16);
+        let is_active_notify = Arc::new(Notify::new());
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval: Duration::from_millis(*options.sync_interval_ms),
@@ -75,7 +75,7 @@ impl AbsoluteHybridRateLimiter {
             max_batch_size: 4,
             limiter_sender: tx,
             redis_proxy: Box::new(redis_proxy.clone()),
-            is_active_sender: is_active_sender.clone(),
+            is_active_notify: is_active_notify.clone(),
         });
 
         let limiter = Self {
@@ -85,7 +85,7 @@ impl AbsoluteHybridRateLimiter {
             redis_proxy,
             limiting_state: DashMap::new(),
             sync_interval_ms: options.sync_interval_ms,
-            is_active_sender,
+            is_active_notify,
         };
 
         let limiter = Arc::new(limiter);
@@ -125,7 +125,7 @@ impl AbsoluteHybridRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let _ = self.is_active_sender.send(());
+        self.is_active_notify.notify_waiters();
 
         let decision = self
             .is_allowed_with_count_increment(key, count, count, Some(rate_limit))
@@ -142,7 +142,7 @@ impl AbsoluteHybridRateLimiter {
     ///
     /// This method performs lazy eviction of expired buckets for the key.
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
-        let _ = self.is_active_sender.send(());
+        self.is_active_notify.notify_waiters();
 
         self.is_allowed_with_count_increment(key, 1, 0, None).await
     } // end method is_allowed

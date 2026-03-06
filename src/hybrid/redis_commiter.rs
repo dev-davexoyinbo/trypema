@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, mpsc};
 
 use crate::redis::tick;
 use crate::runtime::{TaskHandle, sleep, spawn_task_handle};
@@ -18,7 +18,7 @@ pub(crate) struct RedisCommitterOptions<T> {
     pub channel_capacity: usize,
     pub max_batch_size: usize,
     pub limiter_sender: mpsc::Sender<RedisRateLimiterSignal>,
-    pub is_active_sender: broadcast::Sender<()>,
+    pub is_active_notify: Arc<Notify>,
     pub redis_proxy: Box<dyn RedisProxyCommitter<T> + Send + Sync>,
 }
 
@@ -55,7 +55,7 @@ impl RedisCommitter {
             max_batch_size,
             limiter_sender,
             redis_proxy,
-            is_active_sender,
+            is_active_notify,
         } = options;
 
         let (tx, mut rx) = mpsc::channel::<AbsoluteHybridCommitterSignal<T>>(channel_capacity);
@@ -64,32 +64,17 @@ impl RedisCommitter {
             let mut flush_interval = new_interval(sync_interval);
             let mut batch: Vec<T> = Vec::new();
             let is_active = Arc::new(AtomicBool::new(false));
-            let mut is_active_receiver = is_active_sender.subscribe();
 
             let is_active_cancel_task: TaskHandle = spawn_task_handle({
                 let is_active = is_active.clone();
-                let is_active_sender = is_active_sender.clone();
-                let mut is_active_receiver = is_active_sender.subscribe();
+                let is_active_notify = is_active_notify.clone();
                 let sleep_interval =
                     Duration::from_millis(1000.max(sync_interval.as_millis() as u64 * 10));
 
                 async move {
                     loop {
                         futures::select! {
-                            val = is_active_receiver.recv().fuse() => {
-                                match val {
-                                    Ok(_) => {}
-                                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                                        is_active_receiver = is_active_sender.subscribe();
-                                    }
-                                    Err(broadcast::error::RecvError::Closed) => {
-                                        break;
-                                    }
-                                }
-
-                                while is_active_receiver.try_recv().is_ok() {
-                                }
-
+                            _ = is_active_notify.notified().fuse() => {
                                 is_active.store(true, Ordering::Release);
                             }
                             _ = sleep(sleep_interval).fuse() => {
@@ -107,27 +92,8 @@ impl RedisCommitter {
 
             loop {
                 if !is_active.load(Ordering::Acquire) {
-                    match is_active_receiver.recv().await {
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => {
-                            break;
-                        }
-                    }
-
-                    // Drain the channel to make sure we don't miss any signals
-                    loop {
-                        match is_active_receiver.try_recv() {
-                            Ok(_) => {}
-                            Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                                is_active_receiver = is_active_sender.subscribe();
-                                break;
-                            }
-                            Err(_) => {
-                                break;
-                            }
-                        }
-                    }
+                    is_active_notify.notified().await;
+                    is_active.store(true, Ordering::Release);
                 }
 
                 {
