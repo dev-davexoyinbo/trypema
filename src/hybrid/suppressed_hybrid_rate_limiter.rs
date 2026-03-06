@@ -162,7 +162,7 @@ impl SuppressedHybridRateLimiter {
             let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
 
             // Guard hard limit
-            if starting_count.saturating_add(count.load(Ordering::Relaxed)) > window_limit {
+            if starting_count.saturating_add(count.load(Ordering::Acquire)) > window_limit {
                 suppression_factor = 1f64;
             }
 
@@ -179,7 +179,7 @@ impl SuppressedHybridRateLimiter {
             let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
             let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
             let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
-            let current_total_count = starting_count.saturating_add(count.load(Ordering::Relaxed));
+            let current_total_count = starting_count.saturating_add(count.load(Ordering::Acquire));
 
             let suppression_factor = if current_total_count > window_limit {
                 1f64
@@ -270,7 +270,7 @@ impl SuppressedHybridRateLimiter {
             let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
 
             // Guard hard limit
-            if starting_count.saturating_add(count.load(Ordering::Relaxed)) > window_limit {
+            if starting_count.saturating_add(count.load(Ordering::Acquire)) > window_limit {
                 suppression_factor = 1f64;
             }
 
@@ -283,7 +283,7 @@ impl SuppressedHybridRateLimiter {
                     random_bool(1f64 - suppression_factor)
                 };
 
-                count.fetch_add(increment, Ordering::Relaxed);
+                count.fetch_add(increment, Ordering::AcqRel);
                 return Ok(RateLimitDecision::Suppressed {
                     suppression_factor,
                     is_allowed: should_allow,
@@ -303,11 +303,11 @@ impl SuppressedHybridRateLimiter {
             let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
 
             if starting_count
-                .saturating_add(count.load(Ordering::Relaxed))
+                .saturating_add(count.load(Ordering::Acquire))
                 .saturating_add(increment)
                 < soft_window_limit
             {
-                count.fetch_add(increment, Ordering::Relaxed);
+                count.fetch_add(increment, Ordering::AcqRel);
                 return Ok(RateLimitDecision::Allowed);
             }
 
@@ -332,7 +332,7 @@ impl SuppressedHybridRateLimiter {
                 let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
                 let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
                 let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
-                let count_value = count.load(Ordering::Relaxed);
+                let count_value = count.load(Ordering::Acquire);
 
                 if starting_count
                     .saturating_add(count_value)
@@ -379,7 +379,7 @@ impl SuppressedHybridRateLimiter {
                     });
                 } else {
                     // we are still in the accepting state, so we need to set the starting_count to the current total count
-                    count.fetch_add(increment, Ordering::Relaxed);
+                    count.fetch_add(increment, Ordering::AcqRel);
                     return Ok(RateLimitDecision::Allowed);
                 }
             } else if let SuppressedRedisLimitingState::Suppressing {
@@ -402,7 +402,7 @@ impl SuppressedHybridRateLimiter {
                 let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
 
                 // Guard hard limit
-                if starting_count.saturating_add(count.load(Ordering::Relaxed)) > window_limit {
+                if starting_count.saturating_add(count.load(Ordering::Acquire)) > window_limit {
                     suppression_factor = 1f64;
                 }
 
@@ -415,7 +415,7 @@ impl SuppressedHybridRateLimiter {
                 };
 
                 if elapsed_ms < ttl_ms {
-                    count.fetch_add(increment, Ordering::Relaxed);
+                    count.fetch_add(increment, Ordering::AcqRel);
                     return Ok(RateLimitDecision::Suppressed {
                         suppression_factor,
                         is_allowed: should_allow,
@@ -515,7 +515,7 @@ impl SuppressedHybridRateLimiter {
                     hard_window_limit = Some(*mutex_lock(window_limit, "accepting.window_limit")?);
                 }
 
-                let count = count.load(Ordering::Relaxed);
+                let count = count.load(Ordering::Acquire);
 
                 if count > 0 {
                     current_total_count = current_total_count.saturating_add(count);
@@ -540,7 +540,7 @@ impl SuppressedHybridRateLimiter {
                 count,
                 ..
             } => {
-                let count = count.load(Ordering::Relaxed);
+                let count = count.load(Ordering::Acquire);
 
                 if hard_window_limit.is_none() {
                     hard_window_limit = Some(*mutex_lock(window_limit, "accepting.window_limit")?);
@@ -610,7 +610,7 @@ impl SuppressedHybridRateLimiter {
                 *mutex_lock(suppression_factor, "suppressing.suppression_factor")? =
                     current_suppression_factor;
                 *mutex_lock(starting_count, "suppressing.starting_count")? = current_total_count;
-                count.store(increment, Ordering::Relaxed);
+                count.store(increment, Ordering::Release);
                 drop(state);
             } else {
                 drop(state);
@@ -654,7 +654,7 @@ impl SuppressedHybridRateLimiter {
             *mutex_lock(window_limit, "accepting.window_limit")? = hard_window_limit;
             *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
             *mutex_lock(starting_count, "accepting.starting_count")? = current_total_count;
-            count.store(increment, Ordering::Relaxed);
+            count.store(increment, Ordering::Release);
             drop(state);
         } else {
             drop(state);
