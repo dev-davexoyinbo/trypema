@@ -54,6 +54,7 @@ pub struct SuppressedHybridRateLimiter {
     epoch: AtomicU64,
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
+    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl SuppressedHybridRateLimiter {
@@ -96,6 +97,7 @@ impl SuppressedHybridRateLimiter {
             is_active_watch,
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
+            reset_locks: DashMap::new(),
         };
 
         let limiter = Arc::new(limiter);
@@ -152,6 +154,17 @@ impl SuppressedHybridRateLimiter {
             let _ = self.is_active_watch.send(epoch);
             self.last_commited_epoch.store(epoch, Ordering::Relaxed);
         }
+    }
+
+    /// Acquire (or create) the per-key reset lock and return an `Arc` to it.
+    fn get_or_create_reset_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(lock) = self.reset_locks.get(key) {
+            return Arc::clone(&lock);
+        }
+        self.reset_locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Determine whether `key` is currently allowed.
@@ -337,7 +350,7 @@ impl SuppressedHybridRateLimiter {
             if starting_count
                 .saturating_add(count.load(Ordering::Acquire))
                 .saturating_add(increment)
-                < soft_window_limit
+                <= soft_window_limit
             {
                 count.fetch_add(increment, Ordering::AcqRel);
                 return Ok(RateLimitDecision::Allowed);
@@ -478,6 +491,83 @@ impl SuppressedHybridRateLimiter {
         rate_limit: Option<&RateLimit>,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<RateLimitDecision, TrypemaError> {
+        // Acquire the per-key lock so that only one task at a time runs the
+        // Redis read + state update for this key.  All other tasks wait here
+        // and then re-check the (now-updated) state via the fast path below.
+        let lock = self.get_or_create_reset_lock(key);
+        let _guard = lock.lock().await;
+
+        // Re-check the current state now that we hold the lock.  If another
+        // task already transitioned us to Accepting while we were waiting, we
+        // can serve the request from the local counter without another Redis
+        // read.
+        {
+            let state_entry = self.limiting_state.get(key);
+            if let Some(ref state_entry) = state_entry
+                && let SuppressedRedisLimitingState::Accepting {
+                    window_limit,
+                    count,
+                    starting_count,
+                    ..
+                } = state_entry.deref()
+            {
+                let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
+                let window_limit = *mutex_lock(window_limit, "accepting.accept_limit")?;
+                let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
+
+                if starting_count
+                    .saturating_add(count.load(Ordering::Acquire))
+                    .saturating_add(increment)
+                    <= soft_window_limit
+                {
+                    count.fetch_add(increment, Ordering::AcqRel);
+                    return Ok(RateLimitDecision::Allowed);
+                }
+                // Still over limit after lock — fall through to Redis read.
+            } else if let Some(state_entry) = state_entry
+                && let SuppressedRedisLimitingState::Suppressing {
+                    time_instant,
+                    suppression_factor_ttl_ms,
+                    suppression_factor,
+                    count,
+                    starting_count,
+                    window_limit,
+                    ..
+                } = state_entry.deref()
+            {
+                let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
+                let mut suppression_factor =
+                    *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
+                let elapsed_ms = mutex_lock(time_instant, "suppressing.time_instant")?
+                    .elapsed()
+                    .as_millis();
+                let ttl_ms = *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? as u128;
+                let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
+
+                // Guard hard limit
+                if starting_count.saturating_add(count.load(Ordering::Acquire)) > window_limit {
+                    suppression_factor = 1f64;
+                }
+
+                if elapsed_ms < ttl_ms {
+                    let should_allow = if suppression_factor == 0f64 {
+                        true
+                    } else if suppression_factor == 1f64 {
+                        false
+                    } else {
+                        random_bool(1f64 - suppression_factor)
+                    };
+
+                    count.fetch_add(increment, Ordering::AcqRel);
+                    return Ok(RateLimitDecision::Suppressed {
+                        suppression_factor,
+                        is_allowed: should_allow,
+                    });
+                }
+                // Suppression has expired - fail through to Redis read.
+            }
+        }
+
         let read_state_result =
             self.redis_proxy.read_state(key).await.map_err(|err| {
                 TrypemaError::CustomError(format!("Failed to read state: {err:?}"))
