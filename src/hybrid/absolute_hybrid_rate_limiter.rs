@@ -327,11 +327,24 @@ impl AbsoluteHybridRateLimiter {
                         Some(*mutex_lock(window_limit, "accepting.window_limit")?);
                 }
 
-                if local_count > 0 {
-                    current_total_count += local_count;
-                }
+                current_total_count = current_total_count.saturating_add(local_count);
 
-                state
+                if local_count > 0 {
+                    let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
+
+                    let commit = AbsoluteHybridCommit {
+                        key: key.clone(),
+                        window_limit,
+                        count: local_count,
+                    };
+
+                    drop(state);
+                    self.send_commit(commit).await?;
+
+                    self.limiting_state.get(key).expect("Key should be present")
+                } else {
+                    state
+                }
             }
         };
 
@@ -443,6 +456,15 @@ impl AbsoluteHybridRateLimiter {
 
         Ok(RateLimitDecision::Allowed)
     }
+
+    async fn send_commit(&self, commit: AbsoluteHybridCommit) -> Result<(), TrypemaError> {
+        self.commiter_sender
+            .send(commit.into())
+            .await
+            .map_err(|err| TrypemaError::CustomError(format!("Failed to send commit: {err:?}")))?;
+
+        Ok(())
+    } // end method send_commit
 
     async fn is_allowed_with_count_increment(
         &self,
