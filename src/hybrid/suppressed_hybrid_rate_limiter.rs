@@ -401,9 +401,7 @@ impl SuppressedHybridRateLimiter {
 
                 let (suppression_factor, should_allow) = if forecasted_total_count > window_limit {
                     (1f64, false)
-                } else if forecasted_total_count > soft_window_limit
-                    && soft_window_limit < window_limit
-                    && forecasted_total_count < window_limit
+                } else if soft_window_limit < window_limit && forecasted_total_count < window_limit
                 {
                     (0f64, true)
                 } else {
@@ -558,7 +556,8 @@ impl SuppressedHybridRateLimiter {
         rate_limit: Option<&RateLimit>,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let mut current_total_count = read_state_result.current_total_count;
+        let redis_total = read_state_result.current_total_count;
+        let mut current_total_count = redis_total;
         let mut current_suppression_factor_ttl_ms = read_state_result.suppression_factor_ttl_ms;
         let current_suppression_factor = read_state_result.suppression_factor;
 
@@ -597,9 +596,9 @@ impl SuppressedHybridRateLimiter {
 
                 let count = count.load(Ordering::Acquire);
 
-                if count > 0 {
-                    current_total_count = current_total_count.saturating_add(count);
+                current_total_count = current_total_count.saturating_add(count);
 
+                if count > 0 {
                     let commit = SuppressedHybridCommit {
                         key: key.clone(),
                         window_limit: hard_window_limit.expect("Window limit should be set"),
@@ -626,9 +625,9 @@ impl SuppressedHybridRateLimiter {
                     hard_window_limit = Some(*mutex_lock(window_limit, "accepting.window_limit")?);
                 }
 
-                if count > 0 {
-                    current_total_count = current_total_count.saturating_add(count);
+                current_total_count = current_total_count.saturating_add(count);
 
+                if count > 0 {
                     let commit = SuppressedHybridCommit {
                         key: key.clone(),
                         window_limit: hard_window_limit.expect("Window limit should be set"),
@@ -688,7 +687,7 @@ impl SuppressedHybridRateLimiter {
                 *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? = new_ttl_ms;
                 *mutex_lock(suppression_factor, "suppressing.suppression_factor")? =
                     current_suppression_factor;
-                *mutex_lock(starting_count, "suppressing.starting_count")? = current_total_count;
+                *mutex_lock(starting_count, "suppressing.starting_count")? = redis_total;
                 count.store(increment, Ordering::Release);
                 drop(state);
             } else {
@@ -703,7 +702,7 @@ impl SuppressedHybridRateLimiter {
                     window_limit: Mutex::new(hard_window_limit),
                     suppression_factor: Mutex::new(current_suppression_factor),
                     suppression_factor_ttl_ms: Mutex::new(new_ttl_ms),
-                    starting_count: Mutex::new(current_total_count),
+                    starting_count: Mutex::new(redis_total),
                     count: AtomicU64::new(increment),
                 };
             }
@@ -732,7 +731,7 @@ impl SuppressedHybridRateLimiter {
         {
             *mutex_lock(window_limit, "accepting.window_limit")? = hard_window_limit;
             *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
-            *mutex_lock(starting_count, "accepting.starting_count")? = current_total_count;
+            *mutex_lock(starting_count, "accepting.starting_count")? = redis_total;
             count.store(increment, Ordering::Release);
             drop(state);
         } else {
@@ -745,7 +744,7 @@ impl SuppressedHybridRateLimiter {
             *state = SuppressedRedisLimitingState::Accepting {
                 window_limit: Mutex::new(hard_window_limit),
                 time_instant: Mutex::new(new_time_instant),
-                starting_count: Mutex::new(current_total_count),
+                starting_count: Mutex::new(redis_total),
                 count: AtomicU64::new(increment),
             };
         }
