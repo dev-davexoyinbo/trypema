@@ -21,6 +21,8 @@ const CLEANUP_LUA: &str = r#"
     local total_count_suffix = ARGV[4]
     local active_keys_suffix = ARGV[5]
     local suppression_factor_key_suffix = ARGV[6]
+    local total_declined_suffix = ARGV[7]
+    local hash_declined_suffix = ARGV[8]
 
 
     local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
@@ -31,7 +33,7 @@ const CLEANUP_LUA: &str = r#"
 
     local remove_keys = {}
 
-    local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
+    local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix, total_declined_suffix, hash_declined_suffix}
     for i = 1, #active_entities do
         local entity = active_entities[i]
 
@@ -54,35 +56,41 @@ const LUA_HELPERS: &str = r#"
         return tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
     end
 
-    local function cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
+    local function cleanup_expired_keys(hash_key, hash_declined_key, active_keys, total_count_key, total_declined_key, timestamp_ms, window_size_seconds)
         local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
 
         if #to_remove_keys == 0 then
             return
         end
 
-        local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+        local to_remove_counts = redis.call("HMGET", hash_key, unpack(to_remove_keys))
+        local to_remove_declines = redis.call("HMGET", hash_declined_key, unpack(to_remove_keys))
+
         redis.call("HDEL", hash_key, unpack(to_remove_keys))
+        redis.call("HDEL", hash_declined_key, unpack(to_remove_keys))
 
-        local remove_sum = 0
+        local remove_count_sum = 0
+        local remove_declined_sum = 0
 
-        for i = 1, #to_remove do
-            remove_sum = remove_sum + (tonumber(to_remove[i]) or 0)
+        for i = 1, #to_remove_counts do
+            remove_count_sum = remove_count_sum + (tonumber(to_remove_counts[i]) or 0)
+            remove_declined_sum = remove_declined_sum + (tonumber(to_remove_declines[i]) or 0)
         end
 
-        redis.call("DECRBY", total_count_key, remove_sum)
+        redis.call("DECRBY", total_count_key, remove_count_sum)
+        redis.call("DECRBY", total_declined_key, remove_declined_sum)
         redis.call("ZREM", active_keys, unpack(to_remove_keys))
     end
 
-    local function calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+    local function calculate_suppression_factor(hash_key, active_keys, total_count, total_declined, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
         if window_limit == nil then
             return 0
         end
 
-        if total_count >= window_limit then
-            return 1
-        elseif total_count < window_limit / hard_limit_factor then
+        if (total_count - total_declined) <= window_limit / hard_limit_factor then
             return 0
+        elseif total_count > window_limit then
+            return 1
         end
 
         local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
@@ -117,6 +125,8 @@ const SUPPRESSED_INC_LUA: &str = r#"
     local total_count_key = KEYS[4]
     local get_active_entities_key = KEYS[5]
     local suppression_factor_key = KEYS[6]
+    local total_declined_key = KEYS[7]
+    local hash_declined_key = KEYS[8]
 
     local entity = ARGV[1]
     local window_size_seconds = tonumber(ARGV[2])
@@ -130,14 +140,15 @@ const SUPPRESSED_INC_LUA: &str = r#"
 
     redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
-    cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
+    cleanup_expired_keys(hash_key, hash_declined_key, active_keys, total_count_key, total_declined_key, timestamp_ms, window_size_seconds)
 
     local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+    local total_declined = tonumber(redis.call("GET", total_declined_key)) or 0
 
     local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
     if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
-        suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+        suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, total_declined, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
 
         redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
     end
@@ -169,6 +180,11 @@ const SUPPRESSED_INC_LUA: &str = r#"
     local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
     redis.call("INCRBY", total_count_key, count)
 
+    if not should_allow then
+        redis.call("HINCRBY", hash_declined_key, hash_field, count)
+        redis.call("INCRBY", total_declined_key, count)
+    end
+
     if new_count == count then
         redis.call("ZADD", active_keys, timestamp_ms, hash_field)
         redis.call("SET", window_limit_key, window_limit)
@@ -176,7 +192,7 @@ const SUPPRESSED_INC_LUA: &str = r#"
 
     redis.call("EXPIRE", window_limit_key, window_size_seconds)
 
-    if suppression_factor == 0 then
+    if total_count - total_declined < window_limit / hard_limit_factor then
         return {"allowed", 0, 0}
     else
         return {"suppressed", tostring(suppression_factor), should_allow and "1" or "0"}
@@ -192,6 +208,8 @@ const SUPPRESSED_GET_FACTOR_LUA: &str = r#"
     local total_count_key = KEYS[4]
     local get_active_entities_key = KEYS[5]
     local suppression_factor_key = KEYS[6]
+    local total_declined_key = KEYS[7]
+    local hash_declined_key = KEYS[8]
 
     local entity = ARGV[1]
     local window_size_seconds = tonumber(ARGV[2])
@@ -201,9 +219,10 @@ const SUPPRESSED_GET_FACTOR_LUA: &str = r#"
 
     redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
 
-    cleanup_expired_keys(hash_key, active_keys, total_count_key, timestamp_ms, window_size_seconds)
+    cleanup_expired_keys(hash_key, hash_declined_key, active_keys, total_count_key, total_declined_key, timestamp_ms, window_size_seconds)
 
     local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+    local total_declined = tonumber(redis.call("GET", total_declined_key)) or 0
 
     local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
 
@@ -212,7 +231,7 @@ const SUPPRESSED_GET_FACTOR_LUA: &str = r#"
         if window_limit == nil then
             suppression_factor = 0
         else
-            suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
+            suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, total_declined, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
         end
 
         redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
@@ -278,6 +297,8 @@ impl SuppressedRedisRateLimiter {
             .key(self.key_generator.get_total_count_key(key))
             .key(self.key_generator.get_active_entities_key())
             .key(self.key_generator.get_suppression_factor_key(key))
+            .key(self.key_generator.get_total_declined_key(key))
+            .key(self.key_generator.get_hash_declined_key(key))
             .arg(key.to_string())
             .arg(*self.window_size_seconds)
             .arg(window_limit)
@@ -321,6 +342,8 @@ impl SuppressedRedisRateLimiter {
             .key(self.key_generator.get_total_count_key(key))
             .key(self.key_generator.get_active_entities_key())
             .key(self.key_generator.get_suppression_factor_key(key))
+            .key(self.key_generator.get_total_declined_key(key))
+            .key(self.key_generator.get_hash_declined_key(key))
             .arg(key.to_string())
             .arg(*self.window_size_seconds)
             .arg(*self.rate_group_size_ms)
@@ -346,6 +369,8 @@ impl SuppressedRedisRateLimiter {
             .arg(self.key_generator.total_count_key_suffix.to_string())
             .arg(self.key_generator.active_keys_key_suffix.to_string())
             .arg(self.key_generator.suppression_factor_key_suffix.to_string())
+            .arg(self.key_generator.total_declined_key_suffix.to_string())
+            .arg(self.key_generator.hash_declined_key_suffix.to_string())
             .invoke_async(&mut connection_manager)
             .await?;
 

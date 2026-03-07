@@ -69,8 +69,10 @@ pub(crate) struct RedisKeyGenerator {
     pub rate_type: RateType,
     pub active_entities_key_suffix: String,
     pub hash_key_suffix: String,
+    pub hash_declined_key_suffix: String,
     pub window_limit_key_suffix: String,
     pub total_count_key_suffix: String,
+    pub total_declined_key_suffix: String,
     pub active_keys_key_suffix: String,
     pub suppression_factor_key_suffix: String,
 }
@@ -82,8 +84,10 @@ impl RedisKeyGenerator {
             rate_type,
             active_entities_key_suffix: "active_entities".to_string(),
             hash_key_suffix: "h".to_string(),
+            hash_declined_key_suffix: "hd".to_string(),
             window_limit_key_suffix: "w".to_string(),
             total_count_key_suffix: "t".to_string(),
+            total_declined_key_suffix: "d".to_string(),
             active_keys_key_suffix: "a".to_string(),
             suppression_factor_key_suffix: "sf".to_string(),
         }
@@ -97,12 +101,20 @@ impl RedisKeyGenerator {
         self.get_key_with_suffix(key, &self.hash_key_suffix)
     }
 
+    pub(crate) fn get_hash_declined_key(&self, key: &RedisKey) -> String {
+        self.get_key_with_suffix(key, &self.hash_declined_key_suffix)
+    }
+
     pub(crate) fn get_window_limit_key(&self, key: &RedisKey) -> String {
         self.get_key_with_suffix(key, &self.window_limit_key_suffix)
     }
 
     pub(crate) fn get_total_count_key(&self, key: &RedisKey) -> String {
         self.get_key_with_suffix(key, &self.total_count_key_suffix)
+    }
+
+    pub(crate) fn get_total_declined_key(&self, key: &RedisKey) -> String {
+        self.get_key_with_suffix(key, &self.total_declined_key_suffix)
     }
 
     pub(crate) fn get_active_keys(&self, key: &RedisKey) -> String {
