@@ -461,3 +461,162 @@ fn suppressed_is_fully_denied_after_hard_limit_observed_redis() {
         }
     });
 }
+
+/// After the window elapses, previously committed usage must be evicted from Redis so that
+/// a fresh burst is admitted at the full rate again.
+///
+/// This test catches the bug where `read_state` passes `window_size_ms` to the Lua script
+/// instead of `window_size_seconds`. With the wrong value the eviction threshold is pushed
+/// ~16 minutes into the past, old buckets are never removed, `total_count` accumulates
+/// indefinitely, and suppression stays at 1.0 even after the window has expired.
+#[test]
+fn suppressed_redis_window_eviction_allows_fresh_burst_after_expiry() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 1_u64;
+        // hard_limit_factor=1.0 so hard_window_limit == soft_window_limit == window capacity.
+        let hard_limit_factor = 1.0_f64;
+        let cache_ms = 5_u64;
+
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        // window_limit = 1s * 5 req/s * 1.0 = 5
+        let window_limit = (window_size_seconds as f64 * *rate_limit * hard_limit_factor) as u64;
+
+        let rl = build_limiter_with_cache_ms(
+            &url,
+            window_size_seconds,
+            1_000,
+            hard_limit_factor,
+            cache_ms,
+        )
+        .await;
+
+        let k = key("k_evict");
+
+        // Drive observed count to the hard limit in one call.
+        let d1 = rl
+            .redis()
+            .suppressed()
+            .inc(&k, &rate_limit, window_limit)
+            .await
+            .unwrap();
+        assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {d1:?}");
+
+        // Let the suppression_factor cache expire so the next read recomputes from Redis.
+        runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+
+        // Confirm full suppression before the window expires.
+        let sf_before = rl
+            .redis()
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+        assert!(
+            (sf_before - 1.0).abs() < 1e-12,
+            "expected sf=1.0 before window expiry, got {sf_before}"
+        );
+
+        // Wait for the full window to expire, then let the suppression cache expire again.
+        std::thread::sleep(Duration::from_millis(window_size_seconds * 1_000 + 50));
+        runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+
+        // After the window has expired, eviction must have cleared the old buckets.
+        let sf_after = rl
+            .redis()
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+        assert!(
+            (sf_after - 0.0).abs() < 1e-12,
+            "expected sf=0.0 after window expiry but got {sf_after} — \
+             old buckets were not evicted (window_size_ms passed instead of window_size_seconds?)"
+        );
+
+        // A new request must be admitted.
+        let d2 = rl
+            .redis()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(d2, RateLimitDecision::Allowed),
+            "expected Allowed after window expiry, got {d2:?}"
+        );
+    });
+}
+
+/// Run for three consecutive windows at well above the rate limit and assert that the total
+/// admitted volume across all windows is close to `rate * num_windows`.
+///
+/// If window eviction is broken, `total_count` accumulates and the hard limit is hit after
+/// the first window — every subsequent request is suppressed, giving total_allowed ≈
+/// window_limit instead of ≈ rate * num_windows.
+#[test]
+fn suppressed_redis_throughput_over_multiple_windows_stays_at_rate_limit() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 1_u64;
+        let hard_limit_factor = 1.5_f64;
+        let cache_ms = 5_u64;
+        let num_windows = 3_u64;
+
+        let rate_limit = RateLimit::try_from(10f64).unwrap();
+        // soft_limit = 10, hard_limit = 15
+        let soft_limit = (window_size_seconds as f64 * *rate_limit) as u64;
+        let hard_limit = (soft_limit as f64 * hard_limit_factor) as u64;
+
+        let rl = build_limiter_with_cache_ms(
+            &url,
+            window_size_seconds,
+            100,
+            hard_limit_factor,
+            cache_ms,
+        )
+        .await;
+
+        let k = key("k_multi");
+        let mut total_allowed: u64 = 0;
+
+        for _window in 0..num_windows {
+            // Hammer at 10× the rate limit to ensure we hit the ceiling each window.
+            let burst = soft_limit * 10;
+            for _ in 0..burst {
+                let d = rl
+                    .redis()
+                    .suppressed()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap();
+                match d {
+                    RateLimitDecision::Allowed => total_allowed += 1,
+                    RateLimitDecision::Suppressed { is_allowed, .. } => {
+                        if is_allowed {
+                            total_allowed += 1;
+                        }
+                    }
+                    RateLimitDecision::Rejected { .. } => {
+                        panic!("suppressed strategy must never return Rejected")
+                    }
+                }
+            }
+
+            // Wait for the window to expire and the suppression cache to clear.
+            std::thread::sleep(Duration::from_millis(window_size_seconds * 1_000 + 50));
+            runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+        }
+
+        // Over num_windows windows the total must be at least soft_limit * num_windows.
+        // If eviction is broken, total_allowed ≈ hard_limit (15) instead of ≈ 30+.
+        let expected_min = soft_limit * num_windows;
+        assert!(
+            total_allowed >= expected_min,
+            "total_allowed={total_allowed} but expected >= {expected_min} over {num_windows} windows \
+             (hard_limit={hard_limit}) — window eviction is likely broken"
+        );
+    });
+}

@@ -1,20 +1,11 @@
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    TrypemaError,
+    RateGroupSizeMs, TrypemaError, WindowSizeSeconds,
     common::RateType,
     hybrid::RedisProxyCommitter,
     redis::{RedisKey, RedisKeyGenerator},
 };
-
-#[derive(Debug)]
-pub(crate) struct AbsoluteHybridCommit {
-    pub key: RedisKey,
-    pub window_size_seconds: u64,
-    pub window_limit: u64,
-    pub rate_group_size_ms: u64,
-    pub count: u64,
-}
 
 const ABSOLUTE_CLEANUP_LUA: &str = r#"
     local time_array = redis.call("TIME")
@@ -102,7 +93,7 @@ const COMMIT_STATE_SCRIPT: &str = r#"
 
     local hash_field = tostring(timestamp_ms)
     local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
-    local total_count = redis.call("INCRBY", total_count_key, count)
+    redis.call("INCRBY", total_count_key, count)
 
     if new_count == count then
         redis.call("ZADD", active_keys, timestamp_ms, hash_field)
@@ -169,12 +160,26 @@ const READ_STATE_SCRIPT: &str = r#"
 "#;
 
 #[derive(Debug)]
+pub(crate) struct AbsoluteHybridCommit {
+    pub key: RedisKey,
+    pub window_limit: u64,
+    pub count: u64,
+}
+
+#[derive(Debug)]
 pub(crate) struct AbsoluteHybridRedisProxyReadStateResult {
     pub key: RedisKey,
     pub current_total_count: u64,
     pub window_limit: Option<u64>,
     pub last_rate_group_ttl: Option<u64>,
     pub last_rate_group_count: Option<u64>,
+}
+
+pub(crate) struct AbsoluteHybridRedisProxyOptions {
+    pub prefix: RedisKey,
+    pub connection_manager: ConnectionManager,
+    pub window_size_seconds: WindowSizeSeconds,
+    pub rate_group_size_ms: RateGroupSizeMs,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +190,179 @@ pub(crate) struct AbsoluteHybridRedisProxy {
     cleanup_script: Script,
     connection_manager: ConnectionManager,
     read_chunk_size: usize,
+    window_size_seconds: WindowSizeSeconds,
+    rate_group_size_ms: RateGroupSizeMs,
+    window_size_ms: u128,
+}
+
+impl AbsoluteHybridRedisProxy {
+    pub(crate) fn new(options: AbsoluteHybridRedisProxyOptions) -> Self {
+        let AbsoluteHybridRedisProxyOptions {
+            prefix,
+            connection_manager,
+            window_size_seconds,
+            rate_group_size_ms,
+        } = options;
+
+        let window_size_ms = *window_size_seconds as u128 * 1000;
+
+        Self {
+            key_generator: RedisKeyGenerator::new(prefix, RateType::HybridAbsolute),
+            read_state_script: Script::new(READ_STATE_SCRIPT),
+            commit_state_script: Script::new(COMMIT_STATE_SCRIPT),
+            cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
+            connection_manager,
+            read_chunk_size: 100,
+            window_size_seconds,
+            window_size_ms,
+            rate_group_size_ms,
+        }
+    }
+
+    pub(crate) async fn read_state(
+        self: &AbsoluteHybridRedisProxy,
+        key: &RedisKey,
+    ) -> Result<AbsoluteHybridRedisProxyReadStateResult, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let res: (String, u64, i64, i64, i64) = self
+            .read_state_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .arg(key.as_str())
+            .arg(self.window_size_ms)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(map_redis_read_result_to_state(res))
+    } // end method read_state
+
+    #[inline]
+    fn build_commit_pipeline(
+        &self,
+        commits: &[AbsoluteHybridCommit],
+        should_load_script: bool,
+    ) -> redis::Pipeline {
+        let mut pipe = redis::Pipeline::new();
+        if should_load_script {
+            pipe.load_script(&self.commit_state_script).ignore();
+        }
+
+        for commit in commits {
+            pipe.invoke_script(
+                self.commit_state_script
+                    .key(self.key_generator.get_hash_key(&commit.key))
+                    .key(self.key_generator.get_active_keys(&commit.key))
+                    .key(self.key_generator.get_window_limit_key(&commit.key))
+                    .key(self.key_generator.get_total_count_key(&commit.key))
+                    .key(self.key_generator.get_active_entities_key())
+                    .arg(commit.key.as_str())
+                    .arg(*self.window_size_seconds)
+                    .arg(commit.window_limit)
+                    .arg(*self.rate_group_size_ms)
+                    .arg(commit.count),
+            );
+        }
+
+        pipe
+    }
+
+    pub(crate) async fn batch_read_state(
+        self: &AbsoluteHybridRedisProxy,
+        keys: &[RedisKey],
+    ) -> Result<Vec<AbsoluteHybridRedisProxyReadStateResult>, TrypemaError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut connection_manager = self.connection_manager.clone();
+
+        let chunk_size = self.read_chunk_size.max(1);
+        let mut all_results: Vec<AbsoluteHybridRedisProxyReadStateResult> =
+            Vec::with_capacity(keys.len());
+
+        for chunk in keys.chunks(chunk_size) {
+            let pipe = self.build_read_pipeline(chunk, false);
+
+            let results = match pipe
+                .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
+                .await
+            {
+                Ok(results) => results,
+                Err(err) => {
+                    if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
+                        tracing::error!("redis.read.error, error executing pipeline: {:?}", err);
+                        return Err(TrypemaError::RedisError(err));
+                    }
+
+                    let pipe = self.build_read_pipeline(chunk, true);
+
+                    match pipe
+                        .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
+                        .await
+                    {
+                        Ok(results) => results,
+                        Err(err) => {
+                            tracing::error!(
+                                "redis.read.error, error executing pipeline: {:?}",
+                                err
+                            );
+                            return Err(TrypemaError::RedisError(err));
+                        }
+                    }
+                }
+            };
+
+            all_results.extend(results.into_iter().map(map_redis_read_result_to_state));
+        }
+
+        Ok(all_results)
+    } // end method batch_commit_state
+
+    #[inline]
+    fn build_read_pipeline(&self, keys: &[RedisKey], should_load_script: bool) -> redis::Pipeline {
+        let mut pipe = redis::Pipeline::new();
+        if should_load_script {
+            pipe.load_script(&self.read_state_script).ignore();
+        }
+
+        for key in keys {
+            pipe.invoke_script(
+                self.read_state_script
+                    .key(self.key_generator.get_hash_key(key))
+                    .key(self.key_generator.get_active_keys(key))
+                    .key(self.key_generator.get_window_limit_key(key))
+                    .key(self.key_generator.get_total_count_key(key))
+                    .arg(key.as_str())
+                    .arg(self.window_size_ms),
+            );
+        }
+
+        pipe
+    }
+
+    /// Evict expired buckets and update the total count.
+    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let _: () = self
+            .cleanup_script
+            .key(self.key_generator.prefix.to_string())
+            .key(self.key_generator.rate_type.to_string())
+            .key(self.key_generator.get_active_entities_key())
+            .arg(stale_after_ms)
+            .arg(self.key_generator.hash_key_suffix.to_string())
+            .arg(self.key_generator.window_limit_key_suffix.to_string())
+            .arg(self.key_generator.total_count_key_suffix.to_string())
+            .arg(self.key_generator.active_keys_key_suffix.to_string())
+            .arg(self.key_generator.suppression_factor_key_suffix.to_string())
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -219,171 +397,6 @@ impl RedisProxyCommitter<AbsoluteHybridCommit> for AbsoluteHybridRedisProxy {
 
         Ok(())
     } // end method batch_commit_state
-}
-
-impl AbsoluteHybridRedisProxy {
-    pub(crate) fn new(prefix: RedisKey, connection_manager: ConnectionManager) -> Self {
-        Self {
-            key_generator: RedisKeyGenerator::new(prefix, RateType::HybridAbsolute),
-            read_state_script: Script::new(READ_STATE_SCRIPT),
-            commit_state_script: Script::new(COMMIT_STATE_SCRIPT),
-            cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
-            connection_manager,
-            read_chunk_size: 100,
-        }
-    }
-
-    pub(crate) async fn read_state(
-        self: &AbsoluteHybridRedisProxy,
-        key: &RedisKey,
-        window_size_ms: u128,
-    ) -> Result<AbsoluteHybridRedisProxyReadStateResult, TrypemaError> {
-        let mut connection_manager = self.connection_manager.clone();
-
-        let res: (String, u64, i64, i64, i64) = self
-            .read_state_script
-            .key(self.key_generator.get_hash_key(key))
-            .key(self.key_generator.get_active_keys(key))
-            .key(self.key_generator.get_window_limit_key(key))
-            .key(self.key_generator.get_total_count_key(key))
-            .arg(key.as_str())
-            .arg(window_size_ms)
-            .invoke_async(&mut connection_manager)
-            .await?;
-
-        Ok(map_redis_read_result_to_state(res))
-    } // end method read_state
-
-    #[inline]
-    fn build_commit_pipeline(
-        &self,
-        commits: &[AbsoluteHybridCommit],
-        should_load_script: bool,
-    ) -> redis::Pipeline {
-        let mut pipe = redis::Pipeline::new();
-        if should_load_script {
-            pipe.load_script(&self.commit_state_script).ignore();
-        }
-
-        for commit in commits {
-            pipe.invoke_script(
-                self.commit_state_script
-                    .key(self.key_generator.get_hash_key(&commit.key))
-                    .key(self.key_generator.get_active_keys(&commit.key))
-                    .key(self.key_generator.get_window_limit_key(&commit.key))
-                    .key(self.key_generator.get_total_count_key(&commit.key))
-                    .key(self.key_generator.get_active_entities_key())
-                    .arg(commit.key.as_str())
-                    .arg(commit.window_size_seconds)
-                    .arg(commit.window_limit)
-                    .arg(commit.rate_group_size_ms)
-                    .arg(commit.count),
-            );
-        }
-
-        pipe
-    }
-
-    pub(crate) async fn batch_read_state(
-        self: &AbsoluteHybridRedisProxy,
-        keys: &[RedisKey],
-        window_size_ms: u128,
-    ) -> Result<Vec<AbsoluteHybridRedisProxyReadStateResult>, TrypemaError> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut connection_manager = self.connection_manager.clone();
-
-        let chunk_size = self.read_chunk_size.max(1);
-        let mut all_results: Vec<AbsoluteHybridRedisProxyReadStateResult> =
-            Vec::with_capacity(keys.len());
-
-        for chunk in keys.chunks(chunk_size) {
-            let pipe = self.build_read_pipeline(chunk, window_size_ms, false);
-
-            let results = match pipe
-                .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
-                .await
-            {
-                Ok(results) => results,
-                Err(err) => {
-                    if err.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
-                        tracing::error!("redis.read.error, error executing pipeline: {:?}", err);
-                        return Err(TrypemaError::RedisError(err));
-                    }
-
-                    let pipe = self.build_read_pipeline(chunk, window_size_ms, true);
-
-                    match pipe
-                        .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
-                        .await
-                    {
-                        Ok(results) => results,
-                        Err(err) => {
-                            tracing::error!(
-                                "redis.read.error, error executing pipeline: {:?}",
-                                err
-                            );
-                            return Err(TrypemaError::RedisError(err));
-                        }
-                    }
-                }
-            };
-
-            all_results.extend(results.into_iter().map(map_redis_read_result_to_state));
-        }
-
-        Ok(all_results)
-    } // end method batch_commit_state
-
-    #[inline]
-    fn build_read_pipeline(
-        &self,
-        keys: &[RedisKey],
-        window_size_ms: u128,
-        should_load_script: bool,
-    ) -> redis::Pipeline {
-        let mut pipe = redis::Pipeline::new();
-        if should_load_script {
-            pipe.load_script(&self.read_state_script).ignore();
-        }
-
-        for key in keys {
-            pipe.invoke_script(
-                self.read_state_script
-                    .key(self.key_generator.get_hash_key(key))
-                    .key(self.key_generator.get_active_keys(key))
-                    .key(self.key_generator.get_window_limit_key(key))
-                    .key(self.key_generator.get_total_count_key(key))
-                    .arg(key.as_str())
-                    .arg(window_size_ms),
-            );
-        }
-
-        pipe
-    }
-
-    /// Evict expired buckets and update the total count.
-    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        let mut connection_manager = self.connection_manager.clone();
-
-        let _: () = self
-            .cleanup_script
-            .key(self.key_generator.prefix.to_string())
-            .key(self.key_generator.rate_type.to_string())
-            .key(self.key_generator.get_active_entities_key())
-            .arg(stale_after_ms)
-            .arg(self.key_generator.hash_key_suffix.to_string())
-            .arg(self.key_generator.window_limit_key_suffix.to_string())
-            .arg(self.key_generator.total_count_key_suffix.to_string())
-            .arg(self.key_generator.active_keys_key_suffix.to_string())
-            .arg(self.key_generator.suppression_factor_key_suffix.to_string())
-            .invoke_async(&mut connection_manager)
-            .await?;
-
-        Ok(())
-    }
 }
 
 fn map_redis_read_result_to_state(

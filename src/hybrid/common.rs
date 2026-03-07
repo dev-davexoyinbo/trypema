@@ -1,9 +1,29 @@
 use std::ops::{Deref, DerefMut};
+use std::time::Duration;
 
 use crate::TrypemaError;
 
+/// How often each hybrid rate limiter advances its epoch (used to detect activity periods).
+pub(crate) const EPOCH_CHANGE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Computes the inactivity-detection sleep duration for the Redis committer.
+///
+/// The committer waits at least this long without observing activity before marking itself
+/// inactive. The interval is floored at 30 s and scales with the configured `sync_interval`
+/// (at `10×`), then halved so the inactivity check fires roughly mid-cycle:
+///
+/// ```text
+/// max(30_000 ms, sync_interval × 10) / 2
+/// ```
+pub(crate) fn committer_inactivity_sleep(sync_interval: Duration) -> Duration {
+    let min_ms = (EPOCH_CHANGE_INTERVAL * 2).as_millis() as u64;
+    let multiplier: u64 = 10;
+    Duration::from_millis(min_ms.max(sync_interval.as_millis() as u64 * multiplier)) / 2
+}
+
 /// A signal to the Redis rate limiter to flush its local cache.
-pub enum RedisRateLimiterSignal {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum RedisRateLimiterSignal {
     /// Flush the local cache.
     Flush,
 }

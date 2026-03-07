@@ -1,7 +1,10 @@
 use std::{
+    hash::Hash,
     ops::{Deref, DerefMut},
     sync::Mutex,
 };
+
+use dashmap::{DashMap, mapref::one::RefMut, try_result::TryResult};
 
 use crate::{TrypemaError, common::RateType};
 
@@ -66,8 +69,10 @@ pub(crate) struct RedisKeyGenerator {
     pub rate_type: RateType,
     pub active_entities_key_suffix: String,
     pub hash_key_suffix: String,
+    pub hash_declined_key_suffix: String,
     pub window_limit_key_suffix: String,
     pub total_count_key_suffix: String,
+    pub total_declined_key_suffix: String,
     pub active_keys_key_suffix: String,
     pub suppression_factor_key_suffix: String,
 }
@@ -79,8 +84,10 @@ impl RedisKeyGenerator {
             rate_type,
             active_entities_key_suffix: "active_entities".to_string(),
             hash_key_suffix: "h".to_string(),
+            hash_declined_key_suffix: "hd".to_string(),
             window_limit_key_suffix: "w".to_string(),
             total_count_key_suffix: "t".to_string(),
+            total_declined_key_suffix: "d".to_string(),
             active_keys_key_suffix: "a".to_string(),
             suppression_factor_key_suffix: "sf".to_string(),
         }
@@ -94,12 +101,20 @@ impl RedisKeyGenerator {
         self.get_key_with_suffix(key, &self.hash_key_suffix)
     }
 
+    pub(crate) fn get_hash_declined_key(&self, key: &RedisKey) -> String {
+        self.get_key_with_suffix(key, &self.hash_declined_key_suffix)
+    }
+
     pub(crate) fn get_window_limit_key(&self, key: &RedisKey) -> String {
         self.get_key_with_suffix(key, &self.window_limit_key_suffix)
     }
 
     pub(crate) fn get_total_count_key(&self, key: &RedisKey) -> String {
         self.get_key_with_suffix(key, &self.total_count_key_suffix)
+    }
+
+    pub(crate) fn get_total_declined_key(&self, key: &RedisKey) -> String {
+        self.get_key_with_suffix(key, &self.total_declined_key_suffix)
     }
 
     pub(crate) fn get_active_keys(&self, key: &RedisKey) -> String {
@@ -121,4 +136,29 @@ pub(crate) fn mutex_lock<'a, T>(
 ) -> Result<std::sync::MutexGuard<'a, T>, TrypemaError> {
     m.lock()
         .map_err(|_| TrypemaError::CustomError(format!("mutex poisoned: {what}")))
+}
+
+pub(crate) const _GET_MUT_TIMEOUT_MS: u64 = 3;
+
+pub(crate) async fn _try_get_mut_async_with_timeout<'a, K, V>(
+    map: &'a DashMap<K, V>,
+    key: &K,
+    timeout_ms: u64,
+) -> Option<RefMut<'a, K, V>>
+where
+    K: Eq + Hash,
+{
+    let start = std::time::Instant::now();
+    loop {
+        match map.try_get_mut(key) {
+            TryResult::Present(v) => return Some(v),
+            TryResult::Absent => return None,
+            TryResult::Locked => {
+                if start.elapsed().as_millis() >= timeout_ms as u128 {
+                    return None;
+                }
+                crate::runtime::_yield_now().await;
+            }
+        }
+    }
 }
