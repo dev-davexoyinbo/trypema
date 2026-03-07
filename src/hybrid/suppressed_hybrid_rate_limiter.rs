@@ -334,8 +334,6 @@ impl SuppressedHybridRateLimiter {
                     is_allowed: should_allow,
                 });
             }
-
-            drop(state_entry);
         } else if let SuppressedRedisLimitingState::Accepting {
             window_limit,
             starting_count,
@@ -355,79 +353,9 @@ impl SuppressedHybridRateLimiter {
                 count.fetch_add(increment, Ordering::AcqRel);
                 return Ok(RateLimitDecision::Allowed);
             }
-
-            drop(state_entry);
-
-            let permit = self.commiter_sender.reserve().await.map_err(|_| {
-                TrypemaError::CustomError("Failed to reserve commiter sender".to_string())
-            })?;
-
-            // since the permit can take some time, we need to check again if the key is still in the map
-            let Some(mut state_entry) = self.limiting_state.get_mut(key) else {
-                unreachable!("Key should be present");
-            };
-
-            if let SuppressedRedisLimitingState::Accepting {
-                window_limit,
-                count,
-                starting_count,
-                ..
-            } = state_entry.deref()
-            {
-                let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
-                let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
-                let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
-                let count_value = count.load(Ordering::Acquire);
-                let forecasted_total_count = starting_count
-                    .saturating_add(count_value)
-                    .saturating_add(increment);
-
-                if forecasted_total_count <= soft_window_limit {
-                    count.fetch_add(increment, Ordering::AcqRel);
-                    return Ok(RateLimitDecision::Allowed);
-                }
-
-                let current_total_count = starting_count.saturating_add(count_value);
-
-                if count_value > 0 {
-                    let commit = SuppressedHybridCommit {
-                        key: key.clone(),
-                        window_limit,
-                        count: count_value,
-                    };
-
-                    permit.send(commit.into());
-                }
-
-                let (suppression_factor, should_allow) = if forecasted_total_count > window_limit {
-                    (1f64, false)
-                } else if soft_window_limit < window_limit && forecasted_total_count < window_limit
-                {
-                    (0f64, true)
-                } else {
-                    // if forcasted would be == window_limit, we are in the accepting state, so we need to set the starting_count to the current total count
-                    (1f64, true)
-                };
-
-                *state_entry = SuppressedRedisLimitingState::Suppressing {
-                    time_instant: Mutex::new(Instant::now()),
-                    suppression_factor: Mutex::new(suppression_factor),
-                    window_limit: Mutex::new(window_limit),
-                    suppression_factor_ttl_ms: Mutex::new(*self.suppression_factor_cache_ms),
-                    starting_count: Mutex::new(current_total_count),
-                    count: AtomicU64::new(increment),
-                };
-
-                return Ok(RateLimitDecision::Suppressed {
-                    suppression_factor,
-                    is_allowed: should_allow,
-                });
-            }
-
-            drop(state_entry);
-        } else {
-            drop(state_entry);
         }
+
+        drop(state_entry);
 
         self.reset_state_from_redis_read_result_and_get_decision(
             key,
