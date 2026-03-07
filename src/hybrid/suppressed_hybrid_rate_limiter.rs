@@ -718,25 +718,4 @@ impl SuppressedHybridRateLimiter {
 
         Ok(())
     } // end method flush
-
-    fn _calculate_suppression_factor(
-        &self,
-        hard_window_limit: u64,
-        count: u64,
-        last_second_count: u64,
-    ) -> f64 {
-        if count < (hard_window_limit as f64 / *self.hard_limit_factor) as u64 {
-            return 0f64;
-        } else if count > hard_window_limit {
-            return 1f64;
-        }
-
-        let average_rate_in_window = count as f64 / *self.window_size_seconds as f64;
-        let perceived_rate_limit = average_rate_in_window.max(last_second_count as f64);
-
-        let rate_limit =
-            hard_window_limit as f64 / *self.window_size_seconds as f64 / *self.hard_limit_factor;
-
-        1f64 - (rate_limit / perceived_rate_limit)
-    }
 }
