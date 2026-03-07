@@ -74,6 +74,9 @@ const LUA_HELPERS: &str = r#"
 
         for i = 1, #to_remove_counts do
             remove_count_sum = remove_count_sum + (tonumber(to_remove_counts[i]) or 0)
+        end
+
+        for i = 1, #to_remove_declines do
             remove_declined_sum = remove_declined_sum + (tonumber(to_remove_declines[i]) or 0)
         end
 
@@ -375,7 +378,9 @@ impl SuppressedHybridRedisProxy {
                     let pipe = self.build_read_pipeline(chunk, true);
 
                     match pipe
-                        .query_async::<Vec<(String, f64, u64, u64, i64, i64)>>(&mut connection_manager)
+                        .query_async::<Vec<(String, f64, u64, u64, i64, i64)>>(
+                            &mut connection_manager,
+                        )
                         .await
                     {
                         Ok(results) => results,
@@ -484,14 +489,14 @@ impl RedisProxyCommitter<SuppressedHybridCommit> for SuppressedHybridRedisProxy 
 }
 
 fn map_redis_read_result_to_state(
-    (entity, suppression_factor, current_total_count, current_total_declined, window_limit, suppression_factor_ttl_ms): (
-        String,
-        f64,
-        u64,
-        u64,
-        i64,
-        i64,
-    ),
+    (
+        entity,
+        suppression_factor,
+        current_total_count,
+        current_total_declined,
+        window_limit,
+        suppression_factor_ttl_ms,
+    ): (String, f64, u64, u64, i64, i64),
 ) -> SuppressedHybridRedisProxyReadStateResult {
     SuppressedHybridRedisProxyReadStateResult {
         key: RedisKey::from(entity),
