@@ -129,13 +129,19 @@ stress-hybrid: stress-hybrid-hot stress-hybrid-skew ## Run hybrid (local+redis) 
 stress: stress-local stress-redis stress-hybrid ## Run all stress presets
 
 stress-local-hot: ## Stress local provider (hot keys)
-	@cargo run --release -p trypema-stress -- \
+	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 \
+		--key-dist hot --duration-s 30; \
+	cargo run --release -p trypema-stress -- \
+		--provider local --strategy suppressed --threads 16 \
 		--key-dist hot --duration-s 30
 
 stress-local-uniform: ## Stress local provider (uniform keys)
-	@cargo run --release -p trypema-stress -- \
+	cargo run --release -p trypema-stress -- \
 		--provider local --strategy absolute --threads 16 \
+		--key-dist uniform --key-space 100000 --duration-s 60; \
+	cargo run --release -p trypema-stress -- \
+		--provider local --strategy suppressed --threads 16 \
 		--key-dist uniform --key-space 100000 --duration-s 60
 
 # Uniform distribution sweep across (key_space, rate_limit_per_s).
