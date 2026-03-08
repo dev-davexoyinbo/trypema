@@ -279,7 +279,7 @@ impl SuppressedLocalRateLimiter {
 
         let soft_window_limit = rate_limit_series.limit / *self.hard_limit_factor;
 
-        let total = rate_limit_series.total.fetch_add(count, Ordering::AcqRel) + count;
+        let mut total = rate_limit_series.total.load(Ordering::Acquire);
         let mut total_declined = rate_limit_series.total_declined.load(Ordering::Acquire);
         let suppression_factor;
         let should_allow;
@@ -298,11 +298,15 @@ impl SuppressedLocalRateLimiter {
                 random_bool(1f64 - suppression_factor)
             };
 
-            total_declined = rate_limit_series
-                .total_declined
-                .fetch_add(count, Ordering::AcqRel)
-                + count;
+            if !should_allow {
+                total_declined = rate_limit_series
+                    .total_declined
+                    .fetch_add(count, Ordering::AcqRel)
+                    + count;
+            }
         }
+
+        total = rate_limit_series.total.fetch_add(count, Ordering::AcqRel) + count;
 
         if let Some(last_entry) = rate_limit_series.series.back()
             && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
