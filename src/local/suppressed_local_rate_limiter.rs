@@ -258,17 +258,17 @@ impl SuppressedLocalRateLimiter {
                     .drain(..split)
                     .fold((0u64, 0u64), |(count, declined), r| {
                         (
-                            count + r.count.load(Ordering::Relaxed),
-                            declined + r.declined.load(Ordering::Relaxed),
+                            count + r.count.load(Ordering::Acquire),
+                            declined + r.declined.load(Ordering::Acquire),
                         )
                     });
 
                 rate_limit_series
                     .total
-                    .fetch_sub(removed_count, Ordering::Relaxed);
+                    .fetch_sub(removed_count, Ordering::AcqRel);
                 rate_limit_series
                     .total_declined
-                    .fetch_sub(removed_declined, Ordering::Relaxed);
+                    .fetch_sub(removed_declined, Ordering::AcqRel);
 
                 drop(rate_limit_series);
 
@@ -279,8 +279,8 @@ impl SuppressedLocalRateLimiter {
 
         let soft_window_limit = rate_limit_series.limit / *self.hard_limit_factor;
 
-        let total = rate_limit_series.total.fetch_add(count, Ordering::Relaxed) + count;
-        let mut total_declined = rate_limit_series.total_declined.load(Ordering::Relaxed);
+        let total = rate_limit_series.total.fetch_add(count, Ordering::AcqRel) + count;
+        let mut total_declined = rate_limit_series.total_declined.load(Ordering::Acquire);
         let suppression_factor;
         let should_allow;
 
@@ -300,16 +300,16 @@ impl SuppressedLocalRateLimiter {
 
             total_declined = rate_limit_series
                 .total_declined
-                .fetch_add(count, Ordering::Relaxed)
+                .fetch_add(count, Ordering::AcqRel)
                 + count;
         }
 
         if let Some(last_entry) = rate_limit_series.series.back()
             && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
         {
-            last_entry.count.fetch_add(count, Ordering::Relaxed);
+            last_entry.count.fetch_add(count, Ordering::AcqRel);
             if !should_allow {
-                last_entry.declined.fetch_add(count, Ordering::Relaxed);
+                last_entry.declined.fetch_add(count, Ordering::AcqRel);
             }
         } else {
             drop(rate_limit_series);
@@ -366,17 +366,17 @@ impl SuppressedLocalRateLimiter {
                 .drain(..split)
                 .fold((0u64, 0u64), |(count, declined), r| {
                     (
-                        count + r.count.load(Ordering::Relaxed),
-                        declined + r.declined.load(Ordering::Relaxed),
+                        count + r.count.load(Ordering::Acquire),
+                        declined + r.declined.load(Ordering::Acquire),
                     )
                 });
 
         rate_limit_series
             .total
-            .fetch_sub(removed_count, Ordering::Relaxed);
+            .fetch_sub(removed_count, Ordering::AcqRel);
         rate_limit_series
             .total_declined
-            .fetch_sub(removed_declined, Ordering::Relaxed);
+            .fetch_sub(removed_declined, Ordering::AcqRel);
     } // end method remove_expired_buckets
 
     /// Get the current suppression factor for `key`.
@@ -444,8 +444,8 @@ impl SuppressedLocalRateLimiter {
         let hard_window_limit = series.limit;
         let soft_window_limit = hard_window_limit / *self.hard_limit_factor;
 
-        let total = series.total.load(Ordering::Relaxed);
-        let total_declined = series.total_declined.load(Ordering::Relaxed);
+        let total = series.total.load(Ordering::Acquire);
+        let total_declined = series.total_declined.load(Ordering::Acquire);
 
         if total >= hard_window_limit as u64 {
             return self.persist_suppression_factor(key, 1f64);
@@ -463,7 +463,7 @@ impl SuppressedLocalRateLimiter {
             }
 
             total_in_last_second =
-                total_in_last_second.saturating_add(instant_rate.count.load(Ordering::Relaxed));
+                total_in_last_second.saturating_add(instant_rate.count.load(Ordering::Acquire));
         }
 
         let average_rate_in_window: f64 = total as f64 / *self.window_size_seconds as f64;
