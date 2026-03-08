@@ -75,9 +75,9 @@ impl RateLimitSeries {
 ///
 /// # Performance
 ///
-/// - **Admission check:** O(buckets_in_window) - typically < 10 buckets
-/// - **Increment:** O(1) if coalesced, O(log n) to add new bucket
-/// - **Memory:** ~50-200 bytes per key (depends on bucket count)
+/// - **Admission check:** O(buckets_in_window) — typically < 10 buckets
+/// - **Increment:** O(1) amortised (coalesced into existing bucket or appended via `push_back`)
+/// - **Memory:** ~50–200 bytes per key (depends on bucket count)
 ///
 /// # Examples
 ///

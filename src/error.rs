@@ -1,19 +1,24 @@
-/// Error types for Trypema rate limiters.
+/// All errors that can occur when using the Trypema rate limiter.
 ///
-/// This enum encompasses all errors that can occur when using the rate limiter,
-/// including configuration validation errors and Redis operation errors.
+/// Errors fall into two categories:
 ///
-/// # Error Categories
+/// - **Validation errors** — Returned when constructing configuration types with invalid values
+///   (e.g., a rate limit of `0.0`, an empty Redis key). These are returned as `Err` from
+///   `TryFrom` implementations and are deterministic.
 ///
-/// - **Validation errors:** Invalid configuration values (rate limit, window size, etc.)
-/// - **Redis errors:** Connection issues, command failures, script errors (if Redis feature enabled)
+/// - **Redis errors** — Returned from async Redis operations when the connection fails, a Lua
+///   script encounters an error, or Redis returns an unexpected result. Only available when the
+///   `redis-tokio` or `redis-smol` feature is enabled.
+///
+/// This enum implements [`std::error::Error`] via `thiserror` and can be used with `?` in
+/// functions returning `Result<_, TrypemaError>`.
 ///
 /// # Examples
 ///
 /// ```
 /// use trypema::{RateLimit, TrypemaError};
 ///
-/// // Validation error
+/// // Validation errors are returned by TryFrom implementations
 /// match RateLimit::try_from(-1.0) {
 ///     Err(TrypemaError::InvalidRateLimit(msg)) => {
 ///         println!("Invalid rate: {}", msg);

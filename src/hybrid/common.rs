@@ -30,11 +30,41 @@ pub(crate) enum RedisRateLimiterSignal {
 
 /// Sync interval (milliseconds) for the hybrid provider's background flush.
 ///
-/// The hybrid provider batches local increments and periodically commits them to Redis.
-/// Smaller values reduce sync lag (but increase Redis write frequency); larger values reduce Redis
-/// write frequency (but increase how stale Redis state can be between flushes).
+/// The hybrid provider batches local increments and periodically commits them to Redis
+/// via a background actor (the `RedisCommitter`). This value controls
+/// how often that flush occurs.
 ///
-/// It is generally recommended to keep `sync_interval_ms` <= `rate_group_size_ms`.
+/// # Trade-offs
+///
+/// - **Shorter interval** (5–10ms): less lag between local and Redis state, at the cost of
+///   more frequent Redis writes.
+/// - **Longer interval** (50–100ms): fewer Redis writes, but admission decisions may be
+///   based on stale state for longer.
+///
+/// # Recommendation
+///
+/// Start with **10ms** (the default). It is generally recommended to keep
+/// `sync_interval_ms` ≤ `rate_group_size_ms`.
+///
+/// # Validation
+///
+/// Must be ≥ 1. A value of `0` returns an error.
+///
+/// # Examples
+///
+/// ```
+/// use trypema::hybrid::SyncIntervalMs;
+///
+/// // Default: 10ms
+/// let interval = SyncIntervalMs::default();
+/// assert_eq!(*interval, 10);
+///
+/// // Custom: 50ms for reduced Redis writes
+/// let interval = SyncIntervalMs::try_from(50).unwrap();
+///
+/// // Invalid: 0ms
+/// assert!(SyncIntervalMs::try_from(0).is_err());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct SyncIntervalMs(u64);
 

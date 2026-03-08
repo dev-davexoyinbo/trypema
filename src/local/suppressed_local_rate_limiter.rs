@@ -207,7 +207,38 @@ impl SuppressedLocalRateLimiter {
         }
     } // end constructor
 
-    /// inc
+    /// Check admission and record the increment for `key` using probabilistic suppression.
+    ///
+    /// This is the primary method for the suppressed strategy. It always records the increment
+    /// (both the total count and, if denied, the declined count), then returns an admission
+    /// decision.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Unique identifier for the rate-limited resource (e.g., `"user_123"`)
+    /// - `rate_limit`: Per-second rate limit. **Sticky:** stored on first call, ignored on subsequent calls
+    /// - `count`: Amount to increment (typically `1` for single requests, or batch size)
+    ///
+    /// # Returns
+    ///
+    /// - [`RateLimitDecision::Allowed`]: Below capacity, no suppression active
+    /// - [`RateLimitDecision::Suppressed`]: At or above capacity. **Check `is_allowed`** for admission.
+    ///   When over the hard limit, returns `Suppressed { is_allowed: false, suppression_factor: 1.0 }`.
+    ///
+    /// This method never returns [`RateLimitDecision::Rejected`].
+    ///
+    /// # Behaviour
+    ///
+    /// 1. The increment is **always** recorded in the sliding window (both allowed and denied calls)
+    /// 2. If the forecasted accepted usage is below the soft window capacity, return `Allowed`
+    /// 3. If above the hard limit (`rate_limit × hard_limit_factor`), return
+    ///    `Suppressed { is_allowed: false, suppression_factor: 1.0 }`
+    /// 4. Otherwise, compute (or retrieve cached) suppression factor and probabilistically decide
+    ///
+    /// # Concurrency
+    ///
+    /// Same best-effort semantics as the absolute strategy. Under concurrent load, multiple
+    /// threads may proceed simultaneously, causing temporary overshoot. This is by design.
     pub fn inc(&self, key: &str, rate_limit: &RateLimit, count: u64) -> RateLimitDecision {
         let mut rng = |p: f64| rand::random_bool(p);
         self.inc_with_rng(key, rate_limit, count, &mut rng)
@@ -388,10 +419,16 @@ impl SuppressedLocalRateLimiter {
 
     /// Get the current suppression factor for `key`.
     ///
-    /// This is useful for exporting metrics or debugging why calls are being suppressed.
+    /// Returns a value in the range `[0.0, 1.0]`:
+    /// - `0.0` — no suppression (below capacity or key not found)
+    /// - `0.0 < sf < 1.0` — partial suppression (at capacity)
+    /// - `1.0` — full suppression (over hard limit)
     ///
-    /// Returns the cached value if it is still fresh, otherwise recomputes and refreshes
-    /// the cache.
+    /// This method is read-only and does not record any increment. It is useful for
+    /// exporting metrics, building dashboards, or debugging why calls are being suppressed.
+    ///
+    /// **Caching:** Returns the cached value if it was computed within `suppression_factor_cache_ms`.
+    /// Otherwise, evicts expired buckets and recomputes the factor from the current sliding window.
     pub fn get_suppression_factor(&self, key: &str) -> f64 {
         self.remove_expired_buckets(key);
         self.get_suppression_factor_without_bucket_expire(key)

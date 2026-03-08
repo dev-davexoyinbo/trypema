@@ -8,11 +8,36 @@ use dashmap::{DashMap, mapref::one::RefMut, try_result::TryResult};
 
 use crate::{TrypemaError, common::RateType};
 
-/// A validated newtype for Redis keys.
+/// A validated newtype for Redis rate limiting keys.
 ///
-/// This is a string with the following constraints:
-/// - Must not be empty
-/// - Must not contain colons
+/// All Redis and hybrid provider operations require keys wrapped in this type. Validation
+/// is performed at construction time via `TryFrom<String>`.
+///
+/// # Validation Rules
+///
+/// - **Must not be empty** — an empty key has no semantic meaning
+/// - **Must be ≤ 255 bytes** — prevents excessively long Redis keys
+/// - **Must not contain `:` (colon)** — colons are used internally as key separators
+///   (e.g., `{prefix}:{user_key}:{rate_type}:{suffix}`)
+///
+/// # Examples
+///
+/// ```
+/// use trypema::redis::RedisKey;
+///
+/// // Valid keys
+/// let key = RedisKey::try_from("user_123".to_string()).unwrap();
+/// let key = RedisKey::try_from("api_v2_endpoint".to_string()).unwrap();
+///
+/// // Invalid: contains ':'
+/// assert!(RedisKey::try_from("user:123".to_string()).is_err());
+///
+/// // Invalid: empty string
+/// assert!(RedisKey::try_from("".to_string()).is_err());
+///
+/// // Invalid: too long (> 255 bytes)
+/// assert!(RedisKey::try_from("a".repeat(256)).is_err());
+/// ```
 #[derive(Debug, Clone, PartialEq, PartialOrd, Hash, Eq)]
 pub struct RedisKey(String);
 

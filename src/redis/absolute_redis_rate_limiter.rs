@@ -191,7 +191,37 @@ const ABSOLUTE_CLEANUP_LUA: &str = r#"
     return
 "#;
 
-/// A rate limiter backed by Redis.
+/// Strict sliding-window rate limiter backed by Redis.
+///
+/// Provides the same deterministic admission semantics as
+/// [`AbsoluteLocalRateLimiter`](crate::local::AbsoluteLocalRateLimiter), but stores
+/// all state in Redis so limits are shared across processes and servers.
+///
+/// # Implementation
+///
+/// Every `inc()` and `is_allowed()` call executes an atomic Lua script against Redis.
+/// Within a single script execution, Redis guarantees atomicity — there are no
+/// TOCTOU (time-of-check-to-time-of-use) races between reading and updating state
+/// for a single key.
+///
+/// Timestamps are obtained server-side via `redis.call("TIME")`, avoiding client
+/// clock skew issues.
+///
+/// # Data Model
+///
+/// For a key `K` with prefix `P`:
+/// - `P:K:absolute:h` — Hash of `timestamp_ms → count` (sliding window buckets)
+/// - `P:K:absolute:a` — Sorted set of active bucket timestamps (for efficient eviction)
+/// - `P:K:absolute:w` — Window limit string (set on first call, refreshed with `EXPIRE`)
+/// - `P:K:absolute:t` — Total count across all active buckets
+/// - `P:active_entities` — Sorted set of all active keys (used by cleanup)
+///
+/// # Semantics
+///
+/// - Rate limits are **sticky**: the first `inc()` call for a key stores the window limit;
+///   subsequent calls use the stored limit.
+/// - Rejected increments are **not** recorded (the count is only added on `Allowed`).
+/// - Overall rate limiting across multiple clients is **best-effort** (not linearisable).
 #[derive(Clone, Debug)]
 pub struct AbsoluteRedisRateLimiter {
     connection_manager: ConnectionManager,
@@ -218,7 +248,25 @@ impl AbsoluteRedisRateLimiter {
         }
     } // end method with_rate_type
 
-    /// Check admission and, if allowed, increment the observed count for `key`.
+    /// Check admission and, if allowed, atomically record the increment for `key`.
+    ///
+    /// Executes an atomic Lua script that:
+    /// 1. Evicts expired buckets (lazy cleanup)
+    /// 2. Checks if `total + count > window_limit`
+    /// 3. If under limit: records the increment and returns `Allowed`
+    /// 4. If over limit: returns `Rejected` with best-effort backoff hints
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Validated [`RedisKey`] identifying the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit (sticky — stored on first call per key)
+    /// - `count`: Amount to increment (typically `1`)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Allowed)` — under limit, increment recorded
+    /// - `Ok(Rejected { .. })` — over limit, increment **not** recorded
+    /// - `Err(TrypemaError)` — Redis connectivity or script error
     pub async fn inc(
         &self,
         key: &RedisKey,

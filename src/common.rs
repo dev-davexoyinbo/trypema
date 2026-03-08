@@ -1,13 +1,18 @@
 //! Common types shared across all rate limiting providers.
 //!
-//! This module defines core types used throughout the crate:
-//! - [`RateLimitDecision`]: Admission decision result
-//! - [`RateLimit`]: Per-second rate limit (positive `f64`)
-//! - [`WindowSizeSeconds`]: Sliding window duration
-//! - [`RateGroupSizeMs`]: Bucket coalescing interval
-//! - [`HardLimitFactor`]: Hard cutoff multiplier for suppressed strategy
+//! This module defines the core types used throughout the crate. All public types are
+//! re-exported at the crate root for convenience.
 //!
-//! These types are re-exported at the crate root for convenience.
+//! # Types
+//!
+//! | Type | Purpose |
+//! |------|---------|
+//! | [`RateLimitDecision`] | The admission decision returned by every `inc()` and `is_allowed()` call |
+//! | [`RateLimit`] | Per-second rate limit (positive `f64`, supports non-integer rates) |
+//! | [`WindowSizeSeconds`] | Sliding window duration in seconds (≥ 1) |
+//! | [`RateGroupSizeMs`] | Bucket coalescing interval in milliseconds (≥ 1, default 100ms) |
+//! | [`HardLimitFactor`] | Hard cutoff multiplier for the suppressed strategy (> 0, default 1.0) |
+//! | [`SuppressionFactorCacheMs`] | Cache duration for suppression factor recomputation (≥ 1, default 100ms) |
 
 use std::{
     ops::{Deref, DerefMut},
@@ -143,10 +148,12 @@ pub enum RateLimitDecision {
         /// Use as a backoff hint, not a guarantee.
         retry_after_ms: u128,
 
-        /// **Best-effort** estimate of window usage after waiting `retry_after_ms`.
+        /// **Best-effort** estimate of how many requests will still be counted in the
+        /// window after `retry_after_ms` elapses.
         ///
-        /// Represents the count in the oldest bucket that will expire. May be:
-        /// - `0` if heavily coalesced into one bucket
+        /// Computed as `total_count - oldest_bucket_count`. This represents the number of
+        /// requests that will remain in the window once the oldest bucket expires. May be:
+        /// - `0` if all activity is heavily coalesced into the oldest bucket
         /// - Inaccurate if concurrent activity modifies buckets
         ///
         /// Use for rough capacity indication only.
@@ -475,10 +482,40 @@ pub(crate) enum RateType {
     HybridSuppressed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 /// Cache duration (milliseconds) for suppression factor recomputation.
 ///
-/// Used by the suppressed strategy to avoid recomputing the suppression factor on every request.
+/// The suppressed strategy computes a suppression factor based on the current perceived rate
+/// relative to the rate limit. This computation involves iterating over recent buckets and
+/// can be non-trivial under high throughput. To amortise this cost, the computed factor is
+/// cached per key for up to `SuppressionFactorCacheMs`.
+///
+/// # Trade-offs
+///
+/// - **Shorter cache** (10–50ms): suppression reacts faster to traffic changes, but
+///   recomputation happens more frequently.
+/// - **Longer cache** (100–1000ms): less CPU overhead, but suppression may lag behind
+///   sudden traffic changes.
+///
+/// # Validation
+///
+/// Must be ≥ 1. A value of `0` returns [`TrypemaError::InvalidSuppressionFactorCacheMs`].
+///
+/// # Examples
+///
+/// ```
+/// use trypema::SuppressionFactorCacheMs;
+///
+/// // Default: 100ms
+/// let cache = SuppressionFactorCacheMs::default();
+/// assert_eq!(*cache, 100);
+///
+/// // Custom: 50ms for faster reaction
+/// let cache = SuppressionFactorCacheMs::try_from(50).unwrap();
+///
+/// // Invalid: 0ms
+/// assert!(SuppressionFactorCacheMs::try_from(0).is_err());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct SuppressionFactorCacheMs(u64);
 
 impl Default for SuppressionFactorCacheMs {

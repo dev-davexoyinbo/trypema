@@ -15,12 +15,21 @@ pub(crate) mod runtime;
 pub mod local;
 use local::*;
 
-/// Redis-specific rate limiter implementations.
+/// Redis-backed distributed rate limiter implementations.
+///
+/// Provides [`RedisRateLimiterProvider`](redis::RedisRateLimiterProvider), which executes
+/// all operations as atomic Lua scripts against Redis 6.2+. Each `inc()` or `is_allowed()`
+/// call results in one Redis round-trip.
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
 pub mod redis;
 
-/// Redis-specific rate limiter implementations.
+/// Hybrid rate limiter implementations (local fast-path + periodic Redis sync).
+///
+/// Provides [`HybridRateLimiterProvider`](hybrid::HybridRateLimiterProvider), which maintains
+/// local in-memory state for low-latency admission checks and periodically flushes accumulated
+/// increments to Redis in batches. This reduces Redis round-trips compared to the pure Redis
+/// provider, at the cost of some additional approximation due to sync lag.
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
 pub mod hybrid;

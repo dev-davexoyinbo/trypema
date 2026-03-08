@@ -46,7 +46,39 @@ enum AbsoluteRedisLimitingState {
     },
 }
 
-/// A rate limiter backed by Redis.
+/// Strict sliding-window rate limiter with a local fast-path and periodic Redis sync.
+///
+/// This is the hybrid counterpart to [`AbsoluteRedisRateLimiter`](crate::redis::AbsoluteRedisRateLimiter).
+/// Instead of executing a Redis round-trip on every `inc()` call, it maintains local
+/// in-memory state per key and periodically flushes accumulated increments to Redis via
+/// a background actor (the `RedisCommitter`).
+///
+/// # State Machine
+///
+/// Each key transitions through three states:
+///
+/// - **`Undefined`** — No local state exists. The first `inc()` call reads Redis to
+///   initialise local state, then transitions to `Accepting` or `Rejecting`.
+///
+/// - **`Accepting`** — Serving from a local counter. Each `inc()` is a fast atomic
+///   increment with no Redis I/O. When the local counter exceeds the available capacity,
+///   it commits the count to Redis and transitions based on the result.
+///
+/// - **`Rejecting`** — A rejection cache based on the oldest bucket's TTL. All calls
+///   return `Rejected` until the TTL expires, at which point the state resets to
+///   `Undefined` for a fresh Redis read.
+///
+/// # Thundering Herd Prevention
+///
+/// Each key has its own `tokio::sync::Mutex`. When local state is exhausted and a
+/// Redis read is needed, only one task performs the read+state-update; other tasks
+/// wait on the mutex and then re-check the refreshed state.
+///
+/// # When to Use
+///
+/// Use this over the pure Redis provider when per-request Redis latency is unacceptable.
+/// The trade-off is that admission decisions may lag behind the true Redis state by up
+/// to `sync_interval_ms`.
 #[derive(Debug)]
 pub struct AbsoluteHybridRateLimiter {
     window_size_seconds: WindowSizeSeconds,
@@ -168,7 +200,24 @@ impl AbsoluteHybridRateLimiter {
             .clone()
     }
 
-    /// Check admission and, if allowed, increment the observed count for `key`.
+    /// Check admission and, if allowed, record the increment for `key`.
+    ///
+    /// This is the primary method for rate limiting with the hybrid absolute strategy.
+    /// On the fast-path (key in `Accepting` state with capacity remaining), this is a
+    /// single atomic increment with no Redis I/O. When local capacity is exhausted,
+    /// it flushes to Redis and refreshes local state.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Validated [`RedisKey`] identifying the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit (sticky — stored on first call per key)
+    /// - `count`: Amount to increment (typically `1`)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Allowed)` — under limit, increment recorded locally
+    /// - `Ok(Rejected { .. })` — over limit (may be served from local rejection cache)
+    /// - `Err(TrypemaError)` — Redis error during state refresh
     pub async fn inc(
         &self,
         key: &RedisKey,
@@ -184,13 +233,18 @@ impl AbsoluteHybridRateLimiter {
         Ok(decision)
     } // end method inc
 
-    /// Determine whether `key` is currently allowed.
+    /// Check if `key` is currently under its rate limit (read-only).
     ///
-    /// Returns [`RateLimitDecision::Allowed`] if the current sliding window total
-    /// is below the window limit, otherwise returns [`RateLimitDecision::Rejected`]
-    /// with a best-effort `retry_after_ms`.
+    /// Performs an admission check **without** recording an increment. On the fast-path
+    /// (key in `Accepting` state), this is served from local state with no Redis I/O.
     ///
-    /// This method performs lazy eviction of expired buckets for the key.
+    /// Useful for previewing whether a request would be allowed before doing expensive work.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Allowed)` — under limit
+    /// - `Ok(Rejected { .. })` — over limit, includes best-effort backoff hints
+    /// - `Err(TrypemaError)` — Redis error during state refresh
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
         self.send_epoch_change_if_needed();
 

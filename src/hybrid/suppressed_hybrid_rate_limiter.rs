@@ -44,7 +44,29 @@ enum SuppressedRedisLimitingState {
     },
 }
 
-/// A rate limiter backed by Redis.
+/// Probabilistic suppression rate limiter with a local fast-path and periodic Redis sync.
+///
+/// This is the hybrid counterpart to [`SuppressedRedisRateLimiter`](crate::redis::SuppressedRedisRateLimiter).
+/// Like the absolute hybrid limiter, it maintains local in-memory state per key and
+/// periodically flushes accumulated increments (both observed and declined) to Redis.
+///
+/// # State Machine
+///
+/// Each key transitions through three states:
+///
+/// - **`Undefined`** — No local state exists. The first call reads Redis to initialise.
+///
+/// - **`Accepting`** — Below capacity. All requests are allowed from local state with
+///   no Redis I/O. When the local counter exceeds the soft capacity, it commits to Redis
+///   and transitions based on the result.
+///
+/// - **`Suppressing`** — At or above capacity. Probabilistic admission based on the
+///   suppression factor from the last Redis read. Continues until the local state is
+///   flushed and refreshed from Redis.
+///
+/// # Thundering Herd Prevention
+///
+/// Same per-key `tokio::sync::Mutex` mechanism as the absolute hybrid limiter.
 #[derive(Debug)]
 pub struct SuppressedHybridRateLimiter {
     window_size_seconds: WindowSizeSeconds,
@@ -169,13 +191,19 @@ impl SuppressedHybridRateLimiter {
             .clone()
     }
 
-    /// Determine whether `key` is currently allowed.
+    /// Get the current suppression factor for `key`.
     ///
-    /// Returns [`RateLimitDecision::Allowed`] if the current sliding window total
-    /// is below the window limit, otherwise returns [`RateLimitDecision::Rejected`]
-    /// with a best-effort `retry_after_ms`.
+    /// Returns a value in the range `[0.0, 1.0]`:
+    /// - `0.0` — no suppression (below capacity or key not found)
+    /// - `0.0 < sf < 1.0` — partial suppression (at capacity)
+    /// - `1.0` — full suppression (over hard limit)
     ///
-    /// This method performs lazy eviction of expired buckets for the key.
+    /// On the fast-path (key in `Suppressing` state with a fresh cached factor), this is
+    /// served entirely from local state with no Redis I/O. Otherwise, it performs a Redis
+    /// read to refresh the state.
+    ///
+    /// This method is read-only with respect to request counts. It is useful for metrics
+    /// and observability dashboards.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         self.send_epoch_change_if_needed();
 
@@ -265,7 +293,27 @@ impl SuppressedHybridRateLimiter {
         }
     }
 
-    /// Check admission and, if allowed, increment the observed count for `key`.
+    /// Check admission and record the increment for `key` using probabilistic suppression.
+    ///
+    /// On the fast-path (key in `Accepting` state with capacity remaining), this is a
+    /// single atomic increment with no Redis I/O. When local capacity is exhausted or the
+    /// key enters the `Suppressing` state, probabilistic admission is applied based on the
+    /// suppression factor from the last Redis read.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Validated [`RedisKey`] identifying the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit (sticky — stored on first call per key)
+    /// - `count`: Amount to increment (typically `1`)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Allowed)` — below capacity, no suppression active
+    /// - `Ok(Suppressed { is_allowed, suppression_factor })` — at/above capacity, check `is_allowed`
+    /// - `Err(TrypemaError)` — Redis error during state refresh
+    ///
+    /// The total observed counter is always incremented. If `is_allowed` is `false`,
+    /// the declined counter is also incremented.
     pub async fn inc(
         &self,
         key: &RedisKey,

@@ -242,7 +242,35 @@ const SUPPRESSED_GET_FACTOR_LUA: &str = r#"
     return tostring(suppression_factor)
 "#;
 
-/// A rate limiter backed by Redis.
+/// Probabilistic suppression rate limiter backed by Redis.
+///
+/// Provides the same probabilistic suppression semantics as
+/// [`SuppressedLocalRateLimiter`](crate::local::SuppressedLocalRateLimiter), but stores
+/// all state in Redis so limits are shared across processes and servers.
+///
+/// # Implementation
+///
+/// Every `inc()` and `get_suppression_factor()` call executes an atomic Lua script
+/// against Redis. The scripts handle bucket eviction, suppression factor computation,
+/// and the probabilistic admission decision in a single atomic operation.
+///
+/// # Data Model
+///
+/// For a key `K` with prefix `P`:
+/// - `P:K:suppressed:h` — Hash of `timestamp_ms → count` (total observed per bucket)
+/// - `P:K:suppressed:hd` — Hash of `timestamp_ms → declined_count` (declined per bucket)
+/// - `P:K:suppressed:a` — Sorted set of active bucket timestamps
+/// - `P:K:suppressed:w` — Window limit (set on first call)
+/// - `P:K:suppressed:t` — Total observed count across all buckets
+/// - `P:K:suppressed:d` — Total declined count across all buckets
+/// - `P:K:suppressed:sf` — Cached suppression factor (string with `PX` TTL)
+/// - `P:active_entities` — Sorted set of all active keys (used by cleanup)
+///
+/// # Tracking
+///
+/// The suppressed strategy always increments the total observed counter. If a call is
+/// denied (`is_allowed: false`), it also increments the declined counter. This allows
+/// deriving accepted usage as: `accepted = observed - declined`.
 #[derive(Clone, Debug)]
 pub struct SuppressedRedisRateLimiter {
     connection_manager: ConnectionManager,
@@ -277,10 +305,28 @@ impl SuppressedRedisRateLimiter {
         }
     }
 
-    /// Check admission and increment counters for `key`.
+    /// Check admission and increment counters for `key` using probabilistic suppression.
     ///
-    /// The suppressed strategy always increments the total observed counter. If the call is
-    /// denied (`is_allowed: false`), it also increments the declined counter.
+    /// Executes an atomic Lua script that:
+    /// 1. Evicts expired buckets (lazy cleanup)
+    /// 2. Computes or retrieves cached suppression factor
+    /// 3. Probabilistically decides admission
+    /// 4. Records the increment (always) and declined count (if denied)
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Validated [`RedisKey`] identifying the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit (sticky — stored on first call per key)
+    /// - `count`: Amount to increment (typically `1`)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Allowed)` — below capacity, no suppression active
+    /// - `Ok(Suppressed { is_allowed, suppression_factor })` — at/above capacity, check `is_allowed`
+    /// - `Err(TrypemaError)` — Redis connectivity or script error
+    ///
+    /// The total observed counter is **always** incremented, regardless of the decision.
+    /// If `is_allowed` is `false`, the declined counter is also incremented.
     pub async fn inc(
         &self,
         key: &RedisKey,
@@ -327,12 +373,19 @@ impl SuppressedRedisRateLimiter {
 
     /// Get the current suppression factor for `key`.
     ///
-    /// This is useful for exporting metrics or debugging why calls are being suppressed.
+    /// Returns a value in the range `[0.0, 1.0]`:
+    /// - `0.0` — no suppression (below capacity or key not found)
+    /// - `0.0 < sf < 1.0` — partial suppression (at capacity)
+    /// - `1.0` — full suppression (over hard limit)
     ///
-    /// If a cached value exists in Redis, it is returned. Otherwise, this recomputes the
-    /// suppression factor and writes it back to Redis with a TTL.
+    /// This method is read-only with respect to request counts — it does not record any
+    /// increment. It is useful for exporting metrics, building dashboards, or debugging
+    /// why calls are being suppressed.
     ///
-    /// If the cached value is outside `[0.0, 1.0]`, this recomputes and overwrites it.
+    /// **Caching:** If a cached value exists in Redis (set via `SET ... PX`), it is returned
+    /// directly. Otherwise, this recomputes the factor via the same algorithm used in `inc()`
+    /// and writes it back to Redis with a `suppression_factor_cache_ms` TTL. If the cached
+    /// value is outside `[0.0, 1.0]`, it is treated as stale and recomputed.
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 

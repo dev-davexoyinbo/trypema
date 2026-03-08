@@ -1,10 +1,15 @@
 //! Top-level rate limiter facade.
 //!
-//! This module provides [`RateLimiter`], the main entry point for rate limiting.
-//! It coordinates multiple providers:
-//! - [`LocalRateLimiterProvider`]: In-process rate limiting
-//! - [`RedisRateLimiterProvider`]: Distributed rate limiting (requires Redis 6.2+)
-//! - [`HybridRateLimiterProvider`]: Redis-backed limiting with a local fast-path and periodic Redis sync
+//! This module provides [`RateLimiter`], the main entry point for the Trypema library.
+//! A single `RateLimiter` instance gives access to all three providers:
+//!
+//! - [`LocalRateLimiterProvider`] via [`RateLimiter::local()`] — in-process rate limiting
+//! - [`RedisRateLimiterProvider`] via [`RateLimiter::redis()`] — distributed rate limiting (Redis 6.2+)
+//! - [`HybridRateLimiterProvider`] via [`RateLimiter::hybrid()`] — local fast-path with periodic Redis sync
+//!
+//! `RateLimiter` is thread-safe and designed to be wrapped in `Arc<RateLimiter>`. The
+//! optional cleanup loop uses `Weak` references internally, so dropping all `Arc` references
+//! automatically stops background tasks without risk of keeping the limiter alive.
 //!
 //! # Examples
 //!
@@ -162,11 +167,14 @@ pub struct RateLimiterOptions {
 
 /// Primary rate limiter facade.
 ///
-/// Provides access to multiple rate limiting providers and strategies:
-/// - **Local provider:** In-process rate limiting with per-key state
-/// - **Redis provider:** Distributed rate limiting across processes/servers
+/// Provides access to all rate limiting providers and strategies through a single instance:
 ///
-/// Each provider supports multiple strategies (absolute, suppressed).
+/// - **Local provider** ([`RateLimiter::local()`]) — in-process, sub-microsecond latency
+/// - **Redis provider** ([`RateLimiter::redis()`]) — distributed via atomic Lua scripts
+/// - **Hybrid provider** ([`RateLimiter::hybrid()`]) — local fast-path with periodic Redis sync
+///
+/// Each provider exposes two strategies: **absolute** (deterministic sliding-window) and
+/// **suppressed** (probabilistic degradation).
 ///
 /// # Thread Safety
 ///
