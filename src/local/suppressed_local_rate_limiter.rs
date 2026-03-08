@@ -221,16 +221,6 @@ impl SuppressedLocalRateLimiter {
         count: u64,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> RateLimitDecision {
-        let suppression_factor = self.get_suppression_factor(key);
-
-        let should_allow = if suppression_factor == 0f64 {
-            true
-        } else if suppression_factor == 1f64 {
-            false
-        } else {
-            random_bool(1f64 - suppression_factor)
-        };
-
         let rate_limit_series = match self.series.get(key) {
             Some(rate_limit_series) => rate_limit_series,
             None => {
@@ -287,24 +277,39 @@ impl SuppressedLocalRateLimiter {
             _ => rate_limit_series,
         };
 
-        let total_declined;
-        let total;
         let soft_window_limit = rate_limit_series.limit / *self.hard_limit_factor;
+
+        let total = rate_limit_series.total.fetch_add(count, Ordering::Relaxed) + count;
+        let mut total_declined = rate_limit_series.total_declined.load(Ordering::Relaxed);
+        let suppression_factor;
+        let should_allow;
+
+        if total.saturating_sub(total_declined.saturating_add(count)) <= soft_window_limit as u64 {
+            suppression_factor = 0f64;
+            should_allow = true;
+        } else {
+            suppression_factor = self.get_suppression_factor(key);
+
+            should_allow = if suppression_factor == 0f64 {
+                true
+            } else if suppression_factor == 1f64 {
+                false
+            } else {
+                random_bool(1f64 - suppression_factor)
+            };
+
+            total_declined = rate_limit_series
+                .total_declined
+                .fetch_add(count, Ordering::Relaxed)
+                + count;
+        }
 
         if let Some(last_entry) = rate_limit_series.series.back()
             && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
         {
             last_entry.count.fetch_add(count, Ordering::Relaxed);
-            total = rate_limit_series.total.fetch_add(count, Ordering::Relaxed) + count;
-
             if !should_allow {
                 last_entry.declined.fetch_add(count, Ordering::Relaxed);
-                total_declined = rate_limit_series
-                    .total_declined
-                    .fetch_add(count, Ordering::Relaxed)
-                    + count;
-            } else {
-                total_declined = rate_limit_series.total_declined.load(Ordering::Relaxed);
             }
         } else {
             drop(rate_limit_series);
@@ -318,17 +323,6 @@ impl SuppressedLocalRateLimiter {
                 declined: AtomicU64::new(if should_allow { 0 } else { count }),
                 timestamp: Instant::now(),
             });
-
-            total = rate_limit_series.total.fetch_add(count, Ordering::Relaxed) + count;
-
-            if !should_allow {
-                total_declined = rate_limit_series
-                    .total_declined
-                    .fetch_add(count, Ordering::Relaxed)
-                    + count;
-            } else {
-                total_declined = rate_limit_series.total_declined.load(Ordering::Relaxed);
-            }
         }
 
         if total - total_declined <= soft_window_limit as u64 {
