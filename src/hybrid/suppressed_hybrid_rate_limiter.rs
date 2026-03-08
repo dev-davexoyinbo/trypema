@@ -260,16 +260,15 @@ impl SuppressedHybridRateLimiter {
                 .saturating_add(count.load(Ordering::Acquire))
                 .saturating_sub(declined);
 
-            let suppression_factor = if effective_total > window_limit {
-                1f64
-            } else if effective_total >= soft_window_limit
-                && soft_window_limit < window_limit
-                && effective_total < window_limit
-            {
+            let suppression_factor = if effective_total < soft_window_limit {
                 0f64
-            } else {
-                // soft == hard or effective == hard: full suppression.
+            } else if effective_total == soft_window_limit && soft_window_limit == window_limit {
+                // soft == hard: full suppression.
                 1f64
+            } else {
+                // soft < hard: local state hasn't been committed to Redis yet so we return 0 as a
+                // conservative approximation (Redis read will give the accurate value).
+                0f64
             };
             return Ok(suppression_factor);
         }

@@ -502,8 +502,6 @@ impl SuppressedLocalRateLimiter {
             return self.persist_suppression_factor(key, 0f64);
         }
 
-        eprintln!("calculate_suppression_factor: key={key}");
-
         let hard_window_limit = series.limit as u64;
         let soft_window_limit = (hard_window_limit as f64 / *self.hard_limit_factor) as u64;
 
@@ -516,19 +514,12 @@ impl SuppressedLocalRateLimiter {
 
         let accepted = total.saturating_sub(total_declined);
 
-        eprintln!(
-            "calculate_suppression_factor: key={key} total={total} total_declined={total_declined} accepted={accepted} soft_window_limit={soft_window_limit}"
-        );
-
         if accepted < soft_window_limit {
             return self.persist_suppression_factor(key, 0f64);
         }
 
-        if accepted == soft_window_limit {
-            // Exactly at the soft limit: full suppression only when soft == hard (no headroom).
-            if soft_window_limit == hard_window_limit {
-                return self.persist_suppression_factor(key, 1f64);
-            }
+        if accepted == soft_window_limit && soft_window_limit == hard_window_limit {
+            return self.persist_suppression_factor(key, 1f64);
         }
 
         let mut total_in_last_second = 0u64;

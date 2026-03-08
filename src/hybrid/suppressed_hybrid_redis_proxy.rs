@@ -98,8 +98,6 @@ const LUA_HELPERS: &str = r#"
             if soft_window_limit == window_limit then
                 return 1
             end
-
-            return 0
         elseif total_count >= window_limit then
             return 1
         end
