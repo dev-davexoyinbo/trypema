@@ -17,7 +17,7 @@ use local::*;
 
 /// Redis-backed distributed rate limiter implementations.
 ///
-/// Provides [`RedisRateLimiterProvider`](redis::RedisRateLimiterProvider), which executes
+/// Provides [`RedisRateLimiterProvider`], which executes
 /// all operations as atomic Lua scripts against Redis 6.2+. Each `inc()` or `is_allowed()`
 /// call results in one Redis round-trip.
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]

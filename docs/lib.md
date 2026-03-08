@@ -391,7 +391,7 @@ resource being limited (e.g., a user ID, API endpoint, or IP address). Each key 
 completely independent rate limiting state.
 
 - **Local provider:** Keys are arbitrary `&str` values. Any string is valid.
-- **Redis / Hybrid providers:** Keys use the [`RedisKey`](redis::RedisKey) newtype, which
+- **Redis / Hybrid providers:** Keys use the `RedisKey` newtype, which
   enforces validation rules (non-empty, ≤ 255 bytes, no `:` character).
 
 ### Rate Limits
@@ -463,7 +463,7 @@ Includes the same four fields as `LocalRateLimiterOptions`, plus:
 | -------------------- | ------------------------------------------ | ------------ | ---------------------------------------------------------------------------------------------------------------- |
 | `connection_manager` | `redis::aio::ConnectionManager`            | _(required)_ | Redis connection (handles pooling and reconnection).                                                             |
 | `prefix`             | `Option<RedisKey>`                         | `"trypema"`  | Namespace prefix for all Redis keys. Pattern: `{prefix}:{user_key}:{rate_type}:{suffix}`.                        |
-| `sync_interval_ms`   | [`SyncIntervalMs`](hybrid::SyncIntervalMs) | 10 ms        | How often the **hybrid** provider flushes local increments to Redis. The pure Redis provider ignores this value. |
+| `sync_interval_ms`   | `SyncIntervalMs`                           | 10 ms        | How often the **hybrid** provider flushes local increments to Redis. The pure Redis provider ignores this value. |
 
 ## Rate Limit Decisions
 
@@ -857,7 +857,7 @@ This section applies to both the **Redis** and **Hybrid** providers.
 
 ### Key Constraints
 
-Redis keys use the [`RedisKey`](redis::RedisKey) newtype with validation:
+Redis keys use the `RedisKey` newtype with validation:
 
 - **Must not be empty**
 - **Must be ≤ 255 bytes**

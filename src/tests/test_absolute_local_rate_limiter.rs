@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::common::{
-    HardLimitFactor, InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimitSeries,
+    HardLimitFactor, InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision,
     SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};

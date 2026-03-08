@@ -169,9 +169,9 @@ pub struct RateLimiterOptions {
 ///
 /// Provides access to all rate limiting providers and strategies through a single instance:
 ///
-/// - **Local provider** ([`RateLimiter::local()`]) — in-process, sub-microsecond latency
-/// - **Redis provider** ([`RateLimiter::redis()`]) — distributed via atomic Lua scripts
-/// - **Hybrid provider** ([`RateLimiter::hybrid()`]) — local fast-path with periodic Redis sync
+/// - **Local provider** (`rl.local()`) — in-process, sub-microsecond latency
+/// - **Redis provider** (`rl.redis()`) — distributed via atomic Lua scripts
+/// - **Hybrid provider** (`rl.hybrid()`) — local fast-path with periodic Redis sync
 ///
 /// Each provider exposes two strategies: **absolute** (deterministic sliding-window) and
 /// **suppressed** (probabilistic degradation).
