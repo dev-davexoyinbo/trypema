@@ -221,6 +221,16 @@ impl SuppressedLocalRateLimiter {
         count: u64,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> RateLimitDecision {
+        let suppression_factor = self.get_suppression_factor(key);
+
+        let should_allow = if suppression_factor == 0f64 {
+            true
+        } else if suppression_factor == 1f64 {
+            false
+        } else {
+            random_bool(1f64 - suppression_factor)
+        };
+
         let rate_limit_series = match self.series.get(key) {
             Some(rate_limit_series) => rate_limit_series,
             None => {
@@ -281,28 +291,11 @@ impl SuppressedLocalRateLimiter {
 
         let total = rate_limit_series.total.fetch_add(count, Ordering::AcqRel);
         let total_declined = rate_limit_series.total_declined.load(Ordering::Acquire);
-        let suppression_factor;
-        let should_allow;
 
-        if total.saturating_sub(total_declined) <= soft_window_limit as u64 {
-            suppression_factor = 0f64;
-            should_allow = true;
-        } else {
-            suppression_factor = self.get_suppression_factor(key);
-
-            should_allow = if suppression_factor == 0f64 {
-                true
-            } else if suppression_factor == 1f64 {
-                false
-            } else {
-                random_bool(1f64 - suppression_factor)
-            };
-
-            if !should_allow {
-                rate_limit_series
-                    .total_declined
-                    .fetch_add(count, Ordering::AcqRel);
-            }
+        if total.saturating_sub(total_declined) > soft_window_limit as u64 && !should_allow {
+            rate_limit_series
+                .total_declined
+                .fetch_add(count, Ordering::AcqRel);
         }
 
         if let Some(last_entry) = rate_limit_series.series.back()
