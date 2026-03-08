@@ -104,15 +104,19 @@ fn get_suppression_factor_computed_uses_last_second_peak_rate_at_threshold_bound
     let url = redis_url();
 
     runtime::block_on(async {
-        // window_size=10s, hard_limit_factor=2 => window_limit=20 and threshold is 10.
-        // We drive total_count to exactly 10 with a burst in < 1s so perceived_rate uses
-        // last-second peak (10 req/s) instead of average (1 req/s).
+        // window_size=10s, hard_limit_factor=2 => window_limit=20, soft_limit=10.
+        // Under the new semantics, accepted == soft with soft < hard returns sf=0 (no suppression
+        // yet). We must drive accepted *past* soft (to 11) so the ramp zone is entered and
+        // perceived_rate uses last-second peak instead of average.
         let cache_ms = 50_u64;
         let rl = build_limiter_with_cache_ms(&url, 10, 100, 2f64, cache_ms).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
 
-        for _ in 0..10 {
+        // Drive accepted to 11 in a burst < 1s. All 11 calls are pre-increment checks:
+        // call 11 sees pre-increment total=10. accepted=10 == soft=10, soft(10) != hard(20) => Allowed.
+        // After all 11 calls, total_count=11, total_declined=0, accepted=11.
+        for _ in 0..11 {
             let _ = rl
                 .redis()
                 .suppressed()
@@ -131,8 +135,12 @@ fn get_suppression_factor_computed_uses_last_second_peak_rate_at_threshold_bound
             .await
             .unwrap();
 
-        // rate_limit = 1 req/s; perceived_rate = 10 req/s => sf = 1 - 1/10 = 0.9
-        let expected = 1.0_f64 - (1.0_f64 / 10.0_f64);
+        // accepted(11) > soft(10) and total(11) < hard(20): enter ramp zone.
+        // rate_in_last_1s = 11, average_rate = 11/10 = 1.1.
+        // perceived_rate = max(1.1, 11) = 11.
+        // rate_limit = window_limit / window_size / hard_limit_factor = 20 / 10 / 2 = 1.
+        // sf = 1 - (1 / 11)
+        let expected = 1.0_f64 - (1.0_f64 / 11.0_f64);
         assert!(
             (sf - expected).abs() < 1e-12,
             "sf: {sf}, expected: {expected}"

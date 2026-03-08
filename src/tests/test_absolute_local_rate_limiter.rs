@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{atomic::AtomicU64, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -9,6 +9,7 @@ use crate::common::{
     HardLimitFactor, InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision,
     SuppressionFactorCacheMs, WindowSizeSeconds,
 };
+use crate::local::AbsoluteRateLimitSeries as RateLimitSeries;
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};
 
 fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
@@ -69,7 +70,6 @@ fn insert_series(
             limit,
             series,
             total: AtomicU64::new(total),
-            total_declined: AtomicU64::new(0),
         },
     );
 }

@@ -317,11 +317,25 @@ impl SuppressedLocalRateLimiter {
         let suppression_factor;
         let should_allow;
 
-        if forcasted_allowed <= soft_window_limit as u64 {
+        let soft = soft_window_limit as u64;
+
+        if forcasted_allowed < soft {
             should_allow = true;
             suppression_factor = 0f64;
+        } else if forcasted_allowed == soft {
+            // Exactly at soft limit: full suppression only when soft == hard (no headroom).
+            if soft_window_limit == hard_window_limit {
+                suppression_factor = 1f64;
+                should_allow = false;
+                rate_limit_series
+                    .total_declined
+                    .fetch_add(count, Ordering::AcqRel);
+            } else {
+                should_allow = true;
+                suppression_factor = 0f64;
+            }
         } else {
-            suppression_factor = if forcasted_allowed as f64 > hard_window_limit {
+            suppression_factor = if forcasted_allowed as f64 >= hard_window_limit {
                 1f64
             } else {
                 self.get_suppression_factor_without_bucket_expire(key)
@@ -498,7 +512,18 @@ impl SuppressedLocalRateLimiter {
             return self.persist_suppression_factor(key, 1f64);
         }
 
-        if total.saturating_sub(total_declined) < soft_window_limit as u64 {
+        let accepted = total.saturating_sub(total_declined);
+        let soft = soft_window_limit as u64;
+
+        if accepted < soft {
+            return self.persist_suppression_factor(key, 0f64);
+        }
+
+        if accepted == soft {
+            // Exactly at the soft limit: full suppression only when soft == hard (no headroom).
+            if soft_window_limit == hard_window_limit {
+                return self.persist_suppression_factor(key, 1f64);
+            }
             return self.persist_suppression_factor(key, 0f64);
         }
 
