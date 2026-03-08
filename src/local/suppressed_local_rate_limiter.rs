@@ -293,7 +293,7 @@ impl SuppressedLocalRateLimiter {
             suppression_factor = if forcasted_allowed as f64 > hard_window_limit {
                 1f64
             } else {
-                self.get_suppression_factor(key)
+                self.get_suppression_factor_without_bucket_expire(key)
             };
 
             should_allow = if suppression_factor == 0f64 {
@@ -393,8 +393,11 @@ impl SuppressedLocalRateLimiter {
     /// Returns the cached value if it is still fresh, otherwise recomputes and refreshes
     /// the cache.
     pub fn get_suppression_factor(&self, key: &str) -> f64 {
-        // self.remove_expired_buckets(key);
+        self.remove_expired_buckets(key);
+        self.get_suppression_factor_without_bucket_expire(key)
+    } // end method get_suppression_factor
 
+    fn get_suppression_factor_without_bucket_expire(&self, key: &str) -> f64 {
         let suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
             Some(val)
