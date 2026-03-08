@@ -192,8 +192,10 @@ const SUPPRESSED_INC_LUA: &str = r#"
 
     redis.call("EXPIRE", window_limit_key, window_size_seconds)
 
-    if total_count - total_declined < window_limit / hard_limit_factor then
+    if total_count - total_declined <= window_limit / hard_limit_factor then
         return {"allowed", 0, 0}
+    elseif total_count > window_limit then
+        return {"suppressed", "1", "0"}
     else
         return {"suppressed", tostring(suppression_factor), should_allow and "1" or "0"}
     end
