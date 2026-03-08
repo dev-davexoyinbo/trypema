@@ -1,18 +1,36 @@
 use std::{
+    collections::VecDeque,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-use ahash::RandomState;
 use dashmap::DashMap;
 
 use crate::{
     LocalRateLimiterOptions, RateGroupSizeMs, RateLimitDecision,
     common::{
-        HardLimitFactor, InstantRate, RateLimit, RateLimitSeries, SuppressionFactorCacheMs,
-        WindowSizeSeconds,
+        HardLimitFactor, InstantRate, RateLimit, SuppressionFactorCacheMs, WindowSizeSeconds,
     },
 };
+
+#[derive(Debug)]
+pub(crate) struct RateLimitSeries {
+    pub limit: f64,
+    pub series: VecDeque<InstantRate>,
+    pub total: AtomicU64,
+    pub total_declined: AtomicU64,
+}
+
+impl RateLimitSeries {
+    pub fn new(limit: f64) -> Self {
+        Self {
+            limit,
+            series: VecDeque::new(),
+            total: AtomicU64::new(0),
+            total_declined: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Probabilistic in-process rate limiter for graceful degradation.
 ///
@@ -169,10 +187,10 @@ pub struct SuppressedLocalRateLimiter {
     window_size_ms: u128,
     window_duration: Duration,
     rate_group_size_ms: RateGroupSizeMs,
-    series: DashMap<String, RateLimitSeries, RandomState>,
+    series: DashMap<String, RateLimitSeries>,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
-    suppression_factors: DashMap<String, (Instant, f64), RandomState>,
+    suppression_factors: DashMap<String, (Instant, f64)>,
 }
 
 impl SuppressedLocalRateLimiter {
@@ -216,9 +234,11 @@ impl SuppressedLocalRateLimiter {
         let rate_limit_series = match self.series.get(key) {
             Some(rate_limit_series) => rate_limit_series,
             None => {
-                self.series
-                    .entry(key.to_string())
-                    .or_insert_with(|| RateLimitSeries::new(self.get_hard_limit(rate_limit)));
+                self.series.entry(key.to_string()).or_insert_with(|| {
+                    RateLimitSeries::new(
+                        **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64,
+                    )
+                });
 
                 let Some(rate_limit_series) = self.series.get(key) else {
                     unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
@@ -228,16 +248,63 @@ impl SuppressedLocalRateLimiter {
             }
         };
 
+        // delete expired buckets if necessary
+        let rate_limit_series = match rate_limit_series.series.front() {
+            None => rate_limit_series,
+            Some(instant_rate)
+                if instant_rate.timestamp.elapsed().as_millis() > self.window_size_ms =>
+            {
+                drop(rate_limit_series);
+                let mut rate_limit_series =
+                    self.series.get_mut(key).expect("Key should be present");
+                let now = Instant::now();
+
+                let split = rate_limit_series
+                    .series
+                    .partition_point(|r| now.duration_since(r.timestamp) > self.window_duration);
+
+                let (removed_count, removed_declined) = rate_limit_series
+                    .series
+                    .drain(..split)
+                    .fold((0u64, 0u64), |(count, declined), r| {
+                        (
+                            count + r.count.load(Ordering::Relaxed),
+                            declined + r.declined.load(Ordering::Relaxed),
+                        )
+                    });
+
+                rate_limit_series
+                    .total
+                    .fetch_sub(removed_count, Ordering::Relaxed);
+                rate_limit_series
+                    .total_declined
+                    .fetch_sub(removed_declined, Ordering::Relaxed);
+
+                drop(rate_limit_series);
+
+                self.series.get(key).expect("Key should be present")
+            }
+            _ => rate_limit_series,
+        };
+
+        let total_declined;
+        let total;
+        let soft_window_limit = rate_limit_series.limit / *self.hard_limit_factor;
+
         if let Some(last_entry) = rate_limit_series.series.back()
             && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
         {
             last_entry.count.fetch_add(count, Ordering::Relaxed);
-            rate_limit_series.total.fetch_add(count, Ordering::Relaxed);
+            total = rate_limit_series.total.fetch_add(count, Ordering::Relaxed) + count;
+
             if !should_allow {
                 last_entry.declined.fetch_add(count, Ordering::Relaxed);
-                rate_limit_series
+                total_declined = rate_limit_series
                     .total_declined
-                    .fetch_add(count, Ordering::Relaxed);
+                    .fetch_add(count, Ordering::Relaxed)
+                    + count;
+            } else {
+                total_declined = rate_limit_series.total_declined.load(Ordering::Relaxed);
             }
         } else {
             drop(rate_limit_series);
@@ -252,21 +319,25 @@ impl SuppressedLocalRateLimiter {
                 timestamp: Instant::now(),
             });
 
-            rate_limit_series.total.fetch_add(count, Ordering::Relaxed);
+            total = rate_limit_series.total.fetch_add(count, Ordering::Relaxed) + count;
 
             if !should_allow {
-                rate_limit_series
+                total_declined = rate_limit_series
                     .total_declined
-                    .fetch_add(count, Ordering::Relaxed);
+                    .fetch_add(count, Ordering::Relaxed)
+                    + count;
+            } else {
+                total_declined = rate_limit_series.total_declined.load(Ordering::Relaxed);
             }
         }
 
-        match suppression_factor {
-            0f64 => RateLimitDecision::Allowed,
-            _ => RateLimitDecision::Suppressed {
+        if total - total_declined <= soft_window_limit as u64 {
+            RateLimitDecision::Allowed
+        } else {
+            RateLimitDecision::Suppressed {
                 suppression_factor,
                 is_allowed: should_allow,
-            },
+            }
         }
     }
 
@@ -376,17 +447,17 @@ impl SuppressedLocalRateLimiter {
             return self.persist_suppression_factor(key, 0f64);
         }
 
-        let hard_limit = series.limit;
-        let rate_limit = self.get_rate_limit_from_hard_limit(&hard_limit);
+        let hard_window_limit = series.limit;
+        let soft_window_limit = hard_window_limit / *self.hard_limit_factor;
 
-        let window_limit = *self.window_size_seconds as f64 * *rate_limit;
-        let hard_window_limit = *self.window_size_seconds as f64 * *hard_limit;
+        let total = series.total.load(Ordering::Relaxed);
+        let total_declined = series.total_declined.load(Ordering::Relaxed);
 
-        if series.total.load(Ordering::Relaxed) >= hard_window_limit as u64 {
+        if total >= hard_window_limit as u64 {
             return self.persist_suppression_factor(key, 1f64);
         }
 
-        if series.total.load(Ordering::Relaxed) < window_limit as u64 {
+        if total.saturating_sub(total_declined) < soft_window_limit as u64 {
             return self.persist_suppression_factor(key, 0f64);
         }
 
@@ -401,38 +472,15 @@ impl SuppressedLocalRateLimiter {
                 total_in_last_second.saturating_add(instant_rate.count.load(Ordering::Relaxed));
         }
 
-        let average_rate_in_window: f64 =
-            series.total.load(Ordering::Relaxed) as f64 / *self.window_size_seconds as f64;
+        let average_rate_in_window: f64 = total as f64 / *self.window_size_seconds as f64;
 
         let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
 
-        let suppression_factor = 1f64 - (*rate_limit / perceived_rate_limit);
+        let suppression_factor =
+            1f64 - (soft_window_limit / *self.window_size_seconds as f64 / perceived_rate_limit);
 
         self.persist_suppression_factor(key, suppression_factor)
     } // end method calculate_suppression_factor
-
-    #[inline]
-    fn get_hard_limit(&self, rate_limit: &RateLimit) -> RateLimit {
-        // if hard limit factor is always > 0 and rate limit is always > 0, this is safe
-        let Ok(val) = RateLimit::try_from(*self.hard_limit_factor * **rate_limit) else {
-            unreachable!(
-                "SuppressedLocalRateLimiter::get_hard_limit: hard_limit_factor is always > 0"
-            );
-        };
-
-        val
-    } // end method get_hard_limit
-
-    #[inline]
-    fn get_rate_limit_from_hard_limit(&self, hard_limit: &RateLimit) -> RateLimit {
-        let Ok(val) = RateLimit::try_from(**hard_limit / *self.hard_limit_factor) else {
-            unreachable!(
-                "SuppressedLocalRateLimiter::get_rate_limit_from_hard_limit: hard_limit_factor is always > 0"
-            );
-        };
-
-        val
-    }
 
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {
         self.suppression_factors
