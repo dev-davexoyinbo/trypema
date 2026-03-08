@@ -202,13 +202,6 @@ const SUPPRESSED_INC_LUA: &str = r#"
 
     if (total_count - total_declined) < soft_window_limit then
         return {"allowed", 0, 0}
-    elseif (total_count - total_declined) == soft_window_limit then
-        if soft_window_limit == window_limit then
-            return {"suppressed", "1", "0"}
-        end
-        return {"allowed", 0, 0}
-    elseif total_count >= window_limit then
-        return {"suppressed", "1", "0"}
     else
         return {"suppressed", tostring(suppression_factor), should_allow and "1" or "0"}
     end
