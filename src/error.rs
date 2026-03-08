@@ -104,7 +104,8 @@ pub enum TrypemaError {
 
     /// Hard limit factor is invalid.
     ///
-    /// Hard limit factor must be positive (> 0.0).
+    /// Hard limit factor must be ≥ 1.0. A value below 1.0 would set the hard limit
+    /// below the base rate limit, causing suppression to be permanently active.
     ///
     /// # Examples
     ///
@@ -113,6 +114,10 @@ pub enum TrypemaError {
     ///
     /// assert!(matches!(
     ///     HardLimitFactor::try_from(0.0),
+    ///     Err(TrypemaError::InvalidHardLimitFactor(_))
+    /// ));
+    /// assert!(matches!(
+    ///     HardLimitFactor::try_from(0.5),
     ///     Err(TrypemaError::InvalidHardLimitFactor(_))
     /// ));
     /// ```

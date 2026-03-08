@@ -11,7 +11,7 @@
 //! | [`RateLimit`] | Per-second rate limit (positive `f64`, supports non-integer rates) |
 //! | [`WindowSizeSeconds`] | Sliding window duration in seconds (≥ 1) |
 //! | [`RateGroupSizeMs`] | Bucket coalescing interval in milliseconds (≥ 1, default 100ms) |
-//! | [`HardLimitFactor`] | Hard cutoff multiplier for the suppressed strategy (> 0, default 1.0) |
+//! | [`HardLimitFactor`] | Hard cutoff multiplier for the suppressed strategy (≥ 1.0, default 1.0) |
 //! | [`SuppressionFactorCacheMs`] | Cache duration for suppression factor recomputation (≥ 1, default 100ms) |
 
 use std::{
@@ -405,12 +405,18 @@ impl TryFrom<u64> for RateGroupSizeMs {
 ///
 /// The suppressed strategy uses probabilistic suppression to keep the accepted rate
 /// near the target limit. This factor sets a hard ceiling beyond which all requests
-/// are unconditionally rejected (not suppressed).
+/// are unconditionally denied (suppression factor forced to `1.0`).
+///
+/// # Validation
+///
+/// Must be ≥ 1.0. A value below 1.0 would set the hard limit *below* the base rate
+/// limit, which makes no sense — suppression would be permanently active even under
+/// normal load.
 ///
 /// # Values
 ///
-/// - `1.0` (default): Hard limit equals base limit (suppression less useful)
-/// - `1.5-2.0`: Recommended; allows 50-100% burst headroom before hard rejection
+/// - `1.0` (default): Hard limit equals base limit (suppression ramps from 0 to 1 with no headroom)
+/// - `1.5–2.0` (**recommended**): Allows 50–100% burst headroom before full suppression
 /// - `> 2.0`: Very permissive; large gap between target and hard limit
 ///
 /// # Only Relevant For
@@ -431,8 +437,9 @@ impl TryFrom<u64> for RateGroupSizeMs {
 /// let rate = RateLimit::try_from(10.0).unwrap();
 /// // Hard limit = 10.0 × 1.5 = 15.0 req/s
 ///
-/// // Invalid: must be positive
+/// // Invalid: must be at least 1.0
 /// assert!(HardLimitFactor::try_from(0.0).is_err());
+/// assert!(HardLimitFactor::try_from(0.99).is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct HardLimitFactor(f64);
@@ -459,9 +466,9 @@ impl TryFrom<f64> for HardLimitFactor {
     type Error = TrypemaError;
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
-        if value <= 0f64 {
+        if value < 1f64 {
             Err(TrypemaError::InvalidHardLimitFactor(
-                "Hard limit factor must be greater than 0".to_string(),
+                "Hard limit factor must be greater than or equal to 1".to_string(),
             ))
         } else {
             Ok(Self(value))

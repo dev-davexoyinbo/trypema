@@ -2,16 +2,16 @@
 
 ## Name and Biblical Inspiration
 
-The name **Trypema** is derived from the Koine Greek word **"τρυπήματος"** (*trypematos*),
+The name **Trypema** is derived from the Koine Greek word **"τρυπήματος"** (_trypematos_),
 meaning "hole" or "opening." It appears in the phrase **"διὰ τρυπήματος ῥαφίδος"**
 ("through the eye of a needle"), spoken by Jesus in three of the four Gospels:
 
-- **Matthew 19:24** — *"Again I tell you, it is easier for a camel to go through the eye of a
-  needle than for someone who is rich to enter the kingdom of God."*
-- **Mark 10:25** — *"It is easier for a camel to go through the eye of a needle than for someone
-  who is rich to enter the kingdom of God."*
-- **Luke 18:25** — *"Indeed, it is easier for a camel to go through the eye of a needle than for
-  someone who is rich to enter the kingdom of God."*
+- **Matthew 19:24** — _"Again I tell you, it is easier for a camel to go through the eye of a
+  needle than for someone who is rich to enter the kingdom of God."_
+- **Mark 10:25** — _"It is easier for a camel to go through the eye of a needle than for someone
+  who is rich to enter the kingdom of God."_
+- **Luke 18:25** — _"Indeed, it is easier for a camel to go through the eye of a needle than for
+  someone who is rich to enter the kingdom of God."_
 
 Just as the eye of a needle is a narrow passage that restricts what can pass through,
 a rate limiter is a narrow gate that controls the flow of requests into a system.
@@ -34,10 +34,10 @@ probabilistic suppression — across three provider backends.
 Trypema organises rate limiting into three **providers**, each suited to different deployment
 scenarios:
 
-| Provider | Backend | Latency | Consistency | Use Case |
-|----------|---------|---------|-------------|----------|
-| **Local** | In-process `DashMap` + atomics | Sub-microsecond | Single-process only | CLI tools, single-server APIs |
-| **Redis** | Redis 6.2+ via Lua scripts | Network round-trip per call | Distributed (best-effort) | Multi-process / multi-server |
+| Provider   | Backend                               | Latency                     | Consistency               | Use Case                         |
+| ---------- | ------------------------------------- | --------------------------- | ------------------------- | -------------------------------- |
+| **Local**  | In-process `DashMap` + atomics        | Sub-microsecond             | Single-process only       | CLI tools, single-server APIs    |
+| **Redis**  | Redis 6.2+ via Lua scripts            | Network round-trip per call | Distributed (best-effort) | Multi-process / multi-server     |
 | **Hybrid** | Local fast-path + periodic Redis sync | Sub-microsecond (fast-path) | Distributed with sync lag | High-throughput distributed APIs |
 
 ### Strategies
@@ -49,7 +49,7 @@ Each provider exposes two **strategies** that determine how rate limit decisions
 
 - **Suppressed** — A probabilistic strategy inspired by
   [Ably's distributed rate limiting approach](https://ably.com/blog/distributed-rate-limiting-scale-your-platform).
-  Instead of a hard cutoff, it computes a *suppression factor* and probabilistically denies a
+  Instead of a hard cutoff, it computes a _suppression factor_ and probabilistically denies a
   fraction of requests proportional to how far over the limit the key is. This produces smooth
   degradation rather than a cliff-edge rejection.
 
@@ -408,6 +408,7 @@ window_capacity = window_size_seconds × rate_limit
 ```
 
 **Example:** With a 60-second window and a rate limit of `5.0`:
+
 - Window capacity = 60 × 5.0 = **300 requests**
 
 ### Sliding Windows
@@ -426,6 +427,7 @@ To reduce memory and computational overhead, increments that occur within
 tracked individually.
 
 For example, with `rate_group_size_ms = 10`:
+
 - 50 requests arriving within 10ms produce **1 bucket** with count = 50
 - 50 requests spread over 100ms produce roughly **10 buckets** with count ≈ 5 each
 
@@ -446,22 +448,22 @@ and start fresh.
 
 ### `LocalRateLimiterOptions`
 
-| Field | Type | Default | Valid Range | Description |
-|-------|------|---------|-------------|-------------|
-| `window_size_seconds` | [`WindowSizeSeconds`] | *(required)* | ≥ 1 | Length of the sliding window. Larger = smoother but slower recovery. |
-| `rate_group_size_ms` | [`RateGroupSizeMs`] | 100 ms | ≥ 1 | Bucket coalescing interval. Larger = less memory, coarser timing. |
-| `hard_limit_factor` | [`HardLimitFactor`] | 1.0 | > 0.0 | Multiplier for hard cutoff in suppressed strategy. Ignored by absolute. |
-| `suppression_factor_cache_ms` | [`SuppressionFactorCacheMs`] | 100 ms | ≥ 1 | How long to cache the computed suppression factor per key before recomputing. |
+| Field                         | Type                         | Default      | Valid Range | Description                                                                   |
+| ----------------------------- | ---------------------------- | ------------ | ----------- | ----------------------------------------------------------------------------- |
+| `window_size_seconds`         | [`WindowSizeSeconds`]        | _(required)_ | ≥ 1         | Length of the sliding window. Larger = smoother but slower recovery.          |
+| `rate_group_size_ms`          | [`RateGroupSizeMs`]          | 100 ms       | ≥ 1         | Bucket coalescing interval. Larger = less memory, coarser timing.             |
+| `hard_limit_factor`           | [`HardLimitFactor`]          | 1.0          | ≥ 1.0       | Multiplier for hard cutoff in suppressed strategy. Ignored by absolute.       |
+| `suppression_factor_cache_ms` | [`SuppressionFactorCacheMs`] | 100 ms       | ≥ 1         | How long to cache the computed suppression factor per key before recomputing. |
 
 ### `RedisRateLimiterOptions`
 
 Includes the same four fields as `LocalRateLimiterOptions`, plus:
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `connection_manager` | `redis::aio::ConnectionManager` | *(required)* | Redis connection (handles pooling and reconnection). |
-| `prefix` | `Option<RedisKey>` | `"trypema"` | Namespace prefix for all Redis keys. Pattern: `{prefix}:{user_key}:{rate_type}:{suffix}`. |
-| `sync_interval_ms` | [`SyncIntervalMs`](hybrid::SyncIntervalMs) | 10 ms | How often the **hybrid** provider flushes local increments to Redis. The pure Redis provider ignores this value. |
+| Field                | Type                                       | Default      | Description                                                                                                      |
+| -------------------- | ------------------------------------------ | ------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `connection_manager` | `redis::aio::ConnectionManager`            | _(required)_ | Redis connection (handles pooling and reconnection).                                                             |
+| `prefix`             | `Option<RedisKey>`                         | `"trypema"`  | Namespace prefix for all Redis keys. Pattern: `{prefix}:{user_key}:{rate_type}:{suffix}`.                        |
+| `sync_interval_ms`   | [`SyncIntervalMs`](hybrid::SyncIntervalMs) | 10 ms        | How often the **hybrid** provider flushes local increments to Redis. The pure Redis provider ignores this value. |
 
 ## Rate Limit Decisions
 
@@ -528,6 +530,7 @@ let decision = RateLimitDecision::Suppressed {
 **Tracking observed vs. declined:**
 
 The suppressed strategy tracks two counters per key:
+
 - **observed** (`total`): all calls seen (always incremented, regardless of admission)
 - **declined**: calls that were denied by suppression (`is_allowed: false`)
 
@@ -573,17 +576,20 @@ fraction of requests as the key approaches and exceeds its limit.
 The suppressed strategy operates in three regimes:
 
 **1. Below capacity** — When `accepted_usage < window_capacity`:
+
 - Suppression factor is `0.0`
 - All requests return [`RateLimitDecision::Allowed`]
 - No probabilistic logic involved
 
 **2. At or above capacity (but below hard limit)** — When usage exceeds the soft limit
 but hasn't reached `rate_limit × hard_limit_factor`:
+
 - A suppression factor is computed and cached per key
 - Each request is probabilistically allowed with probability `1.0 - suppression_factor`
 - Returns [`RateLimitDecision::Suppressed { is_allowed, suppression_factor }`]
 
 **3. Over hard limit** — When `observed_usage >= window_capacity × hard_limit_factor`:
+
 - Suppression factor is forced to `1.0`
 - All requests are denied
 - Returns `Suppressed { is_allowed: false, suppression_factor: 1.0 }`
@@ -602,7 +608,7 @@ allowing suppression to respond quickly to short traffic spikes.
 **Use cases:**
 
 - Graceful degradation under load spikes (smooth ramp-up of rejections)
-- Observability: the suppression factor tells you *how close* a key is to its limit
+- Observability: the suppression factor tells you _how close_ a key is to its limit
 - Load shedding with visibility into suppression rates for monitoring dashboards
 
 **Inspiration:** Based on
@@ -644,16 +650,16 @@ calculations, avoiding issues with client clock skew.
 **Data model:** For a key `K` with prefix `P` and rate type `T`, the following Redis keys
 are used:
 
-| Redis Key | Type | Purpose |
-|-----------|------|---------|
-| `P:K:T:h` | Hash | Sliding window buckets (`timestamp_ms → count`) |
-| `P:K:T:a` | Sorted Set | Active bucket timestamps (for efficient eviction) |
-| `P:K:T:w` | String | Window limit (set on first call, refreshed with `EXPIRE`) |
-| `P:K:T:t` | String | Total count across all buckets |
-| `P:K:T:d` | String | Total declined count (suppressed strategy only) |
-| `P:K:T:hd` | Hash | Declined counts per bucket (suppressed strategy only) |
-| `P:K:T:sf` | String | Cached suppression factor (with `PX` TTL, suppressed only) |
-| `P:active_entities` | Sorted Set | All active keys (used by cleanup) |
+| Redis Key           | Type       | Purpose                                                    |
+| ------------------- | ---------- | ---------------------------------------------------------- |
+| `P:K:T:h`           | Hash       | Sliding window buckets (`timestamp_ms → count`)            |
+| `P:K:T:a`           | Sorted Set | Active bucket timestamps (for efficient eviction)          |
+| `P:K:T:w`           | String     | Window limit (set on first call, refreshed with `EXPIRE`)  |
+| `P:K:T:t`           | String     | Total count across all buckets                             |
+| `P:K:T:d`           | String     | Total declined count (suppressed strategy only)            |
+| `P:K:T:hd`          | Hash       | Declined counts per bucket (suppressed strategy only)      |
+| `P:K:T:sf`          | String     | Cached suppression factor (with `PX` TTL, suppressed only) |
+| `P:active_entities` | Sorted Set | All active keys (used by cleanup)                          |
 
 ### Hybrid Provider
 
@@ -665,11 +671,13 @@ local increments and flushes them to Redis, then reads back the updated Redis st
 the local view.
 
 **State machine (absolute):**
+
 - `Undefined` → First call reads Redis to initialise local state
 - `Accepting` → Serving from local counter (no Redis I/O per request)
 - `Rejecting` → Rejection cache based on oldest bucket's TTL
 
 **State machine (suppressed):**
+
 - `Undefined` → First call reads Redis to initialise
 - `Accepting` → Below capacity; all requests allowed from local state
 - `Suppressing` → At/above capacity; probabilistic admission based on the suppression factor

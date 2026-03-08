@@ -40,19 +40,28 @@ fn rate_group_size_ms_try_from_validates_nonzero() {
 }
 
 #[test]
-fn hard_limit_factor_default_and_try_from_validate_positive() {
+fn hard_limit_factor_default_and_try_from_validate_at_least_one() {
     let d = HardLimitFactor::default();
     assert_eq!(*d, 1f64);
 
     let h = HardLimitFactor::try_from(2f64).unwrap();
     assert_eq!(*h, 2f64);
 
+    // Exactly 1.0 is valid (the minimum)
+    let h = HardLimitFactor::try_from(1f64).unwrap();
+    assert_eq!(*h, 1f64);
+
+    // Below 1.0 is invalid
     assert_eq!(
         HardLimitFactor::try_from(0f64).unwrap_err().to_string(),
-        "invalid hard limit factor: Hard limit factor must be greater than 0"
+        "invalid hard limit factor: Hard limit factor must be greater than or equal to 1"
+    );
+    assert_eq!(
+        HardLimitFactor::try_from(0.5f64).unwrap_err().to_string(),
+        "invalid hard limit factor: Hard limit factor must be greater than or equal to 1"
     );
     assert_eq!(
         HardLimitFactor::try_from(-1f64).unwrap_err().to_string(),
-        "invalid hard limit factor: Hard limit factor must be greater than 0"
+        "invalid hard limit factor: Hard limit factor must be greater than or equal to 1"
     );
 }
