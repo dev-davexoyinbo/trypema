@@ -90,9 +90,17 @@ const LUA_HELPERS: &str = r#"
             return 0
         end
 
-        if (total_count - total_declined) <= window_limit / hard_limit_factor then
+        local soft_window_limit = (window_limit / hard_limit_factor)
+
+        if (total_count - total_declined) < soft_window_limit then
             return 0
-        elseif total_count > window_limit then
+        elseif (total_count - total_declined) == soft_window_limit then
+            if soft_window_limit == window_limit then
+                return 1
+            end
+
+            return 0
+        elseif total_count >= window_limit then
             return 1
         end
 
