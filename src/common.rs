@@ -10,7 +10,6 @@
 //! These types are re-exported at the crate root for convenience.
 
 use std::{
-    collections::VecDeque,
     ops::{Deref, DerefMut},
     sync::atomic::AtomicU64,
     time::Instant,
@@ -23,25 +22,6 @@ pub(crate) struct InstantRate {
     pub count: AtomicU64,
     pub declined: AtomicU64,
     pub timestamp: Instant,
-}
-
-#[derive(Debug)]
-pub(crate) struct RateLimitSeries {
-    pub limit: RateLimit,
-    pub series: VecDeque<InstantRate>,
-    pub total: AtomicU64,
-    pub total_declined: AtomicU64,
-}
-
-impl RateLimitSeries {
-    pub fn new(limit: RateLimit) -> Self {
-        Self {
-            limit,
-            series: VecDeque::new(),
-            total: AtomicU64::new(0),
-            total_declined: AtomicU64::new(0),
-        }
-    }
 }
 
 /// Result of a rate limit admission check.

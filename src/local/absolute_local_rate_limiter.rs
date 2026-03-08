@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -8,11 +9,25 @@ use dashmap::DashMap;
 
 use crate::{
     LocalRateLimiterOptions,
-    common::{
-        InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimitSeries,
-        WindowSizeSeconds,
-    },
+    common::{InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, WindowSizeSeconds},
 };
+
+#[derive(Debug)]
+pub(crate) struct RateLimitSeries {
+    pub limit: RateLimit,
+    pub series: VecDeque<InstantRate>,
+    pub total: AtomicU64,
+}
+
+impl RateLimitSeries {
+    pub fn new(limit: RateLimit) -> Self {
+        Self {
+            limit,
+            series: VecDeque::new(),
+            total: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Strict sliding-window rate limiter for in-process use.
 ///
