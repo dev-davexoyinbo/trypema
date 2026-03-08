@@ -1,85 +1,49 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 
+#[path = "runtime.rs"]
+mod runtime;
+
+#[path = "common.rs"]
+mod common;
+
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 mod enabled {
-    use std::{env, sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use criterion::Criterion;
     use std::hint::black_box;
 
-    use trypema::local::LocalRateLimiterOptions;
-    use trypema::redis::{RedisKey, RedisRateLimiterOptions};
-    use trypema::{
-        HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions,
-        SuppressionFactorCacheMs, WindowSizeSeconds, hybrid::SyncIntervalMs,
-    };
+    use trypema::redis::RedisKey;
+    use trypema::{HardLimitFactor, RateLimit};
 
-    #[cfg(feature = "redis-tokio")]
-    macro_rules! block_on {
-        ($rt:expr, $fut:expr) => {
-            $rt.block_on($fut)
-        };
-    }
-
-    #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-    macro_rules! block_on {
-        ($rt:expr, $fut:expr) => {
-            smol::block_on($fut)
-        };
-    }
-
-    fn redis_url() -> String {
-        env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379/".to_string())
-    }
+    use super::common::redis::{LimiterConfig, build_limiter};
+    use super::runtime;
 
     pub fn bench_inc(c: &mut Criterion) {
         let mut group = c.benchmark_group("redis_absolute");
         group.sample_size(50);
 
-        #[cfg(feature = "redis-tokio")]
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(2)
-            .build()
-            .unwrap();
+        let rt = runtime::build();
 
-        #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-        let rt = ();
-
-        let rl = block_on!(rt, async {
-            let client = redis::Client::open(redis_url()).unwrap();
-            let connection_manager = client.get_connection_manager().await.unwrap();
-
-            Arc::new(RateLimiter::new(RateLimiterOptions {
-                local: LocalRateLimiterOptions {
-                    window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-                    rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-                    hard_limit_factor: HardLimitFactor::default(),
-                    suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-                },
-                redis: RedisRateLimiterOptions {
-                    connection_manager,
-                    prefix: Some(RedisKey::try_from("bench".to_string()).unwrap()),
-                    window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-                    rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
-                    hard_limit_factor: HardLimitFactor::default(),
-                    suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-                    sync_interval_ms: SyncIntervalMs::default(),
-                },
-            }))
-        });
+        let rl = runtime::block_on(
+            &rt,
+            build_limiter(LimiterConfig {
+                hard_limit_factor: *HardLimitFactor::default(),
+                ..LimiterConfig::default()
+            }),
+        );
 
         let key = RedisKey::try_from("user_1".to_string()).unwrap();
         let rate = RateLimit::max();
 
         // Ensure connection is warm.
-        block_on!(rt, async {
+        runtime::block_on(&rt, async {
             let _ = rl.redis().absolute().inc(&key, &rate, 1).await.unwrap();
         });
 
         group.bench_function("inc/hot_key", |b| {
             b.iter(|| {
-                let _ = block_on!(rt, async {
+                let _ = runtime::block_on(&rt, async {
                     let res = rl
                         .redis()
                         .absolute()
@@ -92,7 +56,7 @@ mod enabled {
 
         group.bench_function("is_allowed/hot_key", |b| {
             b.iter(|| {
-                let _ = block_on!(rt, async {
+                let _ = runtime::block_on(&rt, async {
                     let res = rl.redis().absolute().is_allowed(black_box(&key)).await;
                     black_box(res)
                 });
