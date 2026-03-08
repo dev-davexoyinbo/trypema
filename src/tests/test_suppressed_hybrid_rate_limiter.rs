@@ -188,13 +188,14 @@ fn hybrid_suppressed_crossing_base_capacity_does_not_call_rng_when_sf_is_zero() 
         let rate_group_size_ms = 1_000_u64;
         let sync_interval_ms = 25_u64;
         let hard_limit_factor = 1.0_f64;
+        let cache_ms = 25_u64;
 
         let rl = build_limiter_with_prefix(
             &url,
             window_size_seconds,
             rate_group_size_ms,
             hard_limit_factor,
-            25,
+            cache_ms,
             sync_interval_ms,
             unique_prefix(),
         )
@@ -218,7 +219,9 @@ fn hybrid_suppressed_crossing_base_capacity_does_not_call_rng_when_sf_is_zero() 
                 // With hard_limit_factor=1.0, the final request that *reaches* soft==hard
                 // triggers a Redis-read. Redis may not yet reflect committed increments so
                 // sf can be 0.0 or 1.0; either way the request must be admitted (is_allowed: true).
-                RateLimitDecision::Suppressed { is_allowed: true, .. } => {}
+                RateLimitDecision::Suppressed {
+                    is_allowed: true, ..
+                } => {}
                 other => panic!("d: {other:?}"),
             }
         }
@@ -580,7 +583,9 @@ fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_zero() {
                 RateLimitDecision::Allowed => {}
                 // The final item (accepted == soft == hard) triggers a Redis-read; sf may be 0.0
                 // or 1.0 depending on Redis commit lag, but the request must be admitted.
-                RateLimitDecision::Suppressed { is_allowed: true, .. } => {}
+                RateLimitDecision::Suppressed {
+                    is_allowed: true, ..
+                } => {}
                 other => panic!("d: {other:?}"),
             }
         }
@@ -666,7 +671,9 @@ fn hybrid_suppressed_per_key_state_is_independent() {
             match d {
                 RateLimitDecision::Allowed => {}
                 // Final item may trigger Redis-read with stale sf; must be admitted.
-                RateLimitDecision::Suppressed { is_allowed: true, .. } => {}
+                RateLimitDecision::Suppressed {
+                    is_allowed: true, ..
+                } => {}
                 other => panic!("d: {other:?}"),
             }
         }
@@ -749,8 +756,6 @@ fn hybrid_suppressed_batch_increment_respects_soft_limit_boundary() {
             "d2: {d2:?}"
         );
 
-        runtime::async_sleep(Duration::from_millis(100)).await;
-
         // Crosses boundary -> suppression begins; sf is 0.0 on the local overflow path.
         let mut rng3 = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
         let d3 = rl
@@ -822,7 +827,9 @@ fn hybrid_suppressed_does_not_commit_before_soft_limit_overflow() {
             match d {
                 RateLimitDecision::Allowed => {}
                 // Final item may trigger Redis-read with stale sf; must be admitted.
-                RateLimitDecision::Suppressed { is_allowed: true, .. } => {}
+                RateLimitDecision::Suppressed {
+                    is_allowed: true, ..
+                } => {}
                 other => panic!("d: {other:?}"),
             }
         }
@@ -875,7 +882,9 @@ fn hybrid_suppressed_suppressing_hard_cap_guard_forces_full_denial_without_rng()
             match d {
                 RateLimitDecision::Allowed => {}
                 // Final item may trigger Redis-read with stale sf; must be admitted.
-                RateLimitDecision::Suppressed { is_allowed: true, .. } => {}
+                RateLimitDecision::Suppressed {
+                    is_allowed: true, ..
+                } => {}
                 other => panic!("d: {other:?}"),
             }
         }
@@ -1217,7 +1226,9 @@ fn hybrid_suppressed_usage_is_committed_to_redis_and_visible_to_others() {
             match d {
                 RateLimitDecision::Allowed => {}
                 // Final item may trigger Redis-read with stale sf; must be admitted.
-                RateLimitDecision::Suppressed { is_allowed: true, .. } => {}
+                RateLimitDecision::Suppressed {
+                    is_allowed: true, ..
+                } => {}
                 other => panic!("d: {other:?}"),
             }
         }
@@ -1347,7 +1358,10 @@ fn hybrid_suppressed_prefix_isolation() {
                 matches!(
                     d,
                     RateLimitDecision::Allowed
-                        | RateLimitDecision::Suppressed { is_allowed: true, .. }
+                        | RateLimitDecision::Suppressed {
+                            is_allowed: true,
+                            ..
+                        }
                 ),
                 "d: {d:?}"
             );

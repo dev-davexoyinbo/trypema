@@ -684,6 +684,15 @@ impl SuppressedHybridRateLimiter {
             .saturating_add(check_count)
             > soft_window_limit
         {
+            let current_suppression_factor = if current_total_count
+                .saturating_sub(current_declined_count)
+                >= hard_window_limit
+            {
+                1f64
+            } else {
+                current_suppression_factor
+            };
+
             let should_allow = if current_suppression_factor == 0f64 {
                 true
             } else if current_suppression_factor == 1f64 {
