@@ -138,13 +138,31 @@ This suite compares three in-process limiters using the same stress harness:
 Notes:
 
 - For `burster`, the window is a const-generic (`W` ms). The harness currently supports `--window-s 10|60|300`.
-- For `governor`, we configure `Quota::per_second(rate).allow_burst(rate * window_s)` to roughly match “capacity per window”. This is still not a strict sliding window.
+- For `governor`, we configure `Quota::per_second(rate).allow_burst(rate * window_s)` to roughly match "capacity per window". This is still not a strict sliding window.
 
 Run:
 
 ```bash
 make stress-local-compare
 ```
+
+### Hot Key (Single Key, 16 threads, 30s, 1000 ops/s limit, 10s window)
+
+| Limiter | Ops/s | Allowed | Rejected | p50 (µs) | p95 (µs) | p99 (µs) | p999 (µs) | Max (µs) |
+|---------|-------|---------|----------|----------|----------|----------|-----------|----------|
+| Burster | 413k | 30k | 12.4M | 6 | 207 | 463 | 974 | 3457 |
+| Governor | 4.9M | 40k | 147.7M | 1 | 3 | 10 | 54 | 28095 |
+| Trypema (Absolute) | 3.5M | 30k | 106.2M | 1 | 5 | 31 | 129 | 26463 |
+| Trypema (Suppressed) | 3.6M | 30.5k | 0 | 1 | 3 | 9 | 65 | 92031 |
+
+### Uniform Keys (100k keys, 16 threads, 30s, 1B ops/s limit, 10s window)
+
+| Limiter | Ops/s | Allowed | Rejected | p50 (µs) | p95 (µs) | p99 (µs) | p999 (µs) | Max (µs) |
+|---------|-------|---------|----------|----------|----------|----------|-----------|----------|
+| Burster | 55k | 1.7M | 0 | 105 | 969 | 1565 | 7415 | 105407 |
+| Governor | 6.3M | 188.9M | 0 | 1 | 1 | 1 | 1 | 12727 |
+| Trypema (Absolute) | 6.1M | 182.1M | 0 | 1 | 1 | 3 | 359 | 9167 |
+| Trypema (Suppressed) | 7.5M | 224.1M | 0 | 1 | 2 | 43 | 135 | 5767 |
 
 ## Recommended Baseline Suite (1/2/3)
 

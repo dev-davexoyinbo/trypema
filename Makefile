@@ -1,5 +1,5 @@
 .PHONY: \
-	test-redis test-redis-tokio test-redis-smol test redis-up redis-down \
+	test-redis test-redis-tokio test-redis-smol test redis-up redis-up-test redis-up-compare redis-down \
 	bench-local bench-redis bench-redis-tokio bench-redis-smol bench \
 	sanity sanity-noredis sanity-redis-tokio sanity-redis-smol \
 	stress \
@@ -30,17 +30,28 @@ help: ## Show available commands
 	@echo
 	@echo "Tip: use 'make <target>' (e.g. 'make dev-up')"
 
-redis-up: ## Start local redis (docker compose)
+redis-up: redis-up-test ## Start local redis for tests (alias for redis-up-test)
+
+redis-up-test: ## Start redis:6.2-alpine for tests (profile: test)
 	@docker info >/dev/null 2>&1 || (echo "docker daemon not running" >&2; exit 1)
-	@REDIS_PORT="$(REDIS_PORT)" docker compose up -d redis
+	@REDIS_PORT="$(REDIS_PORT)" docker compose --profile test up -d redis-test
 	@sh -c 'for i in $$(seq 1 60); do \
-		if docker compose exec -T redis redis-cli ping >/dev/null 2>&1; then exit 0; fi; \
+		if docker compose --profile test exec -T redis-test redis-cli ping >/dev/null 2>&1; then exit 0; fi; \
 		sleep 0.25; \
 	done; \
 	echo "redis did not become ready in time" >&2; exit 1'
 
-redis-down: ## Stop local redis and remove volumes
-	@docker compose down -v --remove-orphans
+redis-up-compare: ## Start redis-with-cell for compare/stress targets (profile: compare)
+	@docker info >/dev/null 2>&1 || (echo "docker daemon not running" >&2; exit 1)
+	@REDIS_PORT="$(REDIS_PORT)" docker compose --profile compare up -d redis-compare
+	@sh -c 'for i in $$(seq 1 60); do \
+		if docker compose --profile compare exec -T redis-compare redis-cli ping >/dev/null 2>&1; then exit 0; fi; \
+		sleep 0.25; \
+	done; \
+	echo "redis did not become ready in time" >&2; exit 1'
+
+redis-down: ## Stop local redis and remove volumes (both profiles)
+	@docker compose --profile test --profile compare down -v --remove-orphans
 
 test-redis: test-redis-tokio test-redis-smol ## Run Redis-backed tests (tokio + smol)
 
@@ -222,7 +233,7 @@ stress-redis-uniform-matrix: ## Sweep (key_space, rate_limit_per_s) with Redis (
 stress-redis-uniform-matrix-tokio: ## Sweep (key_space, rate_limit_per_s) with Redis (tokio)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	for ks in $(STRESS_REDIS_UNIFORM_KEY_SPACES); do \
 	  for r in $(STRESS_REDIS_UNIFORM_RATES); do \
 	    echo "== redis-cell: key_space=$$ks rate_limit_per_s=$$r =="; \
@@ -279,7 +290,7 @@ stress-redis-uniform-matrix-tokio: ## Sweep (key_space, rate_limit_per_s) with R
 stress-redis-uniform-matrix-smol: ## Sweep (key_space, rate_limit_per_s) with Redis (smol)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	for ks in $(STRESS_REDIS_UNIFORM_KEY_SPACES); do \
 	  for r in $(STRESS_REDIS_UNIFORM_RATES); do \
 	    echo "== redis-cell: key_space=$$ks rate_limit_per_s=$$r =="; \
@@ -348,7 +359,7 @@ stress-redis-hot: ## Stress Redis provider (hot keys)
 stress-redis-hot-tokio: ## Stress Redis provider (tokio, hot keys)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 \
 		--key-dist hot --duration-s 60 --redis-url "$(REDIS_URL)" --redis-prefix stress
@@ -356,7 +367,7 @@ stress-redis-hot-tokio: ## Stress Redis provider (tokio, hot keys)
 stress-redis-hot-smol: ## Stress Redis provider (smol, hot keys)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider redis --strategy absolute --threads 16 \
 		--key-dist hot --duration-s 60 --redis-url "$(REDIS_URL)" --redis-prefix stress
@@ -368,7 +379,7 @@ stress-redis-skew: ## Stress Redis provider (skewed keys)
 stress-redis-skew-tokio: ## Stress Redis provider (tokio, skewed keys)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 \
 		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
@@ -377,7 +388,7 @@ stress-redis-skew-tokio: ## Stress Redis provider (tokio, skewed keys)
 stress-redis-skew-smol: ## Stress Redis provider (smol, skewed keys)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider redis --strategy absolute --threads 16 \
 		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
@@ -390,7 +401,7 @@ stress-hybrid-hot: ## Stress hybrid provider (hot keys)
 stress-hybrid-hot-tokio: ## Stress hybrid provider (tokio, hot keys)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider hybrid --strategy absolute --threads 16 \
 		--key-dist hot --duration-s 60 --redis-url "$(REDIS_URL)" --redis-prefix stresshybrid
@@ -398,7 +409,7 @@ stress-hybrid-hot-tokio: ## Stress hybrid provider (tokio, hot keys)
 stress-hybrid-hot-smol: ## Stress hybrid provider (smol, hot keys)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider hybrid --strategy absolute --threads 16 \
 		--key-dist hot --duration-s 60 --redis-url "$(REDIS_URL)" --redis-prefix stresshybrid
@@ -410,7 +421,7 @@ stress-hybrid-skew: ## Stress hybrid provider (skewed keys)
 stress-hybrid-skew-tokio: ## Stress hybrid provider (tokio, skewed keys)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider hybrid --strategy absolute --threads 16 \
 		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
@@ -419,7 +430,7 @@ stress-hybrid-skew-tokio: ## Stress hybrid provider (tokio, skewed keys)
 stress-hybrid-skew-smol: ## Stress hybrid provider (smol, skewed keys)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider hybrid --strategy absolute --threads 16 \
 		--key-dist skewed --key-space 100000 --hot-fraction 0.8 \
@@ -432,7 +443,7 @@ stress-redis-compare: ## Compare Redis provider implementations (tokio + smol)
 stress-redis-compare-tokio: ## Compare Redis provider implementations (tokio)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) hot absolute rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-tokio -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
@@ -485,7 +496,7 @@ stress-redis-compare-tokio: ## Compare Redis provider implementations (tokio)
 stress-redis-compare-smol: ## Compare Redis provider implementations (smol)
 	@set -e; \
 	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
+	$(MAKE) -s redis-up-compare; \
 	printf "\n\n== redis compare: trypema (redis provider; compare harness) hot absolute rate=1000 ==\n"; \
 	REDIS_URL="$(REDIS_URL)" cargo run --release -p trypema-stress --features redis-smol -- \
 		--provider redis --strategy absolute --threads 16 --key-dist hot --duration-s 30 \
