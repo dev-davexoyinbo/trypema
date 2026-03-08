@@ -37,7 +37,7 @@ scenarios:
 | Provider   | Backend                               | Latency                     | Consistency               | Use Case                         |
 | ---------- | ------------------------------------- | --------------------------- | ------------------------- | -------------------------------- |
 | **Local**  | In-process `DashMap` + atomics        | Sub-microsecond             | Single-process only       | CLI tools, single-server APIs    |
-| **Redis**  | Redis 6.2+ via Lua scripts            | Network round-trip per call | Distributed (best-effort) | Multi-process / multi-server     |
+| **Redis**  | Redis 7.2+ via Lua scripts            | Network round-trip per call | Distributed (best-effort) | Multi-process / multi-server     |
 | **Hybrid** | Local fast-path + periodic Redis sync | Sub-microsecond (fast-path) | Distributed with sync lag | High-throughput distributed APIs |
 
 ### Strategies
@@ -189,7 +189,7 @@ Every `inc()` and `is_allowed()` call executes an atomic Lua script against Redi
 
 **Requirements:**
 
-- Redis >= 6.2
+- Redis >= 7.2
 - Tokio or Smol async runtime
 
 ```toml
@@ -637,7 +637,7 @@ alternative (per-key locking) would significantly reduce throughput.
 
 **Access:** `rl.redis()`
 
-The Redis provider executes all operations as atomic Lua scripts against a Redis 6.2+ server.
+The Redis provider executes all operations as atomic Lua scripts against a Redis 7.2+ server.
 Each `inc()` call (and `is_allowed()` for the absolute strategy) results in one Redis round-trip.
 
 **Atomic Lua scripts:** Within a single Lua script execution, Redis guarantees atomicity.
@@ -852,7 +852,7 @@ This section applies to both the **Redis** and **Hybrid** providers.
 
 ### Requirements
 
-- **Redis version:** >= 6.2.0 (required for Lua script features used internally)
+- **Redis version:** >= 7.2.0 (required for Lua script features used internally)
 - **Async runtime:** Tokio (`redis-tokio` feature) or Smol (`redis-smol` feature)
 
 ### Key Constraints

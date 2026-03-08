@@ -1,7 +1,7 @@
 services:
   redis-test:
     profiles: [test]
-    image: redis:6.2-alpine
+    image: redis:7.2-alpine
     ports:
       - "${REDIS_PORT:-16379}:6379"
     healthcheck:

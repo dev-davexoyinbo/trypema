@@ -37,7 +37,7 @@ scenarios:
 | Provider   | Backend                               | Latency                     | Consistency               | Use Case                         |
 | ---------- | ------------------------------------- | --------------------------- | ------------------------- | -------------------------------- |
 | **Local**  | In-process `DashMap` + atomics        | Sub-microsecond             | Single-process only       | CLI tools, single-server APIs    |
-| **Redis**  | Redis 6.2+ via Lua scripts            | Network round-trip per call | Distributed (best-effort) | Multi-process / multi-server     |
+| **Redis**  | Redis 7.2+ via Lua scripts            | Network round-trip per call | Distributed (best-effort) | Multi-process / multi-server     |
 | **Hybrid** | Local fast-path + periodic Redis sync | Sub-microsecond (fast-path) | Distributed with sync lag | High-throughput distributed APIs |
 
 ### Strategies
@@ -171,7 +171,7 @@ Every `inc()` and `is_allowed()` call executes an atomic Lua script against Redi
 
 **Requirements:**
 
-- Redis >= 6.2
+- Redis >= 7.2
 - Tokio or Smol async runtime
 
 ```toml
@@ -543,7 +543,7 @@ and all proceed, causing temporary overshoot. This is by design for performance.
 
 **Access:** `rl.redis()`
 
-Executes all operations as atomic Lua scripts against Redis 6.2+. Each call results in one
+Executes all operations as atomic Lua scripts against Redis 7.2+. Each call results in one
 Redis round-trip.
 
 **Server-side timestamps:** Lua scripts use `redis.call("TIME")` for all timestamp
@@ -678,7 +678,7 @@ This section applies to both the **Redis** and **Hybrid** providers.
 
 ### Requirements
 
-- **Redis version:** >= 6.2.0
+- **Redis version:** >= 7.2.0
 - **Async runtime:** Tokio or Smol
 
 ### Key Constraints
