@@ -221,16 +221,6 @@ impl SuppressedLocalRateLimiter {
         count: u64,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> RateLimitDecision {
-        let suppression_factor = self.get_suppression_factor(key);
-
-        let should_allow = if suppression_factor == 0f64 {
-            true
-        } else if suppression_factor == 1f64 {
-            false
-        } else {
-            random_bool(1f64 - suppression_factor)
-        };
-
         let rate_limit_series = match self.series.get(key) {
             Some(rate_limit_series) => rate_limit_series,
             None => {
@@ -287,15 +277,38 @@ impl SuppressedLocalRateLimiter {
             _ => rate_limit_series,
         };
 
-        let soft_window_limit = rate_limit_series.limit / *self.hard_limit_factor;
+        let hard_window_limit = rate_limit_series.limit;
+        let soft_window_limit = hard_window_limit / *self.hard_limit_factor;
 
-        let total = rate_limit_series.total.fetch_add(count, Ordering::AcqRel);
+        let total = rate_limit_series.total.fetch_add(count, Ordering::AcqRel) + count;
         let total_declined = rate_limit_series.total_declined.load(Ordering::Acquire);
+        let forcasted_allowed = total.saturating_sub(total_declined).saturating_add(count);
+        let suppression_factor;
+        let should_allow;
 
-        if total.saturating_sub(total_declined) > soft_window_limit as u64 && !should_allow {
-            rate_limit_series
-                .total_declined
-                .fetch_add(count, Ordering::AcqRel);
+        if forcasted_allowed <= soft_window_limit as u64 {
+            should_allow = true;
+            suppression_factor = 0f64;
+        } else {
+            suppression_factor = if forcasted_allowed as f64 > hard_window_limit {
+                1f64
+            } else {
+                self.get_suppression_factor(key)
+            };
+
+            should_allow = if suppression_factor == 0f64 {
+                true
+            } else if suppression_factor == 1f64 {
+                false
+            } else {
+                random_bool(1f64 - suppression_factor)
+            };
+
+            if !should_allow {
+                rate_limit_series
+                    .total_declined
+                    .fetch_add(count, Ordering::AcqRel);
+            }
         }
 
         if let Some(last_entry) = rate_limit_series.series.back()
@@ -319,7 +332,7 @@ impl SuppressedLocalRateLimiter {
             });
         }
 
-        if total - total_declined <= soft_window_limit as u64 {
+        if total.saturating_sub(total_declined).saturating_add(count) <= soft_window_limit as u64 {
             RateLimitDecision::Allowed
         } else {
             RateLimitDecision::Suppressed {
@@ -380,6 +393,8 @@ impl SuppressedLocalRateLimiter {
     /// Returns the cached value if it is still fresh, otherwise recomputes and refreshes
     /// the cache.
     pub fn get_suppression_factor(&self, key: &str) -> f64 {
+        // self.remove_expired_buckets(key);
+
         let suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
             Some(val)
@@ -425,8 +440,6 @@ impl SuppressedLocalRateLimiter {
     }
 
     fn calculate_suppression_factor(&self, key: &str) -> (Instant, f64) {
-        self.remove_expired_buckets(key);
-
         let Some(series) = self.series.get(key) else {
             return self.persist_suppression_factor(key, 0f64);
         };
