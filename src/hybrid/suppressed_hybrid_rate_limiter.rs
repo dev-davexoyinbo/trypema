@@ -16,7 +16,7 @@ use crate::{
     hybrid::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions,
         SuppressedHybridCommit, SuppressedHybridRedisProxy, SuppressedHybridRedisProxyOptions,
-        SuppressedHybridRedisProxyReadStateResult,
+        SuppressedHybridRedisProxyReadStateResult, SyncIntervalMs,
         common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal},
     },
     redis::{mutex_lock, spawn_task},
@@ -79,6 +79,7 @@ pub struct SuppressedHybridRateLimiter {
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
     reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
+    sync_interval_ms: SyncIntervalMs,
 }
 
 impl SuppressedHybridRateLimiter {
@@ -122,6 +123,7 @@ impl SuppressedHybridRateLimiter {
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
             reset_locks: DashMap::new(),
+            sync_interval_ms: options.sync_interval_ms,
         };
 
         let limiter = Arc::new(limiter);
@@ -673,8 +675,9 @@ impl SuppressedHybridRateLimiter {
         };
 
         let soft_window_limit = (hard_window_limit as f64 / *self.hard_limit_factor) as u64;
-        let new_ttl_ms =
-            current_suppression_factor_ttl_ms.unwrap_or(*self.suppression_factor_cache_ms);
+        let new_ttl_ms = current_suppression_factor_ttl_ms
+            .unwrap_or(*self.suppression_factor_cache_ms)
+            .max(*self.sync_interval_ms);
 
         let new_time_instant = Instant::now();
 
