@@ -26,7 +26,7 @@
 ///     _ => {}
 /// }
 /// ```
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, thiserror::Error, PartialEq, Clone)]
 pub enum TrypemaError {
     /// Redis operation failed.
     ///
