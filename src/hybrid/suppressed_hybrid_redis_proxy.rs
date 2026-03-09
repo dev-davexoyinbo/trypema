@@ -286,7 +286,7 @@ impl SuppressedHybridRedisProxy {
             connection_manager,
             rate_group_size_ms,
             window_size_seconds,
-            read_chunk_size: 100,
+            read_chunk_size: 200,
         }
     }
 
