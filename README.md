@@ -1,4 +1,7 @@
 # Trypema Rate Limiter
+[![Crates.io](https://img.shields.io/crates/v/trypema.svg)](https://crates.io/crates/trypema)
+[![Documentation](https://docs.rs/trypema/badge.svg)](https://docs.rs/trypema)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Name and Biblical Inspiration
 
