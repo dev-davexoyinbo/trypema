@@ -147,7 +147,10 @@ impl RedisKeyGenerator {
     }
 
     pub(crate) fn get_active_entities_key(&self) -> String {
-        format!("{}:{}", *self.prefix, self.active_entities_key_suffix)
+        format!(
+            "{}:{}:{}",
+            *self.prefix, self.rate_type, self.active_entities_key_suffix
+        )
     }
 
     pub(crate) fn get_suppression_factor_key(&self, key: &RedisKey) -> String {
