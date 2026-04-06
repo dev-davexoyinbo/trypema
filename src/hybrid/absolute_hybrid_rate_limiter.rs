@@ -35,6 +35,7 @@ enum AbsoluteRedisLimitingState {
         time_instant: Mutex<Instant>,
         last_rate_group_ttl: Mutex<Option<u64>>,
         last_rate_group_count: Mutex<Option<u64>>,
+        last_modified: Mutex<Instant>,
     },
     Undefined,
     Rejecting {
@@ -274,6 +275,7 @@ impl AbsoluteHybridRateLimiter {
                 && let AbsoluteRedisLimitingState::Accepting {
                     accept_limit,
                     count,
+                    last_modified,
                     ..
                 } = state_entry.deref()
             {
@@ -281,6 +283,7 @@ impl AbsoluteHybridRateLimiter {
                     *mutex_lock(accept_limit, "accepting.accept_limit (recheck)")?;
                 let current = count.load(Ordering::Acquire);
                 if current + check_count <= accept_limit_val {
+                    *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
                     count.fetch_add(increment, Ordering::AcqRel);
                     return Ok(RateLimitDecision::Allowed);
                 }
@@ -479,12 +482,14 @@ impl AbsoluteHybridRateLimiter {
             time_instant,
             last_rate_group_ttl,
             last_rate_group_count,
+            last_modified,
         } = state.deref()
         {
             *mutex_lock(window_limit, "accepting.window_limit")? = new_window_limit;
             *mutex_lock(accept_limit, "accepting.accept_limit")? = new_accept_limit;
             *mutex_lock(starting_count, "accepting.starting_count")? = redis_total;
             *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
+            *mutex_lock(last_modified, "accepting.last_modified")? = new_time_instant;
             *mutex_lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")? =
                 read_state_result.last_rate_group_ttl;
             *mutex_lock(last_rate_group_count, "accepting.last_rate_group_count")? =
@@ -503,6 +508,7 @@ impl AbsoluteHybridRateLimiter {
                 starting_count: Mutex::new(redis_total),
                 count: AtomicU64::new(increment),
                 time_instant: Mutex::new(new_time_instant),
+                last_modified: Mutex::new(new_time_instant),
                 last_rate_group_ttl: Mutex::new(read_state_result.last_rate_group_ttl),
                 last_rate_group_count: Mutex::new(read_state_result.last_rate_group_count),
             };
@@ -564,11 +570,13 @@ impl AbsoluteHybridRateLimiter {
         } else if let AbsoluteRedisLimitingState::Accepting {
             accept_limit,
             count,
+            last_modified,
             ..
         } = state_entry.deref()
         {
             let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
             if count.load(Ordering::Acquire) + check_count <= accept_limit {
+                *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
                 count.fetch_add(increment, Ordering::AcqRel);
                 return Ok(RateLimitDecision::Allowed);
             }
@@ -592,6 +600,7 @@ impl AbsoluteHybridRateLimiter {
                 last_rate_group_ttl,
                 last_rate_group_count,
                 accept_limit,
+                last_modified,
                 ..
             } = state_entry.deref()
             {
@@ -601,6 +610,7 @@ impl AbsoluteHybridRateLimiter {
                 let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
 
                 if local_count + check_count <= accept_limit {
+                    *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
                     count.fetch_add(increment, Ordering::AcqRel);
                     return Ok(RateLimitDecision::Allowed);
                 }
@@ -687,16 +697,63 @@ impl AbsoluteHybridRateLimiter {
 
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        self.redis_proxy.cleanup(stale_after_ms).await
+        self.redis_proxy.cleanup(stale_after_ms).await?;
+        self.limiting_state.retain(|_, state| match state {
+            AbsoluteRedisLimitingState::Undefined => false,
+            AbsoluteRedisLimitingState::Accepting {
+                last_modified: time_instant,
+                ..
+            }
+            | AbsoluteRedisLimitingState::Rejecting { time_instant, .. } => {
+                let time_instant = match time_instant.get_mut() {
+                    Ok(time_instant) => time_instant,
+                    Err(err) => {
+                        tracing::warn!("time_instant is poisoned: {err:?}");
+                        return false;
+                    }
+                };
+
+                time_instant.elapsed().as_millis() < stale_after_ms as u128
+            }
+        });
+
+        Ok(())
     }
 
     async fn flush(&self) -> Result<(), TrypemaError> {
         let mut resets: Vec<RedisKey> = Vec::new();
 
-        for state in self.limiting_state.iter() {
+        for mut state in self.limiting_state.iter_mut() {
             let key = state.key();
 
-            if let AbsoluteRedisLimitingState::Accepting { .. } = state.deref() {
+            if let AbsoluteRedisLimitingState::Accepting {
+                last_modified,
+                count,
+                ..
+            } = state.deref()
+            {
+                let elapsed = {
+                    let last_modified = match last_modified.lock() {
+                        Ok(last_modified) => last_modified,
+                        Err(err) => {
+                            tracing::warn!("last_modified is poisoned: {err:?}");
+                            continue;
+                        }
+                    };
+
+                    last_modified.elapsed()
+                };
+
+                if elapsed.as_millis() > (*self.window_size_seconds * 1000) as u128 {
+                    *state = AbsoluteRedisLimitingState::Undefined;
+
+                    continue;
+                }
+
+                if count.load(Ordering::Acquire) == 0 {
+                    continue;
+                }
+
                 resets.push(key.clone());
             }
         }

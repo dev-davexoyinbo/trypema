@@ -1,6 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use crate::common::RateType;
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use crate::hybrid::SyncIntervalMs;
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimiter,
@@ -8,7 +10,13 @@ use crate::{
 };
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use redis::AsyncCommands;
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use super::runtime;
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use super::common::key_gen;
 
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 #[test]
@@ -288,5 +296,395 @@ fn test_redis_stop_cleanup_loop_prevents_cleanup() {
         // Still within the 5s window, so we should remain rejected if cleanup did not run.
         let d1 = rl.redis().absolute().is_allowed(&key).await.unwrap();
         assert!(matches!(d1, RateLimitDecision::Rejected { .. }));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid cleanup loop tests
+// ---------------------------------------------------------------------------
+
+/// The cleanup loop must remove stale hybrid absolute Redis keys automatically.
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn test_hybrid_absolute_cleanup_loop_removes_stale_redis_keys() {
+    use crate::{RateLimitDecision, RedisKey};
+
+    runtime::block_on(async {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            return;
+        };
+        let client = redis::Client::open(url.clone()).unwrap();
+        let connection_manager = match client.get_connection_manager().await {
+            Ok(cm) => cm,
+            Err(_) => return,
+        };
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let prefix = RedisKey::try_from(format!("test_hybrid_abs_cleanup_{unique}")).unwrap();
+        let sync_interval_ms = 25_u64;
+
+        let options = RateLimiterOptions {
+            local: LocalRateLimiterOptions {
+                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                hard_limit_factor: HardLimitFactor::default(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            },
+            redis: crate::RedisRateLimiterOptions {
+                connection_manager,
+                prefix: Some(prefix.clone()),
+                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                hard_limit_factor: HardLimitFactor::default(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                sync_interval_ms: SyncIntervalMs::try_from(sync_interval_ms).unwrap(),
+            },
+        };
+
+        let rl = Arc::new(RateLimiter::new(options));
+
+        let rate_limit = RateLimit::try_from(2.0).unwrap();
+        let k = RedisKey::try_from(format!("k_{unique}")).unwrap();
+        let cap = 5_u64 * 2; // window=5s, rate=2/s => cap=10
+
+        // Overflow to trigger a Redis commit.
+        for _ in 0..cap {
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+        }
+        let d = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(d, RateLimitDecision::Rejected { .. }),
+            "expected Rejected after overflow: {d:?}"
+        );
+
+        runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+
+        let kg = key_gen(&prefix, RateType::HybridAbsolute);
+        let total_key = kg.get_total_count_key(&k);
+        let active_entities_key = kg.get_active_entities_key();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let exists: bool = conn.exists(&total_key).await.unwrap();
+        assert!(
+            exists,
+            "hybrid absolute total key must exist before cleanup loop fires"
+        );
+
+        rl.run_cleanup_loop_with_config(100, 50);
+        runtime::async_sleep(Duration::from_millis(350)).await;
+        rl.stop_cleanup_loop();
+
+        for entity_key in kg.get_all_entity_keys(&k) {
+            let exists: bool = conn.exists(&entity_key).await.unwrap();
+            assert!(!exists, "key {entity_key} must be absent after cleanup loop");
+        }
+
+        let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(
+            score.is_none(),
+            "entity must be removed from active_entities after cleanup loop"
+        );
+    });
+}
+
+/// The cleanup loop must leave active hybrid absolute entities untouched.
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn test_hybrid_absolute_cleanup_loop_keeps_active_entity() {
+    use crate::{RateLimitDecision, RedisKey};
+
+    runtime::block_on(async {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            return;
+        };
+        let client = redis::Client::open(url.clone()).unwrap();
+        let connection_manager = match client.get_connection_manager().await {
+            Ok(cm) => cm,
+            Err(_) => return,
+        };
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let prefix = RedisKey::try_from(format!("test_hybrid_abs_active_{unique}")).unwrap();
+        let sync_interval_ms = 25_u64;
+
+        let options = RateLimiterOptions {
+            local: LocalRateLimiterOptions {
+                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                hard_limit_factor: HardLimitFactor::default(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            },
+            redis: crate::RedisRateLimiterOptions {
+                connection_manager,
+                prefix: Some(prefix.clone()),
+                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                hard_limit_factor: HardLimitFactor::default(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                sync_interval_ms: SyncIntervalMs::try_from(sync_interval_ms).unwrap(),
+            },
+        };
+
+        let rl = Arc::new(RateLimiter::new(options));
+
+        let rate_limit = RateLimit::try_from(2.0).unwrap();
+        let k = RedisKey::try_from(format!("k_{unique}")).unwrap();
+        let cap = 5_u64 * 2;
+
+        for _ in 0..cap {
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+        }
+        let d = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(d, RateLimitDecision::Rejected { .. }),
+            "expected Rejected: {d:?}"
+        );
+        runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+
+        let total_key = key_gen(&prefix, RateType::HybridAbsolute).get_total_count_key(&k);
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let exists: bool = conn.exists(&total_key).await.unwrap();
+        assert!(exists, "total key must exist before cleanup loop");
+
+        // stale_after_ms = 5000 — entity is recent, loop interval = 100ms.
+        rl.run_cleanup_loop_with_config(5_000, 100);
+        runtime::async_sleep(Duration::from_millis(400)).await;
+        rl.stop_cleanup_loop();
+
+        let exists_after: bool = conn.exists(&total_key).await.unwrap();
+        assert!(
+            exists_after,
+            "active entity must NOT be removed by cleanup loop"
+        );
+    });
+}
+
+/// The cleanup loop must remove stale hybrid suppressed Redis keys automatically.
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn test_hybrid_suppressed_cleanup_loop_removes_stale_redis_keys() {
+    use crate::RedisKey;
+
+    runtime::block_on(async {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            return;
+        };
+        let client = redis::Client::open(url.clone()).unwrap();
+        let connection_manager = client
+            .get_connection_manager()
+            .await
+            .expect("connection manager should be present");
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let prefix = RedisKey::try_from(format!("test_hybrid_sup_cleanup_{unique}")).unwrap();
+        let sync_interval_ms = 25_u64;
+
+        let options = RateLimiterOptions {
+            local: LocalRateLimiterOptions {
+                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                hard_limit_factor: HardLimitFactor::try_from(2.0).unwrap(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            },
+            redis: crate::RedisRateLimiterOptions {
+                connection_manager,
+                prefix: Some(prefix.clone()),
+                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                hard_limit_factor: HardLimitFactor::try_from(2.0).unwrap(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                sync_interval_ms: SyncIntervalMs::try_from(sync_interval_ms).unwrap(),
+            },
+        };
+
+        let rl = Arc::new(RateLimiter::new(options));
+
+        let rate_limit = RateLimit::try_from(2.0).unwrap();
+        let k = RedisKey::try_from(format!("k_{unique}")).unwrap();
+        let soft_cap = 5_u64 * 2; // window=5s, rate=2/s => soft_cap=10
+
+        // Overflow past soft limit to trigger a commit.
+        for _ in 0..=soft_cap {
+            let _ = rl
+                .hybrid()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+        }
+        runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+
+        let kg = key_gen(&prefix, RateType::HybridSuppressed);
+        let total_key = kg.get_total_count_key(&k);
+        let active_entities_key = kg.get_active_entities_key();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let exists: bool = conn.exists(&total_key).await.unwrap();
+        assert!(
+            exists,
+            "hybrid suppressed total key must exist before cleanup loop fires"
+        );
+
+        rl.run_cleanup_loop_with_config(100, 50);
+        runtime::async_sleep(Duration::from_millis(350)).await;
+        rl.stop_cleanup_loop();
+
+        for entity_key in kg.get_all_entity_keys(&k) {
+            let exists: bool = conn.exists(&entity_key).await.unwrap();
+            assert!(!exists, "key {entity_key} must be absent after cleanup loop");
+        }
+
+        let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(
+            score.is_none(),
+            "entity must be removed from active_entities after cleanup loop"
+        );
+    });
+}
+
+/// End-to-end: the cleanup loop cleans a stale hybrid absolute entity, and the next request
+/// for that entity is allowed (in-memory state was cleared alongside Redis state).
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn test_hybrid_cleanup_loop_fresh_requests_allowed_after_cleanup() {
+    use crate::{RateLimitDecision, RedisKey};
+
+    runtime::block_on(async {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            return;
+        };
+        let client = redis::Client::open(url.clone()).unwrap();
+        let connection_manager = match client.get_connection_manager().await {
+            Ok(cm) => cm,
+            Err(_) => return,
+        };
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let prefix = RedisKey::try_from(format!("test_hybrid_loop_fresh_{unique}")).unwrap();
+        let sync_interval_ms = 25_u64;
+
+        let options = RateLimiterOptions {
+            local: LocalRateLimiterOptions {
+                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                hard_limit_factor: HardLimitFactor::default(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            },
+            redis: crate::RedisRateLimiterOptions {
+                connection_manager,
+                prefix: Some(prefix.clone()),
+                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                hard_limit_factor: HardLimitFactor::default(),
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                sync_interval_ms: SyncIntervalMs::try_from(sync_interval_ms).unwrap(),
+            },
+        };
+
+        let rl = Arc::new(RateLimiter::new(options));
+
+        let rate_limit = RateLimit::try_from(2.0).unwrap();
+        let k = RedisKey::try_from(format!("k_{unique}")).unwrap();
+        let cap = 5_u64 * 2;
+
+        // Overflow — entity ends up in Rejecting state.
+        for _ in 0..cap {
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+        }
+        let rejected = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(rejected, RateLimitDecision::Rejected { .. }),
+            "expected Rejected after overflow: {rejected:?}"
+        );
+        runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+
+        // Start cleanup loop with stale_after_ms=150, interval=75.
+        // The entity should be cleaned after roughly 150 + 75 ms from loop start.
+        rl.run_cleanup_loop_with_config(150, 75);
+        runtime::async_sleep(Duration::from_millis(400)).await;
+        rl.stop_cleanup_loop();
+
+        let total_key = key_gen(&prefix, RateType::HybridAbsolute).get_total_count_key(&k);
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let exists_after: bool = conn.exists(&total_key).await.unwrap();
+        assert!(
+            !exists_after,
+            "hybrid absolute total key must be deleted after cleanup loop"
+        );
+
+        // Next request must be allowed — stale in-memory Rejecting state must have been cleared.
+        let decision = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "expected Allowed after cleanup loop cleared state, got {decision:?}"
+        );
     });
 }

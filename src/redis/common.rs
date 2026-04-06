@@ -156,6 +156,23 @@ impl RedisKeyGenerator {
     pub(crate) fn get_suppression_factor_key(&self, key: &RedisKey) -> String {
         self.get_key_with_suffix(key, &self.suppression_factor_key_suffix)
     }
+
+    /// All Redis keys associated with a single entity key.
+    ///
+    /// Includes every key the generator can produce for `key` regardless of rate type.
+    /// Keys that are not written by a particular rate type (e.g. `hd`/`d`/`sf` for absolute
+    /// limiters) will simply not exist, so `!exists` is trivially true in cleanup checks.
+    pub(crate) fn get_all_entity_keys(&self, key: &RedisKey) -> Vec<String> {
+        vec![
+            self.get_hash_key(key),
+            self.get_hash_declined_key(key),
+            self.get_active_keys(key),
+            self.get_window_limit_key(key),
+            self.get_total_count_key(key),
+            self.get_total_declined_key(key),
+            self.get_suppression_factor_key(key),
+        ]
+    }
 }
 
 pub(crate) fn mutex_lock<'a, T>(
