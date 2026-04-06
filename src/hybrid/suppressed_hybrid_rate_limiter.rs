@@ -31,6 +31,7 @@ enum SuppressedRedisLimitingState {
         count: AtomicU64,
         declined_count: Mutex<u64>,
         time_instant: Mutex<Instant>,
+        // TODO: Add last modified
     },
     Undefined,
     Suppressing {
@@ -41,6 +42,7 @@ enum SuppressedRedisLimitingState {
         starting_count: Mutex<u64>,
         count: AtomicU64,
         declined_count: AtomicU64,
+        // TODO: Add last modified
     },
 }
 
@@ -401,6 +403,9 @@ impl SuppressedHybridRateLimiter {
             ..
         } = state_entry.deref()
         {
+            // TODO: Before performing the check, check if the values here are stale
+            // stale would mean the time elapsed is more than the flush interval
+
             let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
             let window_limit = *mutex_lock(window_limit, "accepting.accept_limit")?;
             let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
@@ -458,6 +463,8 @@ impl SuppressedHybridRateLimiter {
                     ..
                 } = state_entry.deref()
             {
+                // TODO: Before performing the check, check if the values here are stale
+                // stale would mean the time elapsed is more than the flush interval
                 let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
                 let window_limit = *mutex_lock(window_limit, "accepting.accept_limit")?;
                 let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
@@ -782,7 +789,9 @@ impl SuppressedHybridRateLimiter {
 
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        self.redis_proxy.cleanup(stale_after_ms).await
+        self.redis_proxy.cleanup(stale_after_ms).await?;
+        self.limiting_state.clear();
+        Ok(())
     }
 
     async fn flush(&self) -> Result<(), TrypemaError> {
@@ -790,6 +799,9 @@ impl SuppressedHybridRateLimiter {
 
         for state in self.limiting_state.iter() {
             let key = state.key();
+            // TODO: only flush the keys that needs to be flushed, eg, an inactive key should be
+            // ignored. We would compare last modified time with the current time.
+            // If we don't have any count for both Accepting and Suppressing, we can skip it.
 
             if let SuppressedRedisLimitingState::Accepting { .. }
             | SuppressedRedisLimitingState::Suppressing { .. } = state.deref()
