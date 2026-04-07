@@ -162,6 +162,7 @@ impl RedisKeyGenerator {
     /// Includes every key the generator can produce for `key` regardless of rate type.
     /// Keys that are not written by a particular rate type (e.g. `hd`/`d`/`sf` for absolute
     /// limiters) will simply not exist, so `!exists` is trivially true in cleanup checks.
+    #[cfg(test)]
     pub(crate) fn get_all_entity_keys(&self, key: &RedisKey) -> Vec<String> {
         vec![
             self.get_hash_key(key),

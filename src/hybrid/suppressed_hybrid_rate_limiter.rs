@@ -32,7 +32,6 @@ enum SuppressedRedisLimitingState {
         declined_count: Mutex<u64>,
         time_instant: Mutex<Instant>,
         last_modified: Mutex<Instant>,
-        // TODO: Add last modified
     },
     Undefined,
     Suppressing {
@@ -43,7 +42,6 @@ enum SuppressedRedisLimitingState {
         starting_count: Mutex<u64>,
         count: AtomicU64,
         declined_count: AtomicU64,
-        // TODO: Add last modified
     },
 }
 
@@ -82,7 +80,6 @@ pub struct SuppressedHybridRateLimiter {
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
     reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
-    sync_interval: Duration,
 }
 
 impl SuppressedHybridRateLimiter {
@@ -109,7 +106,7 @@ impl SuppressedHybridRateLimiter {
         let sync_interval = Duration::from_millis(*options.sync_interval_ms);
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
-            sync_interval: sync_interval.clone(),
+            sync_interval,
             channel_capacity: 8192,
             max_batch_size: 4,
             limiter_sender: tx,
@@ -128,7 +125,6 @@ impl SuppressedHybridRateLimiter {
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
             reset_locks: DashMap::new(),
-            sync_interval,
         };
 
         let limiter = Arc::new(limiter);
@@ -404,22 +400,19 @@ impl SuppressedHybridRateLimiter {
             window_limit,
             starting_count,
             count,
-            declined_count,
+            // declined_count,
             last_modified,
             ..
         } = state_entry.deref()
         {
-            // TODO: Before performing the check, check if the values here are stale
-            // stale would mean the time elapsed is more than the flush interval
-
             let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
             let window_limit = *mutex_lock(window_limit, "accepting.accept_limit")?;
-            let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
+            // let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
             let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
 
             if starting_count
                 .saturating_add(count.load(Ordering::Acquire))
-                .saturating_sub(declined)
+                // .saturating_sub(declined)
                 .saturating_add(increment)
                 <= soft_window_limit
             {
@@ -466,21 +459,19 @@ impl SuppressedHybridRateLimiter {
                     window_limit,
                     count,
                     starting_count,
-                    declined_count,
+                    // declined_count,
                     last_modified,
                     ..
                 } = state_entry.deref()
             {
-                // TODO: Before performing the check, check if the values here are stale
-                // stale would mean the time elapsed is more than the flush interval
                 let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
                 let window_limit = *mutex_lock(window_limit, "accepting.accept_limit")?;
-                let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
+                // let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
                 let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
 
                 if starting_count
                     .saturating_add(count.load(Ordering::Acquire))
-                    .saturating_sub(declined)
+                    // .saturating_sub(declined)
                     .saturating_add(increment)
                     <= soft_window_limit
                 {
@@ -617,7 +608,7 @@ impl SuppressedHybridRateLimiter {
                 current_total_count = current_total_count.saturating_add(count);
                 current_declined_count = current_declined_count.saturating_add(declined);
 
-                if count > 0 {
+                if count > 0 || declined > 0 {
                     let commit = SuppressedHybridCommit {
                         key: key.clone(),
                         window_limit: hard_window_limit.expect("Window limit should be set"),
@@ -804,11 +795,18 @@ impl SuppressedHybridRateLimiter {
         self.redis_proxy.cleanup(stale_after_ms).await?;
         self.limiting_state.retain(|_, state| match state {
             SuppressedRedisLimitingState::Undefined => false,
-            SuppressedRedisLimitingState::Suppressing { time_instant, .. }
-            | SuppressedRedisLimitingState::Accepting {
-                last_modified: time_instant,
-                ..
-            } => {
+            SuppressedRedisLimitingState::Accepting { last_modified, .. } => {
+                let last_modified = match last_modified.get_mut() {
+                    Ok(last_modified) => last_modified,
+                    Err(err) => {
+                        tracing::warn!("last_modified is poisoned: {err:?}");
+                        return false;
+                    }
+                };
+
+                last_modified.elapsed().as_millis() < stale_after_ms as u128
+            }
+            SuppressedRedisLimitingState::Suppressing { time_instant, .. } => {
                 let time_instant = match time_instant.get_mut() {
                     Ok(time_instant) => time_instant,
                     Err(err) => {
@@ -837,19 +835,46 @@ impl SuppressedHybridRateLimiter {
                 SuppressedRedisLimitingState::Undefined => continue,
                 SuppressedRedisLimitingState::Accepting {
                     count,
-                    last_modified: time_instant,
+                    last_modified,
                     ..
+                } => {
+                    let elapsed = {
+                        let last_modified = match last_modified.lock() {
+                            Ok(last_modified) => last_modified,
+                            Err(err) => {
+                                tracing::warn!("last_modified is poisoned: {err:?}");
+                                continue;
+                            }
+                        };
+
+                        last_modified.elapsed()
+                    };
+
+                    // let elapsed = (*mutex_lock(last_modified, "last_modified"))?.elapsed();
+
+                    if elapsed.as_millis() > (*self.window_size_seconds * 1000) as u128
+                        || count.load(Ordering::Acquire) == 0
+                    {
+                        *state = SuppressedRedisLimitingState::Undefined;
+
+                        continue;
+                    }
+
+                    // if count.load(Ordering::Acquire) == 0 {
+                    //     continue;
+                    // }
                 }
-                | SuppressedRedisLimitingState::Suppressing {
+                SuppressedRedisLimitingState::Suppressing {
                     time_instant,
                     count,
+                    declined_count,
                     ..
                 } => {
                     let elapsed = {
                         let time_instant = match time_instant.lock() {
                             Ok(time_instant) => time_instant,
                             Err(err) => {
-                                tracing::warn!("last_modified is poisoned: {err:?}");
+                                tracing::warn!("time_instant is poisoned: {err:?}");
                                 continue;
                             }
                         };
@@ -865,7 +890,10 @@ impl SuppressedHybridRateLimiter {
                         continue;
                     }
 
-                    if count.load(Ordering::Acquire) == 0 {
+                    if count.load(Ordering::Acquire) == 0
+                        && declined_count.load(Ordering::Acquire) == 0
+                    {
+                        *state = SuppressedRedisLimitingState::Undefined;
                         continue;
                     }
                 }
