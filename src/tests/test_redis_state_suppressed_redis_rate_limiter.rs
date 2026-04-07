@@ -220,8 +220,17 @@ fn redis_state_suppressed_sf_cache_key_is_set_in_suppression_zone() {
 
     runtime::block_on(async {
         // window=10s, rate=1, hard_limit_factor=2 => soft=10, hard=20.
-        // Use a tiny cache_ms so the key is always freshly computed.
-        let (rl, prefix) = build_limiter(&url, 10, 100, 2.0, 1).await;
+        //
+        // Use a cache_ms that is large enough for the `sf` key to survive the Redis
+        // round-trip that asserts its value, but short enough that we can wait for it
+        // to expire before calling `get_suppression_factor` so that function is forced
+        // to recompute (and therefore write) a fresh value.
+        //
+        // Previously this test used cache_ms=1, which created a race: `get_suppression_factor`
+        // wrote the `sf` key with a 1ms TTL, but by the time the assertion opened a new
+        // connection and issued GET the key had already expired, causing intermittent failures.
+        let cache_ms = 500_u64;
+        let (rl, prefix) = build_limiter(&url, 10, 100, 2.0, cache_ms).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
 
@@ -235,15 +244,28 @@ fn redis_state_suppressed_sf_cache_key_is_set_in_suppression_zone() {
                 .unwrap();
         }
 
-        // Let any cached suppression factor expire, then trigger a recompute.
-        runtime::async_sleep(Duration::from_millis(10)).await;
-        let _ = rl
+        // Wait for the `sf` key written by the inc loop to expire, so that the
+        // subsequent `get_suppression_factor` call is guaranteed to recompute and
+        // re-write the `sf` key with a fresh cache_ms TTL.
+        runtime::async_sleep(Duration::from_millis(cache_ms + 10)).await;
+
+        // Trigger a fresh computation. This writes `sf` with `cache_ms` TTL.
+        let sf = rl
             .redis()
             .suppressed()
             .get_suppression_factor(&k)
             .await
             .unwrap();
 
+        // Verify the return value directly — no separate Redis read needed here.
+        assert!(sf > 0.0, "suppression factor should be > 0 past the soft limit, got {sf}");
+        assert!(
+            (0.0..=1.0).contains(&sf),
+            "suppression factor must be in [0, 1], got {sf}"
+        );
+
+        // Also verify the `sf` key was physically written to Redis.  The key now has
+        // a full cache_ms TTL so there is no race with the assertion below.
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
             .get_multiplexed_async_connection()
@@ -256,12 +278,11 @@ fn redis_state_suppressed_sf_cache_key_is_set_in_suppression_zone() {
             "suppression factor cache key should be set when in the suppression zone"
         );
 
-        let sf: f64 = sf_raw.unwrap().parse().expect("sf should be a valid float");
+        let sf_stored: f64 = sf_raw.unwrap().parse().expect("sf should be a valid float");
         assert!(
-            (0.0..=1.0).contains(&sf),
-            "cached suppression factor must be in [0, 1], got {sf}"
+            (sf_stored - sf).abs() < 1e-9,
+            "stored sf value ({sf_stored}) should match the value returned by get_suppression_factor ({sf})"
         );
-        assert!(sf > 0.0, "suppression factor should be > 0 past the soft limit");
     });
 }
 
