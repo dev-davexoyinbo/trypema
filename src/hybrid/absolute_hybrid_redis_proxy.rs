@@ -122,6 +122,7 @@ const READ_STATE_SCRIPT: &str = r#"
     local active_keys = KEYS[2]
     local window_limit_key = KEYS[3]
     local total_count_key = KEYS[4]
+    local active_entities_key = KEYS[5]
 
     local entity = ARGV[1]
     local window_size_ms = tonumber(ARGV[2])
@@ -155,6 +156,8 @@ const READ_STATE_SCRIPT: &str = r#"
         oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_fields[1])) or 0
         oldest_ttl = window_size_ms - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
     end
+
+    redis.call("ZADD", active_entities_key, timestamp_ms, entity)
 
     return {entity, total_count, window_limit or -1, oldest_ttl or -1, oldest_count or -1}
 "#;
@@ -231,6 +234,7 @@ impl AbsoluteHybridRedisProxy {
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))
             .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
             .arg(key.as_str())
             .arg(self.window_size_ms)
             .invoke_async(&mut connection_manager)
@@ -335,6 +339,7 @@ impl AbsoluteHybridRedisProxy {
                     .key(self.key_generator.get_active_keys(key))
                     .key(self.key_generator.get_window_limit_key(key))
                     .key(self.key_generator.get_total_count_key(key))
+                    .key(self.key_generator.get_active_entities_key())
                     .arg(key.as_str())
                     .arg(self.window_size_ms),
             );
