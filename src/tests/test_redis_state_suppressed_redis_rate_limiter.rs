@@ -14,41 +14,21 @@
 //! | `P:K:suppressed:t`           | String      | Running total count (allowed + denied)          |
 //! | `P:K:suppressed:d`           | String      | Running total declined count                    |
 //! | `P:K:suppressed:sf`          | String      | Cached suppression factor (with PX TTL)         |
-//! | `P:active_entities`          | Sorted set  | All active user-keys (for cleanup)              |
+//! | `P:suppressed:active_entities` | Sorted set  | All active user-keys (for cleanup)            |
 
-use std::{collections::HashMap, env, thread, time::Duration};
+use std::{collections::HashMap, thread, time::Duration};
 
 use redis::AsyncCommands;
 
 use super::runtime;
+use super::common::{redis_url, unique_prefix, key, key_gen};
 
-use crate::common::SuppressionFactorCacheMs;
+use crate::common::{RateType, SuppressionFactorCacheMs};
 use crate::hybrid::SyncIntervalMs;
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
     RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
 };
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn redis_url() -> String {
-    env::var("REDIS_URL").unwrap_or_else(|_| {
-        panic!(
-            "REDIS_URL env var must be set for Redis-backed tests (e.g. REDIS_URL=redis://127.0.0.1:16379/)"
-        )
-    })
-}
-
-fn unique_prefix() -> RedisKey {
-    let n: u64 = rand::random();
-    RedisKey::try_from(format!("trypema_test_{n}")).unwrap()
-}
-
-fn key(s: &str) -> RedisKey {
-    RedisKey::try_from(s.to_string()).unwrap()
-}
 
 /// Build a rate limiter and return its unique prefix.
 async fn build_limiter(
@@ -89,13 +69,23 @@ async fn build_limiter(
     (std::sync::Arc::new(RateLimiter::new(options)), prefix)
 }
 
-/// `{prefix}:{user_key}:suppressed:{suffix}`
+/// Construct the canonical Redis key for a given suffix using the key generator.
 fn redis_key(prefix: &RedisKey, user_key: &RedisKey, suffix: &str) -> String {
-    format!("{}:{}:suppressed:{}", **prefix, **user_key, suffix)
+    let kg = key_gen(prefix, RateType::Suppressed);
+    match suffix {
+        "h"  => kg.get_hash_key(user_key),
+        "hd" => kg.get_hash_declined_key(user_key),
+        "a"  => kg.get_active_keys(user_key),
+        "w"  => kg.get_window_limit_key(user_key),
+        "t"  => kg.get_total_count_key(user_key),
+        "d"  => kg.get_total_declined_key(user_key),
+        "sf" => kg.get_suppression_factor_key(user_key),
+        _    => panic!("unknown suffix for suppressed rate type: {suffix}"),
+    }
 }
 
 fn active_entities_key(prefix: &RedisKey) -> String {
-    format!("{}:active_entities", **prefix)
+    key_gen(prefix, RateType::Suppressed).get_active_entities_key()
 }
 
 // ---------------------------------------------------------------------------

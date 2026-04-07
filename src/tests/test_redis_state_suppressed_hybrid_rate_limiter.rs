@@ -15,17 +15,19 @@
 //! | `P:K:hybrid_suppressed:t`              | String      | Running total count (allowed + denied)           |
 //! | `P:K:hybrid_suppressed:d`              | String      | Running total declined count                     |
 //! | `P:K:hybrid_suppressed:sf`             | String      | Cached suppression factor (with PX TTL)          |
-//! | `P:active_entities`                    | Sorted set  | All active user-keys (for cleanup)               |
+//! | `P:hybrid_suppressed:active_entities`  | Sorted set  | All active user-keys (for cleanup)               |
 //!
 //! **Important:** because the hybrid limiter batches writes, tests must wait for the
 //! background committer to flush (`wait_for_hybrid_sync`) before inspecting Redis state.
 
-use std::{collections::HashMap, env, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use redis::AsyncCommands;
 
+use super::common::{key, key_gen, redis_url, unique_prefix, wait_for_hybrid_sync};
 use super::runtime;
 
+use crate::common::RateType;
 use crate::hybrid::SyncIntervalMs;
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
@@ -36,23 +38,6 @@ use crate::{
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn redis_url() -> String {
-    env::var("REDIS_URL").unwrap_or_else(|_| {
-        panic!(
-            "REDIS_URL env var must be set for Redis-backed tests (e.g. REDIS_URL=redis://127.0.0.1:16379/)"
-        )
-    })
-}
-
-fn unique_prefix() -> RedisKey {
-    let n: u64 = rand::random();
-    RedisKey::try_from(format!("trypema_test_{n}")).unwrap()
-}
-
-fn key(s: &str) -> RedisKey {
-    RedisKey::try_from(s.to_string()).unwrap()
-}
 
 async fn build_limiter(
     url: &str,
@@ -93,14 +78,19 @@ async fn build_limiter(
     std::sync::Arc::new(RateLimiter::new(options))
 }
 
-/// `{prefix}:{user_key}:hybrid_suppressed:{suffix}`
+/// Construct the canonical Redis key for a given suffix using the key generator.
 fn redis_key(prefix: &RedisKey, user_key: &RedisKey, suffix: &str) -> String {
-    format!("{}:{}:hybrid_suppressed:{}", **prefix, **user_key, suffix)
-}
-
-/// Wait long enough for the background committer to flush two ticks.
-async fn wait_for_hybrid_sync(sync_interval_ms: u64) {
-    runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+    let kg = key_gen(prefix, RateType::HybridSuppressed);
+    match suffix {
+        "h" => kg.get_hash_key(user_key),
+        "hd" => kg.get_hash_declined_key(user_key),
+        "a" => kg.get_active_keys(user_key),
+        "w" => kg.get_window_limit_key(user_key),
+        "t" => kg.get_total_count_key(user_key),
+        "d" => kg.get_total_declined_key(user_key),
+        "sf" => kg.get_suppression_factor_key(user_key),
+        _ => panic!("unknown suffix for hybrid_suppressed rate type: {suffix}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,9 +233,11 @@ fn redis_state_hybrid_suppressed_commit_writes_total_count_after_overflow() {
             "total count ({total}) should not exceed soft_cap + 1 ({soft_cap} + 1)"
         );
 
-        let hash: HashMap<String, u64> =
-            conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
-        assert!(!hash.is_empty(), "hash must have at least one bucket after commit");
+        let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
+        assert!(
+            !hash.is_empty(),
+            "hash must have at least one bucket after commit"
+        );
     });
 }
 
@@ -395,10 +387,7 @@ fn redis_state_hybrid_suppressed_sf_cache_key_has_ttl() {
             .await
             .unwrap();
 
-        let pttl: i64 = conn
-            .pttl(redis_key(&prefix, &k, "sf"))
-            .await
-            .unwrap();
+        let pttl: i64 = conn.pttl(redis_key(&prefix, &k, "sf")).await.unwrap();
 
         assert!(
             pttl > 0,
@@ -478,13 +467,9 @@ fn redis_state_hybrid_suppressed_hash_sums_match_counters_after_commit_with_deni
             .unwrap();
 
         let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
-        let declined: u64 = conn
-            .get(redis_key(&prefix, &k, "d"))
-            .await
-            .unwrap_or(0u64);
+        let declined: u64 = conn.get(redis_key(&prefix, &k, "d")).await.unwrap_or(0u64);
 
-        let hash: HashMap<String, u64> =
-            conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
+        let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
         let hash_d: HashMap<String, u64> =
             conn.hgetall(redis_key(&prefix, &k, "hd")).await.unwrap();
 
@@ -697,6 +682,345 @@ fn redis_state_hybrid_suppressed_does_not_contaminate_redis_suppressed_keyspace(
         assert!(
             suppressed_total.is_none(),
             "redis suppressed keyspace must not be contaminated by hybrid suppressed writes"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup tests
+// ---------------------------------------------------------------------------
+
+/// After cleanup with a stale threshold the entity has exceeded, all per-entity Redis keys
+/// (h, hd, a, w, t, d, sf) must be deleted and the entity removed from `active_entities`.
+#[test]
+fn redis_state_hybrid_suppressed_cleanup_removes_all_redis_keys_for_stale_entity() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 5_u64;
+        let hard_limit_factor = 2.0_f64;
+        let sync_interval_ms = 25_u64;
+        let cache_ms = 60_000_u64; // long TTL so sf doesn't expire naturally
+        let stale_after_ms = 150_u64;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let hard_cap = (window_size_seconds as f64 * *rate_limit * hard_limit_factor) as u64;
+
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+
+        // Drive past the hard limit (hard_cap + 2 calls) so that at least one call hits
+        // suppression_factor=1 and writes the declined-count keys (hd, d).
+        for _ in 0..hard_cap + 2 {
+            let _ = rl
+                .hybrid()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+        }
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        // Force a Redis read on a fresh instance to ensure `sf` is written.
+        let rl2 = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+        let _ = rl2
+            .hybrid()
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+
+        wait_for_hybrid_sync(sync_interval_ms * 3).await;
+
+        let kg = key_gen(&prefix, RateType::HybridSuppressed);
+        let active_entities_key = kg.get_active_entities_key();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        // Verify all expected keys exist before cleanup.
+        for entity_key in kg.get_all_entity_keys(&k) {
+            let exists: bool = conn.exists(&entity_key).await.unwrap();
+            assert!(exists, "key {entity_key} must exist before cleanup");
+        }
+        let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(
+            score.is_some(),
+            "entity must be in active_entities before cleanup"
+        );
+
+        // Wait until the entity is stale.
+        runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
+
+        rl2.hybrid()
+            .suppressed()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+
+        // All per-entity keys must be deleted.
+        for entity_key in kg.get_all_entity_keys(&k) {
+            let exists: bool = conn.exists(&entity_key).await.unwrap();
+            assert!(!exists, "key {entity_key} must be deleted after cleanup");
+        }
+        let score_after: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(
+            score_after.is_none(),
+            "entity must be removed from active_entities after cleanup"
+        );
+    });
+}
+
+/// An entity whose last-commit timestamp is within `stale_after_ms` must survive cleanup.
+#[test]
+fn redis_state_hybrid_suppressed_cleanup_does_not_remove_active_entity() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 5_u64;
+        let hard_limit_factor = 1.0_f64;
+        let sync_interval_ms = 25_u64;
+        let cache_ms = 5_u64;
+        let stale_after_ms = 5_000_u64; // very long — entity will not be stale yet
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let soft_cap = (window_size_seconds as f64 * *rate_limit) as u64;
+
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+
+        // Overflow and sync — entity is recent.
+        for _ in 0..=soft_cap {
+            let _ = rl
+                .hybrid()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+        }
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        // Immediately cleanup with a long threshold — nothing should be removed.
+        rl.hybrid()
+            .suppressed()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+
+        let active_entities_key =
+            key_gen(&prefix, RateType::HybridSuppressed).get_active_entities_key();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let t_exists: bool = conn.exists(redis_key(&prefix, &k, "t")).await.unwrap();
+        assert!(
+            t_exists,
+            "total count key must still exist for active entity"
+        );
+        let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(
+            score.is_some(),
+            "active entity must remain in active_entities after cleanup"
+        );
+    });
+}
+
+/// After cleanup removes Redis state, a subsequent `inc` for the same key must be allowed
+/// (the in-memory state must also be cleared so the limiter starts fresh from Redis).
+#[test]
+fn redis_state_hybrid_suppressed_cleanup_allows_fresh_requests_after_cleanup() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 5_u64;
+        let hard_limit_factor = 2.0_f64; // soft_cap=10, hard_cap=20 — genuine suppression zone
+        let sync_interval_ms = 25_u64;
+        let cache_ms = 5_u64;
+        let stale_after_ms = 150_u64;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let soft_cap = (window_size_seconds as f64 * *rate_limit) as u64; // 10
+
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+
+        // Fill past the soft limit — entity ends up in Suppressing state.
+        for _ in 0..=soft_cap {
+            let _ = rl
+                .hybrid()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+        }
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        // Wait until entity is stale, then clean up.
+        runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
+        rl.hybrid()
+            .suppressed()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let t_exists: bool = conn.exists(redis_key(&prefix, &k, "t")).await.unwrap();
+        assert!(!t_exists, "total count key must be deleted after cleanup");
+
+        // The next request must be allowed — stale in-memory Suppressing state must be cleared.
+        let decision = rl
+            .hybrid()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        let is_allowed = match decision {
+            RateLimitDecision::Allowed => true,
+            RateLimitDecision::Suppressed { is_allowed, .. } => is_allowed,
+            _ => false,
+        };
+        assert!(
+            is_allowed,
+            "expected Allowed or Suppressed{{is_allowed:true}} after cleanup but got {decision:?}"
+        );
+    });
+}
+
+/// The `sf` cache key with a long TTL must be explicitly deleted by the cleanup Lua script
+/// (not merely allowed to expire naturally).
+#[test]
+fn redis_state_hybrid_suppressed_sf_key_deleted_by_cleanup() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 5_u64;
+        let hard_limit_factor = 2.0_f64;
+        let sync_interval_ms = 25_u64;
+        let cache_ms = 60_000_u64; // 60 s TTL — won't expire naturally during the test
+        let stale_after_ms = 150_u64;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let hard_cap = (window_size_seconds as f64 * *rate_limit * hard_limit_factor) as u64;
+
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+
+        // Drive past hard limit, sync, then force a read_state to write `sf`.
+        for _ in 0..=hard_cap {
+            let _ = rl
+                .hybrid()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+        }
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        let rl2 = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            hard_limit_factor,
+            cache_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+        let _ = rl2
+            .hybrid()
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        // Confirm sf exists with a long TTL.
+        let pttl: i64 = conn.pttl(redis_key(&prefix, &k, "sf")).await.unwrap();
+        assert!(
+            pttl > 1_000,
+            "sf key must have a long TTL before cleanup, got {pttl}ms"
+        );
+
+        // Wait for entity to become stale, then cleanup.
+        runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
+
+        rl2.hybrid()
+            .suppressed()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+
+        // sf must be explicitly deleted by the Lua script — not just waiting for TTL.
+        let sf_exists: bool = conn.exists(redis_key(&prefix, &k, "sf")).await.unwrap();
+        assert!(
+            !sf_exists,
+            "sf key must be deleted by cleanup, not left to expire via TTL"
         );
     });
 }

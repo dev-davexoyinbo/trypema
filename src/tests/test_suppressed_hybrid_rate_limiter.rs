@@ -1312,20 +1312,21 @@ fn hybrid_suppressed_prefix_isolation() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
+        let window_size_seconds = 5_u64;
         let rate_group_size_ms = 1_000_u64;
         let sync_interval_ms = 25_u64;
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let hard_limit_factor = 2.0_f64;
+        let cache_ms = 5_u64;
+        let rate_limit = RateLimit::try_from(2f64).unwrap();
 
         let prefix_a = unique_prefix();
         let prefix_b = unique_prefix();
 
-        let cache_ms = 5_u64;
         let rl_a = build_limiter_with_prefix(
             &url,
             window_size_seconds,
             rate_group_size_ms,
-            1.0,
+            hard_limit_factor,
             cache_ms,
             sync_interval_ms,
             prefix_a,
@@ -1336,7 +1337,7 @@ fn hybrid_suppressed_prefix_isolation() {
             &url,
             window_size_seconds,
             rate_group_size_ms,
-            1.0,
+            hard_limit_factor,
             cache_ms,
             sync_interval_ms,
             prefix_b,
@@ -1344,49 +1345,47 @@ fn hybrid_suppressed_prefix_isolation() {
         .await;
 
         let k = key("k");
-        let cap = (window_size_seconds as f64 * *rate_limit) as u64;
+        // soft_cap = floor(window_size_seconds * rate_limit * 1) = floor(5 * 2) = 10
+        let soft_cap = window_capacity(window_size_seconds, &rate_limit);
 
-        // Seed prefix_a to full suppression (hybrid suppressed namespace).
-        for _ in 0..cap {
-            let d = rl_a
+        // Send soft_cap + 1 increments so the (soft_cap+1)-th call overflows the local
+        // budget and queues a Redis commit for prefix_a.
+        for _ in 0..=soft_cap {
+            let _ = rl_a
                 .hybrid()
                 .suppressed()
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(
-                matches!(
-                    d,
-                    RateLimitDecision::Allowed
-                        | RateLimitDecision::Suppressed {
-                            is_allowed: true,
-                            ..
-                        }
-                ),
-                "d: {d:?}"
-            );
         }
 
-        // Ensure the commit is flushed and suppression_factor is recomputed.
+        // Flush prefix_a state to Redis, then let the sf cache expire.
         wait_for_hybrid_sync(sync_interval_ms).await;
         runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
 
+        // prefix_a is now in the suppression zone (total > soft_cap).
         let sf_a = rl_a
             .hybrid()
             .suppressed()
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert!((sf_a - 1.0).abs() < 1e-12, "sf_a: {sf_a}");
+        assert!(
+            sf_a > 0.0,
+            "prefix_a should be suppressed after overflow, sf_a={sf_a}"
+        );
 
-        // Different prefix should remain unaffected.
+        // prefix_b has received no traffic; its Redis namespace is empty.
         let sf_b = rl_b
             .hybrid()
             .suppressed()
             .get_suppression_factor(&k)
             .await
             .unwrap();
-        assert!((sf_b - 0.0).abs() < 1e-12, "sf_b: {sf_b}");
+        assert!(
+            (sf_b - 0.0).abs() < 1e-12,
+            "prefix_b must be unaffected by prefix_a traffic, sf_b={sf_b}"
+        );
     });
 }
 

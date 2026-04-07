@@ -12,18 +12,19 @@
 //! | `P:K:hybrid_absolute:a`           | Sorted set  | Active bucket timestamps (scores = ts_ms)  |
 //! | `P:K:hybrid_absolute:w`           | String      | Stored window limit                        |
 //! | `P:K:hybrid_absolute:t`           | String      | Running total count                        |
-//! | `P:active_entities`               | Sorted set  | All active user-keys (for cleanup)         |
+//! | `P:hybrid_absolute:active_entities` | Sorted set  | All active user-keys (for cleanup)        |
 //!
 //! **Important:** because the hybrid limiter batches writes, tests must wait for the
 //! background committer to flush (`wait_for_hybrid_sync`) before inspecting Redis state.
 
-use std::{collections::HashMap, env, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use redis::AsyncCommands;
 
 use super::runtime;
+use super::common::{redis_url, unique_prefix, key, key_gen, wait_for_hybrid_sync};
 
-use crate::common::SuppressionFactorCacheMs;
+use crate::common::{RateType, SuppressionFactorCacheMs};
 use crate::hybrid::SyncIntervalMs;
 use crate::{
     HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
@@ -33,23 +34,6 @@ use crate::{
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn redis_url() -> String {
-    env::var("REDIS_URL").unwrap_or_else(|_| {
-        panic!(
-            "REDIS_URL env var must be set for Redis-backed tests (e.g. REDIS_URL=redis://127.0.0.1:16379/)"
-        )
-    })
-}
-
-fn unique_prefix() -> RedisKey {
-    let n: u64 = rand::random();
-    RedisKey::try_from(format!("trypema_test_{n}")).unwrap()
-}
-
-fn key(s: &str) -> RedisKey {
-    RedisKey::try_from(s.to_string()).unwrap()
-}
 
 async fn build_limiter(
     url: &str,
@@ -82,14 +66,16 @@ async fn build_limiter(
     std::sync::Arc::new(RateLimiter::new(options))
 }
 
-/// `{prefix}:{user_key}:hybrid_absolute:{suffix}`
+/// Construct the canonical Redis key for a given suffix using the key generator.
 fn redis_key(prefix: &RedisKey, user_key: &RedisKey, suffix: &str) -> String {
-    format!("{}:{}:hybrid_absolute:{}", **prefix, **user_key, suffix)
-}
-
-/// Wait long enough for the background committer to flush two ticks.
-async fn wait_for_hybrid_sync(sync_interval_ms: u64) {
-    runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+    let kg = key_gen(prefix, RateType::HybridAbsolute);
+    match suffix {
+        "h" => kg.get_hash_key(user_key),
+        "a" => kg.get_active_keys(user_key),
+        "w" => kg.get_window_limit_key(user_key),
+        "t" => kg.get_total_count_key(user_key),
+        _   => panic!("unknown suffix for hybrid_absolute rate type: {suffix}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +441,228 @@ fn redis_state_hybrid_absolute_active_sorted_set_scores_are_ordered() {
                 "scores must be non-decreasing: {scores:?}"
             );
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup tests
+// ---------------------------------------------------------------------------
+
+/// After cleanup with a stale threshold the entity has exceeded, all per-entity Redis keys
+/// must be deleted and the entity must be removed from the `active_entities` sorted set.
+#[test]
+fn redis_state_hybrid_absolute_cleanup_removes_all_redis_keys_for_stale_entity() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 5_u64;
+        let sync_interval_ms = 25_u64;
+        let stale_after_ms = 150_u64;
+
+        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let cap = (window_size_seconds as f64 * *rate_limit) as u64;
+
+        // Overflow to trigger a Redis commit.
+        for _ in 0..cap {
+            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        }
+        let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        let active_entities_key = key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let kg = key_gen(&prefix, RateType::HybridAbsolute);
+
+        // Verify all keys exist before cleanup.
+        for entity_key in kg.get_all_entity_keys(&k) {
+            // Absolute limiter only writes h, a, w, t — others are trivially absent.
+            // We check only the ones that must exist.
+            if entity_key == kg.get_hash_key(&k)
+                || entity_key == kg.get_active_keys(&k)
+                || entity_key == kg.get_window_limit_key(&k)
+                || entity_key == kg.get_total_count_key(&k)
+            {
+                let exists: bool = conn.exists(&entity_key).await.unwrap();
+                assert!(exists, "key {entity_key} must exist before cleanup");
+            }
+        }
+        let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(score.is_some(), "entity must be in active_entities before cleanup");
+
+        // Wait until the entity is stale.
+        runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
+
+        rl.hybrid().absolute().cleanup(stale_after_ms).await.unwrap();
+
+        // All per-entity keys must be deleted.
+        for entity_key in kg.get_all_entity_keys(&k) {
+            let exists: bool = conn.exists(&entity_key).await.unwrap();
+            assert!(!exists, "key {entity_key} must be deleted after cleanup");
+        }
+
+        // Entity must be removed from active_entities.
+        let score_after: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(score_after.is_none(), "entity must be removed from active_entities after cleanup");
+    });
+}
+
+/// An entity whose last-commit timestamp is within `stale_after_ms` must survive cleanup.
+#[test]
+fn redis_state_hybrid_absolute_cleanup_does_not_remove_active_entity() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 5_u64;
+        let sync_interval_ms = 25_u64;
+        let stale_after_ms = 5_000_u64; // very long — entity will not be stale yet
+
+        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let cap = (window_size_seconds as f64 * *rate_limit) as u64;
+
+        // Overflow and sync — entity is recent.
+        for _ in 0..cap {
+            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        }
+        let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        // Immediately cleanup with a long threshold — nothing should be removed.
+        rl.hybrid().absolute().cleanup(stale_after_ms).await.unwrap();
+
+        let active_entities_key = key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let t_exists: bool = conn.exists(redis_key(&prefix, &k, "t")).await.unwrap();
+        assert!(t_exists, "total count key must still exist for active entity");
+        let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(score.is_some(), "active entity must remain in active_entities after cleanup");
+    });
+}
+
+/// After cleanup removes Redis state, a subsequent `inc` for the same key must be allowed
+/// (the in-memory state must also be cleared so the limiter starts fresh from Redis).
+#[test]
+fn redis_state_hybrid_absolute_cleanup_allows_fresh_requests_after_cleanup() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 5_u64;
+        let sync_interval_ms = 25_u64;
+        let stale_after_ms = 150_u64;
+
+        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let cap = (window_size_seconds as f64 * *rate_limit) as u64; // 10
+
+        // Fill capacity then overflow — entity ends up in Rejecting state.
+        for _ in 0..cap {
+            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        }
+        let rejected = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        assert!(
+            matches!(rejected, RateLimitDecision::Rejected { .. }),
+            "expected Rejected after overflow, got {rejected:?}"
+        );
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        // Wait until entity is stale, then clean up.
+        runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
+        rl.hybrid().absolute().cleanup(stale_after_ms).await.unwrap();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let t_exists: bool = conn.exists(redis_key(&prefix, &k, "t")).await.unwrap();
+        assert!(!t_exists, "total count key must be deleted after cleanup");
+
+        // The next request must be allowed — stale in-memory Rejecting state must be cleared.
+        let decision = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "expected Allowed after cleanup but got {decision:?}"
+        );
+    });
+}
+
+/// When multiple entities exist under the same prefix, cleanup must only remove stale ones
+/// and leave recently-active entities intact.
+#[test]
+fn redis_state_hybrid_absolute_cleanup_multiple_entities_mixed() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 5_u64;
+        let sync_interval_ms = 25_u64;
+        let stale_after_ms = 150_u64;
+
+        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let stale = key("stale_user");
+        let active = key("active_user");
+        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let cap = (window_size_seconds as f64 * *rate_limit) as u64;
+
+        // Overflow stale_user and sync.
+        for _ in 0..cap {
+            let _ = rl.hybrid().absolute().inc(&stale, &rate_limit, 1).await.unwrap();
+        }
+        let _ = rl.hybrid().absolute().inc(&stale, &rate_limit, 1).await.unwrap();
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        // Wait for stale_user to become stale.
+        runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
+
+        // Now overflow active_user — its commit timestamp is recent.
+        let rl2 = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        for _ in 0..cap {
+            let _ = rl2.hybrid().absolute().inc(&active, &rate_limit, 1).await.unwrap();
+        }
+        let _ = rl2.hybrid().absolute().inc(&active, &rate_limit, 1).await.unwrap();
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        rl2.hybrid().absolute().cleanup(stale_after_ms).await.unwrap();
+
+        let active_entities_key = key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        // stale_user keys must be gone.
+        let stale_t: bool = conn.exists(redis_key(&prefix, &stale, "t")).await.unwrap();
+        assert!(!stale_t, "stale_user total count key must be deleted");
+        let stale_score: Option<f64> = conn.zscore(&active_entities_key, stale.as_str()).await.unwrap();
+        assert!(stale_score.is_none(), "stale_user must be removed from active_entities");
+
+        // active_user keys must still exist.
+        let active_t: bool = conn.exists(redis_key(&prefix, &active, "t")).await.unwrap();
+        assert!(active_t, "active_user total count key must still exist");
+        let active_score: Option<f64> = conn.zscore(&active_entities_key, active.as_str()).await.unwrap();
+        assert!(active_score.is_some(), "active_user must remain in active_entities");
     });
 }
 

@@ -31,6 +31,7 @@ enum SuppressedRedisLimitingState {
         count: AtomicU64,
         declined_count: Mutex<u64>,
         time_instant: Mutex<Instant>,
+        last_modified: Mutex<Instant>,
     },
     Undefined,
     Suppressing {
@@ -102,8 +103,10 @@ impl SuppressedHybridRateLimiter {
 
         let is_active_watch = watch::Sender::new(0u64);
 
+        let sync_interval = Duration::from_millis(*options.sync_interval_ms);
+
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
-            sync_interval: Duration::from_millis(*options.sync_interval_ms),
+            sync_interval,
             channel_capacity: 8192,
             max_batch_size: 4,
             limiter_sender: tx,
@@ -397,21 +400,23 @@ impl SuppressedHybridRateLimiter {
             window_limit,
             starting_count,
             count,
-            declined_count,
+            // declined_count,
+            last_modified,
             ..
         } = state_entry.deref()
         {
             let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
             let window_limit = *mutex_lock(window_limit, "accepting.accept_limit")?;
-            let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
+            // let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
             let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
 
             if starting_count
                 .saturating_add(count.load(Ordering::Acquire))
-                .saturating_sub(declined)
+                // .saturating_sub(declined)
                 .saturating_add(increment)
                 <= soft_window_limit
             {
+                *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
                 count.fetch_add(increment, Ordering::AcqRel);
                 return Ok(RateLimitDecision::Allowed);
             }
@@ -454,21 +459,23 @@ impl SuppressedHybridRateLimiter {
                     window_limit,
                     count,
                     starting_count,
-                    declined_count,
+                    // declined_count,
+                    last_modified,
                     ..
                 } = state_entry.deref()
             {
                 let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
                 let window_limit = *mutex_lock(window_limit, "accepting.accept_limit")?;
-                let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
+                // let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
                 let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
 
                 if starting_count
                     .saturating_add(count.load(Ordering::Acquire))
-                    .saturating_sub(declined)
+                    // .saturating_sub(declined)
                     .saturating_add(increment)
                     <= soft_window_limit
                 {
+                    *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
                     count.fetch_add(increment, Ordering::AcqRel);
                     return Ok(RateLimitDecision::Allowed);
                 }
@@ -601,7 +608,7 @@ impl SuppressedHybridRateLimiter {
                 current_total_count = current_total_count.saturating_add(count);
                 current_declined_count = current_declined_count.saturating_add(declined);
 
-                if count > 0 {
+                if count > 0 || declined > 0 {
                     let commit = SuppressedHybridCommit {
                         key: key.clone(),
                         window_limit: hard_window_limit.expect("Window limit should be set"),
@@ -752,10 +759,12 @@ impl SuppressedHybridRateLimiter {
             time_instant,
             starting_count,
             declined_count,
+            last_modified,
         } = state.deref()
         {
             *mutex_lock(window_limit, "accepting.window_limit")? = hard_window_limit;
             *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
+            *mutex_lock(last_modified, "accepting.last_modified")? = new_time_instant;
             *mutex_lock(starting_count, "accepting.starting_count")? = current_total_count;
             *mutex_lock(declined_count, "accepting.declined_count")? = current_declined_count;
             count.store(increment, Ordering::Release);
@@ -771,6 +780,7 @@ impl SuppressedHybridRateLimiter {
             *state = SuppressedRedisLimitingState::Accepting {
                 window_limit: Mutex::new(hard_window_limit),
                 time_instant: Mutex::new(new_time_instant),
+                last_modified: Mutex::new(new_time_instant),
                 starting_count: Mutex::new(current_total_count),
                 declined_count: Mutex::new(current_declined_count),
                 count: AtomicU64::new(increment),
@@ -782,20 +792,118 @@ impl SuppressedHybridRateLimiter {
 
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        self.redis_proxy.cleanup(stale_after_ms).await
+        self.redis_proxy.cleanup(stale_after_ms).await?;
+        self.limiting_state.retain(|_, state| match state {
+            SuppressedRedisLimitingState::Undefined => false,
+            SuppressedRedisLimitingState::Accepting { last_modified, .. } => {
+                let last_modified = match last_modified.get_mut() {
+                    Ok(last_modified) => last_modified,
+                    Err(err) => {
+                        tracing::warn!("last_modified is poisoned: {err:?}");
+                        return false;
+                    }
+                };
+
+                last_modified.elapsed().as_millis() < stale_after_ms as u128
+            }
+            SuppressedRedisLimitingState::Suppressing { time_instant, .. } => {
+                let time_instant = match time_instant.get_mut() {
+                    Ok(time_instant) => time_instant,
+                    Err(err) => {
+                        tracing::warn!("time_instant is poisoned: {err:?}");
+                        return false;
+                    }
+                };
+
+                time_instant.elapsed().as_millis() < stale_after_ms as u128
+            }
+        });
+
+        Ok(())
     }
 
     async fn flush(&self) -> Result<(), TrypemaError> {
         let mut resets: Vec<RedisKey> = Vec::new();
 
-        for state in self.limiting_state.iter() {
+        for mut state in self.limiting_state.iter_mut() {
             let key = state.key();
+            // TODO: only flush the keys that needs to be flushed, eg, an inactive key should be
+            // ignored. We would compare last modified time with the current time.
+            // If we don't have any count for both Accepting and Suppressing, we can skip it.
 
-            if let SuppressedRedisLimitingState::Accepting { .. }
-            | SuppressedRedisLimitingState::Suppressing { .. } = state.deref()
-            {
-                resets.push(key.clone());
+            match state.deref() {
+                SuppressedRedisLimitingState::Undefined => continue,
+                SuppressedRedisLimitingState::Accepting {
+                    count,
+                    last_modified,
+                    ..
+                } => {
+                    let elapsed = {
+                        let last_modified = match last_modified.lock() {
+                            Ok(last_modified) => last_modified,
+                            Err(err) => {
+                                tracing::warn!("last_modified is poisoned: {err:?}");
+                                continue;
+                            }
+                        };
+
+                        last_modified.elapsed()
+                    };
+
+                    // let elapsed = (*mutex_lock(last_modified, "last_modified"))?.elapsed();
+
+                    if elapsed.as_millis() > (*self.window_size_seconds * 1000) as u128
+                        || count.load(Ordering::Acquire) == 0
+                    {
+                        *state = SuppressedRedisLimitingState::Undefined;
+
+                        continue;
+                    }
+
+                    // if count.load(Ordering::Acquire) == 0 {
+                    //     continue;
+                    // }
+                }
+                SuppressedRedisLimitingState::Suppressing {
+                    time_instant,
+                    count,
+                    declined_count,
+                    ..
+                } => {
+                    let elapsed = {
+                        let time_instant = match time_instant.lock() {
+                            Ok(time_instant) => time_instant,
+                            Err(err) => {
+                                tracing::warn!("time_instant is poisoned: {err:?}");
+                                continue;
+                            }
+                        };
+
+                        time_instant.elapsed()
+                    };
+
+                    // let elapsed = (*mutex_lock(last_modified, "last_modified"))?.elapsed();
+
+                    if elapsed.as_millis() > (*self.window_size_seconds * 1000) as u128 {
+                        *state = SuppressedRedisLimitingState::Undefined;
+
+                        continue;
+                    }
+
+                    if count.load(Ordering::Acquire) == 0
+                        && declined_count.load(Ordering::Acquire) == 0
+                    {
+                        *state = SuppressedRedisLimitingState::Undefined;
+                        continue;
+                    }
+                }
             }
+
+            // if let SuppressedRedisLimitingState::Accepting { .. }
+            // | SuppressedRedisLimitingState::Suppressing { .. } = state.deref()
+            // {
+            // }
+            resets.push(key.clone());
         }
 
         if resets.is_empty() {
