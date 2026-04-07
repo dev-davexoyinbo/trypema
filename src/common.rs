@@ -238,6 +238,16 @@ impl RateLimit {
     pub fn max() -> Self {
         Self(f64::MAX)
     }
+
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: f64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: f64) -> Self {
+        Self::try_from(value).expect("RateLimit value must be greater than 0")
+    }
 }
 
 impl Deref for RateLimit {
@@ -294,6 +304,25 @@ impl DerefMut for RateLimit {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct WindowSizeSeconds(u64);
+
+impl Default for WindowSizeSeconds {
+    /// Returns a window size of 10 seconds.
+    fn default() -> Self {
+        Self(10)
+    }
+}
+
+impl WindowSizeSeconds {
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: u64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: u64) -> Self {
+        Self::try_from(value).expect("WindowSizeSeconds must be at least 1")
+    }
+}
 
 impl Deref for WindowSizeSeconds {
     type Target = u64;
@@ -368,6 +397,18 @@ impl Default for RateGroupSizeMs {
     /// Returns a rate group size of 100 ms.
     fn default() -> Self {
         Self(100)
+    }
+}
+
+impl RateGroupSizeMs {
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: u64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: u64) -> Self {
+        Self::try_from(value).expect("RateGroupSizeMs must be greater than 0")
     }
 }
 
@@ -454,6 +495,18 @@ impl Default for HardLimitFactor {
     }
 }
 
+impl HardLimitFactor {
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: f64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: f64) -> Self {
+        Self::try_from(value).expect("HardLimitFactor must be >= 1.0")
+    }
+}
+
 impl Deref for HardLimitFactor {
     type Target = f64;
 
@@ -529,6 +582,18 @@ impl Default for SuppressionFactorCacheMs {
     /// Returns a suppression factor cache duration of 100 ms.
     fn default() -> Self {
         Self(100)
+    }
+}
+
+impl SuppressionFactorCacheMs {
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: u64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: u64) -> Self {
+        Self::try_from(value).expect("SuppressionFactorCacheMs must be greater than 0")
     }
 }
 

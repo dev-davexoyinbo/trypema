@@ -42,7 +42,7 @@ use crate::{
 ///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// };
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LocalRateLimiterOptions {
     /// Sliding window duration for admission decisions.
     ///

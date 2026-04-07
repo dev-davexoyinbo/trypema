@@ -109,6 +109,40 @@ pub struct RedisRateLimiterOptions {
     pub sync_interval_ms: SyncIntervalMs,
 }
 
+impl RedisRateLimiterOptions {
+    /// Create a new [`RedisRateLimiterOptions`] with the given `connection_manager`.
+    ///
+    /// All other fields default to their type's [`Default`] value:
+    /// - `prefix`: `None` (uses `"trypema"`)
+    /// - `window_size_seconds`: [`WindowSizeSeconds::default()`]
+    /// - `rate_group_size_ms`: [`RateGroupSizeMs::default()`]
+    /// - `hard_limit_factor`: [`HardLimitFactor::default()`]
+    /// - `suppression_factor_cache_ms`: [`SuppressionFactorCacheMs::default()`]
+    /// - `sync_interval_ms`: [`SyncIntervalMs::default()`]
+    ///
+    /// Override specific fields with struct update syntax:
+    /// ```no_run
+    /// # use trypema::redis::RedisRateLimiterOptions;
+    /// # use trypema::WindowSizeSeconds;
+    /// # let connection_manager: redis::aio::ConnectionManager = todo!();
+    /// let options = RedisRateLimiterOptions {
+    ///     window_size_seconds: WindowSizeSeconds::new_or_panic(60),
+    ///     ..RedisRateLimiterOptions::new(connection_manager)
+    /// };
+    /// ```
+    pub fn new(connection_manager: ConnectionManager) -> Self {
+        Self {
+            connection_manager,
+            prefix: None,
+            window_size_seconds: WindowSizeSeconds::default(),
+            rate_group_size_ms: RateGroupSizeMs::default(),
+            hard_limit_factor: HardLimitFactor::default(),
+            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            sync_interval_ms: SyncIntervalMs::default(),
+        }
+    }
+}
+
 /// Provider for Redis-backed distributed rate limiting.
 ///
 /// Enables rate limiting across multiple processes or servers using Redis as a

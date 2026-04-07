@@ -75,6 +75,18 @@ impl Default for SyncIntervalMs {
     }
 }
 
+impl SyncIntervalMs {
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: u64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: u64) -> Self {
+        Self::try_from(value).expect("SyncIntervalMs must be greater than 0")
+    }
+}
+
 impl Deref for SyncIntervalMs {
     type Target = u64;
 

@@ -85,11 +85,20 @@ use std::{
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use crate::hybrid::HybridRateLimiterProvider;
-use crate::{LocalRateLimiterOptions, LocalRateLimiterProvider};
+use crate::{
+    HardLimitFactor, LocalRateLimiterOptions, LocalRateLimiterProvider, RateGroupSizeMs,
+    SuppressionFactorCacheMs, TrypemaError, WindowSizeSeconds,
+};
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
-use crate::redis::{RedisRateLimiterOptions, RedisRateLimiterProvider};
+use crate::redis::{RedisKey, RedisRateLimiterOptions, RedisRateLimiterProvider};
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use crate::hybrid::SyncIntervalMs;
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use redis::aio::ConnectionManager;
 
 /// Configuration for [`RateLimiter`].
 ///
@@ -163,6 +172,19 @@ pub struct RateLimiterOptions {
     /// Only available with `redis-tokio` or `redis-smol` features.
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     pub redis: RedisRateLimiterOptions,
+}
+
+/// Default configuration for [`RateLimiterOptions`].
+///
+/// Only available when Redis features are disabled. When Redis features are enabled,
+/// `RateLimiterOptions` requires a `ConnectionManager` which has no meaningful default.
+#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
+impl Default for RateLimiterOptions {
+    fn default() -> Self {
+        Self {
+            local: LocalRateLimiterOptions::default(),
+        }
+    }
 }
 
 /// Primary rate limiter facade.
@@ -253,6 +275,12 @@ pub struct RateLimiter {
     #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
     hybrid: HybridRateLimiterProvider,
     is_loop_running: AtomicBool,
+}
+
+impl Drop for RateLimiter {
+    fn drop(&mut self) {
+        self.stop_cleanup_loop();
+    }
 }
 
 impl RateLimiter {
@@ -453,7 +481,7 @@ impl RateLimiter {
     /// This method is idempotent and safe to call multiple times.
     ///
     /// Stopping is best-effort and asynchronous: background tasks will exit on their next check/tick.
-    pub fn stop_cleanup_loop(self: &Arc<Self>) {
+    pub fn stop_cleanup_loop(&self) {
         self.is_loop_running.store(false, Ordering::SeqCst);
     } // end method stop_cleanup_loop
 
@@ -600,5 +628,188 @@ impl RateLimiter {
     /// ```
     pub fn local(&self) -> &LocalRateLimiterProvider {
         &self.local
+    }
+}
+
+/// Builder for [`RateLimiter`].
+///
+/// Construct via [`RateLimiter::builder()`]. All fields have sensible defaults derived
+/// from each type's own [`Default`] implementation, so changing a type's default
+/// automatically propagates here without code changes.
+///
+/// # Without Redis features
+///
+/// ```no_run
+/// use trypema::RateLimiter;
+///
+/// let rl = RateLimiter::builder()
+///     .window_size_seconds(60)
+///     .build()
+///     .unwrap();
+/// ```
+///
+/// # With Redis features
+///
+/// ```no_run
+/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+/// # async fn example() {
+/// # let connection_manager: redis::aio::ConnectionManager = todo!();
+/// use trypema::RateLimiter;
+///
+/// let rl = RateLimiter::builder(connection_manager)
+///     .window_size_seconds(60)
+///     .build()
+///     .unwrap();
+/// # }
+/// ```
+pub struct RateLimiterBuilder {
+    window_size_seconds: u64,
+    rate_group_size_ms: u64,
+    hard_limit_factor: f64,
+    suppression_factor_cache_ms: u64,
+    stale_after_ms: u64,
+    cleanup_interval_ms: u64,
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    connection_manager: ConnectionManager,
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    redis_prefix: Option<RedisKey>,
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    sync_interval_ms: u64,
+}
+
+#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
+impl Default for RateLimiterBuilder {
+    fn default() -> Self {
+        Self {
+            window_size_seconds: *WindowSizeSeconds::default(),
+            rate_group_size_ms: *RateGroupSizeMs::default(),
+            hard_limit_factor: *HardLimitFactor::default(),
+            suppression_factor_cache_ms: *SuppressionFactorCacheMs::default(),
+            stale_after_ms: 10 * 60 * 1000,
+            cleanup_interval_ms: 30 * 1000,
+        }
+    }
+}
+
+#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
+impl RateLimiter {
+    /// Create a builder for [`RateLimiter`] with sensible defaults.
+    pub fn builder() -> RateLimiterBuilder {
+        RateLimiterBuilder::default()
+    }
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+impl RateLimiterBuilder {
+    fn new_with_connection_manager(connection_manager: ConnectionManager) -> Self {
+        Self {
+            window_size_seconds: *WindowSizeSeconds::default(),
+            rate_group_size_ms: *RateGroupSizeMs::default(),
+            hard_limit_factor: *HardLimitFactor::default(),
+            suppression_factor_cache_ms: *SuppressionFactorCacheMs::default(),
+            stale_after_ms: 10 * 60 * 1000,
+            cleanup_interval_ms: 30 * 1000,
+            connection_manager,
+            redis_prefix: None,
+            sync_interval_ms: *SyncIntervalMs::default(),
+        }
+    }
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+impl RateLimiter {
+    /// Create a builder for [`RateLimiter`].
+    ///
+    /// The `connection_manager` is required because it has no default.
+    /// All other options default to sensible values.
+    pub fn builder(connection_manager: ConnectionManager) -> RateLimiterBuilder {
+        RateLimiterBuilder::new_with_connection_manager(connection_manager)
+    }
+}
+
+impl RateLimiterBuilder {
+    /// Set the sliding window duration in seconds. Default: [`WindowSizeSeconds::default()`].
+    pub fn window_size_seconds(mut self, v: u64) -> Self {
+        self.window_size_seconds = v;
+        self
+    }
+
+    /// Set the bucket coalescing interval in milliseconds. Default: [`RateGroupSizeMs::default()`].
+    pub fn rate_group_size_ms(mut self, v: u64) -> Self {
+        self.rate_group_size_ms = v;
+        self
+    }
+
+    /// Set the hard cutoff multiplier for the suppressed strategy. Default: [`HardLimitFactor::default()`].
+    pub fn hard_limit_factor(mut self, v: f64) -> Self {
+        self.hard_limit_factor = v;
+        self
+    }
+
+    /// Set the suppression factor cache duration in milliseconds. Default: [`SuppressionFactorCacheMs::default()`].
+    pub fn suppression_factor_cache_ms(mut self, v: u64) -> Self {
+        self.suppression_factor_cache_ms = v;
+        self
+    }
+
+    /// Set how long (ms) a key must be inactive before it is considered stale. Default: 600,000 (10 min).
+    pub fn stale_after_ms(mut self, v: u64) -> Self {
+        self.stale_after_ms = v;
+        self
+    }
+
+    /// Set how often (ms) the cleanup loop runs. Default: 30,000 (30 sec).
+    pub fn cleanup_interval_ms(mut self, v: u64) -> Self {
+        self.cleanup_interval_ms = v;
+        self
+    }
+
+    /// Set the Redis key prefix. Default: `None` (uses `"trypema"`).
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+    pub fn redis_prefix(mut self, v: RedisKey) -> Self {
+        self.redis_prefix = Some(v);
+        self
+    }
+
+    /// Set the hybrid provider sync interval in milliseconds. Default: [`SyncIntervalMs::default()`].
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+    pub fn sync_interval_ms(mut self, v: u64) -> Self {
+        self.sync_interval_ms = v;
+        self
+    }
+
+    /// Build the [`RateLimiter`], wrapped in [`Arc`], with the cleanup loop already running.
+    ///
+    /// Returns `Err` if any option value fails validation.
+    pub fn build(self) -> Result<Arc<RateLimiter>, TrypemaError> {
+        let options = RateLimiterOptions {
+            local: LocalRateLimiterOptions {
+                window_size_seconds: WindowSizeSeconds::try_from(self.window_size_seconds)?,
+                rate_group_size_ms: RateGroupSizeMs::try_from(self.rate_group_size_ms)?,
+                hard_limit_factor: HardLimitFactor::try_from(self.hard_limit_factor)?,
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
+                    self.suppression_factor_cache_ms,
+                )?,
+            },
+            #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+            redis: RedisRateLimiterOptions {
+                connection_manager: self.connection_manager,
+                prefix: self.redis_prefix,
+                window_size_seconds: WindowSizeSeconds::try_from(self.window_size_seconds)?,
+                rate_group_size_ms: RateGroupSizeMs::try_from(self.rate_group_size_ms)?,
+                hard_limit_factor: HardLimitFactor::try_from(self.hard_limit_factor)?,
+                suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
+                    self.suppression_factor_cache_ms,
+                )?,
+                sync_interval_ms: SyncIntervalMs::try_from(self.sync_interval_ms)?,
+            },
+        };
+        let rl = Arc::new(RateLimiter::new(options));
+        rl.run_cleanup_loop_with_config(self.stale_after_ms, self.cleanup_interval_ms);
+        Ok(rl)
     }
 }
