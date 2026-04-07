@@ -5,6 +5,7 @@
 # Cargo.lock
 # Ignore for libraries; commit for binaries/apps.
 /Cargo.lock
+!Cargo.lock
 
 # Rustfmt
 /.rustfmt.toml.bk
