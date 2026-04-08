@@ -21,8 +21,8 @@ use std::{collections::HashMap, time::Duration};
 
 use redis::AsyncCommands;
 
+use super::common::{key, key_gen, redis_url, unique_prefix, wait_for_hybrid_sync};
 use super::runtime;
-use super::common::{redis_url, unique_prefix, key, key_gen, wait_for_hybrid_sync};
 
 use crate::common::{RateType, SuppressionFactorCacheMs};
 use crate::hybrid::SyncIntervalMs;
@@ -74,7 +74,7 @@ fn redis_key(prefix: &RedisKey, user_key: &RedisKey, suffix: &str) -> String {
         "a" => kg.get_active_keys(user_key),
         "w" => kg.get_window_limit_key(user_key),
         "t" => kg.get_total_count_key(user_key),
-        _   => panic!("unknown suffix for hybrid_absolute rate type: {suffix}"),
+        _ => panic!("unknown suffix for hybrid_absolute rate type: {suffix}"),
     }
 }
 
@@ -93,12 +93,24 @@ fn redis_state_hybrid_absolute_no_redis_keys_before_overflow() {
         let window_size_seconds = 1_u64;
         let sync_interval_ms = 2000_u64; // very slow tick so no background flush occurs
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         // capacity = 1 * 5 = 5; fill all 5 slots locally.
         for _ in 0..5 {
-            let d = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let d = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
@@ -130,19 +142,36 @@ fn redis_state_hybrid_absolute_commit_writes_total_count_after_overflow() {
         let window_size_seconds = 1_u64;
         let sync_interval_ms = 25_u64;
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = (window_size_seconds as f64 * *rate_limit) as u64; // 5
 
         // Fill the local budget.
         for _ in 0..cap {
-            let d = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let d = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
         // Trigger overflow — this queues the commit.
-        let d_overflow = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let d_overflow = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         assert!(
             matches!(d_overflow, RateLimitDecision::Rejected { .. }),
             "d_overflow: {d_overflow:?}"
@@ -169,7 +198,10 @@ fn redis_state_hybrid_absolute_commit_writes_total_count_after_overflow() {
 
         // The hash must have at least one bucket.
         let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
-        assert!(!hash.is_empty(), "hash must have at least one bucket after commit");
+        assert!(
+            !hash.is_empty(),
+            "hash must have at least one bucket after commit"
+        );
 
         // The active sorted set must have at least one member.
         let active_count: u64 = conn.zcard(redis_key(&prefix, &k, "a")).await.unwrap();
@@ -190,17 +222,34 @@ fn redis_state_hybrid_absolute_window_limit_key_is_set_after_commit() {
         let window_size_seconds = 2_u64;
         let sync_interval_ms = 25_u64;
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(3f64).unwrap();
         // capacity = 2 * 3 = 6
         let expected_window_limit = 6_u64;
 
         for _ in 0..expected_window_limit {
-            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
         // Overflow to trigger commit.
-        let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let _ = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -228,16 +277,33 @@ fn redis_state_hybrid_absolute_committed_state_is_visible_to_another_instance() 
         let window_size_seconds = 1_u64;
         let sync_interval_ms = 25_u64;
 
-        let rl_a = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl_a = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = (window_size_seconds as f64 * *rate_limit) as u64;
 
         // A fills and overflows.
         for _ in 0..cap {
-            let _ = rl_a.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl_a
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl_a.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let _ = rl_a
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -264,15 +330,32 @@ fn redis_state_hybrid_absolute_hash_sum_matches_total_count_after_commit() {
         let window_size_seconds = 1_u64;
         let sync_interval_ms = 25_u64;
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = (window_size_seconds as f64 * *rate_limit) as u64;
 
         for _ in 0..cap {
-            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let _ = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -303,24 +386,49 @@ fn redis_state_hybrid_absolute_evicts_expired_buckets_on_next_commit() {
         let window_size_seconds = 1_u64;
         let sync_interval_ms = 25_u64;
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = (window_size_seconds as f64 * *rate_limit) as u64;
 
         // First burst: fill and overflow to commit.
         for _ in 0..cap {
-            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let _ = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         // Wait for the window to expire.
         runtime::async_sleep(Duration::from_millis(window_size_seconds * 1000 + 100)).await;
 
         // Second burst: this read_state call in the hybrid limiter triggers Redis eviction.
-        let d = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
-        assert!(matches!(d, RateLimitDecision::Allowed), "d after expiry: {d:?}");
+        let d = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(d, RateLimitDecision::Allowed),
+            "d after expiry: {d:?}"
+        );
         // Let the new commit flush if needed.
         wait_for_hybrid_sync(sync_interval_ms).await;
 
@@ -350,8 +458,22 @@ fn redis_state_hybrid_absolute_different_prefixes_are_isolated() {
         let window_size_seconds = 1_u64;
         let sync_interval_ms = 25_u64;
 
-        let rl_a = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix_a.clone()).await;
-        let rl_b = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix_b.clone()).await;
+        let rl_a = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix_a.clone(),
+        )
+        .await;
+        let rl_b = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix_b.clone(),
+        )
+        .await;
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
@@ -359,9 +481,19 @@ fn redis_state_hybrid_absolute_different_prefixes_are_isolated() {
 
         // Overflow A to trigger commit.
         for _ in 0..cap {
-            let _ = rl_a.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl_a
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl_a.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let _ = rl_a
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -378,7 +510,12 @@ fn redis_state_hybrid_absolute_different_prefixes_are_isolated() {
         );
 
         // Sanity: B can still operate independently.
-        let d_b = rl_b.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let d_b = rl_b
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         assert!(matches!(d_b, RateLimitDecision::Allowed), "d_b: {d_b:?}");
     });
 }
@@ -396,26 +533,60 @@ fn redis_state_hybrid_absolute_active_sorted_set_scores_are_ordered() {
         let rate_group_size_ms = 100_u64;
         let sync_interval_ms = 50_u64;
 
-        let rl = build_limiter(&url, window_size_seconds, rate_group_size_ms, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(10f64).unwrap();
 
         // Trigger two separate overflow+commit cycles with a gap between them.
         for _ in 0..10 {
-            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let _ = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         // A brief pause ensures the next commit lands in a later ms bucket.
         runtime::async_sleep(Duration::from_millis(200)).await;
 
         // Reset local state so we can accumulate more.
-        let rl2 = build_limiter(&url, window_size_seconds, rate_group_size_ms, sync_interval_ms, prefix.clone()).await;
+        let rl2 = build_limiter(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         for _ in 0..10 {
-            let _ = rl2.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl2
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl2.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let _ = rl2
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -460,19 +631,37 @@ fn redis_state_hybrid_absolute_cleanup_removes_all_redis_keys_for_stale_entity()
         let sync_interval_ms = 25_u64;
         let stale_after_ms = 150_u64;
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = (window_size_seconds as f64 * *rate_limit) as u64;
 
         // Overflow to trigger a Redis commit.
         for _ in 0..cap {
-            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let _ = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
-        let active_entities_key = key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
+        let active_entities_key =
+            key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -496,12 +685,19 @@ fn redis_state_hybrid_absolute_cleanup_removes_all_redis_keys_for_stale_entity()
             }
         }
         let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
-        assert!(score.is_some(), "entity must be in active_entities before cleanup");
+        assert!(
+            score.is_some(),
+            "entity must be in active_entities before cleanup"
+        );
 
         // Wait until the entity is stale.
         runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
 
-        rl.hybrid().absolute().cleanup(stale_after_ms).await.unwrap();
+        rl.hybrid()
+            .absolute()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
 
         // All per-entity keys must be deleted.
         for entity_key in kg.get_all_entity_keys(&k) {
@@ -511,7 +707,10 @@ fn redis_state_hybrid_absolute_cleanup_removes_all_redis_keys_for_stale_entity()
 
         // Entity must be removed from active_entities.
         let score_after: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
-        assert!(score_after.is_none(), "entity must be removed from active_entities after cleanup");
+        assert!(
+            score_after.is_none(),
+            "entity must be removed from active_entities after cleanup"
+        );
     });
 }
 
@@ -526,22 +725,44 @@ fn redis_state_hybrid_absolute_cleanup_does_not_remove_active_entity() {
         let sync_interval_ms = 25_u64;
         let stale_after_ms = 5_000_u64; // very long — entity will not be stale yet
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = (window_size_seconds as f64 * *rate_limit) as u64;
 
         // Overflow and sync — entity is recent.
         for _ in 0..cap {
-            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let _ = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         // Immediately cleanup with a long threshold — nothing should be removed.
-        rl.hybrid().absolute().cleanup(stale_after_ms).await.unwrap();
+        rl.hybrid()
+            .absolute()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
 
-        let active_entities_key = key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
+        let active_entities_key =
+            key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -550,9 +771,15 @@ fn redis_state_hybrid_absolute_cleanup_does_not_remove_active_entity() {
             .unwrap();
 
         let t_exists: bool = conn.exists(redis_key(&prefix, &k, "t")).await.unwrap();
-        assert!(t_exists, "total count key must still exist for active entity");
+        assert!(
+            t_exists,
+            "total count key must still exist for active entity"
+        );
         let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
-        assert!(score.is_some(), "active entity must remain in active_entities after cleanup");
+        assert!(
+            score.is_some(),
+            "active entity must remain in active_entities after cleanup"
+        );
     });
 }
 
@@ -568,16 +795,33 @@ fn redis_state_hybrid_absolute_cleanup_allows_fresh_requests_after_cleanup() {
         let sync_interval_ms = 25_u64;
         let stale_after_ms = 150_u64;
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(2f64).unwrap();
         let cap = (window_size_seconds as f64 * *rate_limit) as u64; // 10
 
         // Fill capacity then overflow — entity ends up in Rejecting state.
         for _ in 0..cap {
-            let _ = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let rejected = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let rejected = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         assert!(
             matches!(rejected, RateLimitDecision::Rejected { .. }),
             "expected Rejected after overflow, got {rejected:?}"
@@ -586,7 +830,11 @@ fn redis_state_hybrid_absolute_cleanup_allows_fresh_requests_after_cleanup() {
 
         // Wait until entity is stale, then clean up.
         runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
-        rl.hybrid().absolute().cleanup(stale_after_ms).await.unwrap();
+        rl.hybrid()
+            .absolute()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -598,7 +846,12 @@ fn redis_state_hybrid_absolute_cleanup_allows_fresh_requests_after_cleanup() {
         assert!(!t_exists, "total count key must be deleted after cleanup");
 
         // The next request must be allowed — stale in-memory Rejecting state must be cleared.
-        let decision = rl.hybrid().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let decision = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Allowed),
             "expected Allowed after cleanup but got {decision:?}"
@@ -618,7 +871,14 @@ fn redis_state_hybrid_absolute_cleanup_multiple_entities_mixed() {
         let sync_interval_ms = 25_u64;
         let stale_after_ms = 150_u64;
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let stale = key("stale_user");
         let active = key("active_user");
         let rate_limit = RateLimit::try_from(2f64).unwrap();
@@ -626,25 +886,57 @@ fn redis_state_hybrid_absolute_cleanup_multiple_entities_mixed() {
 
         // Overflow stale_user and sync.
         for _ in 0..cap {
-            let _ = rl.hybrid().absolute().inc(&stale, &rate_limit, 1).await.unwrap();
+            let _ = rl
+                .hybrid()
+                .absolute()
+                .inc(&stale, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl.hybrid().absolute().inc(&stale, &rate_limit, 1).await.unwrap();
+        let _ = rl
+            .hybrid()
+            .absolute()
+            .inc(&stale, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         // Wait for stale_user to become stale.
         runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
 
         // Now overflow active_user — its commit timestamp is recent.
-        let rl2 = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl2 = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         for _ in 0..cap {
-            let _ = rl2.hybrid().absolute().inc(&active, &rate_limit, 1).await.unwrap();
+            let _ = rl2
+                .hybrid()
+                .absolute()
+                .inc(&active, &rate_limit, 1)
+                .await
+                .unwrap();
         }
-        let _ = rl2.hybrid().absolute().inc(&active, &rate_limit, 1).await.unwrap();
+        let _ = rl2
+            .hybrid()
+            .absolute()
+            .inc(&active, &rate_limit, 1)
+            .await
+            .unwrap();
         wait_for_hybrid_sync(sync_interval_ms).await;
 
-        rl2.hybrid().absolute().cleanup(stale_after_ms).await.unwrap();
+        rl2.hybrid()
+            .absolute()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
 
-        let active_entities_key = key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
+        let active_entities_key =
+            key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -655,14 +947,26 @@ fn redis_state_hybrid_absolute_cleanup_multiple_entities_mixed() {
         // stale_user keys must be gone.
         let stale_t: bool = conn.exists(redis_key(&prefix, &stale, "t")).await.unwrap();
         assert!(!stale_t, "stale_user total count key must be deleted");
-        let stale_score: Option<f64> = conn.zscore(&active_entities_key, stale.as_str()).await.unwrap();
-        assert!(stale_score.is_none(), "stale_user must be removed from active_entities");
+        let stale_score: Option<f64> = conn
+            .zscore(&active_entities_key, stale.as_str())
+            .await
+            .unwrap();
+        assert!(
+            stale_score.is_none(),
+            "stale_user must be removed from active_entities"
+        );
 
         // active_user keys must still exist.
         let active_t: bool = conn.exists(redis_key(&prefix, &active, "t")).await.unwrap();
         assert!(active_t, "active_user total count key must still exist");
-        let active_score: Option<f64> = conn.zscore(&active_entities_key, active.as_str()).await.unwrap();
-        assert!(active_score.is_some(), "active_user must remain in active_entities");
+        let active_score: Option<f64> = conn
+            .zscore(&active_entities_key, active.as_str())
+            .await
+            .unwrap();
+        assert!(
+            active_score.is_some(),
+            "active_user must remain in active_entities"
+        );
     });
 }
 
@@ -678,7 +982,14 @@ fn redis_state_hybrid_absolute_redis_absolute_keys_do_not_contaminate_hybrid_key
         let window_size_seconds = 1_u64;
         let sync_interval_ms = 2000_u64; // slow tick
 
-        let rl = build_limiter(&url, window_size_seconds, 1000, sync_interval_ms, prefix.clone()).await;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
 

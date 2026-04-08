@@ -11,8 +11,11 @@ use crate::{
 
 /// Provider for hybrid rate limiting (local fast-path + Redis sync).
 ///
-/// This provider is backed by Redis, but maintains per-key in-memory state to enable a low-latency
-/// fast-path. Local increments are periodically flushed to Redis in batches.
+/// This provider is backed by Redis, but keeps per-key in-memory state so common-case admission
+/// checks can avoid per-request Redis I/O. Local increments are flushed to Redis in batches.
+///
+/// It uses [`RedisRateLimiterOptions`] for the shared Redis connection and timing configuration,
+/// and exposes [`AbsoluteHybridRateLimiter`] and [`SuppressedHybridRateLimiter`] as strategies.
 ///
 /// Compared to the pure Redis provider (`rl.redis()`):
 /// - ✅ Lower steady-state latency for admission checks (no per-request Redis I/O)
@@ -27,7 +30,7 @@ use crate::{
 ///
 /// # Requirements
 ///
-/// - Redis 6.2+
+/// - Redis 7.2+
 /// - One of: `redis-tokio` or `redis-smol` features
 #[derive(Clone, Debug)]
 pub struct HybridRateLimiterProvider {
@@ -46,6 +49,22 @@ impl HybridRateLimiterProvider {
     /// Access the absolute strategy for strict sliding-window enforcement.
     ///
     /// See [`AbsoluteHybridRateLimiter`] for full documentation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// assert!(matches!(
+    ///     rl.hybrid().absolute().inc(&key, &rate, 1).await.unwrap(),
+    ///     RateLimitDecision::Allowed
+    /// ));
+    /// # });
+    /// ```
     pub fn absolute(&self) -> &AbsoluteHybridRateLimiter {
         &self.absolute
     }
@@ -53,6 +72,22 @@ impl HybridRateLimiterProvider {
     /// Access the suppressed strategy for probabilistic suppression.
     ///
     /// See [`SuppressedHybridRateLimiter`] for full documentation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// assert!(matches!(
+    ///     rl.hybrid().suppressed().inc(&key, &rate, 1).await.unwrap(),
+    ///     RateLimitDecision::Allowed
+    /// ));
+    /// # });
+    /// ```
     pub fn suppressed(&self) -> &SuppressedHybridRateLimiter {
         &self.suppressed
     }

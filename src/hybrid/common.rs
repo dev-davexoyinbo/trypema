@@ -30,9 +30,8 @@ pub(crate) enum RedisRateLimiterSignal {
 
 /// Sync interval (milliseconds) for the hybrid provider's background flush.
 ///
-/// The hybrid provider batches local increments and periodically commits them to Redis
-/// via a background actor (the `RedisCommitter`). This value controls
-/// how often that flush occurs.
+/// The hybrid provider batches local increments and periodically commits them to Redis via a
+/// background actor. This value controls how often that flush occurs.
 ///
 /// # Trade-offs
 ///
@@ -55,12 +54,11 @@ pub(crate) enum RedisRateLimiterSignal {
 /// ```
 /// use trypema::hybrid::SyncIntervalMs;
 ///
-/// // Default: 10ms
-/// let interval = SyncIntervalMs::default();
+/// let interval = SyncIntervalMs::new(10).unwrap();
 /// assert_eq!(*interval, 10);
 ///
-/// // Custom: 50ms for reduced Redis writes
 /// let interval = SyncIntervalMs::try_from(50).unwrap();
+/// let interval = SyncIntervalMs::new_or_panic(75);
 ///
 /// // Invalid: 0ms
 /// assert!(SyncIntervalMs::try_from(0).is_err());

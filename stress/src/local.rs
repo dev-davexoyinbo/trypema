@@ -56,12 +56,10 @@ impl BursterStore {
                 } else {
                     $map.insert(
                         key.to_owned(),
-                        std::sync::Mutex::new(
-                            burster::SlidingWindowLog::new_with_time_provider(
-                                capacity,
-                                burster_now as fn() -> Duration,
-                            ),
-                        ),
+                        std::sync::Mutex::new(burster::SlidingWindowLog::new_with_time_provider(
+                            capacity,
+                            burster_now as fn() -> Duration,
+                        )),
                     );
                     $map.get(key)
                         .unwrap()
@@ -179,7 +177,14 @@ fn run_trypema(args: &Args) {
 
     let elapsed = started.elapsed();
     let ops = total_ops.load(Ordering::Relaxed);
-    print_results(args, elapsed, ops, ops as f64 / elapsed.as_secs_f64(), &merged, &counts);
+    print_results(
+        args,
+        elapsed,
+        ops,
+        ops as f64 / elapsed.as_secs_f64(),
+        &merged,
+        &counts,
+    );
     print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
 }
 
@@ -202,7 +207,9 @@ fn run_burster(args: &Args) {
         }
     };
 
-    let capacity = (args.rate_limit_per_s * args.window_s as f64).max(1.0).round() as u64;
+    let capacity = (args.rate_limit_per_s * args.window_s as f64)
+        .max(1.0)
+        .round() as u64;
     let keys = crate::args::build_keys(args);
 
     let counts = Arc::new(Counts::default());
@@ -264,7 +271,14 @@ fn run_burster(args: &Args) {
     let elapsed = started.elapsed();
     let ops = total_ops.load(Ordering::Relaxed);
     println!("local_limiter=Burster burster_capacity_per_window={capacity}");
-    print_results(args, elapsed, ops, ops as f64 / elapsed.as_secs_f64(), &merged, &counts);
+    print_results(
+        args,
+        elapsed,
+        ops,
+        ops as f64 / elapsed.as_secs_f64(),
+        &merged,
+        &counts,
+    );
     print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
 }
 
@@ -276,13 +290,14 @@ fn run_governor(args: &Args) {
     // governor also uses extra stack space with many keys.
     const STACK_SIZE: usize = 16 * 1024 * 1024;
 
-    let rate_u32 = u32::try_from(
-        (args.rate_limit_per_s.max(1.0).round() as u64).min(u32::MAX as u64),
-    )
-    .unwrap_or(u32::MAX);
+    let rate_u32 =
+        u32::try_from((args.rate_limit_per_s.max(1.0).round() as u64).min(u32::MAX as u64))
+            .unwrap_or(u32::MAX);
 
     let burst_u32 = u32::try_from(
-        ((args.rate_limit_per_s * args.window_s as f64).max(1.0).round() as u64)
+        ((args.rate_limit_per_s * args.window_s as f64)
+            .max(1.0)
+            .round() as u64)
             .min(u32::MAX as u64),
     )
     .unwrap_or(u32::MAX)
@@ -290,8 +305,7 @@ fn run_governor(args: &Args) {
 
     let quota = Quota::per_second(std::num::NonZeroU32::new(rate_u32).unwrap())
         .allow_burst(std::num::NonZeroU32::new(burst_u32).unwrap());
-    let rl: Arc<DefaultKeyedRateLimiter<String>> =
-        Arc::new(governor::RateLimiter::keyed(quota));
+    let rl: Arc<DefaultKeyedRateLimiter<String>> = Arc::new(governor::RateLimiter::keyed(quota));
 
     let capacity = burst_u32 as u64;
     let keys = crate::args::build_keys(args);
@@ -355,7 +369,14 @@ fn run_governor(args: &Args) {
     let elapsed = started.elapsed();
     let ops = total_ops.load(Ordering::Relaxed);
     println!("local_limiter=Governor governor_capacity_per_window={capacity}");
-    print_results(args, elapsed, ops, ops as f64 / elapsed.as_secs_f64(), &merged, &counts);
+    print_results(
+        args,
+        elapsed,
+        ops,
+        ops as f64 / elapsed.as_secs_f64(),
+        &merged,
+        &counts,
+    );
     print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
 }
 

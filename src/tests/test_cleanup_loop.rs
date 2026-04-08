@@ -394,7 +394,10 @@ fn test_hybrid_absolute_cleanup_loop_removes_stale_redis_keys() {
 
         for entity_key in kg.get_all_entity_keys(&k) {
             let exists: bool = conn.exists(&entity_key).await.unwrap();
-            assert!(!exists, "key {entity_key} must be absent after cleanup loop");
+            assert!(
+                !exists,
+                "key {entity_key} must be absent after cleanup loop"
+            );
         }
 
         let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
@@ -576,7 +579,10 @@ fn test_hybrid_suppressed_cleanup_loop_removes_stale_redis_keys() {
 
         for entity_key in kg.get_all_entity_keys(&k) {
             let exists: bool = conn.exists(&entity_key).await.unwrap();
-            assert!(!exists, "key {entity_key} must be absent after cleanup loop");
+            assert!(
+                !exists,
+                "key {entity_key} must be absent after cleanup loop"
+            );
         }
 
         let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();

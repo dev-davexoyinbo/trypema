@@ -63,7 +63,6 @@ redis-tokio = [
   "tokio/sync",
   "tokio/rt",
   "tokio/time",
-  "tokio/macros",
   "tokio/rt-multi-thread",
   "dep:async-trait",
   "dep:futures",

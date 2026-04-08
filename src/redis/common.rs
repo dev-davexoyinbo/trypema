@@ -15,8 +15,9 @@ use crate::{TrypemaError, common::RateType};
 
 /// A validated newtype for Redis rate limiting keys.
 ///
-/// All Redis and hybrid provider operations require keys wrapped in this type. Validation
-/// is performed at construction time via `TryFrom<String>`.
+/// All Redis and hybrid provider operations require keys wrapped in this type. Validation happens
+/// at construction time, whether you use [`RedisKey::new`], [`TryFrom<String>`], or
+/// [`RedisKey::new_or_panic`].
 ///
 /// # Validation Rules
 ///
@@ -30,9 +31,9 @@ use crate::{TrypemaError, common::RateType};
 /// ```
 /// use trypema::redis::RedisKey;
 ///
-/// // Valid keys
-/// let key = RedisKey::try_from("user_123".to_string()).unwrap();
+/// let key = RedisKey::new("user_123".to_string()).unwrap();
 /// let key = RedisKey::try_from("api_v2_endpoint".to_string()).unwrap();
+/// let key = RedisKey::new_or_panic("team_alpha".to_string());
 ///
 /// // Invalid: contains ':'
 /// assert!(RedisKey::try_from("user:123".to_string()).is_err());

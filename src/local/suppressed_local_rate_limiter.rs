@@ -109,76 +109,19 @@ impl RateLimitSeries {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
-/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-/// # use trypema::hybrid::SyncIntervalMs;
-/// use trypema::local::LocalRateLimiterOptions;
-/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-/// # use trypema::redis::RedisRateLimiterOptions;
-/// #
-/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-/// # fn options() -> RateLimiterOptions {
-/// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-/// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-/// #     let hard_limit_factor = HardLimitFactor::try_from(1.5).unwrap();
-/// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-/// #     let sync_interval_ms = SyncIntervalMs::default();
-/// #
-/// #     RateLimiterOptions {
-/// #         local: LocalRateLimiterOptions {
-/// #             window_size_seconds,
-/// #             rate_group_size_ms,
-/// #             hard_limit_factor,
-/// #             suppression_factor_cache_ms,
-/// #         },
-/// #         redis: RedisRateLimiterOptions {
-/// #             connection_manager: todo!(),
-/// #             prefix: None,
-/// #             window_size_seconds,
-/// #             rate_group_size_ms,
-/// #             hard_limit_factor,
-/// #             suppression_factor_cache_ms,
-/// #             sync_interval_ms,
-/// #         },
-/// #     }
-/// # }
-/// #
-/// # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-/// # fn options() -> RateLimiterOptions {
-/// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-/// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-/// #     let hard_limit_factor = HardLimitFactor::try_from(1.5).unwrap();
-/// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-/// #
-/// #     RateLimiterOptions {
-/// #         local: LocalRateLimiterOptions {
-/// #             window_size_seconds,
-/// #             rate_group_size_ms,
-/// #             hard_limit_factor,
-/// #             suppression_factor_cache_ms,
-/// #         },
-/// #     }
-/// # }
+/// ```
+/// # let rl = trypema::__doctest_helpers::rate_limiter();
+/// use trypema::{RateLimit, RateLimitDecision};
 ///
-/// let rl = RateLimiter::new(options());
 /// let limiter = rl.local().suppressed();
-///
-/// let rate = RateLimit::try_from(10.0).unwrap(); // 10 req/s target, 15 req/s hard limit
+/// let rate = RateLimit::try_from(10.0).unwrap();
 ///
 /// match limiter.inc("user_123", &rate, 1) {
-///     RateLimitDecision::Allowed => {
-///         // Below capacity, proceed normally
+///     RateLimitDecision::Allowed => {}
+///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
+///         println!("suppression: {suppression_factor:.2}, allowed: {is_allowed}");
 ///     }
-///     RateLimitDecision::Suppressed { is_allowed: true, suppression_factor } => {
-///         // At capacity, this request allowed (but suppression active)
-///         println!("Allowed with {}% suppression", suppression_factor * 100.0);
-///     }
-///     RateLimitDecision::Suppressed { is_allowed: false, suppression_factor } => {
-///         // At capacity, this request suppressed
-///         println!("Suppressed ({}% rate)", suppression_factor * 100.0);
-///     }
-///     RateLimitDecision::Rejected { .. } => unreachable!("local suppressed limiter never rejects"),
+///     RateLimitDecision::Rejected { .. } => unreachable!(),
 /// }
 /// ```
 #[derive(Debug)]
@@ -239,6 +182,19 @@ impl SuppressedLocalRateLimiter {
     ///
     /// Same best-effort semantics as the absolute strategy. Under concurrent load, multiple
     /// threads may proceed simultaneously, causing temporary overshoot. This is by design.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// use trypema::{RateLimit, RateLimitDecision};
+    ///
+    /// let limiter = rl.local().suppressed();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    ///
+    /// // Under limit → Allowed
+    /// assert!(matches!(limiter.inc("user_123", &rate, 1), RateLimitDecision::Allowed));
+    /// ```
     pub fn inc(&self, key: &str, rate_limit: &RateLimit, count: u64) -> RateLimitDecision {
         let mut rng = |p: f64| rand::random_bool(p);
         self.inc_with_rng(key, rate_limit, count, &mut rng)
@@ -443,6 +399,16 @@ impl SuppressedLocalRateLimiter {
     ///
     /// **Caching:** Returns the cached value if it was computed within `suppression_factor_cache_ms`.
     /// Otherwise, evicts expired buckets and recomputes the factor from the current sliding window.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// let limiter = rl.local().suppressed();
+    ///
+    /// // No state yet → 0.0 (no suppression)
+    /// assert_eq!(limiter.get_suppression_factor("unknown_key"), 0.0);
+    /// ```
     pub fn get_suppression_factor(&self, key: &str) -> f64 {
         self.remove_expired_buckets(key);
         self.get_suppression_factor_without_bucket_expire(key)

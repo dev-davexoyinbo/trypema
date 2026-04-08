@@ -13,8 +13,8 @@ mod enabled {
     use criterion::Criterion;
     use std::hint::black_box;
 
-    use trypema::redis::RedisKey;
     use trypema::RateLimit;
+    use trypema::redis::RedisKey;
 
     use super::common::redis::{LimiterConfig, build_limiter};
     use super::runtime;
@@ -25,10 +25,13 @@ mod enabled {
 
         let rt = runtime::build();
 
-        let rl = runtime::block_on(&rt, build_limiter(LimiterConfig {
-            hard_limit_factor: 1.5,
-            ..LimiterConfig::default()
-        }));
+        let rl = runtime::block_on(
+            &rt,
+            build_limiter(LimiterConfig {
+                hard_limit_factor: 1.5,
+                ..LimiterConfig::default()
+            }),
+        );
 
         let key = RedisKey::try_from("user_1".to_string()).unwrap();
         let rate = RateLimit::try_from(5.0).unwrap();

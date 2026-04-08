@@ -69,5 +69,3 @@ pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
 pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
     smol::block_on(f)
 }
-
-

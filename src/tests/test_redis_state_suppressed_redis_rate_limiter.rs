@@ -20,8 +20,8 @@ use std::{collections::HashMap, thread, time::Duration};
 
 use redis::AsyncCommands;
 
+use super::common::{key, key_gen, redis_url, unique_prefix};
 use super::runtime;
-use super::common::{redis_url, unique_prefix, key, key_gen};
 
 use crate::common::{RateType, SuppressionFactorCacheMs};
 use crate::hybrid::SyncIntervalMs;
@@ -73,14 +73,14 @@ async fn build_limiter(
 fn redis_key(prefix: &RedisKey, user_key: &RedisKey, suffix: &str) -> String {
     let kg = key_gen(prefix, RateType::Suppressed);
     match suffix {
-        "h"  => kg.get_hash_key(user_key),
+        "h" => kg.get_hash_key(user_key),
         "hd" => kg.get_hash_declined_key(user_key),
-        "a"  => kg.get_active_keys(user_key),
-        "w"  => kg.get_window_limit_key(user_key),
-        "t"  => kg.get_total_count_key(user_key),
-        "d"  => kg.get_total_declined_key(user_key),
+        "a" => kg.get_active_keys(user_key),
+        "w" => kg.get_window_limit_key(user_key),
+        "t" => kg.get_total_count_key(user_key),
+        "d" => kg.get_total_declined_key(user_key),
         "sf" => kg.get_suppression_factor_key(user_key),
-        _    => panic!("unknown suffix for suppressed rate type: {suffix}"),
+        _ => panic!("unknown suffix for suppressed rate type: {suffix}"),
     }
 }
 
@@ -123,15 +123,11 @@ fn redis_state_suppressed_allowed_inc_sets_total_count_and_zero_declined() {
         assert_eq!(total, 3, "total count should be 3");
 
         // Declined count must be 0 (or the key may not exist).
-        let declined: u64 = conn
-            .get(redis_key(&prefix, &k, "d"))
-            .await
-            .unwrap_or(0u64);
+        let declined: u64 = conn.get(redis_key(&prefix, &k, "d")).await.unwrap_or(0u64);
         assert_eq!(declined, 0, "declined count should be 0");
 
         // The main hash must have the increment recorded.
-        let hash: HashMap<String, u64> =
-            conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
+        let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
         let hash_sum: u64 = hash.values().sum();
         assert_eq!(hash_sum, 3, "hash sum should equal the increment");
 
@@ -258,7 +254,10 @@ fn redis_state_suppressed_sf_cache_key_is_set_in_suppression_zone() {
             .unwrap();
 
         // Verify the return value directly — no separate Redis read needed here.
-        assert!(sf > 0.0, "suppression factor should be > 0 past the soft limit, got {sf}");
+        assert!(
+            sf > 0.0,
+            "suppression factor should be > 0 past the soft limit, got {sf}"
+        );
         assert!(
             (0.0..=1.0).contains(&sf),
             "suppression factor must be in [0, 1], got {sf}"
@@ -314,10 +313,7 @@ fn redis_state_suppressed_sf_cache_key_has_ttl() {
             .unwrap();
 
         // PTTL returns -2 (not found), -1 (no expiry), or positive ms.
-        let pttl: i64 = conn
-            .pttl(redis_key(&prefix, &k, "sf"))
-            .await
-            .unwrap();
+        let pttl: i64 = conn.pttl(redis_key(&prefix, &k, "sf")).await.unwrap();
 
         assert!(
             pttl > 0,
@@ -343,11 +339,16 @@ fn redis_state_suppressed_window_limit_key_equals_hard_limit() {
         // hard_window_limit = floor(5 * 4 * 3) = 60
         let expected_hard_limit = 60_u64;
 
-        let (rl, prefix) = build_limiter(&url, window_size_seconds, 1000, hard_limit_factor, 100).await;
+        let (rl, prefix) =
+            build_limiter(&url, window_size_seconds, 1000, hard_limit_factor, 100).await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(rate_limit_value).unwrap();
 
-        rl.redis().suppressed().inc(&k, &rate_limit, 1).await.unwrap();
+        rl.redis()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -402,13 +403,9 @@ fn redis_state_suppressed_hash_sums_match_counter_keys() {
             .unwrap();
 
         let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
-        let declined: u64 = conn
-            .get(redis_key(&prefix, &k, "d"))
-            .await
-            .unwrap_or(0u64);
+        let declined: u64 = conn.get(redis_key(&prefix, &k, "d")).await.unwrap_or(0u64);
 
-        let hash: HashMap<String, u64> =
-            conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
+        let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
         let hash_d: HashMap<String, u64> =
             conn.hgetall(redis_key(&prefix, &k, "hd")).await.unwrap();
 
@@ -474,12 +471,8 @@ fn redis_state_suppressed_evicts_expired_buckets_from_both_hashes() {
             .unwrap();
 
         let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
-        let hash: HashMap<String, u64> =
-            conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
-        let active_count: u64 = conn
-            .zcard(redis_key(&prefix, &k, "a"))
-            .await
-            .unwrap();
+        let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
+        let active_count: u64 = conn.zcard(redis_key(&prefix, &k, "a")).await.unwrap();
 
         // After eviction + one new increment, total must equal 1.
         assert_eq!(
@@ -523,18 +516,12 @@ fn redis_state_suppressed_get_factor_on_unknown_key_writes_no_state() {
 
         // None of the data keys should exist.
         let total: Option<u64> = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
-        let hash_len: u64 = conn
-            .hlen(redis_key(&prefix, &k, "h"))
-            .await
-            .unwrap();
+        let hash_len: u64 = conn.hlen(redis_key(&prefix, &k, "h")).await.unwrap();
         assert!(
             total.is_none(),
             "total count key should not exist for an unknown key"
         );
-        assert_eq!(
-            hash_len, 0,
-            "hash should be empty for an unknown key"
-        );
+        assert_eq!(hash_len, 0, "hash should be empty for an unknown key");
     });
 }
 
@@ -549,8 +536,16 @@ fn redis_state_suppressed_per_key_state_is_independent() {
         let b = key("b");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
 
-        rl.redis().suppressed().inc(&a, &rate_limit, 4).await.unwrap();
-        rl.redis().suppressed().inc(&b, &rate_limit, 9).await.unwrap();
+        rl.redis()
+            .suppressed()
+            .inc(&a, &rate_limit, 4)
+            .await
+            .unwrap();
+        rl.redis()
+            .suppressed()
+            .inc(&b, &rate_limit, 9)
+            .await
+            .unwrap();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -586,9 +581,16 @@ fn redis_state_suppressed_active_entities_updated_on_inc() {
 
         // Not present before any call.
         let score_before: Option<f64> = conn.zscore(&ae_key, &**k).await.unwrap();
-        assert!(score_before.is_none(), "key should not be in active_entities before inc");
+        assert!(
+            score_before.is_none(),
+            "key should not be in active_entities before inc"
+        );
 
-        rl.redis().suppressed().inc(&k, &rate_limit, 1).await.unwrap();
+        rl.redis()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
 
         let score_after: Option<f64> = conn.zscore(&ae_key, &**k).await.unwrap();
         assert!(

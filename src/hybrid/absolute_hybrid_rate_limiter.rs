@@ -219,6 +219,22 @@ impl AbsoluteHybridRateLimiter {
     /// - `Ok(Allowed)` — under limit, increment recorded locally
     /// - `Ok(Rejected { .. })` — over limit (may be served from local rejection cache)
     /// - `Err(TrypemaError)` — Redis error during state refresh
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// assert!(matches!(
+    ///     rl.hybrid().absolute().inc(&key, &rate, 1).await.unwrap(),
+    ///     RateLimitDecision::Allowed
+    /// ));
+    /// # });
+    /// ```
     pub async fn inc(
         &self,
         key: &RedisKey,
@@ -246,6 +262,21 @@ impl AbsoluteHybridRateLimiter {
     /// - `Ok(Allowed)` — under limit
     /// - `Ok(Rejected { .. })` — over limit, includes best-effort backoff hints
     /// - `Err(TrypemaError)` — Redis error during state refresh
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// assert!(matches!(
+    ///     rl.hybrid().absolute().is_allowed(&key).await.unwrap(),
+    ///     RateLimitDecision::Allowed
+    /// ));
+    /// # });
+    /// ```
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
         self.send_epoch_change_if_needed();
 
