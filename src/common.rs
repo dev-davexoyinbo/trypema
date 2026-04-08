@@ -1,7 +1,7 @@
 //! Common types shared across all rate limiting providers.
 //!
-//! This module defines the core types used throughout the crate. All public types are
-//! re-exported at the crate root for convenience.
+//! These types define Trypema's shared configuration and result model. They are all re-exported
+//! at the crate root for convenience.
 //!
 //! # Types
 //!
@@ -31,8 +31,7 @@ pub(crate) struct InstantRate {
 
 /// Result of a rate limit admission check.
 ///
-///
-/// Returned by all rate limiting strategies to indicate whether a request should proceed.
+/// Returned by every strategy to indicate whether a request should proceed.
 ///
 /// # Variants
 ///
@@ -48,74 +47,21 @@ pub(crate) struct InstantRate {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
+/// # let rl = trypema::__doctest_helpers::rate_limiter();
 /// use trypema::{RateLimitDecision, RateLimit};
-/// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
-/// # use trypema::local::LocalRateLimiterOptions;
-/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-/// # use trypema::redis::RedisRateLimiterOptions;
-/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-/// # use trypema::hybrid::SyncIntervalMs;
-/// #
-/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-/// # fn options() -> RateLimiterOptions {
-/// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-/// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-/// #     let hard_limit_factor = HardLimitFactor::default();
-/// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-/// #     let sync_interval_ms = SyncIntervalMs::default();
-/// #
-/// #     RateLimiterOptions {
-/// #         local: LocalRateLimiterOptions {
-/// #             window_size_seconds,
-/// #             rate_group_size_ms,
-/// #             hard_limit_factor,
-/// #             suppression_factor_cache_ms,
-/// #         },
-/// #         redis: RedisRateLimiterOptions {
-/// #             connection_manager: todo!(),
-/// #             prefix: None,
-/// #             window_size_seconds,
-/// #             rate_group_size_ms,
-/// #             hard_limit_factor,
-/// #             suppression_factor_cache_ms,
-/// #             sync_interval_ms,
-/// #         },
-/// #     }
-/// # }
-/// #
-/// # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-/// # fn options() -> RateLimiterOptions {
-/// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-/// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-/// #     let hard_limit_factor = HardLimitFactor::default();
-/// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-/// #
-/// #     RateLimiterOptions {
-/// #         local: LocalRateLimiterOptions {
-/// #             window_size_seconds,
-/// #             rate_group_size_ms,
-/// #             hard_limit_factor,
-/// #             suppression_factor_cache_ms,
-/// #         },
-/// #     }
-/// # }
-/// #
-/// # let rl = RateLimiter::new(options());
-/// # let rate = RateLimit::try_from(10.0).unwrap();
+///
+/// let rate = RateLimit::try_from(10.0).unwrap();
 ///
 /// match rl.local().absolute().inc("user_123", &rate, 1) {
 ///     RateLimitDecision::Allowed => {
-///         // Process request
 ///         println!("Request allowed");
 ///     }
 ///     RateLimitDecision::Rejected { retry_after_ms, remaining_after_waiting, .. } => {
-///         // Send 429 with Retry-After header
 ///         println!("Rate limited, retry in {}ms", retry_after_ms);
 ///         println!("Estimated remaining: {}", remaining_after_waiting);
 ///     }
 ///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
-///         // Only from suppressed strategy
 ///         if is_allowed {
 ///             println!("Allowed with suppression factor {}", suppression_factor);
 ///         } else {
@@ -188,9 +134,10 @@ pub enum RateLimitDecision {
 
 /// Per-second rate limit for a key.
 ///
-/// Wraps a positive `f64` to support non-integer rates (e.g., `5.5` requests/second).
+/// Wraps a positive `f64` so Trypema can express non-integer limits such as `0.5` or `5.5`
+/// requests per second.
 ///
-/// Window capacity is computed as: `window_size_seconds × rate_limit`
+/// Window capacity is computed as `window_size_seconds × rate_limit`.
 ///
 /// # Implementation Notes
 ///
@@ -203,13 +150,14 @@ pub enum RateLimitDecision {
 /// ```
 /// use trypema::RateLimit;
 ///
-/// // Integer rate
-/// let rate = RateLimit::try_from(10.0).unwrap();
+/// let rate = RateLimit::new(10.0).unwrap();
 /// assert_eq!(*rate, 10.0);
 ///
-/// // Non-integer rate
 /// let rate = RateLimit::try_from(5.5).unwrap();
 /// assert_eq!(*rate, 5.5);
+///
+/// let rate = RateLimit::new_or_panic(2.5);
+/// assert_eq!(*rate, 2.5);
 ///
 /// // Invalid: must be positive
 /// assert!(RateLimit::try_from(0.0).is_err());
@@ -237,6 +185,16 @@ impl RateLimit {
     /// ```
     pub fn max() -> Self {
         Self(f64::MAX)
+    }
+
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: f64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: f64) -> Self {
+        Self::try_from(value).expect("RateLimit value must be greater than 0")
     }
 }
 
@@ -285,15 +243,36 @@ impl DerefMut for RateLimit {
 /// ```
 /// use trypema::WindowSizeSeconds;
 ///
-/// // Valid
-/// let window = WindowSizeSeconds::try_from(60).unwrap();
+/// let window = WindowSizeSeconds::new(60).unwrap();
 /// assert_eq!(*window, 60);
+///
+/// let window = WindowSizeSeconds::new_or_panic(30);
+/// assert_eq!(*window, 30);
 ///
 /// // Invalid: too small
 /// assert!(WindowSizeSeconds::try_from(0).is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct WindowSizeSeconds(u64);
+
+impl Default for WindowSizeSeconds {
+    /// Returns a window size of 10 seconds.
+    fn default() -> Self {
+        Self(10)
+    }
+}
+
+impl WindowSizeSeconds {
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: u64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: u64) -> Self {
+        Self::try_from(value).expect("WindowSizeSeconds must be at least 1")
+    }
+}
 
 impl Deref for WindowSizeSeconds {
     type Target = u64;
@@ -352,11 +331,12 @@ impl TryFrom<u64> for WindowSizeSeconds {
 /// ```
 /// use trypema::RateGroupSizeMs;
 ///
-/// // Recommended starting point
-/// let coalescing = RateGroupSizeMs::try_from(10).unwrap();
+/// let coalescing = RateGroupSizeMs::new(10).unwrap();
+/// assert_eq!(*coalescing, 10);
 ///
-/// // Higher performance, coarser timing
 /// let aggressive = RateGroupSizeMs::try_from(100).unwrap();
+/// let precise = RateGroupSizeMs::new_or_panic(1);
+/// let _ = (aggressive, precise);
 ///
 /// // Invalid
 /// assert!(RateGroupSizeMs::try_from(0).is_err());
@@ -368,6 +348,18 @@ impl Default for RateGroupSizeMs {
     /// Returns a rate group size of 100 ms.
     fn default() -> Self {
         Self(100)
+    }
+}
+
+impl RateGroupSizeMs {
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: u64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: u64) -> Self {
+        Self::try_from(value).expect("RateGroupSizeMs must be greater than 0")
     }
 }
 
@@ -428,14 +420,13 @@ impl TryFrom<u64> for RateGroupSizeMs {
 /// ```
 /// use trypema::{HardLimitFactor, RateLimit};
 ///
-/// // Default: no headroom
 /// let factor = HardLimitFactor::default();
 /// assert_eq!(*factor, 1.0);
 ///
-/// // Recommended: 50% burst headroom
-/// let factor = HardLimitFactor::try_from(1.5).unwrap();
+/// let factor = HardLimitFactor::new(1.5).unwrap();
 /// let rate = RateLimit::try_from(10.0).unwrap();
-/// // Hard limit = 10.0 × 1.5 = 15.0 req/s
+/// let bursty = HardLimitFactor::new_or_panic(2.0);
+/// let _ = (rate, bursty);
 ///
 /// // Invalid: must be at least 1.0
 /// assert!(HardLimitFactor::try_from(0.0).is_err());
@@ -451,6 +442,18 @@ impl Default for HardLimitFactor {
     /// Consider using `1.5-2.0` for the suppressed strategy.
     fn default() -> Self {
         Self(1f64)
+    }
+}
+
+impl HardLimitFactor {
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: f64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: f64) -> Self {
+        Self::try_from(value).expect("HardLimitFactor must be >= 1.0")
     }
 }
 
@@ -512,12 +515,12 @@ pub(crate) enum RateType {
 /// ```
 /// use trypema::SuppressionFactorCacheMs;
 ///
-/// // Default: 100ms
 /// let cache = SuppressionFactorCacheMs::default();
 /// assert_eq!(*cache, 100);
 ///
-/// // Custom: 50ms for faster reaction
-/// let cache = SuppressionFactorCacheMs::try_from(50).unwrap();
+/// let cache = SuppressionFactorCacheMs::new(50).unwrap();
+/// let fast = SuppressionFactorCacheMs::new_or_panic(10);
+/// let _ = (cache, fast);
 ///
 /// // Invalid: 0ms
 /// assert!(SuppressionFactorCacheMs::try_from(0).is_err());
@@ -529,6 +532,18 @@ impl Default for SuppressionFactorCacheMs {
     /// Returns a suppression factor cache duration of 100 ms.
     fn default() -> Self {
         Self(100)
+    }
+}
+
+impl SuppressionFactorCacheMs {
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: u64) -> Result<Self, TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: u64) -> Self {
+        Self::try_from(value).expect("SuppressionFactorCacheMs must be greater than 0")
     }
 }
 

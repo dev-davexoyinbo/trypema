@@ -8,34 +8,34 @@ use crate::{
 
 /// Configuration for Redis-backed rate limiters.
 ///
-/// Configures connection, key prefix, and rate limiting parameters for the Redis provider.
+/// Shared configuration for [`RedisRateLimiterProvider`] and
+/// [`crate::hybrid::HybridRateLimiterProvider`].
+///
+/// The same settings define the Redis connection, key prefix, windowing behavior, and hybrid
+/// sync interval.
 ///
 /// # Requirements
 ///
-/// - **Redis version:** >= 6.2.0
+/// - **Redis version:** >= 7.2.0
 /// - **Runtime:** Tokio or Smol (via `redis-tokio` or `redis-smol` features)
 ///
 /// # Examples
 ///
-/// ```rust,no_run
-/// # async fn example() -> Result<(), trypema::TrypemaError> {
-/// use trypema::{HardLimitFactor, RateGroupSizeMs, WindowSizeSeconds};
-/// use trypema::SuppressionFactorCacheMs;
-/// use trypema::hybrid::SyncIntervalMs;
-/// use trypema::redis::{RedisKey, RedisRateLimiterOptions};
+/// ```
+/// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+/// use trypema::redis::RedisRateLimiterOptions;
 ///
-/// let sync_interval_ms = SyncIntervalMs::default();
-/// let options = RedisRateLimiterOptions {
-///     connection_manager: todo!("create redis::aio::ConnectionManager"),
-///     prefix: Some(RedisKey::try_from("myapp".to_string())?),
-///     window_size_seconds: WindowSizeSeconds::try_from(60)?,
-///     rate_group_size_ms: RateGroupSizeMs::try_from(10)?,
-///     hard_limit_factor: HardLimitFactor::try_from(1.5)?,
-///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-///     sync_interval_ms,
-/// };
-/// let _ = options;
-/// # Ok(()) }
+/// let url = std::env::var("REDIS_URL")
+///     .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+/// let conn = redis::Client::open(url)
+///     .unwrap()
+///     .get_connection_manager()
+///     .await
+///     .unwrap();
+///
+/// let _options = RedisRateLimiterOptions::new(conn);
+/// let _ = rl;
+/// # });
 /// ```
 #[derive(Clone, Debug)]
 pub struct RedisRateLimiterOptions {
@@ -43,14 +43,6 @@ pub struct RedisRateLimiterOptions {
     ///
     /// Use `ConnectionManager` for automatic connection pooling and reconnection.
     ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # async fn example() -> Result<(), trypema::TrypemaError> {
-    /// let _connection_manager: redis::aio::ConnectionManager =
-    ///     todo!("create redis::aio::ConnectionManager");
-    /// # Ok(()) }
-    /// ```
     pub connection_manager: ConnectionManager,
 
     /// Optional prefix for all Redis keys.
@@ -67,36 +59,39 @@ pub struct RedisRateLimiterOptions {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```
     /// use trypema::redis::RedisKey;
     ///
     /// // With prefix: myapp:user_123:absolute:h
-    /// let _prefix = Some(RedisKey::try_from("myapp".to_string())?);
+    /// let _prefix = Some(RedisKey::try_from("myapp".to_string()).unwrap());
     ///
     /// // Default prefix: trypema:user_123:absolute:h
     /// let _prefix: Option<RedisKey> = None;
-    /// # Ok::<(), trypema::TrypemaError>(())
     /// ```
     pub prefix: Option<RedisKey>,
 
     /// Sliding window duration for admission decisions.
     ///
-    /// Same semantics as local provider. See [`WindowSizeSeconds`] for details.
+    /// Same semantics as [`crate::local::LocalRateLimiterOptions::window_size_seconds`]. See
+    /// [`WindowSizeSeconds`] for details.
     pub window_size_seconds: WindowSizeSeconds,
 
     /// Bucket coalescing interval in milliseconds.
     ///
-    /// Same semantics as local provider. See [`RateGroupSizeMs`] for details.
+    /// Same semantics as [`crate::local::LocalRateLimiterOptions::rate_group_size_ms`]. See
+    /// [`RateGroupSizeMs`] for details.
     pub rate_group_size_ms: RateGroupSizeMs,
 
     /// Hard cutoff multiplier for the suppressed strategy.
     ///
-    /// Same semantics as local provider. See [`HardLimitFactor`] for details.
+    /// Same semantics as [`crate::local::LocalRateLimiterOptions::hard_limit_factor`]. See
+    /// [`HardLimitFactor`] for details.
     pub hard_limit_factor: HardLimitFactor,
 
     /// Cache duration (milliseconds) for suppression factor recomputation.
     ///
-    /// Same semantics as local provider.
+    /// Same semantics as
+    /// [`crate::local::LocalRateLimiterOptions::suppression_factor_cache_ms`].
     pub suppression_factor_cache_ms: SuppressionFactorCacheMs,
 
     /// Sync interval (milliseconds) for the hybrid provider's background flush.
@@ -109,14 +104,61 @@ pub struct RedisRateLimiterOptions {
     pub sync_interval_ms: SyncIntervalMs,
 }
 
+impl RedisRateLimiterOptions {
+    /// Create a new [`RedisRateLimiterOptions`] with the given `connection_manager`.
+    ///
+    /// All other fields default to their type's [`Default`] value:
+    /// - `prefix`: `None` (uses `"trypema"`)
+    /// - `window_size_seconds`: [`WindowSizeSeconds::default()`]
+    /// - `rate_group_size_ms`: [`RateGroupSizeMs::default()`]
+    /// - `hard_limit_factor`: [`HardLimitFactor::default()`]
+    /// - `suppression_factor_cache_ms`: [`SuppressionFactorCacheMs::default()`]
+    /// - `sync_interval_ms`: [`SyncIntervalMs::default()`]
+    ///
+    /// Override specific fields with struct update syntax:
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::WindowSizeSeconds;
+    /// use trypema::redis::RedisRateLimiterOptions;
+    ///
+    /// let url = std::env::var("REDIS_URL")
+    ///     .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    /// let conn = redis::Client::open(url)
+    ///     .unwrap()
+    ///     .get_connection_manager()
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// let _options = RedisRateLimiterOptions {
+    ///     window_size_seconds: WindowSizeSeconds::new_or_panic(60),
+    ///     ..RedisRateLimiterOptions::new(conn)
+    /// };
+    /// let _ = rl;
+    /// # });
+    /// ```
+    pub fn new(connection_manager: ConnectionManager) -> Self {
+        Self {
+            connection_manager,
+            prefix: None,
+            window_size_seconds: WindowSizeSeconds::default(),
+            rate_group_size_ms: RateGroupSizeMs::default(),
+            hard_limit_factor: HardLimitFactor::default(),
+            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            sync_interval_ms: SyncIntervalMs::default(),
+        }
+    }
+}
+
 /// Provider for Redis-backed distributed rate limiting.
 ///
 /// Enables rate limiting across multiple processes or servers using Redis as a
-/// shared backend. All operations are implemented as atomic Lua scripts.
+/// shared backend. All operations are implemented as atomic Lua scripts, so each individual Redis
+/// call is atomic while overall admission remains best-effort under concurrency.
 ///
 /// # Requirements
 ///
-/// - **Redis:** >= 6.2.0
+/// - **Redis:** >= 7.2.0
 /// - **Runtime:** Tokio or Smol
 ///
 /// # Strategies
@@ -134,51 +176,19 @@ pub struct RedisRateLimiterOptions {
 ///
 /// # Examples
 ///
-/// ```rust,no_run
-/// # async fn example() -> Result<(), trypema::TrypemaError> {
-/// use trypema::{
-///     HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter,
-///     RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
-/// };
-/// use trypema::hybrid::SyncIntervalMs;
-/// use trypema::local::LocalRateLimiterOptions;
-/// use trypema::redis::{RedisKey, RedisRateLimiterOptions};
+/// ```
+/// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+/// use trypema::{RateLimit, RateLimitDecision};
+/// use trypema::redis::RedisKey;
 ///
-/// let window_size_seconds = WindowSizeSeconds::try_from(60)?;
-/// let rate_group_size_ms = RateGroupSizeMs::try_from(10)?;
-/// let hard_limit_factor = HardLimitFactor::default();
-/// let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-/// let sync_interval_ms = SyncIntervalMs::default();
+/// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+/// let rate = RateLimit::try_from(10.0).unwrap();
 ///
-/// let rl = RateLimiter::new(RateLimiterOptions {
-///     local: LocalRateLimiterOptions {
-///         window_size_seconds,
-///         rate_group_size_ms,
-///         hard_limit_factor,
-///         suppression_factor_cache_ms,
-///     },
-///     redis: RedisRateLimiterOptions {
-///         connection_manager: todo!("create redis::aio::ConnectionManager"),
-///         prefix: None,
-///         window_size_seconds,
-///         rate_group_size_ms,
-///         hard_limit_factor,
-///         suppression_factor_cache_ms,
-///         sync_interval_ms,
-///     },
-/// });
-///
-/// let key = RedisKey::try_from("user_123".to_string())?;
-/// let rate = RateLimit::try_from(10.0)?;
-///
-/// match rl.redis().absolute().inc(&key, &rate, 1).await? {
-///     RateLimitDecision::Allowed => {}
-///     RateLimitDecision::Rejected { retry_after_ms, .. } => {
-///         let _ = retry_after_ms;
-///     }
-///     _ => unreachable!(),
-/// }
-/// # Ok(()) }
+/// assert!(matches!(
+///     rl.redis().absolute().inc(&key, &rate, 1).await.unwrap(),
+///     RateLimitDecision::Allowed
+/// ));
+/// # });
 /// ```
 #[derive(Clone, Debug)]
 pub struct RedisRateLimiterProvider {
@@ -205,10 +215,18 @@ impl RedisRateLimiterProvider {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
-    /// # async fn example(rl: &trypema::RateLimiter, key: &trypema::redis::RedisKey, rate: &trypema::RateLimit) -> Result<(), trypema::TrypemaError> {
-    /// let _decision = rl.redis().absolute().inc(key, rate, 1).await?;
-    /// # Ok(()) }
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// assert!(matches!(
+    ///     rl.redis().absolute().inc(&key, &rate, 1).await.unwrap(),
+    ///     RateLimitDecision::Allowed
+    /// ));
+    /// # });
     /// ```
     pub fn absolute(&self) -> &AbsoluteRedisRateLimiter {
         &self.absolute
@@ -222,6 +240,29 @@ impl RedisRateLimiterProvider {
     /// distributed probabilistic suppression via atomic Lua scripts.
     ///
     /// See [`SuppressedRedisRateLimiter`] for full documentation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    ///
+    /// match rl.redis().suppressed().inc(&key, &rate, 1).await.unwrap() {
+    ///     RateLimitDecision::Allowed => {}
+    ///     RateLimitDecision::Suppressed {
+    ///         is_allowed,
+    ///         suppression_factor,
+    ///     } => {
+    ///         let _ = (is_allowed, suppression_factor);
+    ///     }
+    ///     RateLimitDecision::Rejected { .. } => unreachable!(),
+    /// }
+    /// # });
+    /// ```
     pub fn suppressed(&self) -> &SuppressedRedisRateLimiter {
         &self.suppressed
     }

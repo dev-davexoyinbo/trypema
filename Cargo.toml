@@ -49,6 +49,7 @@ tracing = "0.1.44"
 tokio = { version = "1.51", optional = true, default-features = false }
 smol = { version = "2.0.2", optional = true }
 ahash = "0.8.12"
+regex = { version = "1", optional = true }
 futures = { version = "0.3.32", optional = true }
 async-trait = { version = "0.1.89", optional = true }
 
@@ -62,10 +63,10 @@ redis-tokio = [
   "tokio/sync",
   "tokio/rt",
   "tokio/time",
-  "tokio/macros",
   "tokio/rt-multi-thread",
   "dep:async-trait",
   "dep:futures",
+  "dep:regex",
 ]
 redis-smol = [
   "redis",
@@ -77,6 +78,7 @@ redis-smol = [
   "tokio/sync",
   "dep:async-trait",
   "dep:futures",
+  "dep:regex",
 ]
 
 [dev-dependencies]

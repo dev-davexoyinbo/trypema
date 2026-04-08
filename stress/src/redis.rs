@@ -184,7 +184,9 @@ async fn run_async(args: Args) {
                             Ok(decision) => wl.record_decision(decision),
                             Err(err) => wl.record_error(
                                 err.to_string(),
-                                Some(format!("provider=redis limiter=trypema key={k:?} err={err:?}")),
+                                Some(format!(
+                                    "provider=redis limiter=trypema key={k:?} err={err:?}"
+                                )),
                             ),
                         }
                     }
@@ -253,7 +255,14 @@ async fn run_async(args: Args) {
     let elapsed = started.elapsed();
     let ops = total_ops.load(Ordering::Relaxed);
     println!("redis_limiter={:?}", args.redis_limiter);
-    print_results(&args, elapsed, ops, ops as f64 / elapsed.as_secs_f64(), &merged, &counts);
+    print_results(
+        &args,
+        elapsed,
+        ops,
+        ops as f64 / elapsed.as_secs_f64(),
+        &merged,
+        &counts,
+    );
     print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
 }
 

@@ -1,8 +1,13 @@
 use std::{
     hash::Hash,
     ops::{Deref, DerefMut},
-    sync::Mutex,
+    sync::{LazyLock, Mutex},
 };
+
+use regex::Regex;
+
+static REDIS_KEY_STRIP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r":").expect("REDIS_KEY_STRIP_RE is valid"));
 
 use dashmap::{DashMap, mapref::one::RefMut, try_result::TryResult};
 
@@ -10,8 +15,9 @@ use crate::{TrypemaError, common::RateType};
 
 /// A validated newtype for Redis rate limiting keys.
 ///
-/// All Redis and hybrid provider operations require keys wrapped in this type. Validation
-/// is performed at construction time via `TryFrom<String>`.
+/// All Redis and hybrid provider operations require keys wrapped in this type. Validation happens
+/// at construction time, whether you use [`RedisKey::new`], [`TryFrom<String>`], or
+/// [`RedisKey::new_or_panic`].
 ///
 /// # Validation Rules
 ///
@@ -25,9 +31,9 @@ use crate::{TrypemaError, common::RateType};
 /// ```
 /// use trypema::redis::RedisKey;
 ///
-/// // Valid keys
-/// let key = RedisKey::try_from("user_123".to_string()).unwrap();
+/// let key = RedisKey::new("user_123".to_string()).unwrap();
 /// let key = RedisKey::try_from("api_v2_endpoint".to_string()).unwrap();
+/// let key = RedisKey::new_or_panic("team_alpha".to_string());
 ///
 /// // Invalid: contains ':'
 /// assert!(RedisKey::try_from("user:123".to_string()).is_err());
@@ -49,6 +55,47 @@ impl RedisKey {
 
     pub(crate) fn from(value: String) -> Self {
         Self(value)
+    }
+
+    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
+    pub fn new(value: String) -> Result<Self, crate::TrypemaError> {
+        Self::try_from(value)
+    }
+
+    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
+    pub fn new_or_panic(value: String) -> Self {
+        Self::try_from(value).expect("invalid RedisKey")
+    }
+
+    /// Strip colons from `value`, then validate and return a [`RedisKey`].
+    ///
+    /// Colons are stripped because they are used internally as key separators
+    /// (e.g. `{prefix}:{key}:{rate_type}:{suffix}`). Returns `Err` if the sanitized
+    /// string is still invalid — for example, if `value` was entirely colons (empty
+    /// after stripping) or exceeds 255 bytes after stripping.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_sanitize("user:123".to_string()).unwrap();
+    /// assert_eq!(*key, "user123");
+    ///
+    /// // Entirely colons → empty after stripping → Err
+    /// assert!(RedisKey::try_sanitize(":".to_string()).is_err());
+    /// ```
+    pub fn try_sanitize(value: String) -> Result<Self, crate::TrypemaError> {
+        let sanitized = REDIS_KEY_STRIP_RE.replace_all(&value, "").into_owned();
+        Self::try_from(sanitized)
+    }
+
+    /// Strip colons from `value`, then return a [`RedisKey`].
+    ///
+    /// Panics if the sanitized string is still invalid (e.g. was entirely colons, or too long).
+    /// The `_or_panic` suffix signals that this call can panic.
+    pub fn sanitize_or_panic(value: String) -> Self {
+        Self::try_sanitize(value).expect("sanitized RedisKey value is still invalid")
     }
 }
 

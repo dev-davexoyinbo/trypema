@@ -333,6 +333,23 @@ impl SuppressedRedisRateLimiter {
     ///
     /// The total observed counter is **always** incremented, regardless of the decision.
     /// If `is_allowed` is `false`, the declined counter is also incremented.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// // Under limit → Allowed
+    /// assert!(matches!(
+    ///     rl.redis().suppressed().inc(&key, &rate, 1).await.unwrap(),
+    ///     RateLimitDecision::Allowed
+    /// ));
+    /// # });
+    /// ```
     pub async fn inc(
         &self,
         key: &RedisKey,
@@ -392,6 +409,18 @@ impl SuppressedRedisRateLimiter {
     /// directly. Otherwise, this recomputes the factor via the same algorithm used in `inc()`
     /// and writes it back to Redis with a `suppression_factor_cache_ms` TTL. If the cached
     /// value is outside `[0.0, 1.0]`, it is treated as stale and recomputed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// // No state yet → 0.0 (no suppression)
+    /// assert_eq!(rl.redis().suppressed().get_suppression_factor(&key).await.unwrap(), 0.0);
+    /// # });
+    /// ```
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 

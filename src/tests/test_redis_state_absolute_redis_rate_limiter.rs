@@ -19,8 +19,8 @@ use std::{collections::HashMap, thread, time::Duration};
 
 use redis::AsyncCommands;
 
+use super::common::{key, key_gen, redis_url, unique_prefix};
 use super::runtime;
-use super::common::{redis_url, unique_prefix, key, key_gen};
 
 use crate::common::{RateType, SuppressionFactorCacheMs};
 use crate::hybrid::SyncIntervalMs;
@@ -64,11 +64,11 @@ async fn build_limiter(
 fn redis_key(prefix: &RedisKey, user_key: &RedisKey, suffix: &str) -> String {
     let kg = key_gen(prefix, RateType::Absolute);
     match suffix {
-        "h"  => kg.get_hash_key(user_key),
-        "a"  => kg.get_active_keys(user_key),
-        "w"  => kg.get_window_limit_key(user_key),
-        "t"  => kg.get_total_count_key(user_key),
-        _    => panic!("unknown suffix for absolute rate type: {suffix}"),
+        "h" => kg.get_hash_key(user_key),
+        "a" => kg.get_active_keys(user_key),
+        "w" => kg.get_window_limit_key(user_key),
+        "t" => kg.get_total_count_key(user_key),
+        _ => panic!("unknown suffix for absolute rate type: {suffix}"),
     }
 }
 
@@ -102,33 +102,21 @@ fn redis_state_after_single_allowed_inc() {
             .unwrap();
 
         // Total count must equal the incremented value.
-        let total: u64 = conn
-            .get(redis_key(&prefix, &k, "t"))
-            .await
-            .unwrap();
+        let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
         assert_eq!(total, 3, "total count should be 3");
 
         // Window limit must equal window_size * rate_limit = 10 * 5 = 50.
-        let window_limit: u64 = conn
-            .get(redis_key(&prefix, &k, "w"))
-            .await
-            .unwrap();
+        let window_limit: u64 = conn.get(redis_key(&prefix, &k, "w")).await.unwrap();
         assert_eq!(window_limit, 50, "window limit should be 50");
 
         // The hash must contain exactly one bucket whose value equals the increment.
-        let hash: HashMap<String, u64> = conn
-            .hgetall(redis_key(&prefix, &k, "h"))
-            .await
-            .unwrap();
+        let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
         assert_eq!(hash.len(), 1, "hash should have exactly one bucket");
         let bucket_count: u64 = *hash.values().next().unwrap();
         assert_eq!(bucket_count, 3, "bucket count should be 3");
 
         // The sorted set must contain exactly one member.
-        let active_count: u64 = conn
-            .zcard(redis_key(&prefix, &k, "a"))
-            .await
-            .unwrap();
+        let active_count: u64 = conn.zcard(redis_key(&prefix, &k, "a")).await.unwrap();
         assert_eq!(active_count, 1, "active sorted set should have one member");
 
         // The global active_entities sorted set must include the user key.
@@ -164,26 +152,17 @@ fn redis_state_coalesces_increments_within_rate_group() {
             .unwrap();
 
         // Total count must be 5.
-        let total: u64 = conn
-            .get(redis_key(&prefix, &k, "t"))
-            .await
-            .unwrap();
+        let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
         assert_eq!(total, 5, "total count should be 5");
 
         // Hash must have exactly one bucket (coalesced) with count = 5.
-        let hash: HashMap<String, u64> = conn
-            .hgetall(redis_key(&prefix, &k, "h"))
-            .await
-            .unwrap();
+        let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
         assert_eq!(hash.len(), 1, "coalesced — hash should have one bucket");
         let bucket_count: u64 = *hash.values().next().unwrap();
         assert_eq!(bucket_count, 5, "coalesced bucket should hold 5");
 
         // Active sorted set also has one member.
-        let active_count: u64 = conn
-            .zcard(redis_key(&prefix, &k, "a"))
-            .await
-            .unwrap();
+        let active_count: u64 = conn.zcard(redis_key(&prefix, &k, "a")).await.unwrap();
         assert_eq!(active_count, 1, "active sorted set should have one member");
     });
 }
@@ -211,24 +190,15 @@ fn redis_state_creates_distinct_buckets_across_rate_groups() {
             .unwrap();
 
         // Total count = 3.
-        let total: u64 = conn
-            .get(redis_key(&prefix, &k, "t"))
-            .await
-            .unwrap();
+        let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
         assert_eq!(total, 3);
 
         // Two separate buckets in the hash.
-        let hash: HashMap<String, u64> = conn
-            .hgetall(redis_key(&prefix, &k, "h"))
-            .await
-            .unwrap();
+        let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
         assert_eq!(hash.len(), 2, "two buckets should exist: {hash:?}");
 
         // Two entries in the active sorted set.
-        let active_count: u64 = conn
-            .zcard(redis_key(&prefix, &k, "a"))
-            .await
-            .unwrap();
+        let active_count: u64 = conn.zcard(redis_key(&prefix, &k, "a")).await.unwrap();
         assert_eq!(active_count, 2, "active sorted set should have two members");
     });
 }
@@ -254,33 +224,23 @@ fn redis_state_rejected_inc_does_not_mutate_state() {
             .await
             .unwrap();
 
-        let total_before: u64 = conn
-            .get(redis_key(&prefix, &k, "t"))
-            .await
-            .unwrap();
-        let hash_before: HashMap<String, u64> = conn
-            .hgetall(redis_key(&prefix, &k, "h"))
-            .await
-            .unwrap();
+        let total_before: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
+        let hash_before: HashMap<String, u64> =
+            conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
 
         // Attempt a rejected increment.
         let d = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
 
-        let total_after: u64 = conn
-            .get(redis_key(&prefix, &k, "t"))
-            .await
-            .unwrap();
-        let hash_after: HashMap<String, u64> = conn
-            .hgetall(redis_key(&prefix, &k, "h"))
-            .await
-            .unwrap();
+        let total_after: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
+        let hash_after: HashMap<String, u64> =
+            conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
 
-        assert_eq!(total_before, total_after, "total count must not change on rejection");
         assert_eq!(
-            hash_before, hash_after,
-            "hash must not change on rejection"
+            total_before, total_after,
+            "total count must not change on rejection"
         );
+        assert_eq!(hash_before, hash_after, "hash must not change on rejection");
     });
 }
 
@@ -306,10 +266,7 @@ fn redis_state_evicts_expired_buckets_after_window() {
             .unwrap();
 
         // Confirm we are at capacity.
-        let total_before: u64 = conn
-            .get(redis_key(&prefix, &k, "t"))
-            .await
-            .unwrap();
+        let total_before: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
         assert_eq!(total_before, 3, "at capacity before expiry");
 
         // Wait past the 1-second window.
@@ -321,18 +278,9 @@ fn redis_state_evicts_expired_buckets_after_window() {
 
         // The evicted buckets must have been removed from both hash and sorted set,
         // and the total count must reflect only the new increment.
-        let hash: HashMap<String, u64> = conn
-            .hgetall(redis_key(&prefix, &k, "h"))
-            .await
-            .unwrap();
-        let total_after: u64 = conn
-            .get(redis_key(&prefix, &k, "t"))
-            .await
-            .unwrap();
-        let active_count: u64 = conn
-            .zcard(redis_key(&prefix, &k, "a"))
-            .await
-            .unwrap();
+        let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
+        let total_after: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
+        let active_count: u64 = conn.zcard(redis_key(&prefix, &k, "a")).await.unwrap();
 
         assert_eq!(
             total_after, 1,
@@ -401,10 +349,7 @@ fn redis_state_is_allowed_evicts_expired_buckets() {
             .unwrap();
 
         // Confirm state before expiry.
-        let total_before: u64 = conn
-            .get(redis_key(&prefix, &k, "t"))
-            .await
-            .unwrap();
+        let total_before: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
         assert_eq!(total_before, 2, "total should be 2 before expiry");
 
         // At capacity, `is_allowed` must reject immediately (before the window expires).
@@ -564,7 +509,10 @@ fn redis_state_active_entities_updated_on_inc() {
             .await
             .unwrap();
         let score_before: Option<f64> = conn.zscore(&ae_key, &**k).await.unwrap();
-        assert!(score_before.is_none(), "key should not be in active_entities before inc");
+        assert!(
+            score_before.is_none(),
+            "key should not be in active_entities before inc"
+        );
 
         rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
 
@@ -596,10 +544,7 @@ fn redis_state_window_limit_key_has_ttl() {
             .await
             .unwrap();
 
-        let ttl: i64 = conn
-            .ttl(redis_key(&prefix, &k, "w"))
-            .await
-            .unwrap();
+        let ttl: i64 = conn.ttl(redis_key(&prefix, &k, "w")).await.unwrap();
 
         assert!(
             ttl > 0,

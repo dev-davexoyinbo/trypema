@@ -207,6 +207,18 @@ impl SuppressedHybridRateLimiter {
     ///
     /// This method is read-only with respect to request counts. It is useful for metrics
     /// and observability dashboards.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// // No state yet → 0.0 (no suppression)
+    /// assert_eq!(rl.hybrid().suppressed().get_suppression_factor(&key).await.unwrap(), 0.0);
+    /// # });
+    /// ```
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         self.send_epoch_change_if_needed();
 
@@ -316,6 +328,23 @@ impl SuppressedHybridRateLimiter {
     ///
     /// The total observed counter is always incremented. If `is_allowed` is `false`,
     /// the declined counter is also incremented.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// // Under limit → Allowed
+    /// assert!(matches!(
+    ///     rl.hybrid().suppressed().inc(&key, &rate, 1).await.unwrap(),
+    ///     RateLimitDecision::Allowed
+    /// ));
+    /// # });
+    /// ```
     pub async fn inc(
         &self,
         key: &RedisKey,

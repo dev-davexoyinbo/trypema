@@ -5,12 +5,8 @@ use crate::{
 
 /// Configuration for local (in-process) rate limiters.
 ///
-/// Configures the sliding window, bucket coalescing, and hard limit behavior
-/// for both absolute and suppressed strategies.
-///
-/// # Field Descriptions
-///
-/// See individual field documentation for detailed information on each parameter.
+/// Controls the shared settings used by [`AbsoluteLocalRateLimiter`] and
+/// [`SuppressedLocalRateLimiter`].
 ///
 /// # Examples
 ///
@@ -18,7 +14,8 @@ use crate::{
 /// use trypema::{HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds};
 /// use trypema::local::LocalRateLimiterOptions;
 ///
-/// // Recommended defaults for most use cases
+/// let defaults = LocalRateLimiterOptions::default();
+///
 /// let options = LocalRateLimiterOptions {
 ///     window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),   // 60s sliding window
 ///     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),      // 10ms coalescing
@@ -42,7 +39,7 @@ use crate::{
 ///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
 /// };
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LocalRateLimiterOptions {
     /// Sliding window duration for admission decisions.
     ///
@@ -86,8 +83,8 @@ pub struct LocalRateLimiterOptions {
 
 /// Provider for in-process rate limiting strategies.
 ///
-/// Provides access to multiple local rate limiting strategies that share the same
-/// configuration but implement different enforcement policies.
+/// Exposes [`AbsoluteLocalRateLimiter`] and [`SuppressedLocalRateLimiter`] under one shared
+/// configuration.
 ///
 /// # Strategies
 ///
@@ -100,63 +97,11 @@ pub struct LocalRateLimiterOptions {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
-/// use trypema::local::LocalRateLimiterOptions;
-/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-/// # use trypema::redis::RedisRateLimiterOptions;
-/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-/// # use trypema::hybrid::SyncIntervalMs;
-/// #
-/// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-/// # fn options() -> RateLimiterOptions {
-/// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-/// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-/// #     let hard_limit_factor = HardLimitFactor::default();
-/// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-/// #     let sync_interval_ms = SyncIntervalMs::default();
-/// #
-/// #     RateLimiterOptions {
-/// #         local: LocalRateLimiterOptions {
-/// #             window_size_seconds,
-/// #             rate_group_size_ms,
-/// #             hard_limit_factor,
-/// #             suppression_factor_cache_ms,
-/// #         },
-/// #         redis: RedisRateLimiterOptions {
-/// #             connection_manager: todo!(),
-/// #             prefix: None,
-/// #             window_size_seconds,
-/// #             rate_group_size_ms,
-/// #             hard_limit_factor,
-/// #             suppression_factor_cache_ms,
-/// #             sync_interval_ms,
-/// #         },
-/// #     }
-/// # }
-/// #
-/// # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-/// # fn options() -> RateLimiterOptions {
-/// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-/// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-/// #     let hard_limit_factor = HardLimitFactor::default();
-/// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-/// #
-/// #     RateLimiterOptions {
-/// #         local: LocalRateLimiterOptions {
-/// #             window_size_seconds,
-/// #             rate_group_size_ms,
-/// #             hard_limit_factor,
-/// #             suppression_factor_cache_ms,
-/// #         },
-/// #     }
-/// # }
-///
-/// let rl = RateLimiter::new(options());
+/// ```
+/// # let rl = trypema::__doctest_helpers::rate_limiter();
+/// use trypema::RateLimit;
 ///
 /// let rate = RateLimit::try_from(10.0).unwrap();
-///
-/// // Choose strategy based on requirements
 /// let abs_decision = rl.local().absolute().inc("user_123", &rate, 1);
 /// let sup_decision = rl.local().suppressed().inc("user_456", &rate, 1);
 /// ```
@@ -183,60 +128,13 @@ impl LocalRateLimiterProvider {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
-    /// # use trypema::local::LocalRateLimiterOptions;
-    /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    /// # use trypema::redis::RedisRateLimiterOptions;
-    /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    /// # use trypema::hybrid::SyncIntervalMs;
-    /// #
-    /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    /// # fn options() -> RateLimiterOptions {
-    /// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-    /// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-    /// #     let hard_limit_factor = HardLimitFactor::default();
-    /// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-    /// #     let sync_interval_ms = SyncIntervalMs::default();
-    /// #
-    /// #     RateLimiterOptions {
-    /// #         local: LocalRateLimiterOptions {
-    /// #             window_size_seconds,
-    /// #             rate_group_size_ms,
-    /// #             hard_limit_factor,
-    /// #             suppression_factor_cache_ms,
-    /// #         },
-    /// #         redis: RedisRateLimiterOptions {
-    /// #             connection_manager: todo!(),
-    /// #             prefix: None,
-    /// #             window_size_seconds,
-    /// #             rate_group_size_ms,
-    /// #             hard_limit_factor,
-    /// #             suppression_factor_cache_ms,
-    /// #             sync_interval_ms,
-    /// #         },
-    /// #     }
-    /// # }
-    /// #
-    /// # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-    /// # fn options() -> RateLimiterOptions {
-    /// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-    /// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-    /// #     let hard_limit_factor = HardLimitFactor::default();
-    /// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-    /// #
-    /// #     RateLimiterOptions {
-    /// #         local: LocalRateLimiterOptions {
-    /// #             window_size_seconds,
-    /// #             rate_group_size_ms,
-    /// #             hard_limit_factor,
-    /// #             suppression_factor_cache_ms,
-    /// #         },
-    /// #     }
-    /// # }
-    /// # let rl = RateLimiter::new(options());
+    /// ```
+    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// use trypema::{RateLimit, RateLimitDecision};
+    ///
     /// let rate = RateLimit::try_from(10.0).unwrap();
     /// let decision = rl.local().absolute().inc("user_123", &rate, 1);
+    /// assert!(matches!(decision, RateLimitDecision::Allowed));
     /// ```
     pub fn absolute(&self) -> &AbsoluteLocalRateLimiter {
         &self.absolute
@@ -254,64 +152,17 @@ impl LocalRateLimiterProvider {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// # use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
-    /// # use trypema::local::LocalRateLimiterOptions;
-    /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    /// # use trypema::redis::RedisRateLimiterOptions;
-    /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    /// # use trypema::hybrid::SyncIntervalMs;
-    /// #
-    /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    /// # fn options() -> RateLimiterOptions {
-    /// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-    /// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-    /// #     let hard_limit_factor = HardLimitFactor::default();
-    /// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-    /// #     let sync_interval_ms = SyncIntervalMs::default();
-    /// #
-    /// #     RateLimiterOptions {
-    /// #         local: LocalRateLimiterOptions {
-    /// #             window_size_seconds,
-    /// #             rate_group_size_ms,
-    /// #             hard_limit_factor,
-    /// #             suppression_factor_cache_ms,
-    /// #         },
-    /// #         redis: RedisRateLimiterOptions {
-    /// #             connection_manager: todo!(),
-    /// #             prefix: None,
-    /// #             window_size_seconds,
-    /// #             rate_group_size_ms,
-    /// #             hard_limit_factor,
-    /// #             suppression_factor_cache_ms,
-    /// #             sync_interval_ms,
-    /// #         },
-    /// #     }
-    /// # }
-    /// #
-    /// # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-    /// # fn options() -> RateLimiterOptions {
-    /// #     let window_size_seconds = WindowSizeSeconds::try_from(60).unwrap();
-    /// #     let rate_group_size_ms = RateGroupSizeMs::try_from(10).unwrap();
-    /// #     let hard_limit_factor = HardLimitFactor::default();
-    /// #     let suppression_factor_cache_ms = SuppressionFactorCacheMs::default();
-    /// #
-    /// #     RateLimiterOptions {
-    /// #         local: LocalRateLimiterOptions {
-    /// #             window_size_seconds,
-    /// #             rate_group_size_ms,
-    /// #             hard_limit_factor,
-    /// #             suppression_factor_cache_ms,
-    /// #         },
-    /// #     }
-    /// # }
-    /// # let rl = RateLimiter::new(options());
+    /// ```
+    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// use trypema::{RateLimit, RateLimitDecision};
+    ///
     /// let rate = RateLimit::try_from(10.0).unwrap();
     /// match rl.local().suppressed().inc("user_123", &rate, 1) {
     ///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
-    ///         println!("Suppression: {}, allowed: {}", suppression_factor, is_allowed);
+    ///         println!("suppression: {suppression_factor}, allowed: {is_allowed}");
     ///     }
-    ///     _ => {}
+    ///     RateLimitDecision::Allowed => {}
+    ///     _ => unreachable!(),
     /// }
     /// ```
     pub fn suppressed(&self) -> &SuppressedLocalRateLimiter {

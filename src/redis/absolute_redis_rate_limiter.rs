@@ -267,6 +267,22 @@ impl AbsoluteRedisRateLimiter {
     /// - `Ok(Allowed)` — under limit, increment recorded
     /// - `Ok(Rejected { .. })` — over limit, increment **not** recorded
     /// - `Err(TrypemaError)` — Redis connectivity or script error
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// assert!(matches!(
+    ///     rl.redis().absolute().inc(&key, &rate, 1).await.unwrap(),
+    ///     RateLimitDecision::Allowed
+    /// ));
+    /// # });
+    /// ```
     pub async fn inc(
         &self,
         key: &RedisKey,
@@ -306,13 +322,27 @@ impl AbsoluteRedisRateLimiter {
         }
     } // end method inc
 
-    /// Determine whether `key` is currently allowed.
+    /// Determine whether `key` is currently allowed (read-only).
     ///
     /// Returns [`RateLimitDecision::Allowed`] if the current sliding window total
     /// is below the window limit, otherwise returns [`RateLimitDecision::Rejected`]
-    /// with a best-effort `retry_after_ms`.
+    /// with a best-effort `retry_after_ms`. Does not record an increment.
     ///
-    /// This method performs lazy eviction of expired buckets for the key.
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitDecision};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// // Unknown key → always allowed
+    /// assert!(matches!(
+    ///     rl.redis().absolute().is_allowed(&key).await.unwrap(),
+    ///     RateLimitDecision::Allowed
+    /// ));
+    /// # });
+    /// ```
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 

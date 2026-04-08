@@ -25,11 +25,12 @@ pub const BENCH_PREFIX: &str = "bench";
 pub mod redis {
     use std::{env, sync::Arc};
 
-    use trypema::{
-        HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions, SuppressionFactorCacheMs,
-        WindowSizeSeconds, hybrid::SyncIntervalMs, local::LocalRateLimiterOptions,
-    };
     use trypema::redis::{RedisKey, RedisRateLimiterOptions};
+    use trypema::{
+        HardLimitFactor, RateGroupSizeMs, RateLimiter, RateLimiterOptions,
+        SuppressionFactorCacheMs, WindowSizeSeconds, hybrid::SyncIntervalMs,
+        local::LocalRateLimiterOptions,
+    };
 
     /// Read `REDIS_URL` from the environment, defaulting to the local dev address.
     pub fn redis_url() -> String {

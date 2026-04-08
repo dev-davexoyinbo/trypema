@@ -18,7 +18,7 @@ use local::*;
 /// Redis-backed distributed rate limiter implementations.
 ///
 /// Provides [`RedisRateLimiterProvider`], which executes
-/// all operations as atomic Lua scripts against Redis 6.2+. Each `inc()` or `is_allowed()`
+/// all operations as atomic Lua scripts against Redis 7.2+. Each `inc()` or `is_allowed()`
 /// call results in one Redis round-trip.
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
@@ -49,3 +49,6 @@ pub use common::{
 
 #[cfg(test)]
 mod tests;
+
+#[doc(hidden)]
+pub mod __doctest_helpers;
