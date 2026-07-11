@@ -8,7 +8,7 @@ use ahash::RandomState;
 use dashmap::DashMap;
 
 use crate::{
-    LocalRateLimiterOptions,
+    LocalRateLimiterOptions, RateLimitComparator,
     common::{InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, WindowSizeSeconds},
 };
 
@@ -294,20 +294,8 @@ impl AbsoluteLocalRateLimiter {
                     unreachable!("AbsoluteLocalRateLimiter::is_allowed: key should be in map");
                 };
 
-                let now = Instant::now();
-
-                let split = rate_limit
-                    .series
-                    .partition_point(|r| now.duration_since(r.timestamp) > self.window_duration);
-
-                let total = rate_limit
-                    .series
-                    .drain(..split)
-                    .map(|r| r.count.load(Ordering::Relaxed))
-                    .sum::<u64>();
-
-                rate_limit.total.fetch_sub(total, Ordering::Relaxed);
-                total_count -= total;
+                let drained = Self::evict_expired(&mut rate_limit, self.window_duration);
+                total_count -= drained;
 
                 drop(rate_limit);
 
@@ -344,6 +332,71 @@ impl AbsoluteLocalRateLimiter {
         }
     } // end method is_allowed
 
+    fn evict_expired(series: &mut RateLimitSeries, window_duration: Duration) -> u64 {
+        let now = Instant::now();
+
+        let split = series
+            .series
+            .partition_point(|r| now.duration_since(r.timestamp) > window_duration);
+
+        if split == 0 {
+            return 0;
+        }
+
+        let drained = series
+            .series
+            .drain(..split)
+            .map(|r| r.count.load(Ordering::Relaxed))
+            .sum::<u64>();
+
+        series.total.fetch_sub(drained, Ordering::Relaxed);
+
+        drained
+    } // end fn evict_expired
+
+    /// Current window total for `key` (read-only from the caller's perspective).
+    ///
+    /// Evicts expired buckets first, then returns the sum of the remaining bucket
+    /// counts. Unknown keys return `0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// use trypema::RateLimit;
+    ///
+    /// let limiter = rl.local().absolute();
+    /// assert_eq!(limiter.get("user_123"), 0);
+    ///
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// limiter.inc("user_123", &rate, 3);
+    /// assert_eq!(limiter.get("user_123"), 3);
+    /// ```
+    pub fn get(&self, key: &str) -> u64 {
+        let Some(series) = self.series.get(key) else {
+            return 0;
+        };
+
+        let Some(oldest_entry) = series.series.front() else {
+            return 0;
+        };
+
+        if oldest_entry.timestamp.elapsed() <= self.window_duration {
+            return series.total.load(Ordering::Relaxed);
+        };
+
+        drop(series);
+
+        let Some(mut series) = self.series.get_mut(key) else {
+            return 0;
+        };
+
+        // TODO:  continue working here-----
+
+        Self::evict_expired(&mut series, self.window_duration);
+
+        series.total.load(Ordering::Relaxed)
+    } // end method get
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {
         self.series.retain(
             |_, rate_limit_series| match rate_limit_series.series.back() {
