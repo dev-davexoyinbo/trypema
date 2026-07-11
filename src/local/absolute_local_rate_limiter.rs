@@ -391,8 +391,6 @@ impl AbsoluteLocalRateLimiter {
             return 0;
         };
 
-        // TODO:  continue working here-----
-
         Self::evict_expired(&mut series, self.window_duration);
 
         series.total.load(Ordering::Relaxed)
