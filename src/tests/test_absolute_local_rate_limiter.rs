@@ -1,13 +1,17 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use crate::common::{
-    HardLimitFactor, InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    SuppressionFactorCacheMs, WindowSizeSeconds,
+    HardLimitFactor, HistoryPreservation, InstantRate, RateGroupSizeMs, RateLimit,
+    RateLimitComparator, RateLimitDecision, SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 use crate::local::AbsoluteRateLimitSeries as RateLimitSeries;
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};

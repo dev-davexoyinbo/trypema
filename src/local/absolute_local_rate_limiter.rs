@@ -525,8 +525,8 @@ impl AbsoluteLocalRateLimiter {
 
     /// Current window total for `key` (read-only from the caller's perspective).
     ///
-    /// Evicts expired buckets first, then returns the sum of the remaining bucket
-    /// counts. Unknown keys return `0`.
+    /// Ignores expired buckets and returns the sum of live bucket counts without
+    /// mutating the stored history. Unknown keys return `0`.
     ///
     /// # Examples
     ///
