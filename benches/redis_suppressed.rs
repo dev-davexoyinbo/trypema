@@ -13,10 +13,10 @@ mod enabled {
     use criterion::Criterion;
     use std::hint::black_box;
 
-    use trypema::RateLimit;
     use trypema::redis::RedisKey;
+    use trypema::{HistoryPreservation, RateLimit, RateLimitComparator};
 
-    use super::common::redis::{LimiterConfig, build_limiter};
+    use super::common::{LimiterConfig, redis::build_limiter};
     use super::runtime;
 
     pub fn bench_inc(c: &mut Criterion) {
@@ -72,6 +72,80 @@ mod enabled {
                 });
             });
         });
+
+        let set_key = RedisKey::try_from("set_user".to_string()).unwrap();
+        runtime::block_on(&rt, async {
+            rl.redis()
+                .suppressed()
+                .set_if(&set_key, &rate, RateLimitComparator::Nil, 100)
+                .await
+                .unwrap();
+        });
+        group.bench_function("set_if/guard_miss", |b| {
+            b.iter(|| {
+                black_box(runtime::block_on(&rt, async {
+                    rl.redis()
+                        .suppressed()
+                        .set_if(&set_key, &rate, RateLimitComparator::Eq(0), 50)
+                        .await
+                }))
+            });
+        });
+
+        let replace_key = RedisKey::try_from("replace_user".to_string()).unwrap();
+        runtime::block_on(&rt, async {
+            rl.redis()
+                .suppressed()
+                .set_if(&replace_key, &rate, RateLimitComparator::Nil, 100)
+                .await
+                .unwrap();
+        });
+        let mut replace_high = false;
+        group.bench_function("set_if/replace", |b| {
+            b.iter(|| {
+                replace_high = !replace_high;
+                let target = if replace_high { 150 } else { 50 };
+                black_box(runtime::block_on(&rt, async {
+                    rl.redis()
+                        .suppressed()
+                        .set_if(&replace_key, &rate, RateLimitComparator::Nil, target)
+                        .await
+                }))
+            });
+        });
+
+        for preservation in [
+            HistoryPreservation::PreserveNewest,
+            HistoryPreservation::PreserveOldest,
+        ] {
+            let key = RedisKey::try_from(format!("preserve_{preservation:?}")).unwrap();
+            runtime::block_on(&rt, async {
+                rl.redis()
+                    .suppressed()
+                    .set_if(&key, &rate, RateLimitComparator::Nil, 100)
+                    .await
+                    .unwrap();
+            });
+            let mut high = false;
+            group.bench_function(format!("set_if_preserve_history/{preservation:?}"), |b| {
+                b.iter(|| {
+                    high = !high;
+                    let target = if high { 150 } else { 50 };
+                    black_box(runtime::block_on(&rt, async {
+                        rl.redis()
+                            .suppressed()
+                            .set_if_preserve_history(
+                                &key,
+                                &rate,
+                                RateLimitComparator::Nil,
+                                target,
+                                preservation,
+                            )
+                            .await
+                    }))
+                });
+            });
+        }
 
         std::thread::sleep(Duration::from_millis(50));
         group.finish();

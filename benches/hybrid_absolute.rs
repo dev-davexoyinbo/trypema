@@ -8,83 +8,50 @@ mod common;
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 mod enabled {
-    use std::time::Duration;
+    use std::{hint::black_box, time::Duration};
 
     use criterion::Criterion;
-    use std::hint::black_box;
-
     use trypema::redis::RedisKey;
-    use trypema::{HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator};
+    use trypema::{HistoryPreservation, RateLimit, RateLimitComparator};
 
     use super::common::{LimiterConfig, redis::build_limiter};
     use super::runtime;
 
-    pub fn bench_inc(c: &mut Criterion) {
-        let mut group = c.benchmark_group("redis_absolute");
-        group.sample_size(50);
-
+    pub fn bench_conditional_set(c: &mut Criterion) {
+        let mut group = c.benchmark_group("hybrid_absolute/conditional_set");
+        group.sample_size(40);
         let rt = runtime::build();
-
         let rl = runtime::block_on(
             &rt,
             build_limiter(LimiterConfig {
-                hard_limit_factor: *HardLimitFactor::default(),
+                prefix: "bench_hybrid_absolute",
                 ..LimiterConfig::default()
             }),
         );
-
-        let key = RedisKey::try_from("user_1".to_string()).unwrap();
-        let rate = RateLimit::max();
-
-        // Ensure connection is warm.
+        let rate = RateLimit::try_from(100.0).unwrap();
+        let guard_key = RedisKey::try_from("guard".to_string()).unwrap();
         runtime::block_on(&rt, async {
-            let _ = rl.redis().absolute().inc(&key, &rate, 1).await.unwrap();
-        });
-
-        group.bench_function("inc/hot_key", |b| {
-            b.iter(|| {
-                let _ = runtime::block_on(&rt, async {
-                    let res = rl
-                        .redis()
-                        .absolute()
-                        .inc(black_box(&key), black_box(&rate), black_box(1))
-                        .await;
-                    black_box(res)
-                });
-            });
-        });
-
-        group.bench_function("is_allowed/hot_key", |b| {
-            b.iter(|| {
-                let _ = runtime::block_on(&rt, async {
-                    let res = rl.redis().absolute().is_allowed(black_box(&key)).await;
-                    black_box(res)
-                });
-            });
-        });
-
-        let set_key = RedisKey::try_from("set_user".to_string()).unwrap();
-        runtime::block_on(&rt, async {
-            rl.redis()
+            rl.hybrid()
                 .absolute()
-                .set_if(&set_key, &rate, RateLimitComparator::Nil, 100)
+                .set_if(&guard_key, &rate, RateLimitComparator::Nil, 100)
                 .await
                 .unwrap();
         });
+
         group.bench_function("set_if/guard_miss", |b| {
             b.iter(|| {
                 black_box(runtime::block_on(&rt, async {
-                    rl.redis()
+                    rl.hybrid()
                         .absolute()
-                        .set_if(&set_key, &rate, RateLimitComparator::Eq(0), 50)
+                        .set_if(&guard_key, &rate, RateLimitComparator::Eq(0), 50)
                         .await
                 }))
             });
         });
 
-        let replace_key = RedisKey::try_from("replace_user".to_string()).unwrap();
+        let replace_key = RedisKey::try_from("replace".to_string()).unwrap();
         runtime::block_on(&rt, async {
-            rl.redis()
+            rl.hybrid()
                 .absolute()
                 .set_if(&replace_key, &rate, RateLimitComparator::Nil, 100)
                 .await
@@ -96,7 +63,7 @@ mod enabled {
                 replace_high = !replace_high;
                 let target = if replace_high { 150 } else { 50 };
                 black_box(runtime::block_on(&rt, async {
-                    rl.redis()
+                    rl.hybrid()
                         .absolute()
                         .set_if(&replace_key, &rate, RateLimitComparator::Nil, target)
                         .await
@@ -110,7 +77,7 @@ mod enabled {
         ] {
             let key = RedisKey::try_from(format!("preserve_{preservation:?}")).unwrap();
             runtime::block_on(&rt, async {
-                rl.redis()
+                rl.hybrid()
                     .absolute()
                     .set_if(&key, &rate, RateLimitComparator::Nil, 100)
                     .await
@@ -122,7 +89,7 @@ mod enabled {
                     high = !high;
                     let target = if high { 150 } else { 50 };
                     black_box(runtime::block_on(&rt, async {
-                        rl.redis()
+                        rl.hybrid()
                             .absolute()
                             .set_if_preserve_history(
                                 &key,
@@ -137,19 +104,18 @@ mod enabled {
             });
         }
 
-        // Give outstanding IO a moment before runtime drop.
         std::thread::sleep(Duration::from_millis(50));
         group.finish();
     }
 }
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-fn bench_inc(c: &mut Criterion) {
-    enabled::bench_inc(c)
+fn bench_conditional_set(c: &mut Criterion) {
+    enabled::bench_conditional_set(c)
 }
 
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-fn bench_inc(_: &mut Criterion) {}
+fn bench_conditional_set(_: &mut Criterion) {}
 
-criterion_group!(benches, bench_inc);
+criterion_group!(benches, bench_conditional_set);
 criterion_main!(benches);
