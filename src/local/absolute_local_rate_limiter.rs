@@ -546,23 +546,9 @@ impl AbsoluteLocalRateLimiter {
             return 0;
         };
 
-        let Some(oldest_entry) = series.series.front() else {
-            return 0;
-        };
+        let (total, _contains_expired) = Self::live_total(&series, self.window_duration);
 
-        if oldest_entry.timestamp.elapsed() <= self.window_duration {
-            return series.total.load(Ordering::Relaxed);
-        };
-
-        drop(series);
-
-        let Some(mut series) = self.series.get_mut(key) else {
-            return 0;
-        };
-
-        Self::evict_expired(&mut series, self.window_duration);
-
-        series.total.load(Ordering::Relaxed)
+        total
     } // end method get
 
     /// Conditionally replace the window total for `key`.
