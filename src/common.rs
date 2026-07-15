@@ -13,6 +13,7 @@
 //! | [`RateGroupSizeMs`] | Bucket coalescing interval in milliseconds (≥ 1, default 100ms) |
 //! | [`HardLimitFactor`] | Hard cutoff multiplier for the suppressed strategy (≥ 1.0, default 1.0) |
 //! | [`SuppressionFactorCacheMs`] | Cache duration for suppression factor recomputation (≥ 1, default 100ms) |
+//! | [`RateLimitComparator`] | Guard condition for conditional writes (`set_if`) against the current window total |
 
 use std::{
     ops::{Deref, DerefMut},
@@ -565,6 +566,122 @@ impl TryFrom<u64> for SuppressionFactorCacheMs {
             ))
         } else {
             Ok(Self(value))
+        }
+    }
+}
+
+/// Guard condition for conditional writes against a key's current window total.
+///
+/// Used by `set_if`-style operations: the write is applied only when the key's
+/// current (post-eviction) window total satisfies the comparator. The embedded
+/// operand is the value the current total is compared **against**.
+///
+/// # Variants
+///
+/// - [`Eq`](RateLimitComparator::Eq): matches when the current total **equals** the operand
+/// - [`Lt`](RateLimitComparator::Lt): matches when the current total is **less than** the operand
+/// - [`Gt`](RateLimitComparator::Gt): matches when the current total is **greater than** the operand
+/// - [`Ne`](RateLimitComparator::Ne): matches when the current total is **not equal to** the operand
+/// - [`Nil`](RateLimitComparator::Nil): **always** matches (unconditional write through the guarded path)
+///
+/// # Common Idioms
+///
+/// - `Lt(count)` with `set_if(key, rate, Lt(count), count)` — *raise-only* write: lifts the
+///   window total to at least `count` and never lowers it. Idempotent, safe to retry — the
+///   canonical priming pattern.
+/// - `Eq(0)` — initialize only when the window is empty.
+/// - `Nil` — unconditional overwrite.
+///
+/// # Examples
+///
+/// ```
+/// use trypema::RateLimitComparator;
+///
+/// assert!(RateLimitComparator::Eq(5).matches(5));
+/// assert!(!RateLimitComparator::Eq(5).matches(4));
+///
+/// assert!(RateLimitComparator::Lt(5).matches(4));
+/// assert!(!RateLimitComparator::Lt(5).matches(5));
+///
+/// assert!(RateLimitComparator::Gt(5).matches(6));
+/// assert!(!RateLimitComparator::Gt(5).matches(5));
+///
+/// assert!(RateLimitComparator::Ne(5).matches(6));
+/// assert!(!RateLimitComparator::Ne(5).matches(5));
+///
+/// assert!(RateLimitComparator::Nil.matches(0));
+/// assert!(RateLimitComparator::Nil.matches(u64::MAX));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitComparator {
+    /// Matches when the current window total is equal to the embedded operand.
+    Eq(u64),
+    /// Matches when the current window total is less than the embedded operand.
+    Lt(u64),
+    /// Matches when the current window total is greater than the embedded operand.
+    Gt(u64),
+    /// Matches when the current window total is not equal to the embedded operand.
+    Ne(u64),
+    /// Always matches.
+    ///
+    /// This is primarily useful for delegating unconditional writes through the
+    /// conditional write path.
+    Nil,
+}
+
+impl RateLimitComparator {
+    /// Returns whether `current` satisfies this comparator.
+    pub fn matches(self, current: u64) -> bool {
+        match self {
+            Self::Eq(operand) => current == operand,
+            Self::Lt(operand) => current < operand,
+            Self::Gt(operand) => current > operand,
+            Self::Ne(operand) => current != operand,
+            Self::Nil => true,
+        }
+    }
+
+    /// Wire encoding used by the Redis Lua scripts: `(op, operand)`.
+    ///
+    /// `Nil` carries no operand; `0` is sent as a placeholder and ignored by the script.
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    pub(crate) fn redis_args(self) -> (&'static str, u64) {
+        match self {
+            Self::Eq(operand) => ("eq", operand),
+            Self::Lt(operand) => ("lt", operand),
+            Self::Gt(operand) => ("gt", operand),
+            Self::Ne(operand) => ("ne", operand),
+            Self::Nil => ("nil", 0),
+        }
+    }
+}
+
+/// Selects which side of an existing sliding-window history is retained when
+/// [`set_if_preserve_history`](crate::local::AbsoluteLocalRateLimiter::set_if_preserve_history)
+/// changes its total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryPreservation {
+    /// Retain the newest buckets. Reductions consume history from oldest to newest,
+    /// while increases are added to the newest bucket.
+    PreserveNewest,
+    /// Retain the oldest buckets. Reductions consume history from newest to oldest,
+    /// while increases are added to the oldest bucket.
+    PreserveOldest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryUpdateMode {
+    Replace,
+    Preserve(HistoryPreservation),
+}
+
+impl HistoryUpdateMode {
+    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+    pub(crate) fn redis_arg(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Preserve(HistoryPreservation::PreserveNewest) => "preserve_newest",
+            Self::Preserve(HistoryPreservation::PreserveOldest) => "preserve_oldest",
         }
     }
 }

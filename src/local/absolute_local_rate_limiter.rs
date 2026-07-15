@@ -8,8 +8,11 @@ use ahash::RandomState;
 use dashmap::DashMap;
 
 use crate::{
-    LocalRateLimiterOptions, RateLimitComparator,
-    common::{InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision, WindowSizeSeconds},
+    HistoryPreservation, LocalRateLimiterOptions, RateLimitComparator,
+    common::{
+        HistoryUpdateMode, InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision,
+        WindowSizeSeconds,
+    },
 };
 
 #[derive(Debug)]
@@ -332,6 +335,7 @@ impl AbsoluteLocalRateLimiter {
         }
     } // end method is_allowed
 
+    /// Evict buckets older than the window from `series`, keeping `total` consistent.
     fn evict_expired(series: &mut RateLimitSeries, window_duration: Duration) -> u64 {
         let now = Instant::now();
 
@@ -353,6 +357,171 @@ impl AbsoluteLocalRateLimiter {
 
         drained
     } // end fn evict_expired
+
+    fn live_total(series: &RateLimitSeries, window_duration: Duration) -> (u64, bool) {
+        let now = Instant::now();
+
+        let split = series
+            .series
+            .partition_point(|r| now.duration_since(r.timestamp) > window_duration);
+
+        let total = series
+            .series
+            .iter()
+            .skip(split)
+            .map(|r| r.count.load(Ordering::Relaxed))
+            .sum();
+
+        (total, split > 0)
+    }
+
+    fn apply_history_update(
+        series: &mut RateLimitSeries,
+        window_duration: Duration,
+        count: u64,
+        mode: HistoryUpdateMode,
+    ) {
+        Self::evict_expired(series, window_duration);
+        let old_total = series.total.load(Ordering::Relaxed);
+
+        match mode {
+            HistoryUpdateMode::Replace => {
+                series.series.clear();
+
+                if count > 0 {
+                    series.series.push_back(InstantRate {
+                        count: count.into(),
+                        timestamp: Instant::now(),
+                        declined: AtomicU64::new(0),
+                    });
+                }
+            }
+            HistoryUpdateMode::Preserve(preservation) if count > old_total => {
+                let delta = count - old_total;
+                let bucket = match preservation {
+                    HistoryPreservation::PreserveNewest => series.series.back(),
+                    HistoryPreservation::PreserveOldest => series.series.front(),
+                };
+
+                if let Some(bucket) = bucket {
+                    bucket.count.fetch_add(delta, Ordering::Relaxed);
+                } else {
+                    series.series.push_back(InstantRate {
+                        count: delta.into(),
+                        timestamp: Instant::now(),
+                        declined: AtomicU64::new(0),
+                    });
+                }
+            }
+            HistoryUpdateMode::Preserve(preservation) if count < old_total => {
+                let mut to_remove = old_total - count;
+
+                while to_remove > 0 {
+                    let bucket_count = match preservation {
+                        HistoryPreservation::PreserveNewest => series
+                            .series
+                            .front()
+                            .map(|bucket| bucket.count.load(Ordering::Relaxed)),
+                        HistoryPreservation::PreserveOldest => series
+                            .series
+                            .back()
+                            .map(|bucket| bucket.count.load(Ordering::Relaxed)),
+                    };
+
+                    let Some(bucket_count) = bucket_count else {
+                        break;
+                    };
+
+                    if bucket_count <= to_remove {
+                        to_remove -= bucket_count;
+                        match preservation {
+                            HistoryPreservation::PreserveNewest => {
+                                series.series.pop_front();
+                            }
+                            HistoryPreservation::PreserveOldest => {
+                                series.series.pop_back();
+                            }
+                        }
+                    } else {
+                        let bucket = match preservation {
+                            HistoryPreservation::PreserveNewest => {
+                                series.series.front().expect("bucket should exist")
+                            }
+                            HistoryPreservation::PreserveOldest => {
+                                series.series.back().expect("bucket should exist")
+                            }
+                        };
+                        bucket.count.fetch_sub(to_remove, Ordering::Relaxed);
+                        to_remove = 0;
+                    }
+                }
+            }
+            HistoryUpdateMode::Preserve(_) => {}
+        }
+
+        series.total.store(count, Ordering::Relaxed);
+    }
+
+    fn set_if_with_history_mode(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        mode: HistoryUpdateMode,
+    ) -> (u64, u64) {
+        if let Some(series) = self.series.get(key) {
+            let (old_total, contains_expired) = Self::live_total(&series, self.window_duration);
+
+            if !comparator.matches(old_total) {
+                return (old_total, old_total);
+            }
+
+            let unchanged = matches!(mode, HistoryUpdateMode::Preserve(_))
+                && !contains_expired
+                && old_total == count
+                && series.limit == *rate_limit;
+
+            if unchanged {
+                return (old_total, old_total);
+            }
+
+            drop(series);
+
+            if let Some(mut series) = self.series.get_mut(key) {
+                let (old_total, _contains_expired) =
+                    Self::live_total(&series, self.window_duration);
+
+                if !comparator.matches(old_total) {
+                    return (old_total, old_total);
+                }
+
+                series.limit = *rate_limit;
+                Self::apply_history_update(&mut series, self.window_duration, count, mode);
+                return (count, old_total);
+            }
+        }
+
+        if !comparator.matches(0) || count == 0 {
+            return (0, 0);
+        }
+
+        let mut series = self
+            .series
+            .entry(key.to_string())
+            .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+
+        let (old_total, _contains_expired) = Self::live_total(&series, self.window_duration);
+
+        if !comparator.matches(old_total) {
+            return (old_total, old_total);
+        }
+
+        series.limit = *rate_limit;
+        Self::apply_history_update(&mut series, self.window_duration, count, mode);
+
+        (count, old_total)
+    }
 
     /// Current window total for `key` (read-only from the caller's perspective).
     ///
@@ -395,6 +564,91 @@ impl AbsoluteLocalRateLimiter {
 
         series.total.load(Ordering::Relaxed)
     } // end method get
+
+    /// Conditionally replace the window total for `key`.
+    ///
+    /// When `comparator` matches the key's current window total, the
+    /// window contents are replaced by a single current-timestamp bucket holding
+    /// `count` and the stored rate limit is redefined to `rate_limit`; otherwise
+    /// nothing is written. Unlike `inc`, a matched call can therefore replace a
+    /// previously stored limit.
+    ///
+    /// The entire operation runs while holding the key's map entry, so it is
+    /// consistent with respect to other `set_if` calls; interleaving with concurrent
+    /// `inc` calls follows the limiter's usual best-effort concurrency model.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Unique identifier for the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit; redefines the stored limit
+    /// - `comparator`: Guard evaluated against the current window total
+    /// - `count`: The total to write when the guard matches
+    ///
+    /// # Returns
+    ///
+    /// `(new_total, old_total)` — `old_total` is the post-eviction total the
+    /// comparator was evaluated against; `new_total` is `count` when the guard
+    /// matched, `old_total` otherwise.
+    ///
+    /// # Priming Idiom
+    ///
+    /// `set_if(key, rate, RateLimitComparator::Lt(count), count)` raises the window
+    /// total to at least `count` and never lowers it — idempotent and safe to retry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// use trypema::{RateLimit, RateLimitComparator};
+    ///
+    /// let limiter = rl.local().absolute();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    ///
+    /// // Prime the window to 40.
+    /// let (new_total, old_total) =
+    ///     limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
+    /// assert_eq!((new_total, old_total), (40, 0));
+    ///
+    /// // Re-priming is a no-op: the guard no longer matches.
+    /// let (new_total, old_total) =
+    ///     limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
+    /// assert_eq!((new_total, old_total), (40, 40));
+    /// ```
+    pub fn set_if(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+    ) -> (u64, u64) {
+        self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Replace,
+        )
+    } // end method set_if
+
+    /// Conditionally set the current total while retaining the selected side of
+    /// the existing sliding-window history.
+    pub fn set_if_preserve_history(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        preservation: HistoryPreservation,
+    ) -> (u64, u64) {
+        self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Preserve(preservation),
+        )
+    } // end method set_if_preserve_history
+
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {
         self.series.retain(
             |_, rate_limit_series| match rate_limit_series.series.back() {

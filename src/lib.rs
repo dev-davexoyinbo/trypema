@@ -43,8 +43,8 @@ pub use error::*;
 
 mod common;
 pub use common::{
-    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, SuppressionFactorCacheMs,
-    WindowSizeSeconds,
+    HardLimitFactor, HistoryPreservation, RateGroupSizeMs, RateLimit, RateLimitComparator,
+    RateLimitDecision, SuppressionFactorCacheMs, WindowSizeSeconds,
 };
 
 #[cfg(test)]
