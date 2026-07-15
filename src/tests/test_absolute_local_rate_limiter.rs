@@ -844,3 +844,446 @@ fn volume_non_integer_rate_uses_truncating_capacity() {
         "decision: {decision:?}"
     );
 }
+
+#[test]
+fn get_unknown_key_returns_zero() {
+    let limiter = limiter(6, 1000);
+
+    assert_eq!(limiter.get("k"), 0);
+    assert!(limiter.series().is_empty());
+}
+
+#[test]
+fn get_returns_current_window_total() {
+    let limiter = limiter(6, 1000);
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+    for _ in 0..3 {
+        let decision = limiter.inc("k", &rate_limit, 1);
+        assert!(matches!(decision, RateLimitDecision::Allowed));
+    }
+
+    assert_eq!(limiter.get("k"), 3);
+}
+
+#[test]
+fn get_ignores_expired_buckets() {
+    let window_size_seconds = 1_u64;
+    let limiter = limiter(window_size_seconds, 50);
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+    // One bucket well past the 1s window, one recent bucket.
+    insert_series(&limiter, "k", rate_limit, &[(5, 2_000), (3, 100)]);
+
+    assert_eq!(limiter.get("k"), 3, "expired bucket must be ignored");
+    {
+        let series = limiter.series().get("k").expect("series should remain");
+        assert_eq!(series.series.len(), 2, "get must not evict history");
+        assert_eq!(series.total.load(Ordering::Relaxed), 8);
+    }
+
+    // Only the expired bucket for this key.
+    insert_series(&limiter, "k2", rate_limit, &[(5, 2_000)]);
+    assert_eq!(limiter.get("k2"), 0);
+    let series = limiter.series().get("k2").expect("series should remain");
+    assert_eq!(series.series.len(), 1, "get must not evict history");
+    assert_eq!(series.total.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn get_fresh_key_uses_shared_dashmap_lock() {
+    let limiter = Arc::new(limiter(6, 1000));
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let _ = limiter.inc("k", &rate_limit, 3);
+
+    let held_read_guard = limiter.series().get("k").expect("series should exist");
+    let barrier = Arc::new(Barrier::new(2));
+    let (sender, receiver) = mpsc::channel();
+
+    let reader = {
+        let limiter = Arc::clone(&limiter);
+        let barrier = Arc::clone(&barrier);
+
+        thread::spawn(move || {
+            barrier.wait();
+            sender.send(limiter.get("k")).unwrap();
+        })
+    };
+
+    barrier.wait();
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+
+    // Release the guard before joining so a regression to get_mut cannot strand
+    // the worker after the timeout.
+    drop(held_read_guard);
+    reader.join().expect("reader thread panicked");
+
+    assert_eq!(
+        result.expect("fresh-key get blocked on an existing shared DashMap guard"),
+        3
+    );
+}
+
+#[test]
+fn get_expired_key_uses_shared_dashmap_lock() {
+    let limiter = Arc::new(limiter(1, 50));
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    insert_series(&limiter, "k", rate_limit, &[(5, 2_000)]);
+
+    let held_read_guard = limiter.series().get("k").expect("series should exist");
+    let barrier = Arc::new(Barrier::new(2));
+    let (sender, receiver) = mpsc::channel();
+
+    let reader = {
+        let limiter = Arc::clone(&limiter);
+        let barrier = Arc::clone(&barrier);
+
+        thread::spawn(move || {
+            barrier.wait();
+            sender.send(limiter.get("k")).unwrap();
+        })
+    };
+
+    barrier.wait();
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+
+    drop(held_read_guard);
+    reader.join().expect("reader thread panicked");
+
+    assert_eq!(
+        result.expect("expired-key get blocked on an existing shared DashMap guard"),
+        0
+    );
+
+    let series = limiter.series().get("k").expect("series should remain");
+    assert_eq!(series.series.len(), 1, "get must not evict history");
+    assert_eq!(series.total.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
+    let limiter = limiter(6, 1000);
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+    let (new_total, old_total) =
+        limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    assert_eq!((new_total, old_total), (100, 0));
+
+    let (new_total, old_total) =
+        limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    assert_eq!((new_total, old_total), (100, 100));
+
+    assert_eq!(limiter.get("k"), 100);
+}
+
+#[test]
+fn set_if_lt_with_lower_target_is_noop() {
+    let limiter = limiter(6, 1000);
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+    let _ = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(50), 50);
+    assert_eq!((new_total, old_total), (100, 100));
+}
+
+#[test]
+fn set_if_nil_overwrites_unconditionally_including_lowering() {
+    let limiter = limiter(6, 1000);
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+    let _ = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 100);
+
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 30);
+    assert_eq!((new_total, old_total), (30, 100));
+    assert_eq!(limiter.get("k"), 30);
+
+    // Overwriting to 0 clears the window entirely; admission resumes from empty.
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 0);
+    assert_eq!((new_total, old_total), (0, 30));
+    assert_eq!(limiter.get("k"), 0);
+
+    let decision = limiter.inc("k", &rate_limit, 1);
+    assert!(matches!(decision, RateLimitDecision::Allowed));
+}
+
+#[test]
+fn set_if_eq_zero_sets_only_when_window_is_empty() {
+    let limiter = limiter(6, 1000);
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 25);
+    assert_eq!((new_total, old_total), (25, 0));
+
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 99);
+    assert_eq!((new_total, old_total), (25, 25));
+}
+
+#[test]
+fn set_if_gt_and_ne_guards_follow_current_total() {
+    let limiter = limiter(6, 1000);
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+    let _ = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 10);
+
+    // Gt(5): 10 > 5 matches → lowered to 3.
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Gt(5), 3);
+    assert_eq!((new_total, old_total), (3, 10));
+
+    // Ne(3): current is exactly 3 → no match.
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Ne(3), 7);
+    assert_eq!((new_total, old_total), (3, 3));
+
+    // Ne(5): current is 3 → match.
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Ne(5), 7);
+    assert_eq!((new_total, old_total), (7, 3));
+}
+
+#[test]
+fn set_if_prime_then_inc_enforces_remaining_budget() {
+    let window_size_seconds = 6_u64;
+    let limiter = limiter(window_size_seconds, 1000);
+    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    assert_eq!(capacity, 30);
+
+    // Prime 27 of 30: exactly 3 units of budget remain.
+    let (new_total, _) = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(27), 27);
+    assert_eq!(new_total, 27);
+
+    for i in 0..3_u64 {
+        let decision = limiter.inc("k", &rate_limit, 1);
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "i: {i}, decision: {decision:?}"
+        );
+    }
+
+    let decision = limiter.inc("k", &rate_limit, 1);
+    assert!(
+        matches!(decision, RateLimitDecision::Rejected { .. }),
+        "decision: {decision:?}"
+    );
+}
+
+#[test]
+fn set_if_prime_at_capacity_rejects_next_inc() {
+    let window_size_seconds = 6_u64;
+    let limiter = limiter(window_size_seconds, 1000);
+    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let capacity = window_capacity(window_size_seconds, &rate_limit);
+
+    let (new_total, _) = limiter.set_if(
+        "k",
+        &rate_limit,
+        RateLimitComparator::Lt(capacity),
+        capacity,
+    );
+    assert_eq!(new_total, capacity);
+
+    let decision = limiter.inc("k", &rate_limit, 1);
+    assert!(
+        matches!(decision, RateLimitDecision::Rejected { .. }),
+        "decision: {decision:?}"
+    );
+
+    let decision = limiter.is_allowed("k");
+    assert!(
+        matches!(decision, RateLimitDecision::Rejected { .. }),
+        "decision: {decision:?}"
+    );
+}
+
+#[test]
+fn set_if_redefines_sticky_rate_limit() {
+    let window_size_seconds = 6_u64;
+    let limiter = limiter(window_size_seconds, 1000);
+
+    // Fill to the original capacity (6 * 1 = 6); the key is now rejecting.
+    let rate_one = RateLimit::try_from(1f64).unwrap();
+    for _ in 0..6 {
+        let decision = limiter.inc("k", &rate_one, 1);
+        assert!(matches!(decision, RateLimitDecision::Allowed));
+    }
+    let decision = limiter.inc("k", &rate_one, 1);
+    assert!(matches!(decision, RateLimitDecision::Rejected { .. }));
+
+    // Unlike inc (sticky limit), set_if redefines the stored limit: 6 * 10 = 60.
+    let rate_ten = RateLimit::try_from(10f64).unwrap();
+    let _ = limiter.set_if("k", &rate_ten, RateLimitComparator::Nil, 0);
+
+    // The old capacity of 6 no longer applies (the inc rate argument is still
+    // ignored — the stored limit now comes from set_if).
+    for i in 0..12_u64 {
+        let decision = limiter.inc("k", &rate_one, 1);
+        assert!(
+            matches!(decision, RateLimitDecision::Allowed),
+            "i: {i}, decision: {decision:?}"
+        );
+    }
+}
+
+#[test]
+fn set_if_evicts_expired_buckets_before_comparing() {
+    let window_size_seconds = 6_u64;
+    let limiter = limiter(window_size_seconds, 1000);
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+    // A stale bucket outside the 6s window.
+    insert_series(&limiter, "k", rate_limit, &[(50, 7_000)]);
+
+    // Eq(0) must observe the post-eviction total.
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 9);
+    assert_eq!((new_total, old_total), (9, 0));
+}
+
+#[test]
+fn set_if_unmatched_guard_on_unknown_key_writes_no_counts() {
+    let limiter = limiter(6, 1000);
+    let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Gt(5), 9);
+    assert_eq!((new_total, old_total), (0, 0));
+    assert_eq!(limiter.get("k"), 0);
+    assert!(!limiter.series().contains_key("k"));
+}
+
+#[test]
+fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
+    let limiter = limiter(10, 1);
+    let rate = RateLimit::try_from(100f64).unwrap();
+    insert_series(&limiter, "k", rate, &[(4, 3_000), (5, 2_000), (6, 1_000)]);
+
+    let result = limiter.set_if_preserve_history(
+        "k",
+        &rate,
+        RateLimitComparator::Nil,
+        8,
+        HistoryPreservation::PreserveNewest,
+    );
+    assert_eq!(result, (8, 15));
+
+    let series = limiter.series().get("k").unwrap();
+    let counts = series
+        .series
+        .iter()
+        .map(|bucket| bucket.count.load(std::sync::atomic::Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    assert_eq!(counts, vec![2, 6]);
+    drop(series);
+
+    let result = limiter.set_if_preserve_history(
+        "k",
+        &rate,
+        RateLimitComparator::Nil,
+        11,
+        HistoryPreservation::PreserveNewest,
+    );
+    assert_eq!(result, (11, 8));
+    let series = limiter.series().get("k").unwrap();
+    let counts = series
+        .series
+        .iter()
+        .map(|bucket| bucket.count.load(std::sync::atomic::Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    assert_eq!(counts, vec![2, 9]);
+}
+
+#[test]
+fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
+    let limiter = limiter(10, 1);
+    let rate = RateLimit::try_from(100f64).unwrap();
+    insert_series(&limiter, "k", rate, &[(4, 3_000), (5, 2_000), (6, 1_000)]);
+
+    assert_eq!(
+        limiter.set_if_preserve_history(
+            "k",
+            &rate,
+            RateLimitComparator::Nil,
+            8,
+            HistoryPreservation::PreserveOldest,
+        ),
+        (8, 15)
+    );
+    let series = limiter.series().get("k").unwrap();
+    let counts = series
+        .series
+        .iter()
+        .map(|bucket| bucket.count.load(std::sync::atomic::Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    assert_eq!(counts, vec![4, 4]);
+    drop(series);
+
+    assert_eq!(
+        limiter.set_if_preserve_history(
+            "k",
+            &rate,
+            RateLimitComparator::Nil,
+            11,
+            HistoryPreservation::PreserveOldest,
+        ),
+        (11, 8)
+    );
+    let series = limiter.series().get("k").unwrap();
+    let counts = series
+        .series
+        .iter()
+        .map(|bucket| bucket.count.load(std::sync::atomic::Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    assert_eq!(counts, vec![7, 4]);
+}
+
+#[test]
+fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
+    let limiter = Arc::new(limiter(6, 1000));
+    let rate = RateLimit::try_from(100f64).unwrap();
+    let _ = limiter.inc("k", &rate, 3);
+    let held_read_guard = limiter.series().get("k").unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let (sender, receiver) = mpsc::channel();
+
+    let worker = {
+        let limiter = Arc::clone(&limiter);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            let replace = limiter.set_if("k", &rate, RateLimitComparator::Eq(99), 10);
+            let preserve = limiter.set_if_preserve_history(
+                "k",
+                &rate,
+                RateLimitComparator::Eq(99),
+                10,
+                HistoryPreservation::PreserveNewest,
+            );
+            sender.send((replace, preserve)).unwrap();
+        })
+    };
+
+    barrier.wait();
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+    drop(held_read_guard);
+    worker.join().unwrap();
+    assert_eq!(result.unwrap(), ((3, 3), (3, 3)));
+}
+
+#[test]
+fn conditional_set_missing_zero_leaves_key_absent() {
+    let limiter = limiter(6, 1000);
+    let rate = RateLimit::try_from(100f64).unwrap();
+
+    assert_eq!(
+        limiter.set_if("k", &rate, RateLimitComparator::Eq(0), 0),
+        (0, 0)
+    );
+    assert_eq!(
+        limiter.set_if_preserve_history(
+            "k2",
+            &rate,
+            RateLimitComparator::Eq(0),
+            0,
+            HistoryPreservation::PreserveNewest,
+        ),
+        (0, 0)
+    );
+    assert!(limiter.series().is_empty());
+}
