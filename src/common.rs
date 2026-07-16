@@ -8,6 +8,7 @@
 //! | Type | Purpose |
 //! |------|---------|
 //! | [`RateLimitDecision`] | The admission decision returned by every `inc()` and `is_allowed()` call |
+//! | [`SuppressedRateLimitSnapshot`] | Live counters and suppression factor returned by suppressed `get()` calls |
 //! | [`RateLimit`] | Per-second rate limit (positive `f64`, supports non-integer rates) |
 //! | [`WindowSizeSeconds`] | Sliding window duration in seconds (≥ 1) |
 //! | [`RateGroupSizeMs`] | Bucket coalescing interval in milliseconds (≥ 1, default 100ms) |
