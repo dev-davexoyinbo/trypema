@@ -480,6 +480,12 @@ impl AbsoluteLocalRateLimiter {
             return (old_total, old_total);
         }
 
+        if count == 0 {
+            self.series.remove(key);
+
+            return (0, old_total);
+        }
+
         let mut series = self
             .series
             .entry(key.to_string())
