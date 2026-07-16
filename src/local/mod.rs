@@ -94,8 +94,6 @@
 //! ```
 
 mod absolute_local_rate_limiter;
-#[cfg(test)]
-pub(crate) use absolute_local_rate_limiter::RateLimitSeries as AbsoluteRateLimitSeries;
 pub use absolute_local_rate_limiter::*;
 
 mod local_rate_limiter_provider;

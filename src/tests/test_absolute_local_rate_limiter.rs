@@ -284,9 +284,15 @@ fn rejected_metadata_window_6_with_nonzero_grouping_separates_buckets() {
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
     // Two buckets (sleep > group size). window_limit = 6 * 1 = 6
-    limiter.inc(key, &rate_limit, 2);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 2),
+        RateLimitDecision::Allowed
+    ));
     thread::sleep(Duration::from_millis(250));
-    limiter.inc(key, &rate_limit, 4);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 4),
+        RateLimitDecision::Allowed
+    ));
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
@@ -310,9 +316,15 @@ fn rejected_metadata_window_10_with_nonzero_grouping_separates_buckets() {
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
     // Two buckets (sleep > group size). window_limit = 10 * 1 = 10
-    limiter.inc(key, &rate_limit, 3);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 3),
+        RateLimitDecision::Allowed
+    ));
     thread::sleep(Duration::from_millis(250));
-    limiter.inc(key, &rate_limit, 7);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 7),
+        RateLimitDecision::Allowed
+    ));
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
@@ -336,9 +348,15 @@ fn rejected_metadata_window_6_with_nonzero_grouping_merges_within_group() {
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
     // Same bucket (sleep < group size). window_limit = 6 * 1 = 6
-    limiter.inc(key, &rate_limit, 3);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 3),
+        RateLimitDecision::Allowed
+    ));
     thread::sleep(Duration::from_millis(100));
-    limiter.inc(key, &rate_limit, 3);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 3),
+        RateLimitDecision::Allowed
+    ));
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
@@ -361,9 +379,15 @@ fn rejected_metadata_window_10_with_nonzero_grouping_merges_within_group() {
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
     // Same bucket (sleep < group size). window_limit = 10 * 1 = 10
-    limiter.inc(key, &rate_limit, 5);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 5),
+        RateLimitDecision::Allowed
+    ));
     thread::sleep(Duration::from_millis(100));
-    limiter.inc(key, &rate_limit, 5);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 5),
+        RateLimitDecision::Allowed
+    ));
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
@@ -385,7 +409,10 @@ fn unblocks_after_window_expires() {
     let key = "k";
     let rate_limit = RateLimit::try_from(3f64).unwrap();
 
-    limiter.inc(key, &rate_limit, 3);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 3),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Rejected { .. }
@@ -408,7 +435,10 @@ fn unblocks_after_window_expires_window_2_with_nonzero_grouping() {
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
     // window_limit = 2 * 1 = 2
-    limiter.inc(key, &rate_limit, 2);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 2),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Rejected { .. }
@@ -643,8 +673,14 @@ fn cleanup_concurrent_is_allowed_smoke_does_not_panic() {
     let limit = RateLimit::try_from(1f64).unwrap();
 
     // Seed some state through the limiter API.
-    let _ = limiter.inc("a", &limit, 1);
-    let _ = limiter.inc("b", &limit, 1);
+    assert!(matches!(
+        limiter.inc("a", &limit, 1),
+        RateLimitDecision::Allowed
+    ));
+    assert!(matches!(
+        limiter.inc("b", &limit, 1),
+        RateLimitDecision::Allowed
+    ));
 
     let reader = {
         let limiter = limiter.clone();
@@ -904,7 +940,10 @@ fn get_excludes_and_evicts_expired_buckets() {
 fn get_fresh_key_uses_shared_dashmap_lock() {
     let limiter = Arc::new(limiter(6, 1000));
     let rate_limit = RateLimit::try_from(100f64).unwrap();
-    let _ = limiter.inc("k", &rate_limit, 3);
+    assert!(matches!(
+        limiter.inc("k", &rate_limit, 3),
+        RateLimitDecision::Allowed
+    ));
 
     let held_read_guard = limiter.series().get("k").expect("series should exist");
     let barrier = Arc::new(Barrier::new(2));
@@ -935,6 +974,86 @@ fn get_fresh_key_uses_shared_dashmap_lock() {
 }
 
 #[test]
+fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
+    let limiter = Arc::new(limiter(6, 1000));
+    let rate = RateLimit::try_from(100f64).unwrap();
+    assert!(matches!(
+        limiter.inc("k", &rate, 3),
+        RateLimitDecision::Allowed
+    ));
+
+    let held_read_guard = limiter.series().get("k").expect("series should exist");
+    let barrier = Arc::new(Barrier::new(2));
+    let (sender, receiver) = mpsc::channel();
+
+    let worker = {
+        let limiter = Arc::clone(&limiter);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            let replace = limiter.set_if("k", &rate, RateLimitComparator::Eq(99), 10);
+            let preserve = limiter.set_if_preserve_history(
+                "k",
+                &rate,
+                RateLimitComparator::Eq(99),
+                10,
+                HistoryPreservation::PreserveNewest,
+            );
+            sender.send((replace, preserve)).unwrap();
+        })
+    };
+
+    barrier.wait();
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+    drop(held_read_guard);
+    worker.join().expect("worker thread panicked");
+
+    assert_eq!(
+        result.expect("guard-miss conditional sets blocked on a shared DashMap guard"),
+        ((3, 3), (3, 3))
+    );
+}
+
+#[test]
+fn conditional_set_guard_miss_leaves_expired_history_untouched() {
+    let limiter = limiter(1, 1);
+    let rate = RateLimit::try_from(100f64).unwrap();
+    assert!(matches!(
+        limiter.inc("k", &rate, 4),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(200));
+    assert!(matches!(
+        limiter.inc("k", &rate, 5),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(850));
+
+    assert_eq!(
+        limiter.set_if("k", &rate, RateLimitComparator::Eq(99), 10),
+        (5, 5)
+    );
+    assert_eq!(
+        limiter.set_if_preserve_history(
+            "k",
+            &rate,
+            RateLimitComparator::Eq(99),
+            10,
+            HistoryPreservation::PreserveNewest,
+        ),
+        (5, 5)
+    );
+
+    let series = limiter.series().get("k").expect("series should remain");
+    assert_eq!(series.series.len(), 2, "miss must not prune history");
+    assert_eq!(
+        series.total.load(Ordering::Relaxed),
+        9,
+        "miss must not rewrite stored counters"
+    );
+}
+
+#[test]
 fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
     let limiter = limiter(6, 1000);
     let rate_limit = RateLimit::try_from(100f64).unwrap();
@@ -955,7 +1074,10 @@ fn set_if_lt_with_lower_target_is_noop() {
     let limiter = limiter(6, 1000);
     let rate_limit = RateLimit::try_from(100f64).unwrap();
 
-    let _ = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    assert_eq!(
+        limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100),
+        (100, 0)
+    );
 
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(50), 50);
     assert_eq!((new_total, old_total), (100, 100));
@@ -974,7 +1096,10 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
     let limiter = limiter(6, 1000);
     let rate_limit = RateLimit::try_from(100f64).unwrap();
 
-    let _ = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 100);
+    assert_eq!(
+        limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 100),
+        (100, 0)
+    );
 
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 30);
     assert_eq!((new_total, old_total), (30, 100));
@@ -1017,7 +1142,10 @@ fn set_if_gt_and_ne_guards_follow_current_total() {
     let limiter = limiter(6, 1000);
     let rate_limit = RateLimit::try_from(100f64).unwrap();
 
-    let _ = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 10);
+    assert_eq!(
+        limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 10),
+        (10, 0)
+    );
 
     // Gt(5): 10 > 5 matches → lowered to 3.
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Gt(5), 3);
@@ -1398,7 +1526,6 @@ fn set_if_preserve_history_zero_removes_key() {
     assert_eq!(limiter.get("k"), 0);
     assert!(!limiter.series().contains_key("k"));
 }
-
 
 #[test]
 fn conditional_set_missing_zero_leaves_key_absent() {
