@@ -4,7 +4,7 @@ use criterion::{criterion_group, criterion_main};
 mod common;
 
 mod benchmarks {
-    use criterion::{BatchSize, BenchmarkId, Criterion};
+    use criterion::{BenchmarkId, Criterion};
     use std::hint::black_box;
 
     use trypema::{HistoryPreservation, RateLimit, RateLimitComparator};
@@ -96,20 +96,16 @@ mod benchmarks {
             let keys: Vec<String> = (0..50_000).map(|i| format!("user_{i}")).collect();
 
             // Ensure series exists for each key so we measure calculation, not insertion.
-            for k in keys.iter().take(1_000) {
+            for k in &keys {
                 let _ = limiter.inc(k, &rate, 1);
             }
 
-            b.iter_batched(
-                || 0_usize,
-                |mut idx| {
-                    idx = idx.wrapping_add(1);
-                    let k = &keys[idx % keys.len()];
-                    black_box(limiter.get_suppression_factor(black_box(k)));
-                    idx
-                },
-                BatchSize::SmallInput,
-            );
+            let mut idx = 0_usize;
+            b.iter(|| {
+                let k = &keys[idx % keys.len()];
+                idx = idx.wrapping_add(1);
+                black_box(limiter.get_suppression_factor(black_box(k)));
+            });
         });
 
         group.finish();
