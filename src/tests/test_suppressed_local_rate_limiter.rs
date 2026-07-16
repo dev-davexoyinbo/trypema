@@ -48,20 +48,6 @@ fn limiter_with_cache_ms(
 /// single increment of `soft_window_limit` (all accepted, so `total_declined = 0`),
 /// then overwriting the cached suppression factor with the desired test value so the
 /// next call uses it exactly.
-fn assert_admitted(decision: RateLimitDecision, context: &str) {
-    assert!(
-        matches!(decision, RateLimitDecision::Allowed)
-            || matches!(
-                decision,
-                RateLimitDecision::Suppressed {
-                    is_allowed: true,
-                    ..
-                }
-            ),
-        "{context} must be admitted: {decision:?}"
-    );
-}
-
 fn fill_to_soft_window_limit(
     limiter: &SuppressedLocalRateLimiter,
     key: &str,
@@ -117,7 +103,16 @@ fn verify_suppression_factor_calculation_spread() {
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
     let decision = limiter.inc(key, &rate_limit, 20);
-    assert_admitted(decision, "spread-factor setup increment");
+    assert!(
+        matches!(
+            decision,
+            RateLimitDecision::Suppressed {
+                suppression_factor,
+                is_allowed: true,
+            } if suppression_factor.abs() < 1e-12
+        ),
+        "the batch above soft capacity must take the suppression path: {decision:?}"
+    );
     assert_eq!(limiter.get(key).total, 20);
 
     // Keep the bucket in the 10-second window but outside the one-second peak-rate window.

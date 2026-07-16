@@ -669,17 +669,13 @@ impl SuppressedLocalRateLimiter {
                         }
                     } else {
                         let declined = bucket.declined.load(Ordering::Acquire);
+                        let retained_count = bucket_count - to_remove;
+                        let retained_declined = ((declined as u128 * retained_count as u128)
+                            / bucket_count as u128)
+                            as u64;
 
-                        let to_remove_declined = ((declined as f64 * to_remove as f64)
-                            / bucket_count as f64)
-                            .ceil() as u64;
-
-                        bucket
-                            .count
-                            .store(bucket_count - to_remove, Ordering::Release);
-                        bucket
-                            .declined
-                            .store(declined - to_remove_declined, Ordering::Release);
+                        bucket.count.store(retained_count, Ordering::Release);
+                        bucket.declined.store(retained_declined, Ordering::Release);
 
                         to_remove = 0;
                     }
