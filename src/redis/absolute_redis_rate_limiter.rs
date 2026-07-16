@@ -145,7 +145,7 @@ impl AbsoluteRedisRateLimiter {
         }
     } // end method inc
 
-    /// Determine whether `key` is currently allowed (read-only).
+    /// Determine whether `key` is currently allowed without recording an increment.
     ///
     /// Returns [`RateLimitDecision::Allowed`] if the current sliding window total
     /// is below the window limit, otherwise returns [`RateLimitDecision::Rejected`]
@@ -176,7 +176,6 @@ impl AbsoluteRedisRateLimiter {
             .key(self.key_generator.get_window_limit_key(key))
             .key(self.key_generator.get_total_count_key(key))
             .arg(*self.window_size_seconds)
-            .arg(*self.rate_group_size_ms)
             .invoke_async(&mut connection_manager)
             .await?;
 

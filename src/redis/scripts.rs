@@ -167,6 +167,53 @@ pub(crate) const ABSOLUTE_INC_LUA: &str = r#"
 
     return {"allowed", 0, 0}
 "#;
+
+pub(crate) const ABSOLUTE_IS_ALLOWED_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+    local hash_key = KEYS[1]
+    local active_keys = KEYS[2]
+    local window_limit_key = KEYS[3]
+    local total_count_key = KEYS[4]
+
+    local window_size_seconds = tonumber(ARGV[1])
+    local window_limit = tonumber(redis.call("GET", window_limit_key))
+
+    if window_limit == nil then
+        return {"allowed", 0, 0}
+    end
+
+    local window_capacity = math.floor(window_limit)
+    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+
+    if total_count >= window_capacity then
+        total_count = cleanup_expired_absolute(
+            hash_key,
+            active_keys,
+            total_count_key,
+            timestamp_ms,
+            window_size_seconds * 1000,
+            false
+        )
+    end
+
+    if total_count >= window_capacity then
+        local retry_after_ms, oldest_count = oldest_bucket_metadata(
+            hash_key,
+            active_keys,
+            timestamp_ms,
+            window_size_seconds * 1000
+        )
+
+        if retry_after_ms == nil then
+            return {"rejected", 0, 0}
+        end
+
+        return {"rejected", retry_after_ms, oldest_count}
+    end
+
+    return {"allowed", 0, 0}
+"#;
+
 "#;
 "#;
 
