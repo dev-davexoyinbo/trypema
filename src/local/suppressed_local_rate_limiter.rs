@@ -524,7 +524,8 @@ impl SuppressedLocalRateLimiter {
             return SuppressedRateLimitSnapshot::default();
         };
 
-        let (total, contained_expired) = Self::live_total(&series, self.window_duration);
+        let (total, contained_expired) = Self::inspect_live_total(&series, self.window_duration);
+
         if !contained_expired {
             let total_declined = series.total_declined.load(Ordering::Acquire);
             drop(series);
@@ -587,7 +588,7 @@ impl SuppressedLocalRateLimiter {
         (total, true)
     }
 
-    fn live_total(series: &RateLimitSeries, window_duration: Duration) -> (u64, bool) {
+    fn inspect_live_total(series: &RateLimitSeries, window_duration: Duration) -> (u64, bool) {
         let now = Instant::now();
         let split = series
             .series
@@ -606,6 +607,266 @@ impl SuppressedLocalRateLimiter {
 
         (total, split > 0)
     }
+
+    fn apply_history_update(
+        series: &mut RateLimitSeries,
+        count: u64,
+        old_total: u64,
+        mode: HistoryUpdateMode,
+    ) {
+        match mode {
+            HistoryUpdateMode::Replace => {
+                series.series.clear();
+                series.series.push_back(InstantRate {
+                    count: count.into(),
+                    declined: AtomicU64::new(0),
+                    timestamp: Instant::now(),
+                });
+            }
+            HistoryUpdateMode::Preserve(preservation) if count > old_total => {
+                let delta = count - old_total;
+                let bucket = match preservation {
+                    HistoryPreservation::PreserveNewest => series.series.back(),
+                    HistoryPreservation::PreserveOldest => series.series.front(),
+                };
+
+                if let Some(bucket) = bucket {
+                    bucket.count.fetch_add(delta, Ordering::AcqRel);
+                } else {
+                    series.series.push_back(InstantRate {
+                        count: delta.into(),
+                        declined: AtomicU64::new(0),
+                        timestamp: Instant::now(),
+                    });
+                }
+            }
+            HistoryUpdateMode::Preserve(preservation) if count < old_total => {
+                let mut to_remove = old_total - count;
+
+                while to_remove > 0 {
+                    let bucket = match preservation {
+                        HistoryPreservation::PreserveNewest => series.series.front(),
+                        HistoryPreservation::PreserveOldest => series.series.back(),
+                    };
+
+                    let Some(bucket) = bucket else {
+                        break;
+                    };
+
+                    let bucket_count = bucket.count.load(Ordering::Acquire);
+
+                    if bucket_count <= to_remove {
+                        to_remove -= bucket_count;
+
+                        match preservation {
+                            HistoryPreservation::PreserveNewest => {
+                                series.series.pop_front();
+                            }
+
+                            HistoryPreservation::PreserveOldest => {
+                                series.series.pop_back();
+                            }
+                        }
+                    } else {
+                        let declined = bucket.declined.load(Ordering::Acquire);
+
+                        let to_remove_declined = ((declined as f64 * to_remove as f64)
+                            / bucket_count as f64)
+                            .ceil() as u64;
+
+                        bucket
+                            .count
+                            .store(bucket_count - to_remove, Ordering::Release);
+                        bucket
+                            .declined
+                            .store(declined - to_remove_declined, Ordering::Release);
+
+                        to_remove = 0;
+                    }
+                }
+            }
+            HistoryUpdateMode::Preserve(_) => {}
+        }
+
+        let declined = series
+            .series
+            .iter()
+            .map(|bucket| bucket.declined.load(Ordering::Acquire))
+            .sum();
+        series.total.store(count, Ordering::Release);
+        series.total_declined.store(declined, Ordering::Release);
+    }
+
+    fn set_if_with_history_mode(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        mode: HistoryUpdateMode,
+    ) -> (u64, u64) {
+        let existing = match self.series.get(key) {
+            Some(series) => {
+                let (old_total, contains_expired) =
+                    Self::inspect_live_total(&series, self.window_duration);
+
+                if !comparator.matches(old_total) {
+                    return (old_total, old_total);
+                }
+
+                let hard_window_limit =
+                    **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64;
+
+                let unchanged = count > 0
+                    && matches!(mode, HistoryUpdateMode::Preserve(_))
+                    && !contains_expired
+                    && old_total == count
+                    && series.hard_window_limit == hard_window_limit;
+
+                if unchanged {
+                    return (old_total, old_total);
+                }
+
+                true
+            }
+            None => false,
+        };
+
+        if !existing && (!comparator.matches(0) || count == 0) {
+            return (0, 0);
+        }
+
+        let (new_total, old_total) = match self.series.entry(key.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let (old_total, contains_expired) =
+                    Self::inspect_live_total(entry.get(), self.window_duration);
+
+                if !comparator.matches(old_total) {
+                    return (old_total, old_total);
+                }
+
+                if count == 0 {
+                    entry.remove();
+                    (0, old_total)
+                } else {
+                    let series = entry.get_mut();
+
+                    if contains_expired {
+                        Self::evict_expired(series, self.window_duration);
+                    }
+
+                    series.hard_window_limit =
+                        **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64;
+
+                    Self::apply_history_update(series, count, old_total, mode);
+
+                    (count, old_total)
+                }
+            }
+            Entry::Vacant(entry) => {
+                if !comparator.matches(0) || count == 0 {
+                    return (0, 0);
+                }
+
+                let mut series = RateLimitSeries::new(
+                    **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64,
+                );
+
+                Self::apply_history_update(&mut series, count, 0, mode);
+                entry.insert(series);
+
+                (count, 0)
+            }
+        };
+
+        self.suppression_factors.remove(key);
+
+        (new_total, old_total)
+    } // end fn set_if_with_history_mode
+
+    /// Conditionally replace the window total for `key`.
+    ///
+    /// When `comparator` matches the key's current post-eviction window total, the
+    /// window contents are replaced by a single current-timestamp bucket holding
+    /// `count` with **no declines** recorded against it; otherwise nothing is
+    /// written. On a match, the key's stored hard window limit is redefined from
+    /// `rate_limit` (`window_size_seconds × rate_limit × hard_limit_factor`) — unlike
+    /// `inc`, where the limit is sticky after the first call — and the cached
+    /// suppression factor is dropped so it is recomputed from the new state on the
+    /// next call. A comparator miss leaves both the limit and cache untouched. A
+    /// matched `count` of zero removes both the series and cached factor completely.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Unique identifier for the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit; redefines the stored hard limit
+    /// - `comparator`: Guard evaluated against the current window total
+    /// - `count`: The total to write when the guard matches
+    ///
+    /// # Returns
+    ///
+    /// `(new_total, old_total)` — `old_total` is the post-eviction total the
+    /// comparator was evaluated against; `new_total` is `count` when the guard
+    /// matched, `old_total` otherwise.
+    ///
+    /// # Priming Idiom
+    ///
+    /// `set_if(key, rate, RateLimitComparator::Lt(count), count)` raises the window
+    /// total to at least `count` and never lowers it — idempotent and safe to retry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// use trypema::{RateLimit, RateLimitComparator};
+    ///
+    /// let limiter = rl.local().suppressed();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    ///
+    /// // Prime the window to 40.
+    /// let (new_total, old_total) =
+    ///     limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
+    /// assert_eq!((new_total, old_total), (40, 0));
+    ///
+    /// // Re-priming is a no-op: the guard no longer matches.
+    /// let (new_total, old_total) =
+    ///     limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
+    /// assert_eq!((new_total, old_total), (40, 40));
+    /// ```
+    pub fn set_if(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+    ) -> (u64, u64) {
+        self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Replace,
+        )
+    } // end method set_if
+
+    /// Conditionally set the observed total while retaining the selected side of
+    /// the existing sliding-window history.
+    pub fn set_if_preserve_history(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        preservation: HistoryPreservation,
+    ) -> (u64, u64) {
+        self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Preserve(preservation),
+        )
+    } // end method set_if_preserve_history
 
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {
         self.suppression_factors
