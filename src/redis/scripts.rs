@@ -74,6 +74,35 @@ const COMMON_LUA_HELPERS: &str = r#"
         return retry_after_ms, count
     end
 
+    local function cleanup_stale_entities(prefix, rate_type, active_entities_key, timestamp_ms, stale_after_ms, suffixes)
+        local stale_entities = redis.call(
+            "ZRANGE",
+            active_entities_key,
+            "-inf",
+            timestamp_ms - stale_after_ms,
+            "BYSCORE"
+        )
+
+        if #stale_entities == 0 then
+            return
+        end
+
+        local remove_keys = {}
+
+        for i = 1, #stale_entities do
+            local entity = stale_entities[i]
+
+            for j = 1, #suffixes do
+                table.insert(
+                    remove_keys,
+                    prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[j]
+                )
+            end
+        end
+
+        redis.call("DEL", unpack(remove_keys))
+        redis.call("ZREM", active_entities_key, unpack(stale_entities))
+    end
 "#;
 
 /// Helpers shared by absolute Redis and hybrid scripts.
@@ -212,6 +241,33 @@ pub(crate) const ABSOLUTE_IS_ALLOWED_LUA: &str = r#"
     end
 
     return {"allowed", 0, 0}
+"#;
+
+pub(crate) const ABSOLUTE_CLEANUP_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local prefix = KEYS[1]
+    local rate_type = KEYS[2]
+    local active_entities_key = KEYS[3]
+
+    local stale_after_ms = tonumber(ARGV[1]) or 0
+    local hash_suffix = ARGV[2]
+    local window_limit_suffix = ARGV[3]
+    local total_count_suffix = ARGV[4]
+    local active_keys_suffix = ARGV[5]
+    local suppression_factor_key_suffix = ARGV[6]
+
+
+    local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
+
+    cleanup_stale_entities(
+        prefix,
+        rate_type,
+        active_entities_key,
+        timestamp_ms,
+        stale_after_ms,
+        suffixes
+    )
 "#;
 
 "#;
