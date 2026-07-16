@@ -270,6 +270,48 @@ pub(crate) const ABSOLUTE_CLEANUP_LUA: &str = r#"
     )
 "#;
 
+/// Read an absolute sliding window's live total, evicting expired buckets first.
+///
+/// Existing entities are marked active so cleanup tracking stays consistent; unknown reads
+/// remain absent.
+pub(crate) const ABSOLUTE_GET_TOTAL_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local hash_key = KEYS[1]
+    local active_keys = KEYS[2]
+    local total_count_key = KEYS[3]
+    local active_entities_key = KEYS[4]
+    local window_limit_key = KEYS[5]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+
+    local total_count = cleanup_expired_absolute(
+        hash_key,
+        active_keys,
+        total_count_key,
+        timestamp_ms,
+        window_size_seconds * 1000,
+        true
+    )
+
+    local entity_exists = redis.call("EXISTS", hash_key, active_keys, total_count_key, window_limit_key) > 0
+
+    if entity_exists then
+        if total_count < 0 then
+            redis.call("SET", total_count_key, 0)
+        end
+
+        redis.call("ZADD", active_entities_key, timestamp_ms, entity)
+    end
+
+    if total_count < 0 then
+        total_count = 0
+    end
+
+    return total_count
+"#;
+
 "#;
 "#;
 

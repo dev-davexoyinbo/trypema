@@ -194,6 +194,45 @@ impl AbsoluteRedisRateLimiter {
         }
     }
 
+    /// Current live window total for `key`.
+    ///
+    /// Executes an atomic Lua script that evicts expired buckets and returns the
+    /// resulting window total. Unlike the hybrid variant there is no local state,
+    /// so the result is exactly the shared Redis total at execution time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::RateLimit;
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// assert_eq!(rl.redis().absolute().get(&key).await.unwrap(), 0);
+    ///
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// rl.redis().absolute().inc(&key, &rate, 3).await.unwrap();
+    /// assert_eq!(rl.redis().absolute().get(&key).await.unwrap(), 3);
+    /// # });
+    /// ```
+    pub async fn get(&self, key: &RedisKey) -> Result<u64, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let total: u64 = self
+            .get_total_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_window_limit_key(key))
+            .arg(key.to_string())
+            .arg(*self.window_size_seconds)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(total)
+    } // end method get
+
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
