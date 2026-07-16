@@ -271,8 +271,6 @@ impl AbsoluteLocalRateLimiter {
     /// }
     /// ```
     pub fn is_allowed(&self, key: &str) -> RateLimitDecision {
-        // let total_count = self.live_total(key);
-
         let Some(series) = self.series.get(key) else {
             return RateLimitDecision::Allowed;
         };
@@ -479,18 +477,152 @@ impl AbsoluteLocalRateLimiter {
             return (old_total, old_total);
         }
 
-        let mut series = match self.series.get_mut(key) {
-            Some(series) => series,
-            None => self
-                .series
-                .entry(key.to_string())
-                .or_insert_with(|| RateLimitSeries::new(*rate_limit)),
-        };
+        // preservation of history doesn't need the history to be updated in this case
+        if old_total == count && matches!(mode, HistoryUpdateMode::Preserve(_)) {
+            return (old_total, old_total);
+        }
 
-        series.limit = *rate_limit;
-        Self::apply_history_update(&mut series, self.window_duration, count, mode);
+        if old_total == 0 && count == 0 {
+            return (0, 0);
+        }
+
+        // let series = match self.series.get(key) {
+        //     Some(series) => series,
+        //     None => {
+        //         if !comparator.matches(0) || count == 0 {
+        //             return (0, 0);
+        //         }
+        //
+        //         self.series
+        //             .entry(key.to_string())
+        //             .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+        //         self.series.get(key).expect("Key must exist")
+        //     }
+        // };
+
+        match mode {
+            HistoryUpdateMode::Replace => {
+                let mut series = self
+                    .series
+                    .entry(key.to_string())
+                    .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+
+                series.series.clear();
+
+                if count > 0 {
+                    series.series.push_back(InstantRate {
+                        count: count.into(),
+                        timestamp: Instant::now(),
+                        declined: AtomicU64::new(0),
+                    });
+                }
+            }
+            HistoryUpdateMode::Preserve(preservation) if count > old_total => {
+                let series = match self.series.get(key) {
+                    Some(series) => series,
+                    None => {
+                        self.series
+                            .entry(key.to_string())
+                            .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+                        self.series.get(key).expect("Series expected to exist")
+                    }
+                };
+
+                let delta = count - old_total;
+                let bucket = match preservation {
+                    HistoryPreservation::PreserveNewest => series.series.back(),
+                    HistoryPreservation::PreserveOldest => series.series.front(),
+                };
+
+                if let Some(bucket) = bucket {
+                    bucket.count.fetch_add(delta, Ordering::Relaxed);
+                } else {
+                    drop(series);
+
+                    let mut series = self
+                        .series
+                        .entry(key.to_string())
+                        .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+
+                    series.series.push_back(InstantRate {
+                        count: delta.into(),
+                        timestamp: Instant::now(),
+                        declined: AtomicU64::new(0),
+                    });
+                }
+            }
+            HistoryUpdateMode::Preserve(preservation) if count < old_total => {
+                let mut series = self
+                    .series
+                    .entry(key.to_string())
+                    .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+
+                let mut to_remove = old_total - count;
+
+                while to_remove > 0 {
+                    let bucket_count = match preservation {
+                        HistoryPreservation::PreserveNewest => series
+                            .series
+                            .front()
+                            .map(|bucket| bucket.count.load(Ordering::Relaxed)),
+                        HistoryPreservation::PreserveOldest => series
+                            .series
+                            .back()
+                            .map(|bucket| bucket.count.load(Ordering::Relaxed)),
+                    };
+
+                    let Some(bucket_count) = bucket_count else {
+                        break;
+                    };
+
+                    if bucket_count <= to_remove {
+                        to_remove -= bucket_count;
+                        match preservation {
+                            HistoryPreservation::PreserveNewest => {
+                                series.series.pop_front();
+                            }
+                            HistoryPreservation::PreserveOldest => {
+                                series.series.pop_back();
+                            }
+                        }
+                    } else {
+                        let bucket = match preservation {
+                            HistoryPreservation::PreserveNewest => {
+                                series.series.front().expect("bucket should exist")
+                            }
+                            HistoryPreservation::PreserveOldest => {
+                                series.series.back().expect("bucket should exist")
+                            }
+                        };
+                        bucket.count.fetch_sub(to_remove, Ordering::Relaxed);
+                        to_remove = 0;
+                    }
+                }
+            }
+            HistoryUpdateMode::Preserve(_) => {}
+        }
+
+        let series = self
+            .series
+            .get(key)
+            .expect("series should exist at this point");
+
+        let old_total = series.total.load(Ordering::Relaxed);
+        series.total.store(count, Ordering::Relaxed);
 
         (count, old_total)
+        // let mut series = match self.series.get_mut(key) {
+        //     Some(series) => series,
+        //     None => self
+        //         .series
+        //         .entry(key.to_string())
+        //         .or_insert_with(|| RateLimitSeries::new(*rate_limit)),
+        // };
+        //
+        // series.limit = *rate_limit;
+        // Self::apply_history_update(&mut series, self.window_duration, count, mode);
+        //
+        // (count, old_total)
 
         // let Some(mut series) = self.series.get_mut(key) else {
         //     todo!();
