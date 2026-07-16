@@ -1,11 +1,14 @@
 //! Tests for `RateLimiterBuilder`, `Default` impls, and `Drop` behaviour.
 
+#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimiter,
-    RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
+    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, SuppressionFactorCacheMs,
+    WindowSizeSeconds,
 };
+#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
+use crate::{RateLimit, RateLimiter, RateLimiterOptions};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Defaults

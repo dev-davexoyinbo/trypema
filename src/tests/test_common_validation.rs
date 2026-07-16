@@ -1,4 +1,4 @@
-use crate::{HardLimitFactor, RateGroupSizeMs, RateLimit, WindowSizeSeconds};
+use crate::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitComparator, WindowSizeSeconds};
 
 #[test]
 fn rate_limit_try_from_validates_positive() {
@@ -64,4 +64,33 @@ fn hard_limit_factor_default_and_try_from_validate_at_least_one() {
         HardLimitFactor::try_from(-1f64).unwrap_err().to_string(),
         "invalid hard limit factor: Hard limit factor must be greater than or equal to 1"
     );
+}
+
+#[test]
+fn rate_limit_comparator_matches_uses_embedded_operand_and_nil_always_matches() {
+    // (comparator, current, expected)
+    let cases = [
+        (RateLimitComparator::Eq(5), 5, true),
+        (RateLimitComparator::Eq(5), 4, false),
+        (RateLimitComparator::Eq(5), 6, false),
+        (RateLimitComparator::Lt(5), 4, true),
+        (RateLimitComparator::Lt(5), 5, false),
+        (RateLimitComparator::Lt(5), 6, false),
+        (RateLimitComparator::Gt(5), 6, true),
+        (RateLimitComparator::Gt(5), 5, false),
+        (RateLimitComparator::Gt(5), 4, false),
+        (RateLimitComparator::Ne(5), 4, true),
+        (RateLimitComparator::Ne(5), 6, true),
+        (RateLimitComparator::Ne(5), 5, false),
+        (RateLimitComparator::Nil, 0, true),
+        (RateLimitComparator::Nil, u64::MAX, true),
+    ];
+
+    for (comparator, current, expected) in cases {
+        assert_eq!(
+            comparator.matches(current),
+            expected,
+            "comparator: {comparator:?}, current: {current}"
+        );
+    }
 }
