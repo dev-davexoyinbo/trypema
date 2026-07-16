@@ -10,8 +10,12 @@ use crate::common::{
 };
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};
 
+fn window_limit(window_size_seconds: u64, rate_limit: &RateLimit) -> f64 {
+    window_size_seconds as f64 * **rate_limit
+}
+
 fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
-    ((window_size_seconds as f64) * **rate_limit) as u64
+    window_limit(window_size_seconds, rate_limit) as u64
 }
 
 fn record_decision(
@@ -161,8 +165,9 @@ fn per_key_state_is_independent() {
 }
 
 #[test]
-fn rate_limit_for_key_is_not_updated_after_first_inc() {
-    let limiter = limiter(1, 1000);
+fn window_limit_for_key_is_not_updated_after_first_inc() {
+    let window_size_seconds = 6;
+    let limiter = limiter(window_size_seconds, 1000);
     let key = "k";
     let strict_rate_limit = RateLimit::try_from(1f64).unwrap();
     let loose_rate_limit = RateLimit::try_from(100f64).unwrap();
@@ -172,10 +177,16 @@ fn rate_limit_for_key_is_not_updated_after_first_inc() {
         limiter.inc(key, &strict_rate_limit, 0),
         RateLimitDecision::Allowed
     ));
+    assert_eq!(
+        limiter.series().get(key).unwrap().window_limit,
+        window_limit(window_size_seconds, &strict_rate_limit),
+        "the series must store the computed window limit, not the per-second rate"
+    );
 
-    // If the limit were updated to 100 here, this would be allowed.
+    // If the stored window limit were updated from 6 to 600 here, the
+    // resulting total would remain below capacity.
     assert!(matches!(
-        limiter.inc(key, &loose_rate_limit, 1),
+        limiter.inc(key, &loose_rate_limit, 6),
         RateLimitDecision::Allowed
     ));
     assert!(matches!(
@@ -1233,7 +1244,7 @@ fn set_if_redefines_sticky_rate_limit() {
     let decision = limiter.inc("k", &rate_one, 1);
     assert!(matches!(decision, RateLimitDecision::Rejected { .. }));
 
-    // Unlike inc (sticky limit), set_if redefines the stored limit: 6 * 10 = 60.
+    // Unlike inc (sticky limit), set_if redefines the stored window limit: 6 * 10 = 60.
     let rate_ten = RateLimit::try_from(10f64).unwrap();
     assert_eq!(
         limiter.set_if("k", &rate_ten, RateLimitComparator::Nil, 1),
@@ -1243,8 +1254,9 @@ fn set_if_redefines_sticky_rate_limit() {
     {
         let series = limiter.series().get("k").expect("series should remain");
         assert_eq!(
-            series.limit, rate_ten,
-            "matched set_if must redefine the limit"
+            series.window_limit,
+            window_limit(window_size_seconds, &rate_ten),
+            "matched set_if must redefine the stored window limit"
         );
         assert_eq!(series.series.len(), 1);
         assert_eq!(
@@ -1336,7 +1348,7 @@ fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![2, 6]);
     assert_eq!(series.total.load(Ordering::Relaxed), 8);
-    assert_eq!(series.limit, rate);
+    assert_eq!(series.window_limit, window_limit(10, &rate));
     drop(series);
 
     let result = limiter.set_if_preserve_history(
@@ -1394,7 +1406,7 @@ fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![4, 4]);
     assert_eq!(series.total.load(Ordering::Relaxed), 8);
-    assert_eq!(series.limit, rate);
+    assert_eq!(series.window_limit, window_limit(10, &rate));
     drop(series);
 
     assert_eq!(
@@ -1445,8 +1457,9 @@ fn set_if_preserve_history_redefines_limit_even_when_total_is_unchanged() {
 
     let series = limiter.series().get("k").expect("series should exist");
     assert_eq!(
-        series.limit, new_rate,
-        "matched preserve must redefine the limit"
+        series.window_limit,
+        window_limit(6, &new_rate),
+        "matched preserve must redefine the stored window limit"
     );
     let counts = series
         .series
@@ -1605,7 +1618,7 @@ fn set_if_preserve_history_creates_missing_positive_target_for_both_directions()
         );
 
         let series = limiter.series().get(key).expect("series should be created");
-        assert_eq!(series.limit, rate);
+        assert_eq!(series.window_limit, window_limit(6, &rate));
         assert_eq!(series.series.len(), 1);
         assert_eq!(
             series.series.front().unwrap().count.load(Ordering::Relaxed),
