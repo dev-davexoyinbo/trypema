@@ -53,7 +53,7 @@ impl RateLimitSeries {
 /// # Semantics & Limitations
 ///
 /// **Sticky rate limits:**
-/// - The first call for a key stores its computed hard window limit
+/// - The first call for a key stores its computed window limit
 /// - Subsequent calls for the same key do not update that stored window limit
 /// - Rationale: Avoids races where concurrent calls specify different limits
 ///
@@ -394,8 +394,6 @@ impl AbsoluteLocalRateLimiter {
         count: u64,
         mode: HistoryUpdateMode,
     ) -> (u64, u64) {
-        let hard_window_limit = **rate_limit * *self.window_size_seconds as f64;
-
         let existing = match self.series.get(key) {
             Some(series) => {
                 let (old_total, contains_expired) =
@@ -405,11 +403,13 @@ impl AbsoluteLocalRateLimiter {
                     return (old_total, old_total);
                 }
 
+                let window_limit = **rate_limit * *self.window_size_seconds as f64;
+
                 let unchanged = count > 0
                     && matches!(mode, HistoryUpdateMode::Preserve(_))
                     && !contains_expired
                     && old_total == count
-                    && series.window_limit == hard_window_limit;
+                    && series.window_limit == window_limit;
 
                 if unchanged {
                     return (old_total, old_total);
@@ -444,7 +444,7 @@ impl AbsoluteLocalRateLimiter {
                     Self::evict_expired(series, self.window_duration);
                 }
 
-                series.window_limit = hard_window_limit;
+                series.window_limit = **rate_limit * *self.window_size_seconds as f64;
 
                 if old_total == count && matches!(mode, HistoryUpdateMode::Preserve(_)) {
                     return (old_total, old_total);
@@ -459,7 +459,8 @@ impl AbsoluteLocalRateLimiter {
                     return (0, 0);
                 }
 
-                let mut series = RateLimitSeries::new(hard_window_limit);
+                let mut series =
+                    RateLimitSeries::new(**rate_limit * *self.window_size_seconds as f64);
 
                 Self::apply_history_update(&mut series, count, 0, mode);
                 entry.insert(series);
@@ -565,7 +566,7 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// When `comparator` matches the key's current window total, the
     /// window contents are replaced by a single current-timestamp bucket holding
-    /// `count` and the stored hard window limit is recomputed from `rate_limit`;
+    /// `count` and the stored window limit is recomputed from `rate_limit`;
     /// otherwise nothing is written. Unlike `inc`, a matched call can therefore
     /// replace a previously stored limit.
     ///
@@ -576,7 +577,7 @@ impl AbsoluteLocalRateLimiter {
     /// # Arguments
     ///
     /// - `key`: Unique identifier for the rate-limited resource
-    /// - `rate_limit`: Per-second rate limit used to redefine the stored hard window limit
+    /// - `rate_limit`: Per-second rate limit used to redefine the stored window limit
     /// - `comparator`: Guard evaluated against the current window total
     /// - `count`: The total to write when the guard matches
     ///
