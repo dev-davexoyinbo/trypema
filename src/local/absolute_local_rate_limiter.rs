@@ -183,17 +183,11 @@ impl AbsoluteLocalRateLimiter {
 
         let series = match self.series.get(key) {
             Some(series) => series,
-            None => {
-                self.series
-                    .entry(key.to_string())
-                    .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-
-                let Some(series) = self.series.get(key) else {
-                    unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map 1");
-                };
-
-                series
-            }
+            None => self
+                .series
+                .entry(key.to_string())
+                .or_insert_with(|| RateLimitSeries::new(*rate_limit))
+                .downgrade(),
         };
 
         if let Some(last_entry) = series.series.back()
@@ -377,93 +371,6 @@ impl AbsoluteLocalRateLimiter {
         }
 
         total
-    }
-
-    fn apply_history_update(
-        series: &mut RateLimitSeries,
-        window_duration: Duration,
-        count: u64,
-        mode: HistoryUpdateMode,
-    ) {
-        Self::evict_expired(series, window_duration);
-        let old_total = series.total.load(Ordering::Relaxed);
-
-        match mode {
-            HistoryUpdateMode::Replace => {
-                series.series.clear();
-
-                if count > 0 {
-                    series.series.push_back(InstantRate {
-                        count: count.into(),
-                        timestamp: Instant::now(),
-                        declined: AtomicU64::new(0),
-                    });
-                }
-            }
-            HistoryUpdateMode::Preserve(preservation) if count > old_total => {
-                let delta = count - old_total;
-                let bucket = match preservation {
-                    HistoryPreservation::PreserveNewest => series.series.back(),
-                    HistoryPreservation::PreserveOldest => series.series.front(),
-                };
-
-                if let Some(bucket) = bucket {
-                    bucket.count.fetch_add(delta, Ordering::Relaxed);
-                } else {
-                    series.series.push_back(InstantRate {
-                        count: delta.into(),
-                        timestamp: Instant::now(),
-                        declined: AtomicU64::new(0),
-                    });
-                }
-            }
-            HistoryUpdateMode::Preserve(preservation) if count < old_total => {
-                let mut to_remove = old_total - count;
-
-                while to_remove > 0 {
-                    let bucket_count = match preservation {
-                        HistoryPreservation::PreserveNewest => series
-                            .series
-                            .front()
-                            .map(|bucket| bucket.count.load(Ordering::Relaxed)),
-                        HistoryPreservation::PreserveOldest => series
-                            .series
-                            .back()
-                            .map(|bucket| bucket.count.load(Ordering::Relaxed)),
-                    };
-
-                    let Some(bucket_count) = bucket_count else {
-                        break;
-                    };
-
-                    if bucket_count <= to_remove {
-                        to_remove -= bucket_count;
-                        match preservation {
-                            HistoryPreservation::PreserveNewest => {
-                                series.series.pop_front();
-                            }
-                            HistoryPreservation::PreserveOldest => {
-                                series.series.pop_back();
-                            }
-                        }
-                    } else {
-                        let bucket = match preservation {
-                            HistoryPreservation::PreserveNewest => {
-                                series.series.front().expect("bucket should exist")
-                            }
-                            HistoryPreservation::PreserveOldest => {
-                                series.series.back().expect("bucket should exist")
-                            }
-                        };
-                        bucket.count.fetch_sub(to_remove, Ordering::Relaxed);
-                        to_remove = 0;
-                    }
-                }
-            }
-            HistoryUpdateMode::Preserve(_) => {}
-        }
-
-        series.total.store(count, Ordering::Relaxed);
     }
 
     fn set_if_with_history_mode(
