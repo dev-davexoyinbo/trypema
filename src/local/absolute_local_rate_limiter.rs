@@ -189,7 +189,7 @@ impl AbsoluteLocalRateLimiter {
                     .or_insert_with(|| RateLimitSeries::new(*rate_limit));
 
                 let Some(series) = self.series.get(key) else {
-                    unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
+                    unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map 1");
                 };
 
                 series
@@ -204,9 +204,10 @@ impl AbsoluteLocalRateLimiter {
         } else {
             drop(series);
 
-            let Some(mut rate_limit_series) = self.series.get_mut(key) else {
-                unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
-            };
+            let mut rate_limit_series = self
+                .series
+                .entry(key.to_string())
+                .or_insert_with(|| RateLimitSeries::new(*rate_limit));
 
             rate_limit_series.series.push_back(InstantRate {
                 count: count.into(),
@@ -287,8 +288,9 @@ impl AbsoluteLocalRateLimiter {
             Some(instant_rate)
                 if instant_rate.timestamp.elapsed().as_millis() <= self.window_size_ms =>
             {
+                let elapsed_ms = instant_rate.timestamp.elapsed().as_millis();
                 (
-                    instant_rate.timestamp.elapsed().as_millis(),
+                    self.window_size_ms.saturating_sub(elapsed_ms),
                     instant_rate.count.load(Ordering::Relaxed),
                 )
             }
@@ -310,7 +312,8 @@ impl AbsoluteLocalRateLimiter {
                     .front()
                     .map(|i| {
                         (
-                            i.timestamp.elapsed().as_millis(),
+                            self.window_size_ms
+                                .saturating_sub(i.timestamp.elapsed().as_millis()),
                             i.count.load(Ordering::Relaxed),
                         )
                     })
@@ -473,40 +476,25 @@ impl AbsoluteLocalRateLimiter {
     ) -> (u64, u64) {
         let old_total = self.live_total(key);
 
-        if !comparator.matches(old_total) {
+        if !comparator.matches(old_total) || (old_total == 0 && count == 0) {
             return (old_total, old_total);
         }
+
+        let mut series = self
+            .series
+            .entry(key.to_string())
+            .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+
+        let old_total = series.total.load(Ordering::Relaxed);
+        series.limit = *rate_limit;
 
         // preservation of history doesn't need the history to be updated in this case
         if old_total == count && matches!(mode, HistoryUpdateMode::Preserve(_)) {
             return (old_total, old_total);
         }
 
-        if old_total == 0 && count == 0 {
-            return (0, 0);
-        }
-
-        // let series = match self.series.get(key) {
-        //     Some(series) => series,
-        //     None => {
-        //         if !comparator.matches(0) || count == 0 {
-        //             return (0, 0);
-        //         }
-        //
-        //         self.series
-        //             .entry(key.to_string())
-        //             .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-        //         self.series.get(key).expect("Key must exist")
-        //     }
-        // };
-
         match mode {
             HistoryUpdateMode::Replace => {
-                let mut series = self
-                    .series
-                    .entry(key.to_string())
-                    .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-
                 series.series.clear();
 
                 if count > 0 {
@@ -518,16 +506,6 @@ impl AbsoluteLocalRateLimiter {
                 }
             }
             HistoryUpdateMode::Preserve(preservation) if count > old_total => {
-                let series = match self.series.get(key) {
-                    Some(series) => series,
-                    None => {
-                        self.series
-                            .entry(key.to_string())
-                            .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-                        self.series.get(key).expect("Series expected to exist")
-                    }
-                };
-
                 let delta = count - old_total;
                 let bucket = match preservation {
                     HistoryPreservation::PreserveNewest => series.series.back(),
@@ -537,13 +515,6 @@ impl AbsoluteLocalRateLimiter {
                 if let Some(bucket) = bucket {
                     bucket.count.fetch_add(delta, Ordering::Relaxed);
                 } else {
-                    drop(series);
-
-                    let mut series = self
-                        .series
-                        .entry(key.to_string())
-                        .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-
                     series.series.push_back(InstantRate {
                         count: delta.into(),
                         timestamp: Instant::now(),
@@ -552,11 +523,6 @@ impl AbsoluteLocalRateLimiter {
                 }
             }
             HistoryUpdateMode::Preserve(preservation) if count < old_total => {
-                let mut series = self
-                    .series
-                    .entry(key.to_string())
-                    .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-
                 let mut to_remove = old_total - count;
 
                 while to_remove > 0 {
@@ -602,87 +568,9 @@ impl AbsoluteLocalRateLimiter {
             HistoryUpdateMode::Preserve(_) => {}
         }
 
-        let series = self
-            .series
-            .get(key)
-            .expect("series should exist at this point");
-
-        let old_total = series.total.load(Ordering::Relaxed);
         series.total.store(count, Ordering::Relaxed);
 
         (count, old_total)
-        // let mut series = match self.series.get_mut(key) {
-        //     Some(series) => series,
-        //     None => self
-        //         .series
-        //         .entry(key.to_string())
-        //         .or_insert_with(|| RateLimitSeries::new(*rate_limit)),
-        // };
-        //
-        // series.limit = *rate_limit;
-        // Self::apply_history_update(&mut series, self.window_duration, count, mode);
-        //
-        // (count, old_total)
-
-        // let Some(mut series) = self.series.get_mut(key) else {
-        //     todo!();
-        // };
-        //
-        // Self::apply_history_update(&mut series, self.window_duration, count, mode);
-        //
-        // if let Some(series) = self.series.get(key) {
-        //     let (old_total, contains_expired, _should_cleanup) =
-        //         Self::live_total(&series, &self.window_duration);
-        //
-        //     if !comparator.matches(old_total) {
-        //         return (old_total, old_total);
-        //     }
-        //
-        //     let unchanged = matches!(mode, HistoryUpdateMode::Preserve(_))
-        //         && !contains_expired
-        //         && old_total == count
-        //         && series.limit == *rate_limit;
-        //
-        //     if unchanged {
-        //         return (old_total, old_total);
-        //     }
-        //
-        //     drop(series);
-        //
-        //     if let Some(mut series) = self.series.get_mut(key) {
-        //         let (old_total, _contains_expired, _should_cleanup) =
-        //             Self::live_total(&series, &self.window_duration);
-        //
-        //         if !comparator.matches(old_total) {
-        //             return (old_total, old_total);
-        //         }
-        //
-        //         series.limit = *rate_limit;
-        //         Self::apply_history_update(&mut series, self.window_duration, count, mode);
-        //         return (count, old_total);
-        //     }
-        // }
-        //
-        // if !comparator.matches(0) || count == 0 {
-        //     return (0, 0);
-        // }
-        //
-        // let mut series = self
-        //     .series
-        //     .entry(key.to_string())
-        //     .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-        //
-        // let (old_total, _contains_expired, _should_cleanup) =
-        //     Self::live_total(&series, &self.window_duration);
-        //
-        // if !comparator.matches(old_total) {
-        //     return (old_total, old_total);
-        // }
-        //
-        // series.limit = *rate_limit;
-        // Self::apply_history_update(&mut series, self.window_duration, count, mode);
-        //
-        // (count, old_total)
     }
 
     /// Current window total for `key` (read-only from the caller's perspective).
