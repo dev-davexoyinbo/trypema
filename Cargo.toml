@@ -104,3 +104,11 @@ harness = false
 [[bench]]
 name = "redis_suppressed"
 harness = false
+
+[[bench]]
+name = "hybrid_absolute"
+harness = false
+
+[[bench]]
+name = "hybrid_suppressed"
+harness = false

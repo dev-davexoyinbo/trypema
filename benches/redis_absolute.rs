@@ -29,6 +29,7 @@ mod enabled {
             &rt,
             build_limiter(LimiterConfig {
                 hard_limit_factor: *HardLimitFactor::default(),
+                prefix: "bench_redis_absolute",
                 ..LimiterConfig::default()
             }),
         );

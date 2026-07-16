@@ -29,6 +29,7 @@ mod enabled {
             &rt,
             build_limiter(LimiterConfig {
                 hard_limit_factor: 1.5,
+                prefix: "bench_redis_suppressed",
                 ..LimiterConfig::default()
             }),
         );
