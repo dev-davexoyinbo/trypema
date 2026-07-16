@@ -181,27 +181,28 @@ impl AbsoluteLocalRateLimiter {
             return is_allowed;
         }
 
-        let rate_limit_series = match self.series.get(key) {
-            Some(rate_limit_series) => rate_limit_series,
+        let series = match self.series.get(key) {
+            Some(series) => series,
             None => {
                 self.series
                     .entry(key.to_string())
                     .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-                let Some(rate_limit_series) = self.series.get(key) else {
+
+                let Some(series) = self.series.get(key) else {
                     unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
                 };
 
-                rate_limit_series
+                series
             }
         };
 
-        if let Some(last_entry) = rate_limit_series.series.back()
+        if let Some(last_entry) = series.series.back()
             && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
         {
             last_entry.count.fetch_add(count, Ordering::Relaxed);
-            rate_limit_series.total.fetch_add(count, Ordering::Relaxed);
+            series.total.fetch_add(count, Ordering::Relaxed);
         } else {
-            drop(rate_limit_series);
+            drop(series);
 
             let Some(mut rate_limit_series) = self.series.get_mut(key) else {
                 unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
@@ -270,61 +271,54 @@ impl AbsoluteLocalRateLimiter {
     /// }
     /// ```
     pub fn is_allowed(&self, key: &str) -> RateLimitDecision {
-        let Some(rate_limit) = self.series.get(key) else {
+        // let total_count = self.live_total(key);
+
+        let Some(series) = self.series.get(key) else {
             return RateLimitDecision::Allowed;
         };
 
-        let mut total_count = rate_limit.total.load(Ordering::Relaxed);
-        let window_limit = (*self.window_size_seconds as f64 * *rate_limit.limit) as u64;
+        let total_count = series.total.load(Ordering::Relaxed);
+        let window_limit = (*self.window_size_seconds as f64 * *series.limit) as u64;
 
         if total_count < window_limit {
             return RateLimitDecision::Allowed;
         }
 
-        // Delay cleanup only if there is a possibility of rejection
-
-        let rate_limit = match rate_limit.series.front() {
-            None => rate_limit,
+        let (retry_after_ms, remaining_after_waiting) = match series.series.front() {
+            None => (0, 0),
             Some(instant_rate)
                 if instant_rate.timestamp.elapsed().as_millis() <= self.window_size_ms =>
             {
-                rate_limit
+                (
+                    instant_rate.timestamp.elapsed().as_millis(),
+                    instant_rate.count.load(Ordering::Relaxed),
+                )
             }
             Some(_) => {
-                drop(rate_limit);
+                drop(series);
 
-                let Some(mut rate_limit) = self.series.get_mut(key) else {
-                    unreachable!("AbsoluteLocalRateLimiter::is_allowed: key should be in map");
+                let Some(mut series) = self.series.get_mut(key) else {
+                    return RateLimitDecision::Allowed;
                 };
 
-                let drained = Self::evict_expired(&mut rate_limit, self.window_duration);
-                total_count -= drained;
+                let total_count = Self::evict_expired(&mut series, self.window_duration);
 
-                drop(rate_limit);
+                if total_count < window_limit {
+                    return RateLimitDecision::Allowed;
+                }
 
-                let Some(rate_limit) = self.series.get(key) else {
-                    unreachable!("AbsoluteLocalRateLimiter::is_allowed: key should be in map");
-                };
+                let (elapsed_ms, count) = series
+                    .series
+                    .front()
+                    .map(|i| {
+                        (
+                            i.timestamp.elapsed().as_millis(),
+                            i.count.load(Ordering::Relaxed),
+                        )
+                    })
+                    .unwrap_or((0, 0));
 
-                rate_limit
-            }
-        };
-
-        if total_count < window_limit {
-            return RateLimitDecision::Allowed;
-        }
-
-        let (retry_after_ms, remaining_after_waiting) = match rate_limit.series.front() {
-            None => (0, 0),
-            Some(instant_rate) => {
-                let elapsed_ms = instant_rate.timestamp.elapsed().as_millis();
-                let retry_after_ms = self.window_size_ms.saturating_sub(elapsed_ms);
-
-                let current_total = rate_limit.total.load(Ordering::Relaxed);
-                let oldest_count = instant_rate.count.load(Ordering::Relaxed);
-                let remaining_after_waiting = current_total.saturating_sub(oldest_count);
-
-                (retry_after_ms, remaining_after_waiting)
+                (elapsed_ms, count)
             }
         };
 
@@ -353,26 +347,35 @@ impl AbsoluteLocalRateLimiter {
             .map(|r| r.count.load(Ordering::Relaxed))
             .sum::<u64>();
 
-        series.total.fetch_sub(drained, Ordering::Relaxed);
+        let prev = series.total.fetch_sub(drained, Ordering::Relaxed);
 
-        drained
+        prev - drained
     } // end fn evict_expired
 
-    fn live_total(series: &RateLimitSeries, window_duration: Duration) -> (u64, bool) {
-        let now = Instant::now();
+    fn live_total(&self, key: &str) -> u64 {
+        let Some(series) = self.series.get(key) else {
+            return 0;
+        };
 
-        let split = series
-            .series
-            .partition_point(|r| now.duration_since(r.timestamp) > window_duration);
+        let mut total = series.total.load(Ordering::Relaxed);
 
-        let total = series
-            .series
-            .iter()
-            .skip(split)
-            .map(|r| r.count.load(Ordering::Relaxed))
-            .sum();
+        match series.series.front() {
+            None => {}
+            // check if the oldest value is still within the window size ms
+            Some(instant_rate)
+                if instant_rate.timestamp.elapsed().as_millis() <= self.window_size_ms => {}
+            Some(_) => {
+                drop(series);
 
-        (total, split > 0)
+                let Some(mut series) = self.series.get_mut(key) else {
+                    return 0;
+                };
+
+                total = Self::evict_expired(&mut series, self.window_duration);
+            }
+        }
+
+        total
     }
 
     fn apply_history_update(
@@ -470,57 +473,84 @@ impl AbsoluteLocalRateLimiter {
         count: u64,
         mode: HistoryUpdateMode,
     ) -> (u64, u64) {
-        if let Some(series) = self.series.get(key) {
-            let (old_total, contains_expired) = Self::live_total(&series, self.window_duration);
-
-            if !comparator.matches(old_total) {
-                return (old_total, old_total);
-            }
-
-            let unchanged = matches!(mode, HistoryUpdateMode::Preserve(_))
-                && !contains_expired
-                && old_total == count
-                && series.limit == *rate_limit;
-
-            if unchanged {
-                return (old_total, old_total);
-            }
-
-            drop(series);
-
-            if let Some(mut series) = self.series.get_mut(key) {
-                let (old_total, _contains_expired) =
-                    Self::live_total(&series, self.window_duration);
-
-                if !comparator.matches(old_total) {
-                    return (old_total, old_total);
-                }
-
-                series.limit = *rate_limit;
-                Self::apply_history_update(&mut series, self.window_duration, count, mode);
-                return (count, old_total);
-            }
-        }
-
-        if !comparator.matches(0) || count == 0 {
-            return (0, 0);
-        }
-
-        let mut series = self
-            .series
-            .entry(key.to_string())
-            .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-
-        let (old_total, _contains_expired) = Self::live_total(&series, self.window_duration);
+        let old_total = self.live_total(key);
 
         if !comparator.matches(old_total) {
             return (old_total, old_total);
         }
 
+        let mut series = match self.series.get_mut(key) {
+            Some(series) => series,
+            None => self
+                .series
+                .entry(key.to_string())
+                .or_insert_with(|| RateLimitSeries::new(*rate_limit)),
+        };
+
         series.limit = *rate_limit;
         Self::apply_history_update(&mut series, self.window_duration, count, mode);
 
         (count, old_total)
+
+        // let Some(mut series) = self.series.get_mut(key) else {
+        //     todo!();
+        // };
+        //
+        // Self::apply_history_update(&mut series, self.window_duration, count, mode);
+        //
+        // if let Some(series) = self.series.get(key) {
+        //     let (old_total, contains_expired, _should_cleanup) =
+        //         Self::live_total(&series, &self.window_duration);
+        //
+        //     if !comparator.matches(old_total) {
+        //         return (old_total, old_total);
+        //     }
+        //
+        //     let unchanged = matches!(mode, HistoryUpdateMode::Preserve(_))
+        //         && !contains_expired
+        //         && old_total == count
+        //         && series.limit == *rate_limit;
+        //
+        //     if unchanged {
+        //         return (old_total, old_total);
+        //     }
+        //
+        //     drop(series);
+        //
+        //     if let Some(mut series) = self.series.get_mut(key) {
+        //         let (old_total, _contains_expired, _should_cleanup) =
+        //             Self::live_total(&series, &self.window_duration);
+        //
+        //         if !comparator.matches(old_total) {
+        //             return (old_total, old_total);
+        //         }
+        //
+        //         series.limit = *rate_limit;
+        //         Self::apply_history_update(&mut series, self.window_duration, count, mode);
+        //         return (count, old_total);
+        //     }
+        // }
+        //
+        // if !comparator.matches(0) || count == 0 {
+        //     return (0, 0);
+        // }
+        //
+        // let mut series = self
+        //     .series
+        //     .entry(key.to_string())
+        //     .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+        //
+        // let (old_total, _contains_expired, _should_cleanup) =
+        //     Self::live_total(&series, &self.window_duration);
+        //
+        // if !comparator.matches(old_total) {
+        //     return (old_total, old_total);
+        // }
+        //
+        // series.limit = *rate_limit;
+        // Self::apply_history_update(&mut series, self.window_duration, count, mode);
+        //
+        // (count, old_total)
     }
 
     /// Current window total for `key` (read-only from the caller's perspective).
@@ -542,13 +572,15 @@ impl AbsoluteLocalRateLimiter {
     /// assert_eq!(limiter.get("user_123"), 3);
     /// ```
     pub fn get(&self, key: &str) -> u64 {
-        let Some(series) = self.series.get(key) else {
-            return 0;
-        };
-
-        let (total, _contains_expired) = Self::live_total(&series, self.window_duration);
-
-        total
+        self.live_total(key)
+        // let Some(series) = self.series.get(key) else {
+        //     return 0;
+        // };
+        //
+        // let (total, _contains_expired, _should_cleanup) =
+        //     Self::live_total(&series, &self.window_duration);
+        //
+        // total
     } // end method get
 
     /// Conditionally replace the window total for `key`.
