@@ -73,9 +73,13 @@ feature configuration.
 
 - Window capacity is calculated as `window_size_seconds * rate_limit`, converted to `u64` using
   the existing truncating behavior.
-- `inc` stores the rate limit when a key is first created. Later `inc` calls for the same key do
-  not redefine that stored limit.
-- A matched conditional set does redefine the stored rate limit.
+- Per-key limiter state stores the computed per-window limit, not the raw per-second
+  [`RateLimit`]. Absolute code names this value `window_limit`; suppressed code names it
+  `hard_window_limit` because it includes the configured `hard_limit_factor`.
+- `inc` stores the computed window limit when a key is first created. Later `inc` calls for the
+  same key do not redefine that stored limit.
+- A matched conditional set recomputes and redefines the stored window limit from the supplied
+  rate limit.
 - Increments within `rate_group_size_ms` of the newest bucket are coalesced into that bucket.
 - A bucket remains live while its age is within the configured window. Expiration and boundary
   comparisons must stay consistent across all operations.
@@ -83,12 +87,41 @@ feature configuration.
   allowed state and temporarily overshoot. Do not accidentally promise strict cross-thread
   atomicity for `inc`.
 
+Naming and initialization are part of this contract:
+
+- Use `window_limit` for absolute fields, parameters, locals, Lua values, test helpers, and
+  benchmark values.
+- Use `hard_window_limit` for the corresponding suppressed values. Use `soft_window_limit` for
+  the derived suppression threshold. Do not shorten either one to an ambiguous `limit`.
+- Shared physical Redis key APIs such as `get_window_limit_key`, `window_limit_key`, and the `w`
+  suffix may keep the generic name because both strategies use the same storage slot. The value
+  read from that key must still use the strategy-specific logical name.
+- Calculate a requested window limit at the latest point where it is actually needed. In
+  particular, do not calculate it before a comparator guard can return, before a missing-key path
+  has decided to insert, or at the start of a method when only one later branch uses it.
+- Prefer direct field access for one-use reads, such as
+  `total < series.window_limit as u64` or
+  `total >= series.hard_window_limit as u64`. Do not introduce a separate local merely to rename
+  a directly accessible field.
+- A local copy is appropriate when the value is used more than once, is derived further, is read
+  through a mutex, must survive dropping a DashMap guard, or materially improves a multi-step
+  calculation. Keep that local immediately before its first use.
+- Put missing-key calculations inside `or_insert_with` so they are not performed when a racing
+  thread has already inserted the key.
+
 ### 3.2 Public read behavior
 
 For `get`:
 
-- Unknown keys return `0` and must not be inserted.
+- Absolute providers return the live total as `u64`; unknown keys return `0`.
+- Suppressed providers return `SuppressedRateLimitSnapshot` with `total`, `total_declined`, and
+  `suppression_factor`; unknown keys return a zero-valued snapshot.
+- Unknown reads must not insert limiter state.
 - The returned value includes only live buckets.
+- Suppressed `total` includes accepted and declined usage, while `total_declined` includes only
+  declined usage and must never exceed `total`.
+- Redis suppressed reads return all three snapshot fields from one atomic script. Hybrid
+  suppressed reads overlay this instance's pending local counts and declines on Redis state.
 - Expired buckets may be lazily evicted. The caller-visible operation is a read, but internal
   expiration maintenance is allowed and expected when necessary.
 - A fresh-key read must use compatible shared DashMap access. It must not unconditionally take
@@ -177,14 +210,19 @@ let Some(mut series) = map.get_mut(key) else {
 ### 4.2 Missing-key insertion must downgrade directly
 
 There is a recurring pattern where an operation wants an immutable guard regardless of whether
-the key already existed. The canonical implementation is:
+the key already existed. This includes the common `series.get(...)` pattern: try the shared lookup
+first and, only when it misses, use `entry(...).or_insert_with(...)`. Do not discard the guard
+returned by `or_insert_with` and then call `get` again. Downgrade that guard and use it as the
+immutable reference. The canonical implementation is:
 
 ```rust,ignore
 let series = match map.get(key) {
     Some(series) => series,
     None => map
         .entry(key.to_string())
-        .or_insert_with(|| RateLimitSeries::new(*rate_limit))
+        .or_insert_with(|| {
+            RateLimitSeries::new(**rate_limit * *window_size_seconds as f64)
+        })
         .downgrade(),
 };
 ```
@@ -196,6 +234,8 @@ This rule is important for both locking and correctness:
 - `or_insert_with` safely handles another thread inserting between `get` and `entry`.
 - `downgrade` converts the returned mutable entry guard into the immutable guard the rest of the
   path needs.
+- The value returned by the `match` is therefore an immutable guard on both branches; callers
+  should continue directly with that guard instead of performing another lookup.
 - Returning the downgraded guard avoids a second hash lookup and a second shard-lock acquisition.
 - It also avoids a race where cleanup removes the newly inserted entry before a follow-up `get`,
   which previously encouraged invalid `expect` or `unreachable!` assumptions.
@@ -205,7 +245,9 @@ Do not write this pattern:
 ```rust,ignore
 if map.get(key).is_none() {
     map.entry(key.to_string())
-        .or_insert_with(|| RateLimitSeries::new(*rate_limit));
+        .or_insert_with(|| {
+            RateLimitSeries::new(**rate_limit * *window_size_seconds as f64)
+        });
 }
 
 let series = map
@@ -214,6 +256,8 @@ let series = map
 ```
 
 The second form performs redundant lookups and is incorrect under concurrent cleanup/removal.
+This prohibition applies even when the follow-up `get` currently uses `expect`, `unwrap`, a
+conditional fallback, or an early return: the intervening removal race still exists.
 If the code truly needs to continue structurally mutating the entry immediately, retaining the
 mutable entry guard can be appropriate. Otherwise, downgrade as soon as insertion is complete.
 
@@ -221,7 +265,7 @@ mutable entry guard can be appropriate. Otherwise, downgrade as soon as insertio
 
 Usually compatible with a shared DashMap guard:
 
-- Reading the stored limit, history, timestamps, or atomic totals.
+- Reading the stored window limit, history, timestamps, or atomic totals.
 - Loading atomic bucket counts or declined counts.
 - Atomic increments/decrements when the bucket structure itself is unchanged.
 - Comparator evaluation.
@@ -232,7 +276,7 @@ Requires exclusive access:
 - Inserting a missing key.
 - Appending, popping, draining, clearing, or otherwise restructuring a bucket deque.
 - Removing expired buckets.
-- Changing a non-atomic stored limit.
+- Changing a non-atomic stored window limit.
 - Removing a key after a matched zero-target conditional set.
 - Invalidating or replacing state that is not independently synchronized.
 
@@ -241,7 +285,7 @@ Important details:
 - `DashMap::entry` is not a harmless read. Use it only for actual insertion or mutation.
 - Do not call `get_mut` merely because mutation might become necessary later.
 - After dropping a shared guard and acquiring exclusive access, re-read ordinary fields such as a
-  stored rate limit; another operation may have replaced them between guards.
+  stored window limit; another operation may have replaced them between guards.
 - Do not hold a DashMap guard across `.await`.
 - Do not hold a mutable DashMap guard while performing Redis I/O.
 - Do not acquire another operation's per-key lock while retaining a mutable DashMap guard unless
@@ -298,7 +342,7 @@ Redis and hybrid variants return these values inside their existing `Result`/asy
 When `set_if` matches:
 
 - Replace live history with one current-timestamp bucket holding `count`.
-- Redefine the stored rate limit to the supplied `rate_limit`.
+- Recompute and redefine the stored window limit from the supplied `rate_limit`.
 - Return `(count, old_live_total)`.
 - A matched target of `0` removes the key completely. Do not leave an empty series behind.
 - For Redis, delete the entity's history, ordering sets, totals, limit/TTL state, suppression
@@ -340,9 +384,9 @@ For either direction:
 - Remove fully consumed buckets. Never retain zero-count boundary buckets.
 - If no retained bucket exists and the target is positive, create a current-timestamp bucket.
 - A matched target of `0` removes the key/state completely.
-- A matched call redefines the stored rate limit even when the requested total equals the old
+- A matched call redefines the stored window limit even when the requested total equals the old
   total.
-- If total, live history, stored limit, and all related metadata are already correct, avoid
+- If total, live history, stored window limit, and all related metadata are already correct, avoid
   needless mutable access and cache invalidation.
 
 ### 5.4 Suppressed-history accounting
@@ -574,8 +618,8 @@ Follow `docs/conventions.md`.
 - Avoid feature-gated links that break no-feature Rustdoc.
 - Public docs should describe caller-visible behavior accurately, including sticky `inc` limits,
   matched conditional-set limit replacement, zero-target deletion, and best-effort concurrency.
-- Do not describe `get` as never mutating internal storage. Say it returns the live total and may
-  perform lazy eviction.
+- Do not describe `get` as never mutating internal storage. Say it returns live state and may
+  perform lazy eviction. Keep the absolute `u64` and suppressed snapshot return contracts clear.
 - Re-export new public common types from `src/lib.rs`.
 - Keep sync local examples and async Redis/hybrid examples consistent with their APIs.
 
@@ -674,10 +718,16 @@ Before handing work back, confirm all applicable items:
 - [ ] Every `get_mut`, `entry`, `remove`, and `retain` protects a concrete mutation.
 - [ ] Shared guards are dropped before exclusive access or `.await`.
 - [ ] Expired buckets are excluded from logical totals and evicted when appropriate.
+- [ ] Absolute `get` returns a `u64`; suppressed `get` returns a snapshot whose total, declined
+      total, and suppression factor all reflect live state and provider-specific pending overlays.
 - [ ] `retry_after_ms` is remaining time, not elapsed age.
 - [ ] `remaining_after_waiting` reflects the oldest bucket released.
 - [ ] Conditional-set comparator semantics use the live total.
-- [ ] Matched conditional sets redefine the stored limit.
+- [ ] Absolute values use `window_limit`; suppressed values use `hard_window_limit`; neither uses
+      an ambiguous `limit` alias.
+- [ ] Window-limit calculations and locals are initialized only where needed; one-use field reads
+      access the field directly.
+- [ ] Matched conditional sets recompute and redefine the stored window limit.
 - [ ] Zero targets remove present state and do not create missing state.
 - [ ] `PreserveNewest` and `PreserveOldest` operate from the correct edges.
 - [ ] Suppressed decline ratios and totals remain consistent.
