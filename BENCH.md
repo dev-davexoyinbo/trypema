@@ -47,8 +47,17 @@ Bench binaries:
 
 - `benches/local_absolute.rs`
 - `benches/local_suppressed.rs`
-- `benches/redis_absolute.rs` (requires `--features redis-tokio`)
-- `benches/redis_suppressed.rs` (requires `--features redis-tokio`)
+- `benches/redis_absolute.rs` (requires a Redis feature)
+- `benches/redis_suppressed.rs` (requires a Redis feature)
+- `benches/hybrid_absolute.rs` (requires a Redis feature)
+- `benches/hybrid_suppressed.rs` (requires a Redis feature)
+
+The local suites include fresh hot-key `get` benchmarks for a single thread and
+for 2, 8, and 16 concurrent readers of the same DashMap entry. These cases make
+shared-to-exclusive lock regressions visible as contended-throughput changes. The suppressed
+cases consume the complete `SuppressedRateLimitSnapshot`, including both counters and the factor.
+All six suites compare conditional-set guard misses with matched replacement,
+`PreserveNewest`, and `PreserveOldest` history adjustments.
 
 Run one bench directly:
 
