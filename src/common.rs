@@ -133,6 +133,23 @@ pub enum RateLimitDecision {
     },
 }
 
+/// A best-effort snapshot of a suppressed rate limiter's live state.
+///
+/// Returned by the suppressed strategy's `get()` method for every provider. Counts include only
+/// buckets that are live at the time of the read. Under concurrent use, individual fields may be
+/// observed while another request is updating the limiter.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SuppressedRateLimitSnapshot {
+    /// Total observed usage in the live window, including accepted and declined usage.
+    pub total: u64,
+
+    /// Total declined usage in the live window.
+    pub total_declined: u64,
+
+    /// Current suppression factor in the inclusive range `0.0..=1.0`.
+    pub suppression_factor: f64,
+}
+
 /// Per-second rate limit for a key.
 ///
 /// Wraps a positive `f64` so Trypema can express non-integer limits such as `0.5` or `5.5`

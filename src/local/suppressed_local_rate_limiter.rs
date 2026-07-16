@@ -8,7 +8,7 @@ use dashmap::{DashMap, mapref::entry::Entry};
 
 use crate::{
     HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimitComparator,
-    RateLimitDecision,
+    RateLimitDecision, SuppressedRateLimitSnapshot,
     common::{
         HardLimitFactor, HistoryUpdateMode, InstantRate, RateLimit, SuppressionFactorCacheMs,
         WindowSizeSeconds,
@@ -76,17 +76,19 @@ impl RateLimitSeries {
 /// - Returns: [`RateLimitDecision::Allowed`]
 /// - Behavior: All requests admitted
 ///
-/// ## 2. At Capacity (Probabilistic Suppression)
+/// ## 2. Above Capacity (Probabilistic Suppression)
 ///
-/// When the observed usage is at/above capacity but below the hard cutoff, the limiter returns
-/// [`RateLimitDecision::Suppressed`]. Callers must check `is_allowed`.
+/// When the forecasted accepted usage is above capacity but below the hard cutoff, the limiter
+/// returns [`RateLimitDecision::Suppressed`]. Callers must check `is_allowed`. The increment that
+/// reaches capacity exactly is still [`RateLimitDecision::Allowed`].
 ///
 /// - Returns: [`RateLimitDecision::Suppressed { is_allowed, suppression_factor }`]
 /// - Behavior: Probabilistically deny requests to maintain target rate
 ///
-/// ## 3. Over Hard Limit (Full Suppression)
+/// ## 3. After the Hard Limit (Full Suppression)
 ///
-/// When the observed usage reaches the hard cutoff, the suppression factor becomes `1.0`.
+/// The increment that reaches the hard cutoff exactly is admitted and caches a suppression factor
+/// of `1.0`. Subsequent increments are fully suppressed while that factor remains applicable.
 ///
 /// - Returns: [`RateLimitDecision::Suppressed { is_allowed: false, suppression_factor: 1.0 }`]
 /// - Behavior: All requests denied
@@ -171,19 +173,23 @@ impl SuppressedLocalRateLimiter {
     ///
     /// # Returns
     ///
-    /// - [`RateLimitDecision::Allowed`]: Below capacity, no suppression active
-    /// - [`RateLimitDecision::Suppressed`]: At or above capacity. **Check `is_allowed`** for admission.
-    ///   When over the hard limit, returns `Suppressed { is_allowed: false, suppression_factor: 1.0 }`.
+    /// - [`RateLimitDecision::Allowed`]: The increment remains within soft capacity or reaches the
+    ///   hard limit exactly
+    /// - [`RateLimitDecision::Suppressed`]: The forecasted accepted total is above soft capacity
+    ///   without landing exactly on the hard limit. **Check `is_allowed`** for admission. When over
+    ///   the hard limit, returns `Suppressed { is_allowed: false, suppression_factor: 1.0 }`.
     ///
     /// This method never returns [`RateLimitDecision::Rejected`].
     ///
     /// # Behaviour
     ///
     /// 1. The increment is **always** recorded in the sliding window (both allowed and denied calls)
-    /// 2. If the forecasted accepted usage is below the soft window capacity, return `Allowed`
-    /// 3. If above the hard limit (`rate_limit × hard_limit_factor`), return
+    /// 2. If the forecasted accepted usage is at or below the soft window capacity, return `Allowed`
+    /// 3. If the increment reaches the hard limit exactly, admit it and cache full suppression for
+    ///    subsequent calls
+    /// 4. If above the hard limit (`window_size_seconds × rate_limit × hard_limit_factor`), return
     ///    `Suppressed { is_allowed: false, suppression_factor: 1.0 }`
-    /// 4. Otherwise, compute (or retrieve cached) suppression factor and probabilistically decide
+    /// 5. Otherwise, compute (or retrieve cached) suppression factor and probabilistically decide
     ///
     /// # Concurrency
     ///
@@ -343,11 +349,11 @@ impl SuppressedLocalRateLimiter {
     }
 
     fn remove_expired_buckets(&self, key: &str) {
-        let Some(rate_limit_series) = self.series.get(key) else {
+        let Some(series) = self.series.get(key) else {
             return;
         };
 
-        let Some(instant_rate) = rate_limit_series.series.front() else {
+        let Some(instant_rate) = series.series.front() else {
             return;
         };
 
@@ -355,35 +361,18 @@ impl SuppressedLocalRateLimiter {
             return;
         }
 
-        drop(rate_limit_series);
+        drop(series);
 
-        let Some(mut rate_limit_series) = self.series.get_mut(key) else {
+        let Some(mut series) = self.series.get_mut(key) else {
             return;
         };
 
-        let now = Instant::now();
+        let (_, evicted) = Self::evict_expired(&mut series, self.window_duration);
+        drop(series);
 
-        let split = rate_limit_series
-            .series
-            .partition_point(|r| now.duration_since(r.timestamp) > self.window_duration);
-
-        let (removed_count, removed_declined) =
-            rate_limit_series
-                .series
-                .drain(..split)
-                .fold((0u64, 0u64), |(count, declined), r| {
-                    (
-                        count + r.count.load(Ordering::Acquire),
-                        declined + r.declined.load(Ordering::Acquire),
-                    )
-                });
-
-        rate_limit_series
-            .total
-            .fetch_sub(removed_count, Ordering::AcqRel);
-        rate_limit_series
-            .total_declined
-            .fetch_sub(removed_declined, Ordering::AcqRel);
+        if evicted {
+            self.suppression_factors.remove(key);
+        }
     } // end method remove_expired_buckets
 
     /// Get the current suppression factor for `key`.
@@ -391,7 +380,7 @@ impl SuppressedLocalRateLimiter {
     /// Returns a value in the range `[0.0, 1.0]`:
     /// - `0.0` — no suppression (below capacity or key not found)
     /// - `0.0 < sf < 1.0` — partial suppression (at capacity)
-    /// - `1.0` — full suppression (over hard limit)
+    /// - `1.0` — full suppression (cached at the hard boundary or on a forecast above it)
     ///
     /// This method is read-only and does not record any increment. It is useful for
     /// exporting metrics, building dashboards, or debugging why calls are being suppressed.
@@ -467,13 +456,12 @@ impl SuppressedLocalRateLimiter {
             return self.persist_suppression_factor(key, 0f64);
         }
 
-        let hard_window_limit = series.limit as u64;
-        let soft_window_limit = (hard_window_limit as f64 / *self.hard_limit_factor) as u64;
+        let soft_window_limit = (series.hard_window_limit / *self.hard_limit_factor) as u64;
 
         let total = series.total.load(Ordering::Acquire);
         let total_declined = series.total_declined.load(Ordering::Acquire);
 
-        if total >= hard_window_limit {
+        if total >= series.hard_window_limit as u64 {
             return self.persist_suppression_factor(key, 1f64);
         }
 
@@ -483,7 +471,7 @@ impl SuppressedLocalRateLimiter {
             return self.persist_suppression_factor(key, 0f64);
         }
 
-        if accepted == soft_window_limit && soft_window_limit == hard_window_limit {
+        if accepted == soft_window_limit && soft_window_limit == series.hard_window_limit as u64 {
             return self.persist_suppression_factor(key, 1f64);
         }
 
@@ -507,6 +495,117 @@ impl SuppressedLocalRateLimiter {
 
         self.persist_suppression_factor(key, suppression_factor)
     } // end method calculate_suppression_factor
+
+    /// Current live window state for `key`.
+    ///
+    /// Evicts expired buckets first, then returns the observed total, declined total,
+    /// and current suppression factor. The observed total includes accepted and declined
+    /// calls, matching the counter that suppression decisions are based on. Unknown keys
+    /// return [`SuppressedRateLimitSnapshot::default()`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// use trypema::RateLimit;
+    ///
+    /// let limiter = rl.local().suppressed();
+    /// let snapshot = limiter.get("user_123");
+    /// assert_eq!(snapshot.total, 0);
+    /// assert_eq!(snapshot.total_declined, 0);
+    /// assert_eq!(snapshot.suppression_factor, 0.0);
+    ///
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// limiter.inc("user_123", &rate, 3);
+    /// assert_eq!(limiter.get("user_123").total, 3);
+    /// ```
+    pub fn get(&self, key: &str) -> SuppressedRateLimitSnapshot {
+        let Some(series) = self.series.get(key) else {
+            return SuppressedRateLimitSnapshot::default();
+        };
+
+        let (total, contained_expired) = Self::live_total(&series, self.window_duration);
+        if !contained_expired {
+            let total_declined = series.total_declined.load(Ordering::Acquire);
+            drop(series);
+
+            return SuppressedRateLimitSnapshot {
+                total,
+                total_declined,
+                suppression_factor: self.get_suppression_factor_without_bucket_expire(key),
+            };
+        }
+
+        drop(series);
+
+        let Some(mut series) = self.series.get_mut(key) else {
+            return SuppressedRateLimitSnapshot::default();
+        };
+
+        let (total, evicted) = Self::evict_expired(&mut series, self.window_duration);
+        let total_declined = series.total_declined.load(Ordering::Acquire);
+
+        drop(series);
+
+        if evicted {
+            self.suppression_factors.remove(key);
+        }
+
+        SuppressedRateLimitSnapshot {
+            total,
+            total_declined,
+            suppression_factor: self.get_suppression_factor_without_bucket_expire(key),
+        }
+    } // end method get
+
+    fn evict_expired(series: &mut RateLimitSeries, window_duration: Duration) -> (u64, bool) {
+        let now = Instant::now();
+        let split = series
+            .series
+            .partition_point(|r| now.duration_since(r.timestamp) > window_duration);
+
+        if split == 0 {
+            return (series.total.load(Ordering::Acquire), false);
+        }
+
+        let (removed_count, removed_declined) =
+            series
+                .series
+                .drain(..split)
+                .fold((0u64, 0u64), |(count, declined), rate| {
+                    (
+                        count + rate.count.load(Ordering::Acquire),
+                        declined + rate.declined.load(Ordering::Acquire),
+                    )
+                });
+
+        let total = series.total.fetch_sub(removed_count, Ordering::AcqRel) - removed_count;
+        series
+            .total_declined
+            .fetch_sub(removed_declined, Ordering::AcqRel);
+
+        (total, true)
+    }
+
+    fn live_total(series: &RateLimitSeries, window_duration: Duration) -> (u64, bool) {
+        let now = Instant::now();
+        let split = series
+            .series
+            .partition_point(|r| now.duration_since(r.timestamp) > window_duration);
+
+        if split == 0 {
+            return (series.total.load(Ordering::Acquire), split > 0);
+        }
+
+        let total = series
+            .series
+            .iter()
+            .skip(split)
+            .map(|r| r.count.load(Ordering::Acquire))
+            .sum();
+
+        (total, split > 0)
+    }
 
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {
         self.suppression_factors
