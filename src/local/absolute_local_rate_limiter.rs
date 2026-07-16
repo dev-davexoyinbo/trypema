@@ -5,7 +5,7 @@ use std::{
 };
 
 use ahash::RandomState;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 
 use crate::{
     HistoryPreservation, LocalRateLimiterOptions, RateLimitComparator,
@@ -295,6 +295,7 @@ impl AbsoluteLocalRateLimiter {
                     return RateLimitDecision::Allowed;
                 };
 
+                let window_limit = (*self.window_size_seconds as f64 * *series.limit) as u64;
                 let total_count = Self::evict_expired(&mut series, self.window_duration);
 
                 if total_count < window_limit {
@@ -333,7 +334,7 @@ impl AbsoluteLocalRateLimiter {
             .partition_point(|r| now.duration_since(r.timestamp) > window_duration);
 
         if split == 0 {
-            return 0;
+            return series.total.load(Ordering::Relaxed);
         }
 
         let drained = series
@@ -347,30 +348,43 @@ impl AbsoluteLocalRateLimiter {
         prev - drained
     } // end fn evict_expired
 
+    fn inspect_live_total(series: &RateLimitSeries, window_duration: Duration) -> (u64, bool) {
+        let now = Instant::now();
+        let split = series
+            .series
+            .partition_point(|bucket| now.duration_since(bucket.timestamp) > window_duration);
+
+        if split == 0 {
+            return (series.total.load(Ordering::Relaxed), false);
+        }
+
+        let total = series
+            .series
+            .iter()
+            .skip(split)
+            .map(|bucket| bucket.count.load(Ordering::Relaxed))
+            .sum();
+
+        (total, true)
+    }
+
     fn live_total(&self, key: &str) -> u64 {
         let Some(series) = self.series.get(key) else {
             return 0;
         };
 
-        let mut total = series.total.load(Ordering::Relaxed);
-
-        match series.series.front() {
-            None => {}
-            // check if the oldest value is still within the window size ms
-            Some(instant_rate)
-                if instant_rate.timestamp.elapsed().as_millis() <= self.window_size_ms => {}
-            Some(_) => {
-                drop(series);
-
-                let Some(mut series) = self.series.get_mut(key) else {
-                    return 0;
-                };
-
-                total = Self::evict_expired(&mut series, self.window_duration);
-            }
+        let (total, contains_expired) = Self::inspect_live_total(&series, self.window_duration);
+        if !contains_expired {
+            return total;
         }
 
-        total
+        drop(series);
+
+        let Some(mut series) = self.series.get_mut(key) else {
+            return 0;
+        };
+
+        Self::evict_expired(&mut series, self.window_duration)
     }
 
     fn set_if_with_history_mode(
@@ -381,42 +395,93 @@ impl AbsoluteLocalRateLimiter {
         count: u64,
         mode: HistoryUpdateMode,
     ) -> (u64, u64) {
-        let old_total = self.live_total(key);
+        let existing = match self.series.get(key) {
+            Some(series) => {
+                let (old_total, contains_expired) =
+                    Self::inspect_live_total(&series, self.window_duration);
 
-        if !comparator.matches(old_total) || (old_total == 0 && count == 0) {
-            return (old_total, old_total);
+                if !comparator.matches(old_total) {
+                    return (old_total, old_total);
+                }
+
+                let unchanged = count > 0
+                    && matches!(mode, HistoryUpdateMode::Preserve(_))
+                    && !contains_expired
+                    && old_total == count
+                    && series.limit == *rate_limit;
+
+                if unchanged {
+                    return (old_total, old_total);
+                }
+
+                true
+            }
+            None => false,
+        };
+
+        if !existing && (!comparator.matches(0) || count == 0) {
+            return (0, 0);
         }
 
-        if count == 0 {
-            self.series.remove(key);
+        match self.series.entry(key.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let (old_total, contains_expired) =
+                    Self::inspect_live_total(entry.get(), self.window_duration);
 
-            return (0, old_total);
+                if !comparator.matches(old_total) {
+                    return (old_total, old_total);
+                }
+
+                if count == 0 {
+                    entry.remove();
+                    return (0, old_total);
+                }
+
+                let series = entry.get_mut();
+
+                if contains_expired {
+                    Self::evict_expired(series, self.window_duration);
+                }
+
+                series.limit = *rate_limit;
+
+                if old_total == count && matches!(mode, HistoryUpdateMode::Preserve(_)) {
+                    return (old_total, old_total);
+                }
+
+                Self::apply_history_update(series, count, old_total, mode);
+
+                (count, old_total)
+            }
+            Entry::Vacant(entry) => {
+                if !comparator.matches(0) || count == 0 {
+                    return (0, 0);
+                }
+
+                let mut series = RateLimitSeries::new(*rate_limit);
+
+                Self::apply_history_update(&mut series, count, 0, mode);
+                entry.insert(series);
+
+                (count, 0)
+            }
         }
+    }
 
-        let mut series = self
-            .series
-            .entry(key.to_string())
-            .or_insert_with(|| RateLimitSeries::new(*rate_limit));
-
-        let old_total = series.total.load(Ordering::Relaxed);
-        series.limit = *rate_limit;
-
-        // preservation of history doesn't need the history to be updated in this case
-        if old_total == count && matches!(mode, HistoryUpdateMode::Preserve(_)) {
-            return (old_total, old_total);
-        }
-
+    fn apply_history_update(
+        series: &mut RateLimitSeries,
+        count: u64,
+        old_total: u64,
+        mode: HistoryUpdateMode,
+    ) {
         match mode {
             HistoryUpdateMode::Replace => {
                 series.series.clear();
-
-                if count > 0 {
-                    series.series.push_back(InstantRate {
-                        count: count.into(),
-                        timestamp: Instant::now(),
-                        declined: AtomicU64::new(0),
-                    });
-                }
+                series.series.push_back(InstantRate {
+                    count: count.into(),
+                    timestamp: Instant::now(),
+                    declined: AtomicU64::new(0),
+                });
             }
             HistoryUpdateMode::Preserve(preservation) if count > old_total => {
                 let delta = count - old_total;
@@ -439,23 +504,20 @@ impl AbsoluteLocalRateLimiter {
                 let mut to_remove = old_total - count;
 
                 while to_remove > 0 {
-                    let bucket_count = match preservation {
-                        HistoryPreservation::PreserveNewest => series
-                            .series
-                            .front()
-                            .map(|bucket| bucket.count.load(Ordering::Relaxed)),
-                        HistoryPreservation::PreserveOldest => series
-                            .series
-                            .back()
-                            .map(|bucket| bucket.count.load(Ordering::Relaxed)),
+                    let bucket = match preservation {
+                        HistoryPreservation::PreserveNewest => series.series.front(),
+                        HistoryPreservation::PreserveOldest => series.series.back(),
                     };
 
-                    let Some(bucket_count) = bucket_count else {
+                    let Some(bucket) = bucket else {
                         break;
                     };
 
+                    let bucket_count = bucket.count.load(Ordering::Relaxed);
+
                     if bucket_count <= to_remove {
                         to_remove -= bucket_count;
+
                         match preservation {
                             HistoryPreservation::PreserveNewest => {
                                 series.series.pop_front();
@@ -465,14 +527,6 @@ impl AbsoluteLocalRateLimiter {
                             }
                         }
                     } else {
-                        let bucket = match preservation {
-                            HistoryPreservation::PreserveNewest => {
-                                series.series.front().expect("bucket should exist")
-                            }
-                            HistoryPreservation::PreserveOldest => {
-                                series.series.back().expect("bucket should exist")
-                            }
-                        };
                         bucket.count.fetch_sub(to_remove, Ordering::Relaxed);
                         to_remove = 0;
                     }
@@ -482,14 +536,12 @@ impl AbsoluteLocalRateLimiter {
         }
 
         series.total.store(count, Ordering::Relaxed);
-
-        (count, old_total)
     }
 
-    /// Current window total for `key` (read-only from the caller's perspective).
+    /// Current live window total for `key`.
     ///
-    /// Ignores expired buckets and returns the sum of live bucket counts without
-    /// mutating the stored history. Unknown keys return `0`.
+    /// Evicts expired buckets when necessary and returns the sum of live bucket
+    /// counts. Unknown keys return `0` without inserting state.
     ///
     /// # Examples
     ///
@@ -506,14 +558,6 @@ impl AbsoluteLocalRateLimiter {
     /// ```
     pub fn get(&self, key: &str) -> u64 {
         self.live_total(key)
-        // let Some(series) = self.series.get(key) else {
-        //     return 0;
-        // };
-        //
-        // let (total, _contains_expired, _should_cleanup) =
-        //     Self::live_total(&series, &self.window_duration);
-        //
-        // total
     } // end method get
 
     /// Conditionally replace the window total for `key`.
