@@ -1,19 +1,13 @@
 use std::{
-    collections::VecDeque,
-    sync::{
-        Arc, Barrier,
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Barrier, atomic::Ordering, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::common::{
-    HardLimitFactor, HistoryPreservation, InstantRate, RateGroupSizeMs, RateLimit,
-    RateLimitComparator, RateLimitDecision, SuppressionFactorCacheMs, WindowSizeSeconds,
+    HardLimitFactor, HistoryPreservation, RateGroupSizeMs, RateLimit, RateLimitComparator,
+    RateLimitDecision, SuppressionFactorCacheMs, WindowSizeSeconds,
 };
-use crate::local::AbsoluteRateLimitSeries as RateLimitSeries;
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};
 
 fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
@@ -52,29 +46,10 @@ fn limiter(window_size_seconds: u64, rate_group_size_ms: u64) -> AbsoluteLocalRa
     })
 }
 
-fn insert_series(
-    limiter: &AbsoluteLocalRateLimiter,
-    key: &str,
-    limit: RateLimit,
-    buckets: &[(u64, u64)],
-) {
-    let total = buckets.iter().map(|(count, _)| *count).sum::<u64>();
-    let series = buckets
-        .iter()
-        .map(|(count, ms_ago)| InstantRate {
-            count: AtomicU64::new(*count),
-            declined: AtomicU64::new(0),
-            timestamp: Instant::now() - Duration::from_millis(*ms_ago),
-        })
-        .collect::<VecDeque<_>>();
-
-    limiter.series().insert(
-        key.to_string(),
-        RateLimitSeries {
-            limit,
-            series,
-            total: AtomicU64::new(total),
-        },
+fn assert_retry_after_between(retry_after_ms: u128, min_ms: u128, max_ms: u128) {
+    assert!(
+        retry_after_ms >= min_ms && retry_after_ms <= max_ms,
+        "retry_after_ms={retry_after_ms}, expected {min_ms} <= retry_after_ms <= {max_ms}"
     );
 }
 
@@ -94,13 +69,19 @@ fn rejects_at_exact_window_limit() {
     let key = "k";
     let rate_limit = RateLimit::try_from(2f64).unwrap();
 
-    limiter.inc(key, &rate_limit, 1);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 1),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Allowed
     ));
 
-    limiter.inc(key, &rate_limit, 1);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 1),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Rejected { .. }
@@ -114,13 +95,19 @@ fn rejects_at_exact_window_limit_window_6() {
     let rate_limit = RateLimit::try_from(2f64).unwrap();
 
     // window_limit = 6 * 2 = 12
-    limiter.inc(key, &rate_limit, 11);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 11),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Allowed
     ));
 
-    limiter.inc(key, &rate_limit, 1);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 1),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Rejected { .. }
@@ -134,13 +121,19 @@ fn rejects_at_exact_window_limit_window_10() {
     let rate_limit = RateLimit::try_from(2f64).unwrap();
 
     // window_limit = 10 * 2 = 20
-    limiter.inc(key, &rate_limit, 19);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 19),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Allowed
     ));
 
-    limiter.inc(key, &rate_limit, 1);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 1),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Rejected { .. }
@@ -152,7 +145,10 @@ fn per_key_state_is_independent() {
     let limiter = limiter(1, 1000);
     let rate_limit = RateLimit::try_from(2f64).unwrap();
 
-    limiter.inc("a", &rate_limit, 2);
+    assert!(matches!(
+        limiter.inc("a", &rate_limit, 2),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed("a"),
         RateLimitDecision::Rejected { .. }
@@ -172,10 +168,16 @@ fn rate_limit_for_key_is_not_updated_after_first_inc() {
     let loose_rate_limit = RateLimit::try_from(100f64).unwrap();
 
     // Seed key with a strict limit.
-    limiter.inc(key, &strict_rate_limit, 0);
+    assert!(matches!(
+        limiter.inc(key, &strict_rate_limit, 0),
+        RateLimitDecision::Allowed
+    ));
 
     // If the limit were updated to 100 here, this would be allowed.
-    limiter.inc(key, &loose_rate_limit, 1);
+    assert!(matches!(
+        limiter.inc(key, &loose_rate_limit, 1),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Rejected { .. }
@@ -188,11 +190,15 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
     let key = "k";
     let rate_limit = RateLimit::try_from(5f64).unwrap();
 
-    // Create two buckets so that after the oldest expires, some usage remains.
-    // Keep the first bucket below the limit so the second increment is applied.
-    limiter.inc(key, &rate_limit, 1);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 1),
+        RateLimitDecision::Allowed
+    ));
     thread::sleep(Duration::from_millis(20));
-    limiter.inc(key, &rate_limit, 4);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 4),
+        RateLimitDecision::Allowed
+    ));
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
@@ -205,8 +211,8 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
     };
 
     assert_eq!(window_size_seconds, 1);
-    assert!(retry_after_ms <= 1000);
-    assert_eq!(remaining_after_waiting, 4);
+    assert_eq!(remaining_after_waiting, 1);
+    assert_retry_after_between(retry_after_ms, 800, 1_000);
 }
 
 #[test]
@@ -215,10 +221,15 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_6() {
     let key = "k";
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
-    // Two buckets; after the oldest expires, some usage remains.
-    limiter.inc(key, &rate_limit, 2);
-    thread::sleep(Duration::from_millis(2));
-    limiter.inc(key, &rate_limit, 4);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 2),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(10));
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 4),
+        RateLimitDecision::Allowed
+    ));
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
@@ -231,8 +242,8 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_6() {
     };
 
     assert_eq!(window_size_seconds, 6);
-    assert!(retry_after_ms <= 6000);
-    assert_eq!(remaining_after_waiting, 4);
+    assert_eq!(remaining_after_waiting, 2);
+    assert_retry_after_between(retry_after_ms, 5_000, 6_000);
 }
 
 #[test]
@@ -241,11 +252,15 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
     let key = "k";
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
-    // Two buckets; after the oldest expires, some usage remains.
-    // Put the second bucket at the exact limit.
-    limiter.inc(key, &rate_limit, 3);
-    thread::sleep(Duration::from_millis(2));
-    limiter.inc(key, &rate_limit, 7);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 3),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(10));
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 7),
+        RateLimitDecision::Allowed
+    ));
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
@@ -258,8 +273,8 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
     };
 
     assert_eq!(window_size_seconds, 10);
-    assert!(retry_after_ms <= 10000);
-    assert_eq!(remaining_after_waiting, 7);
+    assert_eq!(remaining_after_waiting, 3);
+    assert_retry_after_between(retry_after_ms, 9_000, 10_000);
 }
 
 #[test]
@@ -284,8 +299,8 @@ fn rejected_metadata_window_6_with_nonzero_grouping_separates_buckets() {
     };
 
     assert_eq!(window_size_seconds, 6);
-    assert!(retry_after_ms <= 6000);
-    assert_eq!(remaining_after_waiting, 4);
+    assert_eq!(remaining_after_waiting, 2);
+    assert_retry_after_between(retry_after_ms, 5_000, 6_000);
 }
 
 #[test]
@@ -310,8 +325,8 @@ fn rejected_metadata_window_10_with_nonzero_grouping_separates_buckets() {
     };
 
     assert_eq!(window_size_seconds, 10);
-    assert!(retry_after_ms <= 10000);
-    assert_eq!(remaining_after_waiting, 7);
+    assert_eq!(remaining_after_waiting, 3);
+    assert_retry_after_between(retry_after_ms, 9_000, 10_000);
 }
 
 #[test]
@@ -335,9 +350,8 @@ fn rejected_metadata_window_6_with_nonzero_grouping_merges_within_group() {
         panic!("expected rejected decision");
     };
 
-    assert!(retry_after_ms <= 6000);
-    // If grouped, the oldest bucket includes all usage, so nothing remains after waiting.
-    assert_eq!(remaining_after_waiting, 0);
+    assert_eq!(remaining_after_waiting, 6);
+    assert_retry_after_between(retry_after_ms, 5_000, 6_000);
 }
 
 #[test]
@@ -361,8 +375,8 @@ fn rejected_metadata_window_10_with_nonzero_grouping_merges_within_group() {
         panic!("expected rejected decision");
     };
 
-    assert!(retry_after_ms <= 10000);
-    assert_eq!(remaining_after_waiting, 0);
+    assert_eq!(remaining_after_waiting, 10);
+    assert_retry_after_between(retry_after_ms, 9_000, 10_000);
 }
 
 #[test]
@@ -416,73 +430,76 @@ fn evicts_oldest_bucket_but_keeps_newer_bucket_window_2_with_grouping() {
     let key = "k";
     let rate_limit = RateLimit::try_from(1f64).unwrap();
 
-    // Two buckets (sleep > group size) so that after the oldest expires, some usage remains.
-    // window_limit = 2 * 1 = 2
-    limiter.inc(key, &rate_limit, 1);
-    thread::sleep(Duration::from_millis(250));
-    limiter.inc(key, &rate_limit, 1);
-
     assert!(matches!(
-        limiter.is_allowed(key),
-        RateLimitDecision::Rejected { .. }
+        limiter.inc(key, &rate_limit, 1),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(300));
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 1),
+        RateLimitDecision::Allowed
     ));
 
-    // Wait long enough that:
-    // - the oldest bucket is evicted (elapsed > 2000ms)
-    // - the newer bucket is still in-window (elapsed <= 2000ms)
-    thread::sleep(Duration::from_millis(2050));
+    // The first bucket expires while the second remains inside the window.
+    thread::sleep(Duration::from_millis(1_800));
 
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Allowed
     ));
+
+    let series = limiter.series().get(key).expect("series should remain");
+    assert_eq!(series.series.len(), 1);
+    assert_eq!(
+        series.series.front().unwrap().count.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(series.total.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn rate_grouping_merges_within_group() {
     let limiter = limiter(1, 50);
     let key = "k";
-    let rate_limit = RateLimit::try_from(3f64).unwrap();
+    let rate_limit = RateLimit::try_from(6f64).unwrap();
 
-    limiter.inc(key, &rate_limit, 3);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 3),
+        RateLimitDecision::Allowed
+    ));
     thread::sleep(Duration::from_millis(10));
-    limiter.inc(key, &rate_limit, 3);
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 3),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Rejected { .. }
     ));
 
-    // If increments were grouped, they share the oldest timestamp and expire together.
-    // If they were incorrectly split into separate buckets, the newer bucket would still
-    // be within the window and this would remain rejected.
-    thread::sleep(Duration::from_millis(2005));
-
-    assert!(matches!(
-        limiter.is_allowed(key),
-        RateLimitDecision::Allowed
-    ));
+    let series = limiter.series().get(key).expect("series should exist");
+    assert_eq!(series.series.len(), 1, "increments should share one bucket");
+    assert_eq!(
+        series.series.front().unwrap().count.load(Ordering::Relaxed),
+        6
+    );
+    assert_eq!(series.total.load(Ordering::Relaxed), 6);
 }
 
 #[test]
 fn rate_grouping_separates_beyond_group() {
     let limiter = limiter(1, 50);
     let key = "k";
-    let rate_limit = RateLimit::try_from(3f64).unwrap();
+    let rate_limit = RateLimit::try_from(10f64).unwrap();
 
-    // Create an initial bucket without consuming capacity. This ensures we can
-    // later create a second bucket at the exact limit (3) and still have two buckets
-    // so eviction behavior is observable.
-    limiter.inc(key, &rate_limit, 0);
-
-    // Ensure the second increment is beyond the grouping threshold but still within the
-    // 1s window, so we end up with two buckets.
-    thread::sleep(Duration::from_millis(150));
-
-    // Put the second bucket at the exact limit.
-    limiter.inc(key, &rate_limit, 3);
     assert!(matches!(
-        limiter.is_allowed(key),
-        RateLimitDecision::Rejected { .. }
+        limiter.inc(key, &rate_limit, 2),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(75));
+    assert!(matches!(
+        limiter.inc(key, &rate_limit, 3),
+        RateLimitDecision::Allowed
     ));
 
     let series = limiter
@@ -490,48 +507,17 @@ fn rate_grouping_separates_beyond_group() {
         .get(key)
         .expect("expected key to exist in limiter");
     assert_eq!(series.series.len(), 2);
+    let counts = series
+        .series
+        .iter()
+        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    assert_eq!(counts, vec![2, 3]);
+    assert_eq!(series.total.load(Ordering::Relaxed), 5);
     drop(series);
-
-    // Wait until the first bucket is evictable but the second is still in-window.
-    let start = std::time::Instant::now();
-    loop {
-        let series = limiter
-            .series()
-            .get(key)
-            .expect("expected key to exist in limiter");
-
-        let first_elapsed_ms = series
-            .series
-            .front()
-            .expect("expected first bucket")
-            .timestamp
-            .elapsed()
-            .as_millis();
-        let second_elapsed_ms = series
-            .series
-            .back()
-            .expect("expected second bucket")
-            .timestamp
-            .elapsed()
-            .as_millis();
-        drop(series);
-
-        if first_elapsed_ms > 1000 && second_elapsed_ms <= 1000 {
-            break;
-        }
-
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!(
-                "timed out waiting for bucket ages; first_elapsed_ms={first_elapsed_ms} second_elapsed_ms={second_elapsed_ms}"
-            );
-        }
-
-        thread::sleep(Duration::from_millis(10));
-    }
-
     assert!(matches!(
         limiter.is_allowed(key),
-        RateLimitDecision::Rejected { .. }
+        RateLimitDecision::Allowed
     ));
 }
 
@@ -569,8 +555,12 @@ fn cleanup_removes_stale_keys_by_last_activity() {
     let limiter = limiter(60, 1000);
     let limit = RateLimit::try_from(1f64).unwrap();
 
-    insert_series(&limiter, "stale", limit, &[(1, 5_000)]);
+    assert!(matches!(
+        limiter.inc("stale", &limit, 1),
+        RateLimitDecision::Allowed
+    ));
     assert!(limiter.series().contains_key("stale"));
+    thread::sleep(Duration::from_millis(1_100));
 
     limiter.cleanup(1_000);
     assert!(!limiter.series().contains_key("stale"));
@@ -581,23 +571,12 @@ fn cleanup_keeps_fresh_keys() {
     let limiter = limiter(60, 1000);
     let limit = RateLimit::try_from(1f64).unwrap();
 
-    insert_series(&limiter, "fresh", limit, &[(1, 10)]);
+    assert!(matches!(
+        limiter.inc("fresh", &limit, 1),
+        RateLimitDecision::Allowed
+    ));
     limiter.cleanup(10_000);
     assert!(limiter.series().contains_key("fresh"));
-}
-
-#[test]
-fn cleanup_drops_empty_series_entries() {
-    let limiter = limiter(60, 1000);
-    let limit = RateLimit::try_from(1f64).unwrap();
-
-    limiter
-        .series()
-        .insert("empty".to_string(), RateLimitSeries::new(limit));
-    assert!(limiter.series().contains_key("empty"));
-
-    limiter.cleanup(10_000);
-    assert!(!limiter.series().contains_key("empty"));
 }
 
 #[test]
@@ -605,8 +584,15 @@ fn cleanup_uses_most_recent_bucket_not_oldest() {
     let limiter = limiter(60, 1000);
     let limit = RateLimit::try_from(1f64).unwrap();
 
-    // Oldest is very old, but most recent bucket is fresh.
-    insert_series(&limiter, "mixed", limit, &[(1, 60_000), (1, 10)]);
+    assert!(matches!(
+        limiter.inc("mixed", &limit, 1),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(1_100));
+    assert!(matches!(
+        limiter.inc("mixed", &limit, 1),
+        RateLimitDecision::Allowed
+    ));
 
     limiter.cleanup(1_000);
     assert!(limiter.series().contains_key("mixed"));
@@ -618,13 +604,17 @@ fn cleanup_removal_makes_key_unknown_and_allowed() {
     let key = "k";
     let limit = RateLimit::try_from(1f64).unwrap();
 
-    // window_limit = 60 * 1 = 60; total=61 => rejected.
-    insert_series(&limiter, key, limit, &[(61, 50)]);
+    // window_limit = 60 * 1 = 60.
+    assert!(matches!(
+        limiter.inc(key, &limit, 60),
+        RateLimitDecision::Allowed
+    ));
     assert!(matches!(
         limiter.is_allowed(key),
         RateLimitDecision::Rejected { .. }
     ));
 
+    thread::sleep(Duration::from_millis(20));
     limiter.cleanup(10);
     assert!(!limiter.series().contains_key(key));
     assert!(matches!(
@@ -638,7 +628,11 @@ fn cleanup_is_millisecond_granularity() {
     let limiter = limiter(60, 1000);
     let limit = RateLimit::try_from(1f64).unwrap();
 
-    insert_series(&limiter, "ms", limit, &[(1, 150)]);
+    assert!(matches!(
+        limiter.inc("ms", &limit, 1),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(150));
     limiter.cleanup(100);
     assert!(!limiter.series().contains_key("ms"));
 }
@@ -648,9 +642,9 @@ fn cleanup_concurrent_is_allowed_smoke_does_not_panic() {
     let limiter = Arc::new(limiter(60, 1));
     let limit = RateLimit::try_from(1f64).unwrap();
 
-    // Seed some state.
-    insert_series(&limiter, "a", limit, &[(1, 0)]);
-    insert_series(&limiter, "b", limit, &[(1, 0)]);
+    // Seed some state through the limiter API.
+    let _ = limiter.inc("a", &limit, 1);
+    let _ = limiter.inc("b", &limit, 1);
 
     let reader = {
         let limiter = limiter.clone();
@@ -661,7 +655,7 @@ fn cleanup_concurrent_is_allowed_smoke_does_not_panic() {
 
                 // Occasionally re-seed a key to race with cleanup.
                 if i % 5000 == 0 {
-                    insert_series(&limiter, k, limit, &[(1, 0)]);
+                    let _ = limiter.inc(k, &limit, 1);
                 }
             }
         })
@@ -711,6 +705,7 @@ fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
     assert_eq!(rejected_volume, 80 - capacity);
     assert_eq!(allowed_ops, capacity);
     assert_eq!(rejected_ops, 80 - capacity);
+    assert_eq!(limiter.get(k), capacity);
 }
 
 #[test]
@@ -763,16 +758,11 @@ fn volume_batch_increment_matches_expected_volumes_under_local_semantics() {
         &mut rejected_ops,
     );
 
-    assert!(
-        accepted_volume >= capacity,
-        "accepted_volume={accepted_volume} capacity={capacity}"
-    );
-    assert!(
-        accepted_volume <= capacity + 2,
-        "accepted_volume={accepted_volume} capacity={capacity}"
-    );
-    assert_eq!(accepted_volume + rejected_volume, 12);
-    assert_eq!(allowed_ops + rejected_ops, 3);
+    assert_eq!(accepted_volume, 11);
+    assert_eq!(rejected_volume, 1);
+    assert_eq!(allowed_ops, 2);
+    assert_eq!(rejected_ops, 1);
+    assert_eq!(limiter.get(k), 11);
 }
 
 #[test]
@@ -805,6 +795,7 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
         rejected_ops += 1;
     }
     assert_eq!(rejected_ops, 20);
+    assert_eq!(limiter.get(k), capacity, "rejections must not consume");
 
     thread::sleep(Duration::from_millis(1100));
 
@@ -818,6 +809,7 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
         accepted_after_expiry += 1;
     }
     assert_eq!(accepted_after_expiry, capacity);
+    assert_eq!(limiter.get(k), capacity);
 }
 
 #[test]
@@ -843,6 +835,7 @@ fn volume_non_integer_rate_uses_truncating_capacity() {
         matches!(decision, RateLimitDecision::Rejected { .. }),
         "decision: {decision:?}"
     );
+    assert_eq!(limiter.get(k), capacity);
 }
 
 #[test]
@@ -867,27 +860,44 @@ fn get_returns_current_window_total() {
 }
 
 #[test]
-fn get_ignores_expired_buckets() {
+fn get_excludes_and_evicts_expired_buckets() {
     let window_size_seconds = 1_u64;
     let limiter = limiter(window_size_seconds, 50);
     let rate_limit = RateLimit::try_from(100f64).unwrap();
 
-    // One bucket well past the 1s window, one recent bucket.
-    insert_series(&limiter, "k", rate_limit, &[(5, 2_000), (3, 100)]);
+    assert!(matches!(
+        limiter.inc("k2", &rate_limit, 5),
+        RateLimitDecision::Allowed
+    ));
+    assert!(matches!(
+        limiter.inc("k", &rate_limit, 5),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(200));
+    assert!(matches!(
+        limiter.inc("k", &rate_limit, 3),
+        RateLimitDecision::Allowed
+    ));
+
+    // The first bucket for `k` and the only bucket for `k2` expire while the
+    // second bucket for `k` remains live.
+    thread::sleep(Duration::from_millis(850));
 
     assert_eq!(limiter.get("k"), 3, "expired bucket must be ignored");
     {
         let series = limiter.series().get("k").expect("series should remain");
-        assert_eq!(series.series.len(), 2, "get must not evict history");
-        assert_eq!(series.total.load(Ordering::Relaxed), 8);
+        assert_eq!(series.series.len(), 1, "expired history must be evicted");
+        assert_eq!(
+            series.series.front().unwrap().count.load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(series.total.load(Ordering::Relaxed), 3);
     }
 
-    // Only the expired bucket for this key.
-    insert_series(&limiter, "k2", rate_limit, &[(5, 2_000)]);
     assert_eq!(limiter.get("k2"), 0);
     let series = limiter.series().get("k2").expect("series should remain");
-    assert_eq!(series.series.len(), 1, "get must not evict history");
-    assert_eq!(series.total.load(Ordering::Relaxed), 5);
+    assert!(series.series.is_empty(), "expired history must be evicted");
+    assert_eq!(series.total.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -925,42 +935,6 @@ fn get_fresh_key_uses_shared_dashmap_lock() {
 }
 
 #[test]
-fn get_expired_key_uses_shared_dashmap_lock() {
-    let limiter = Arc::new(limiter(1, 50));
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
-    insert_series(&limiter, "k", rate_limit, &[(5, 2_000)]);
-
-    let held_read_guard = limiter.series().get("k").expect("series should exist");
-    let barrier = Arc::new(Barrier::new(2));
-    let (sender, receiver) = mpsc::channel();
-
-    let reader = {
-        let limiter = Arc::clone(&limiter);
-        let barrier = Arc::clone(&barrier);
-
-        thread::spawn(move || {
-            barrier.wait();
-            sender.send(limiter.get("k")).unwrap();
-        })
-    };
-
-    barrier.wait();
-    let result = receiver.recv_timeout(Duration::from_secs(2));
-
-    drop(held_read_guard);
-    reader.join().expect("reader thread panicked");
-
-    assert_eq!(
-        result.expect("expired-key get blocked on an existing shared DashMap guard"),
-        0
-    );
-
-    let series = limiter.series().get("k").expect("series should remain");
-    assert_eq!(series.series.len(), 1, "get must not evict history");
-    assert_eq!(series.total.load(Ordering::Relaxed), 5);
-}
-
-#[test]
 fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
     let limiter = limiter(6, 1000);
     let rate_limit = RateLimit::try_from(100f64).unwrap();
@@ -985,6 +959,14 @@ fn set_if_lt_with_lower_target_is_noop() {
 
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(50), 50);
     assert_eq!((new_total, old_total), (100, 100));
+    assert_eq!(limiter.get("k"), 100);
+    let series = limiter.series().get("k").expect("series should exist");
+    assert_eq!(series.series.len(), 1);
+    assert_eq!(
+        series.series.front().unwrap().count.load(Ordering::Relaxed),
+        100
+    );
+    assert_eq!(series.total.load(Ordering::Relaxed), 100);
 }
 
 #[test]
@@ -997,11 +979,21 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 30);
     assert_eq!((new_total, old_total), (30, 100));
     assert_eq!(limiter.get("k"), 30);
+    {
+        let series = limiter.series().get("k").expect("series should exist");
+        assert_eq!(series.series.len(), 1);
+        assert_eq!(
+            series.series.front().unwrap().count.load(Ordering::Relaxed),
+            30
+        );
+        assert_eq!(series.total.load(Ordering::Relaxed), 30);
+    }
 
-    // Overwriting to 0 clears the window entirely; admission resumes from empty.
+    // Overwriting to 0 removes the key entirely; admission resumes from empty.
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 0);
     assert_eq!((new_total, old_total), (0, 30));
     assert_eq!(limiter.get("k"), 0);
+    assert!(!limiter.series().contains_key("k"));
 
     let decision = limiter.inc("k", &rate_limit, 1);
     assert!(matches!(decision, RateLimitDecision::Allowed));
@@ -1017,6 +1009,7 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
 
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 99);
     assert_eq!((new_total, old_total), (25, 25));
+    assert_eq!(limiter.get("k"), 25);
 }
 
 #[test]
@@ -1037,6 +1030,7 @@ fn set_if_gt_and_ne_guards_follow_current_total() {
     // Ne(5): current is 3 → match.
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Ne(5), 7);
     assert_eq!((new_total, old_total), (7, 3));
+    assert_eq!(limiter.get("k"), 7);
 }
 
 #[test]
@@ -1058,12 +1052,14 @@ fn set_if_prime_then_inc_enforces_remaining_budget() {
             "i: {i}, decision: {decision:?}"
         );
     }
+    assert_eq!(limiter.get("k"), capacity);
 
     let decision = limiter.inc("k", &rate_limit, 1);
     assert!(
         matches!(decision, RateLimitDecision::Rejected { .. }),
         "decision: {decision:?}"
     );
+    assert_eq!(limiter.get("k"), capacity, "rejection must not consume");
 }
 
 #[test]
@@ -1092,6 +1088,7 @@ fn set_if_prime_at_capacity_rejects_next_inc() {
         matches!(decision, RateLimitDecision::Rejected { .. }),
         "decision: {decision:?}"
     );
+    assert_eq!(limiter.get("k"), capacity);
 }
 
 #[test]
@@ -1110,7 +1107,24 @@ fn set_if_redefines_sticky_rate_limit() {
 
     // Unlike inc (sticky limit), set_if redefines the stored limit: 6 * 10 = 60.
     let rate_ten = RateLimit::try_from(10f64).unwrap();
-    let _ = limiter.set_if("k", &rate_ten, RateLimitComparator::Nil, 0);
+    assert_eq!(
+        limiter.set_if("k", &rate_ten, RateLimitComparator::Nil, 1),
+        (1, 6)
+    );
+
+    {
+        let series = limiter.series().get("k").expect("series should remain");
+        assert_eq!(
+            series.limit, rate_ten,
+            "matched set_if must redefine the limit"
+        );
+        assert_eq!(series.series.len(), 1);
+        assert_eq!(
+            series.series.front().unwrap().count.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(series.total.load(Ordering::Relaxed), 1);
+    }
 
     // The old capacity of 6 no longer applies (the inc rate argument is still
     // ignored — the stored limit now comes from set_if).
@@ -1125,16 +1139,26 @@ fn set_if_redefines_sticky_rate_limit() {
 
 #[test]
 fn set_if_evicts_expired_buckets_before_comparing() {
-    let window_size_seconds = 6_u64;
+    let window_size_seconds = 1_u64;
     let limiter = limiter(window_size_seconds, 1000);
     let rate_limit = RateLimit::try_from(100f64).unwrap();
 
-    // A stale bucket outside the 6s window.
-    insert_series(&limiter, "k", rate_limit, &[(50, 7_000)]);
+    assert!(matches!(
+        limiter.inc("k", &rate_limit, 50),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(1_100));
 
     // Eq(0) must observe the post-eviction total.
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 9);
     assert_eq!((new_total, old_total), (9, 0));
+    let series = limiter.series().get("k").expect("series should exist");
+    assert_eq!(series.series.len(), 1);
+    assert_eq!(
+        series.series.front().unwrap().count.load(Ordering::Relaxed),
+        9
+    );
+    assert_eq!(series.total.load(Ordering::Relaxed), 9);
 }
 
 #[test]
@@ -1152,7 +1176,20 @@ fn set_if_unmatched_guard_on_unknown_key_writes_no_counts() {
 fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
     let limiter = limiter(10, 1);
     let rate = RateLimit::try_from(100f64).unwrap();
-    insert_series(&limiter, "k", rate, &[(4, 3_000), (5, 2_000), (6, 1_000)]);
+    assert!(matches!(
+        limiter.inc("k", &rate, 4),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(5));
+    assert!(matches!(
+        limiter.inc("k", &rate, 5),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(5));
+    assert!(matches!(
+        limiter.inc("k", &rate, 6),
+        RateLimitDecision::Allowed
+    ));
 
     let result = limiter.set_if_preserve_history(
         "k",
@@ -1167,9 +1204,11 @@ fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
     let counts = series
         .series
         .iter()
-        .map(|bucket| bucket.count.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Relaxed))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![2, 6]);
+    assert_eq!(series.total.load(Ordering::Relaxed), 8);
+    assert_eq!(series.limit, rate);
     drop(series);
 
     let result = limiter.set_if_preserve_history(
@@ -1184,16 +1223,30 @@ fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
     let counts = series
         .series
         .iter()
-        .map(|bucket| bucket.count.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Relaxed))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![2, 9]);
+    assert_eq!(series.total.load(Ordering::Relaxed), 11);
 }
 
 #[test]
 fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
     let limiter = limiter(10, 1);
     let rate = RateLimit::try_from(100f64).unwrap();
-    insert_series(&limiter, "k", rate, &[(4, 3_000), (5, 2_000), (6, 1_000)]);
+    assert!(matches!(
+        limiter.inc("k", &rate, 4),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(5));
+    assert!(matches!(
+        limiter.inc("k", &rate, 5),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(5));
+    assert!(matches!(
+        limiter.inc("k", &rate, 6),
+        RateLimitDecision::Allowed
+    ));
 
     assert_eq!(
         limiter.set_if_preserve_history(
@@ -1209,9 +1262,11 @@ fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
     let counts = series
         .series
         .iter()
-        .map(|bucket| bucket.count.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Relaxed))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![4, 4]);
+    assert_eq!(series.total.load(Ordering::Relaxed), 8);
+    assert_eq!(series.limit, rate);
     drop(series);
 
     assert_eq!(
@@ -1228,9 +1283,120 @@ fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
     let counts = series
         .series
         .iter()
-        .map(|bucket| bucket.count.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Relaxed))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![7, 4]);
+    assert_eq!(series.total.load(Ordering::Relaxed), 11);
+}
+
+#[test]
+fn set_if_preserve_history_redefines_limit_even_when_total_is_unchanged() {
+    let limiter = limiter(6, 1);
+    let old_rate = RateLimit::try_from(1f64).unwrap();
+    let new_rate = RateLimit::try_from(10f64).unwrap();
+    assert!(matches!(
+        limiter.inc("k", &old_rate, 2),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(5));
+    assert!(matches!(
+        limiter.inc("k", &old_rate, 3),
+        RateLimitDecision::Allowed
+    ));
+
+    assert_eq!(
+        limiter.set_if_preserve_history(
+            "k",
+            &new_rate,
+            RateLimitComparator::Eq(5),
+            5,
+            HistoryPreservation::PreserveNewest,
+        ),
+        (5, 5)
+    );
+
+    let series = limiter.series().get("k").expect("series should exist");
+    assert_eq!(
+        series.limit, new_rate,
+        "matched preserve must redefine the limit"
+    );
+    let counts = series
+        .series
+        .iter()
+        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    assert_eq!(counts, vec![2, 3], "unchanged total must preserve history");
+    assert_eq!(series.total.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn set_if_preserve_history_prunes_expired_before_directional_reduction() {
+    let limiter = limiter(1, 1);
+    let rate = RateLimit::try_from(100f64).unwrap();
+    assert!(matches!(
+        limiter.inc("k", &rate, 4),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(200));
+    assert!(matches!(
+        limiter.inc("k", &rate, 5),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(200));
+    assert!(matches!(
+        limiter.inc("k", &rate, 6),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(700));
+
+    assert_eq!(
+        limiter.set_if_preserve_history(
+            "k",
+            &rate,
+            RateLimitComparator::Eq(11),
+            8,
+            HistoryPreservation::PreserveNewest,
+        ),
+        (8, 11)
+    );
+
+    let series = limiter.series().get("k").expect("series should exist");
+    let counts = series
+        .series
+        .iter()
+        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    assert_eq!(counts, vec![2, 6]);
+    assert_eq!(series.total.load(Ordering::Relaxed), 8);
+}
+
+#[test]
+fn set_if_preserve_history_zero_removes_key() {
+    let limiter = limiter(10, 1);
+    let rate = RateLimit::try_from(100f64).unwrap();
+    assert!(matches!(
+        limiter.inc("k", &rate, 4),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(5));
+    assert!(matches!(
+        limiter.inc("k", &rate, 5),
+        RateLimitDecision::Allowed
+    ));
+
+    assert_eq!(
+        limiter.set_if_preserve_history(
+            "k",
+            &rate,
+            RateLimitComparator::Nil,
+            0,
+            HistoryPreservation::PreserveOldest,
+        ),
+        (0, 9)
+    );
+
+    assert_eq!(limiter.get("k"), 0);
+    assert!(!limiter.series().contains_key("k"));
 }
 
 #[test]
@@ -1255,7 +1421,14 @@ fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
                 10,
                 HistoryPreservation::PreserveNewest,
             );
-            sender.send((replace, preserve)).unwrap();
+            let unchanged = limiter.set_if_preserve_history(
+                "k",
+                &rate,
+                RateLimitComparator::Eq(3),
+                3,
+                HistoryPreservation::PreserveNewest,
+            );
+            sender.send((replace, preserve, unchanged)).unwrap();
         })
     };
 
@@ -1263,7 +1436,68 @@ fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
     let result = receiver.recv_timeout(Duration::from_secs(2));
     drop(held_read_guard);
     worker.join().unwrap();
-    assert_eq!(result.unwrap(), ((3, 3), (3, 3)));
+    assert_eq!(result.unwrap(), ((3, 3), (3, 3), (3, 3)));
+
+    let series = limiter.series().get("k").expect("series should exist");
+    assert_eq!(series.series.len(), 1);
+    assert_eq!(
+        series.series.front().unwrap().count.load(Ordering::Relaxed),
+        3
+    );
+    assert_eq!(series.total.load(Ordering::Relaxed), 3);
+    assert_eq!(series.limit, rate);
+}
+
+#[test]
+fn conditional_set_guard_miss_does_not_evict_expired_history_or_take_write_lock() {
+    let limiter = Arc::new(limiter(1, 1));
+    let rate = RateLimit::try_from(100f64).unwrap();
+    assert!(matches!(
+        limiter.inc("k", &rate, 5),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(200));
+    assert!(matches!(
+        limiter.inc("k", &rate, 3),
+        RateLimitDecision::Allowed
+    ));
+    thread::sleep(Duration::from_millis(850));
+
+    let held_read_guard = limiter.series().get("k").expect("series should exist");
+    let barrier = Arc::new(Barrier::new(2));
+    let (sender, receiver) = mpsc::channel();
+
+    let worker = {
+        let limiter = Arc::clone(&limiter);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            sender
+                .send(limiter.set_if("k", &rate, RateLimitComparator::Eq(99), 10))
+                .unwrap();
+        })
+    };
+
+    barrier.wait();
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+    drop(held_read_guard);
+    worker.join().expect("worker thread panicked");
+
+    let series = limiter.series().get("k").expect("series should remain");
+    assert_eq!(series.series.len(), 2, "guard miss must not evict history");
+    let counts = series
+        .series
+        .iter()
+        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    assert_eq!(counts, vec![5, 3]);
+    assert_eq!(series.total.load(Ordering::Relaxed), 8);
+    drop(series);
+
+    assert_eq!(
+        result.expect("guard miss blocked on an existing shared DashMap guard"),
+        (3, 3)
+    );
 }
 
 #[test]
@@ -1286,4 +1520,70 @@ fn conditional_set_missing_zero_leaves_key_absent() {
         (0, 0)
     );
     assert!(limiter.series().is_empty());
+}
+
+#[test]
+fn conditional_set_present_zero_removes_key() {
+    let limiter = limiter(6, 1);
+    let rate = RateLimit::try_from(100f64).unwrap();
+
+    assert!(matches!(
+        limiter.inc("replace", &rate, 3),
+        RateLimitDecision::Allowed
+    ));
+    assert!(matches!(
+        limiter.inc("preserve", &rate, 4),
+        RateLimitDecision::Allowed
+    ));
+
+    assert_eq!(
+        limiter.set_if("replace", &rate, RateLimitComparator::Nil, 0),
+        (0, 3)
+    );
+    assert_eq!(
+        limiter.set_if_preserve_history(
+            "preserve",
+            &rate,
+            RateLimitComparator::Nil,
+            0,
+            HistoryPreservation::PreserveNewest,
+        ),
+        (0, 4)
+    );
+
+    assert_eq!(limiter.get("replace"), 0);
+    assert_eq!(limiter.get("preserve"), 0);
+    assert!(!limiter.series().contains_key("replace"));
+    assert!(!limiter.series().contains_key("preserve"));
+}
+
+#[test]
+fn set_if_preserve_history_creates_missing_positive_target_for_both_directions() {
+    let limiter = limiter(6, 1);
+    let rate = RateLimit::try_from(100f64).unwrap();
+
+    for (key, preservation) in [
+        ("newest", HistoryPreservation::PreserveNewest),
+        ("oldest", HistoryPreservation::PreserveOldest),
+    ] {
+        assert_eq!(
+            limiter.set_if_preserve_history(
+                key,
+                &rate,
+                RateLimitComparator::Eq(0),
+                9,
+                preservation,
+            ),
+            (9, 0)
+        );
+
+        let series = limiter.series().get(key).expect("series should be created");
+        assert_eq!(series.limit, rate);
+        assert_eq!(series.series.len(), 1);
+        assert_eq!(
+            series.series.front().unwrap().count.load(Ordering::Relaxed),
+            9
+        );
+        assert_eq!(series.total.load(Ordering::Relaxed), 9);
+    }
 }
