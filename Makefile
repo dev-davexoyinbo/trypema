@@ -1,6 +1,6 @@
 .PHONY: \
 	test-redis test-redis-tokio test-redis-smol test redis-up redis-up-test redis-up-compare redis-down \
-	bench-local bench-redis bench-redis-tokio bench-redis-smol bench \
+	bench-local bench-redis bench-redis-tokio bench-redis-smol bench-hybrid bench-hybrid-tokio bench-hybrid-smol bench \
 	sanity sanity-noredis sanity-redis-tokio sanity-redis-smol \
 	stress \
 	stress-local stress-redis stress-hybrid \
@@ -89,7 +89,11 @@ sanity-redis-tokio: ## Run tests + benches with Redis (tokio)
 	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_absolute; \
 	sleep 10; \
-	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_suppressed
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_suppressed; \
+	sleep 10; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench hybrid_absolute; \
+	sleep 10; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench hybrid_suppressed
 
 sanity-redis-smol: ## Run tests + benches with Redis (smol)
 	@set -e; \
@@ -102,7 +106,11 @@ sanity-redis-smol: ## Run tests + benches with Redis (smol)
 	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench redis_absolute; \
 	sleep 10; \
-	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench redis_suppressed
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench redis_suppressed; \
+	sleep 10; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench hybrid_absolute; \
+	sleep 10; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench hybrid_suppressed
 
 bench-local: ## Run local benches (no Redis)
 	@cargo bench -p trypema --bench local_absolute
@@ -117,16 +125,37 @@ bench-redis: ## Run Redis benches (tokio + smol)
 	REDIS_URL="$(REDIS_URL)" $(MAKE) -s bench-redis-smol
 
 bench-redis-tokio: ## Run Redis benches (tokio)
-	@REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_absolute; \
+	@set -e; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_absolute; \
 	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_suppressed
 
 bench-redis-smol: ## Run Redis benches (smol)
-	@REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench redis_absolute; \
+	@set -e; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench redis_absolute; \
 	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench redis_suppressed
 
-bench: bench-local bench-redis ## Run all benches (local + redis)
+bench-hybrid: ## Run hybrid benches (tokio + smol)
+	@set -e; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
+	REDIS_URL="$(REDIS_URL)" $(MAKE) -s bench-hybrid-tokio; \
+	REDIS_URL="$(REDIS_URL)" $(MAKE) -s bench-hybrid-smol
+
+bench-hybrid-tokio: ## Run hybrid benches (tokio)
+	@set -e; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench hybrid_absolute; \
+	sleep 10; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench hybrid_suppressed
+
+bench-hybrid-smol: ## Run hybrid benches (smol)
+	@set -e; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench hybrid_absolute; \
+	sleep 10; \
+	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench hybrid_suppressed
+
+bench: bench-local bench-redis bench-hybrid ## Run all benches
 
 stress-help: ## Show stress harness CLI help
 	@cargo run -p trypema-stress -- --help
