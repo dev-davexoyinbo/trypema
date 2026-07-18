@@ -228,7 +228,7 @@ impl RateLimiter {
         stale_after_ms: u64,
         cleanup_interval_ms: u64,
     ) {
-        if self.is_loop_running.swap(true, Ordering::SeqCst) {
+        if self.is_loop_running.swap(true, Ordering::AcqRel) {
             return;
         }
 
@@ -246,7 +246,7 @@ impl RateLimiter {
                         break;
                     };
 
-                    if !rl.is_loop_running.load(Ordering::SeqCst) {
+                    if !rl.is_loop_running.load(Ordering::Acquire) {
                         break;
                     }
 
@@ -273,7 +273,7 @@ impl RateLimiter {
                         break;
                     };
 
-                    if !rl.is_loop_running.load(Ordering::SeqCst) {
+                    if !rl.is_loop_running.load(Ordering::Acquire) {
                         break;
                     }
 
@@ -297,7 +297,7 @@ impl RateLimiter {
     ///
     /// Stopping is best-effort and asynchronous: background tasks will exit on their next check/tick.
     pub fn stop_cleanup_loop(&self) {
-        self.is_loop_running.store(false, Ordering::SeqCst);
+        self.is_loop_running.store(false, Ordering::Release);
     } // end method stop_cleanup_loop
 
     /// Access the Redis provider for distributed rate limiting.

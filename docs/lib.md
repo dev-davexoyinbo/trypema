@@ -75,6 +75,8 @@ features are enabled.
 [`RateLimitDecision`](crate::RateLimitDecision) is the result returned by methods such as
 [`AbsoluteLocalRateLimiter::inc`](crate::AbsoluteLocalRateLimiter::inc) and
 [`AbsoluteLocalRateLimiter::is_allowed`](crate::AbsoluteLocalRateLimiter::is_allowed), and
+[`SuppressedRateLimitSnapshot`](crate::SuppressedRateLimitSnapshot) is returned by `get` on every
+suppressed provider.
 [`RateLimiter`](crate::RateLimiter) is the top-level entry point used throughout the examples.
 
 ```rust
@@ -252,16 +254,73 @@ assert!(matches!(
 ));
 ```
 
+### Read and Conditionally Adjust Current Totals
+
+Every strategy exposes `get`. Absolute strategies return the live sliding-window total directly.
+Suppressed strategies return a [`SuppressedRateLimitSnapshot`](crate::SuppressedRateLimitSnapshot)
+containing the observed total, declined total, and current suppression factor. Unknown keys return
+zero-valued results without creating limiter state. A read may lazily evict expired buckets and
+repair stored totals; hybrid snapshots also include pending increments and declines from the
+current instance.
+
+Use [`AbsoluteLocalRateLimiter::set_if`](crate::AbsoluteLocalRateLimiter::set_if) to replace a
+total only when a [`RateLimitComparator`](crate::RateLimitComparator) matches the current live
+total. A comparator miss is a true no-op: it does not prune history, redefine the limit, refresh a
+TTL, or invalidate suppression metadata. A match replaces history, recomputes the stored window
+limit (the hard window limit for suppressed strategies) from the supplied rate limit, and returns
+`(new_total, old_total)`. Setting a present key to zero deletes its state; setting a missing key to
+zero leaves it absent.
+
+[`AbsoluteLocalRateLimiter::set_if_preserve_history`](crate::AbsoluteLocalRateLimiter::set_if_preserve_history)
+has the same comparator and return contract but retains sliding-window history. With
+[`HistoryPreservation::PreserveNewest`](crate::HistoryPreservation::PreserveNewest), reductions
+consume oldest buckets and increases extend the newest bucket. `PreserveOldest` does the reverse.
+The same synchronous methods are available on the suppressed local strategy, and asynchronous
+equivalents are available on Redis and hybrid strategies when a Redis feature is enabled.
+
+```rust
+# let rl = trypema::__doctest_helpers::rate_limiter();
+use trypema::{HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision};
+
+let limiter = rl.local().absolute();
+let rate = RateLimit::try_from(10.0).unwrap();
+assert!(matches!(limiter.inc("user_123", &rate, 2), RateLimitDecision::Allowed));
+assert_eq!(limiter.get("user_123"), 2);
+
+assert_eq!(
+    limiter.set_if("user_123", &rate, RateLimitComparator::Eq(2), 5),
+    (5, 2)
+);
+assert_eq!(
+    limiter.set_if_preserve_history(
+        "user_123",
+        &rate,
+        RateLimitComparator::Nil,
+        3,
+        HistoryPreservation::PreserveNewest,
+    ),
+    (3, 5)
+);
+assert_eq!(
+    limiter.set_if("user_123", &rate, RateLimitComparator::Nil, 0),
+    (0, 3)
+);
+assert_eq!(limiter.get("user_123"), 0);
+```
+
 ### Read Current Suppression State
 
-Use [`SuppressedLocalRateLimiter::get_suppression_factor`](crate::SuppressedLocalRateLimiter::get_suppression_factor)
-to inspect suppression state without recording a request.
+Use [`SuppressedLocalRateLimiter::get`](crate::SuppressedLocalRateLimiter::get) to inspect all
+suppression state without recording a request. `get_suppression_factor` remains available when
+only the factor is needed.
 
 ```rust
 # let rl = trypema::__doctest_helpers::rate_limiter();
 
-let sf = rl.local().suppressed().get_suppression_factor("user_123");
-assert_eq!(sf, 0.0);
+let snapshot = rl.local().suppressed().get("user_123");
+assert_eq!(snapshot.total, 0);
+assert_eq!(snapshot.total_declined, 0);
+assert_eq!(snapshot.suppression_factor, 0.0);
 ```
 
 ### Redis Absolute
@@ -288,8 +347,8 @@ assert!(matches!(
 
 ### Redis Suppressed State
 
-Use `SuppressedRedisRateLimiter::get_suppression_factor` to inspect suppression state for a
-Redis-backed key.
+Use `SuppressedRedisRateLimiter::get` to inspect suppression state for a Redis-backed key in one
+atomic Redis operation.
 
 ```rust
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -299,7 +358,10 @@ use trypema::redis::RedisKey;
 
 let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
 
-assert_eq!(rl.redis().suppressed().get_suppression_factor(&key).await.unwrap(), 0.0);
+let snapshot = rl.redis().suppressed().get(&key).await.unwrap();
+assert_eq!(snapshot.total, 0);
+assert_eq!(snapshot.total_declined, 0);
+assert_eq!(snapshot.suppression_factor, 0.0);
 # });
 # }
 ```
@@ -355,8 +417,8 @@ values reduce overhead but make timing less precise.
 ### Sticky Per-Key Limits
 
 The first [`AbsoluteLocalRateLimiter::inc`](crate::AbsoluteLocalRateLimiter::inc) call for a key
-stores that key's rate limit. Later calls for the same key reuse the stored limit so concurrent
-callers cannot race different limits into the same state.
+computes and stores that key's window limit. Later calls for the same key reuse the stored
+window limit so concurrent callers cannot race different limits into the same state.
 
 ### Best-Effort Distributed Limiting
 

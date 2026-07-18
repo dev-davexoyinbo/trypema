@@ -24,10 +24,18 @@ use std::{
 
 use crate::TrypemaError;
 
+/// Hash builder used by Trypema's internal concurrent maps.
+///
+/// AHash is the default because these maps are private, hot-path data structures. Alternatives
+/// include the standard library's `std::collections::hash_map::RandomState` when stronger
+/// adversarial collision resistance is preferred, or another `BuildHasher` selected after
+/// representative performance and security evaluation.
+pub(crate) type RandomState = ahash::RandomState;
+
 #[derive(Debug)]
-pub(crate) struct InstantRate {
+pub(crate) struct Bucket {
     pub count: AtomicU64,
-    pub declined: AtomicU64,
+    pub declined_count: AtomicU64,
     pub timestamp: Instant,
 }
 

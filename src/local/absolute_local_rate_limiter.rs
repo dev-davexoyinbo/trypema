@@ -4,13 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahash::RandomState;
 use dashmap::{DashMap, mapref::entry::Entry};
 
 use crate::{
     HistoryPreservation, LocalRateLimiterOptions, RateLimitComparator,
     common::{
-        HistoryUpdateMode, InstantRate, RateGroupSizeMs, RateLimit, RateLimitDecision,
+        Bucket, HistoryUpdateMode, RandomState, RateGroupSizeMs, RateLimit, RateLimitDecision,
         WindowSizeSeconds,
     },
 };
@@ -18,16 +17,16 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct RateLimitSeries {
     pub window_limit: f64,
-    pub series: VecDeque<InstantRate>,
-    pub total: AtomicU64,
+    pub buckets: VecDeque<Bucket>,
+    pub total_count: AtomicU64,
 }
 
 impl RateLimitSeries {
     pub fn new(window_limit: f64) -> Self {
         Self {
             window_limit,
-            series: VecDeque::new(),
-            total: AtomicU64::new(0),
+            buckets: VecDeque::new(),
+            total_count: AtomicU64::new(0),
         }
     }
 }
@@ -175,10 +174,10 @@ impl AbsoluteLocalRateLimiter {
     /// assert!(matches!(limiter.inc("user_456", &rate, 10), RateLimitDecision::Allowed));
     /// ```
     pub fn inc(&self, key: &str, rate_limit: &RateLimit, count: u64) -> RateLimitDecision {
-        let is_allowed = self.is_allowed(key);
+        let decision = self.is_allowed(key);
 
-        if !matches!(is_allowed, RateLimitDecision::Allowed) {
-            return is_allowed;
+        if !matches!(decision, RateLimitDecision::Allowed) {
+            return decision;
         }
 
         let series = match self.series.get(key) {
@@ -192,25 +191,25 @@ impl AbsoluteLocalRateLimiter {
                 .downgrade(),
         };
 
-        if let Some(last_entry) = series.series.back()
-            && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
+        if let Some(latest_bucket) = series.buckets.back()
+            && latest_bucket.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
         {
-            last_entry.count.fetch_add(count, Ordering::Relaxed);
-            series.total.fetch_add(count, Ordering::Relaxed);
+            latest_bucket.count.fetch_add(count, Ordering::AcqRel);
+            series.total_count.fetch_add(count, Ordering::AcqRel);
         } else {
             drop(series);
 
-            let mut rate_limit_series = self.series.entry(key.to_string()).or_insert_with(|| {
+            let mut series = self.series.entry(key.to_string()).or_insert_with(|| {
                 RateLimitSeries::new(**rate_limit * *self.window_size_seconds as f64)
             });
 
-            rate_limit_series.series.push_back(InstantRate {
+            series.buckets.push_back(Bucket {
                 count: count.into(),
                 timestamp: Instant::now(),
-                declined: AtomicU64::new(0),
+                declined_count: AtomicU64::new(0),
             });
 
-            rate_limit_series.total.fetch_add(count, Ordering::Relaxed);
+            series.total_count.fetch_add(count, Ordering::AcqRel);
         }
 
         RateLimitDecision::Allowed
@@ -271,21 +270,21 @@ impl AbsoluteLocalRateLimiter {
             return RateLimitDecision::Allowed;
         };
 
-        let total_count = series.total.load(Ordering::Relaxed);
+        let total_count = series.total_count.load(Ordering::Acquire);
 
         if total_count < series.window_limit as u64 {
             return RateLimitDecision::Allowed;
         }
 
-        let (retry_after_ms, remaining_after_waiting) = match series.series.front() {
+        let (retry_after_ms, remaining_after_waiting) = match series.buckets.front() {
             None => (0, 0),
-            Some(instant_rate)
-                if instant_rate.timestamp.elapsed().as_millis() <= self.window_size_ms =>
+            Some(oldest_bucket)
+                if oldest_bucket.timestamp.elapsed().as_millis() <= self.window_size_ms =>
             {
-                let elapsed_ms = instant_rate.timestamp.elapsed().as_millis();
+                let elapsed_ms = oldest_bucket.timestamp.elapsed().as_millis();
                 (
                     self.window_size_ms.saturating_sub(elapsed_ms),
-                    instant_rate.count.load(Ordering::Relaxed),
+                    oldest_bucket.count.load(Ordering::Acquire),
                 )
             }
             Some(_) => {
@@ -302,13 +301,13 @@ impl AbsoluteLocalRateLimiter {
                 }
 
                 let (elapsed_ms, count) = series
-                    .series
+                    .buckets
                     .front()
-                    .map(|i| {
+                    .map(|bucket| {
                         (
                             self.window_size_ms
-                                .saturating_sub(i.timestamp.elapsed().as_millis()),
-                            i.count.load(Ordering::Relaxed),
+                                .saturating_sub(bucket.timestamp.elapsed().as_millis()),
+                            bucket.count.load(Ordering::Acquire),
                         )
                     })
                     .unwrap_or((0, 0));
@@ -329,20 +328,20 @@ impl AbsoluteLocalRateLimiter {
         let now = Instant::now();
 
         let split = series
-            .series
-            .partition_point(|r| now.duration_since(r.timestamp) > window_duration);
+            .buckets
+            .partition_point(|bucket| now.duration_since(bucket.timestamp) > window_duration);
 
         if split == 0 {
-            return series.total.load(Ordering::Relaxed);
+            return series.total_count.load(Ordering::Acquire);
         }
 
         let drained = series
-            .series
+            .buckets
             .drain(..split)
-            .map(|r| r.count.load(Ordering::Relaxed))
+            .map(|bucket| bucket.count.load(Ordering::Acquire))
             .sum::<u64>();
 
-        let prev = series.total.fetch_sub(drained, Ordering::Relaxed);
+        let prev = series.total_count.fetch_sub(drained, Ordering::AcqRel);
 
         prev - drained
     } // end fn evict_expired
@@ -350,21 +349,21 @@ impl AbsoluteLocalRateLimiter {
     fn inspect_live_total(series: &RateLimitSeries, window_duration: Duration) -> (u64, bool) {
         let now = Instant::now();
         let split = series
-            .series
+            .buckets
             .partition_point(|bucket| now.duration_since(bucket.timestamp) > window_duration);
 
         if split == 0 {
-            return (series.total.load(Ordering::Relaxed), false);
+            return (series.total_count.load(Ordering::Acquire), false);
         }
 
-        let total = series
-            .series
+        let total_count = series
+            .buckets
             .iter()
             .skip(split)
-            .map(|bucket| bucket.count.load(Ordering::Relaxed))
+            .map(|bucket| bucket.count.load(Ordering::Acquire))
             .sum();
 
-        (total, true)
+        (total_count, true)
     }
 
     fn live_total(&self, key: &str) -> u64 {
@@ -478,27 +477,27 @@ impl AbsoluteLocalRateLimiter {
     ) {
         match mode {
             HistoryUpdateMode::Replace => {
-                series.series.clear();
-                series.series.push_back(InstantRate {
+                series.buckets.clear();
+                series.buckets.push_back(Bucket {
                     count: count.into(),
                     timestamp: Instant::now(),
-                    declined: AtomicU64::new(0),
+                    declined_count: AtomicU64::new(0),
                 });
             }
             HistoryUpdateMode::Preserve(preservation) if count > old_total => {
                 let delta = count - old_total;
                 let bucket = match preservation {
-                    HistoryPreservation::PreserveNewest => series.series.back(),
-                    HistoryPreservation::PreserveOldest => series.series.front(),
+                    HistoryPreservation::PreserveNewest => series.buckets.back(),
+                    HistoryPreservation::PreserveOldest => series.buckets.front(),
                 };
 
                 if let Some(bucket) = bucket {
-                    bucket.count.fetch_add(delta, Ordering::Relaxed);
+                    bucket.count.fetch_add(delta, Ordering::AcqRel);
                 } else {
-                    series.series.push_back(InstantRate {
+                    series.buckets.push_back(Bucket {
                         count: delta.into(),
                         timestamp: Instant::now(),
-                        declined: AtomicU64::new(0),
+                        declined_count: AtomicU64::new(0),
                     });
                 }
             }
@@ -507,29 +506,29 @@ impl AbsoluteLocalRateLimiter {
 
                 while to_remove > 0 {
                     let bucket = match preservation {
-                        HistoryPreservation::PreserveNewest => series.series.front(),
-                        HistoryPreservation::PreserveOldest => series.series.back(),
+                        HistoryPreservation::PreserveNewest => series.buckets.front(),
+                        HistoryPreservation::PreserveOldest => series.buckets.back(),
                     };
 
                     let Some(bucket) = bucket else {
                         break;
                     };
 
-                    let bucket_count = bucket.count.load(Ordering::Relaxed);
+                    let bucket_count = bucket.count.load(Ordering::Acquire);
 
                     if bucket_count <= to_remove {
                         to_remove -= bucket_count;
 
                         match preservation {
                             HistoryPreservation::PreserveNewest => {
-                                series.series.pop_front();
+                                series.buckets.pop_front();
                             }
                             HistoryPreservation::PreserveOldest => {
-                                series.series.pop_back();
+                                series.buckets.pop_back();
                             }
                         }
                     } else {
-                        bucket.count.fetch_sub(to_remove, Ordering::Relaxed);
+                        bucket.count.fetch_sub(to_remove, Ordering::AcqRel);
                         to_remove = 0;
                     }
                 }
@@ -537,7 +536,7 @@ impl AbsoluteLocalRateLimiter {
             HistoryUpdateMode::Preserve(_) => {}
         }
 
-        series.total.store(count, Ordering::Relaxed);
+        series.total_count.store(count, Ordering::Release);
     }
 
     /// Current live window total for `key`.
@@ -647,16 +646,14 @@ impl AbsoluteLocalRateLimiter {
     } // end method set_if_preserve_history
 
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {
-        self.series.retain(
-            |_, rate_limit_series| match rate_limit_series.series.back() {
-                None => false,
-                Some(instant_rate)
-                    if instant_rate.timestamp.elapsed().as_millis() > stale_after_ms as u128 =>
-                {
-                    false
-                }
-                Some(_) => true,
-            },
-        );
+        self.series.retain(|_, series| match series.buckets.back() {
+            None => false,
+            Some(latest_bucket)
+                if latest_bucket.timestamp.elapsed().as_millis() > stale_after_ms as u128 =>
+            {
+                false
+            }
+            Some(_) => true,
+        });
     } // end method cleanup
-} // end of impl
+} // end impl

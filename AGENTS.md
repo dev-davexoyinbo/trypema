@@ -3,6 +3,10 @@
 This file applies to the entire repository. It records the behavioral, concurrency, testing,
 benchmarking, and workflow rules that must be preserved when changing Trypema.
 
+Read `CONVENTIONS.md` alongside this file. `AGENTS.md` owns behavioral contracts, workflow, and
+verification requirements; `CONVENTIONS.md` is the canonical guide for code organization,
+naming, API shape, source style, tests, benchmarks, Lua, and documentation.
+
 The words **must**, **must not**, **should**, and **should not** are intentional. If current code
 appears to disagree with this guide, first inspect the most recent commits and tests. Do not
 silently weaken a test or change a contract merely to make the current implementation pass.
@@ -45,13 +49,14 @@ Trypema has two rate-limiting strategies across three providers:
 Supporting areas:
 
 - Shared public types and comparator/history enums: `src/common.rs`
-- Shared Redis Lua and Redis helpers: `src/redis/common.rs`
+- Redis Lua scripts: `src/redis/scripts.rs`
+- Shared Redis types and Rust helpers: `src/redis/common.rs`
 - Hybrid Redis proxies and commit coordination: `src/hybrid/`
 - Unit/integration tests: `src/tests/`
 - Criterion benchmarks: `benches/`
 - Stress harness: `stress/`
 - Canonical docs.rs content: `docs/lib.md`
-- Documentation conventions: `docs/conventions.md`
+- Code and documentation conventions: `CONVENTIONS.md`
 - Benchmark documentation: `BENCH.md`
 
 Feature rules:
@@ -100,14 +105,28 @@ Naming and initialization are part of this contract:
   particular, do not calculate it before a comparator guard can return, before a missing-key path
   has decided to insert, or at the start of a method when only one later branch uses it.
 - Prefer direct field access for one-use reads, such as
-  `total < series.window_limit as u64` or
-  `total >= series.hard_window_limit as u64`. Do not introduce a separate local merely to rename
+  `total_count < series.window_limit as u64` or
+  `total_count >= series.hard_window_limit as u64`. Do not introduce a separate local merely to rename
   a directly accessible field.
 - A local copy is appropriate when the value is used more than once, is derived further, is read
   through a mutex, must survive dropping a DashMap guard, or materially improves a multi-step
   calculation. Keep that local immediately before its first use.
 - Put missing-key calculations inside `or_insert_with` so they are not performed when a racing
   thread has already inserted the key.
+- The internal timestamped history type is `Bucket`, and the deque in `RateLimitSeries` is
+  `buckets`. Bind `buckets.back()` as `latest_bucket` and `buckets.front()` as `oldest_bucket`.
+  Use `bucket` when a branch dynamically chooses between the front and back. Do not reintroduce
+  `InstantRate`, `instant_rate`, `last_bucket`, or ambiguous element names.
+- Internal count fields and locals use a descriptive `_count` suffix. The increment argument and
+  `Bucket::count` remain exactly `count`. Existing public fields, including suppressed snapshot
+  `total` and `total_declined`, remain source-compatible.
+- Always name a per-key series reference or DashMap guard `series`. Shadow it when transitioning
+  between shared, mutable, entry, and downgraded guards rather than introducing
+  `rate_limit_series`, `series_guard`, or `series_entry`.
+- Name `RateLimitDecision` values `decision`; reserve `is_*` and `should_*` locals for booleans.
+- Keep the public `RateGroupSizeMs` and `rate_group_size_ms` configuration names. Internal state
+  for a concrete bucket uses `_bucket_`, such as `oldest_bucket_ttl` and
+  `oldest_bucket_count`.
 
 ### 3.2 Public read behavior
 
@@ -207,6 +226,9 @@ let Some(mut series) = map.get_mut(key) else {
 // Re-check before applying structural mutation.
 ```
 
+All internal DashMaps use `common::RandomState`, including rate-limit series, caches, hybrid
+state, and per-key lock maps. Do not select a concrete hasher independently at each map site.
+
 ### 4.2 Missing-key insertion must downgrade directly
 
 There is a recurring pattern where an operation wants an immutable guard regardless of whether
@@ -292,6 +314,10 @@ Important details:
   the lock order is explicitly established and tested.
 - Local expiration cleanup is permitted after shared inspection discovers stale history. This
   does not justify unconditional mutable access for fresh entries.
+- Atomic loads use `Ordering::Acquire`, atomic stores use `Ordering::Release`, and atomic
+  read-modify-write operations use `Ordering::AcqRel`. Do not introduce `Relaxed` or `SeqCst`.
+- Do not add an `#[inline(...)]` attribute. Existing maintainer-added inline attributes remain
+  untouched unless the maintainer explicitly changes them.
 
 ### 4.4 Required lock audit
 
@@ -409,11 +435,20 @@ Suppressed variants track both observed count and declined count. Preserve these
 
 ## 6. Redis Lua Rules
 
-Conditional updates must remain atomic within Redis. Shared scripts belong in
-`src/redis/common.rs` when Redis and hybrid providers use the same data model.
+Conditional updates must remain atomic within Redis. All rate-limiter Lua scripts belong in
+`src/redis/scripts.rs`; provider and proxy files should contain only Rust orchestration. Reuse a
+single script constant when Redis and hybrid providers use the same script and data model.
 
 Lua requirements:
 
+- Put cross-strategy helpers in the common Lua prelude, and strategy-specific helpers in the
+  absolute or suppressed prelude in `src/redis/scripts.rs`. Construct scripts through
+  `lua_script`, `absolute_lua_script`, or `suppressed_lua_script`; do not manually concatenate
+  helper strings in providers or proxies.
+- Call `now_ms()` for Redis server time. Do not duplicate `redis.call("TIME")` conversion inside
+  individual script bodies.
+- Reuse the shared expiry, grouping, comparator, history-mode, and cleanup helpers instead of
+  copying those state-transition fragments into individual bodies.
 - Use Redis server time, not client time, for bucket scores and TTL-sensitive behavior.
 - Compute expired contributions and the logical live total before deciding whether the comparator
   matches.
@@ -475,7 +510,7 @@ This is non-negotiable for limiter behavior tests:
 - Use real grouping waits to create multiple buckets.
 - Use real window passage to create expired history.
 - Never add an `insert_series` helper.
-- Never insert fabricated `RateLimitSeries`, `InstantRate`, timestamps, totals, or declined counts
+- Never insert fabricated `RateLimitSeries`, `Bucket`, timestamps, totals, or declined counts
   directly into the DashMap merely to arrange a scenario.
 
 Test-only accessors may be used narrowly to:
@@ -484,6 +519,14 @@ Test-only accessors may be used narrowly to:
 - Inspect post-operation bucket order, counts, totals, limits, or key absence.
 
 They must not be used to bypass the public API when constructing initial state.
+
+Minimize test-only helpers in production impl blocks:
+
+- One or two test-only methods may stay beside the production type with individual `#[cfg(test)]`
+  attributes.
+- For three or more test-only methods, put an inherent impl block in the appropriate
+  `src/tests/test_<production_file_name>.rs` file.
+- Fields required by that test-area impl may be `pub(crate)`, but must not become public API.
 
 ### 8.2 Make setup prove itself
 
@@ -609,7 +652,7 @@ When adding or renaming benchmark cases:
 
 ## 10. Documentation and Public API Rules
 
-Follow `docs/conventions.md`.
+Follow `CONVENTIONS.md`.
 
 - `docs/lib.md` is the canonical docs.rs source.
 - `README.md` is the GitHub/crates companion.
