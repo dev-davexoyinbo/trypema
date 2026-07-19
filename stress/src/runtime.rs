@@ -1,71 +1,93 @@
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use std::time::Duration;
 
-// ---------------------------------------------------------------------------
-// async_sleep
-// ---------------------------------------------------------------------------
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+type WorkerHistogram = hdrhistogram::Histogram<u64>;
 
 #[cfg(feature = "redis-tokio")]
-pub(crate) async fn async_sleep(d: Duration) {
-    tokio::time::sleep(d).await;
-}
+pub(crate) fn name() -> &'static str {
+    "tokio"
+} // end fn name
 
 #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-pub(crate) async fn async_sleep(d: Duration) {
-    smol::Timer::after(d).await;
-}
+pub(crate) fn name() -> &'static str {
+    "smol"
+} // end fn name
 
-// ---------------------------------------------------------------------------
-// spawn_task / join_task
-// ---------------------------------------------------------------------------
+#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
+pub(crate) fn name() -> &'static str {
+    "none"
+} // end fn name
 
 #[cfg(feature = "redis-tokio")]
-pub(crate) fn spawn_task<F>(f: F) -> tokio::task::JoinHandle<hdrhistogram::Histogram<u64>>
+pub(crate) async fn async_sleep(duration: Duration) {
+    tokio::time::sleep(duration).await;
+} // end fn async_sleep
+
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+pub(crate) async fn async_sleep(duration: Duration) {
+    smol::Timer::after(duration).await;
+} // end fn async_sleep
+
+#[cfg(feature = "redis-tokio")]
+pub(crate) async fn yield_now() {
+    tokio::task::yield_now().await;
+} // end fn yield_now
+
+#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
+pub(crate) async fn yield_now() {
+    smol::future::yield_now().await;
+} // end fn yield_now
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+pub(crate) async fn create_redis_connection_manager(
+    redis_url: &str,
+) -> Result<redis::aio::ConnectionManager, redis::RedisError> {
+    let client = redis::Client::open(redis_url)?;
+    client.get_connection_manager().await
+} // end fn create_redis_connection_manager
+
+#[cfg(feature = "redis-tokio")]
+pub(crate) fn spawn_task<Future>(future: Future) -> tokio::task::JoinHandle<WorkerHistogram>
 where
-    F: std::future::Future<Output = hdrhistogram::Histogram<u64>> + Send + 'static,
+    Future: std::future::Future<Output = WorkerHistogram> + Send + 'static,
 {
-    tokio::spawn(f)
-}
+    tokio::spawn(future)
+} // end fn spawn_task
 
 #[cfg(feature = "redis-tokio")]
 pub(crate) async fn join_task(
-    j: tokio::task::JoinHandle<hdrhistogram::Histogram<u64>>,
-) -> hdrhistogram::Histogram<u64> {
-    j.await.unwrap()
-}
+    join_handle: tokio::task::JoinHandle<WorkerHistogram>,
+) -> WorkerHistogram {
+    join_handle.await.unwrap()
+} // end fn join_task
 
 #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-pub(crate) fn spawn_task<F>(f: F) -> smol::Task<hdrhistogram::Histogram<u64>>
+pub(crate) fn spawn_task<Future>(future: Future) -> smol::Task<WorkerHistogram>
 where
-    F: std::future::Future<Output = hdrhistogram::Histogram<u64>> + Send + 'static,
+    Future: std::future::Future<Output = WorkerHistogram> + Send + 'static,
 {
-    smol::spawn(f)
-}
+    smol::spawn(future)
+} // end fn spawn_task
 
 #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-pub(crate) async fn join_task(
-    j: smol::Task<hdrhistogram::Histogram<u64>>,
-) -> hdrhistogram::Histogram<u64> {
-    j.await
-}
-
-// ---------------------------------------------------------------------------
-// block_on  (used by local.rs when building connection manager without a runtime)
-// ---------------------------------------------------------------------------
+pub(crate) async fn join_task(join_handle: smol::Task<WorkerHistogram>) -> WorkerHistogram {
+    join_handle.await
+} // end fn join_task
 
 /// Run a future to completion on a single-threaded executor.
-/// Used outside of an existing async context (e.g. building a connection manager
-/// from a sync thread).
+/// Used outside of an existing async context, such as constructing a connection manager from a
+/// synchronous runner.
 #[cfg(feature = "redis-tokio")]
-pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
+pub(crate) fn block_on<Future: std::future::Future>(future: Future) -> Future::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(f)
-}
+        .block_on(future)
+} // end fn block_on
 
 #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-pub(crate) fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    smol::block_on(f)
-}
+pub(crate) fn block_on<Future: std::future::Future>(future: Future) -> Future::Output {
+    smol::block_on(future)
+} // end fn block_on
