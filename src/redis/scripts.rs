@@ -56,7 +56,7 @@ const COMMON_LUA_HELPERS: &str = r#"
         local latest_timestamp_ms = tonumber(latest[2])
         local age_ms = timestamp_ms - latest_timestamp_ms
 
-        if age_ms >= 0 and age_ms < rate_group_size_ms then
+        if age_ms >= 0 and age_ms <= rate_group_size_ms then
             return tonumber(latest[1])
         end
 

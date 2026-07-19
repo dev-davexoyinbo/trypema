@@ -11,7 +11,10 @@ static REDIS_KEY_STRIP_RE: LazyLock<Regex> =
 
 use dashmap::{DashMap, mapref::one::RefMut, try_result::TryResult};
 
-use crate::{TrypemaError, common::RateType};
+use crate::{
+    TrypemaError,
+    common::{RandomState, RateType},
+};
 
 /// A validated newtype for Redis rate limiting keys.
 ///
@@ -234,7 +237,7 @@ pub(crate) fn mutex_lock<'a, T>(
 pub(crate) const _GET_MUT_TIMEOUT_MS: u64 = 3;
 
 pub(crate) async fn _try_get_mut_async_with_timeout<'a, K, V>(
-    map: &'a DashMap<K, V>,
+    map: &'a DashMap<K, V, RandomState>,
     key: &K,
     timeout_ms: u64,
 ) -> Option<RefMut<'a, K, V>>

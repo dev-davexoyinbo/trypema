@@ -31,6 +31,7 @@ use crate::TrypemaError;
 /// adversarial collision resistance is preferred, or another `BuildHasher` selected after
 /// representative performance and security evaluation.
 pub(crate) type RandomState = ahash::RandomState;
+// pub(crate) type RandomState = std::collections::hash_map::RandomState;
 
 #[derive(Debug)]
 pub(crate) struct Bucket {

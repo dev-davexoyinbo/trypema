@@ -638,9 +638,14 @@ impl SuppressedLocalRateLimiter {
             }
             HistoryUpdateMode::Preserve(preservation) if count < old_total => {
                 let mut to_remove = old_total - count;
+                let mut bucket;
+                let mut bucket_count;
+                let mut declined_count;
+                let mut retained_count;
+                let mut retained_declined_count;
 
                 while to_remove > 0 {
-                    let bucket = match preservation {
+                    bucket = match preservation {
                         HistoryPreservation::PreserveNewest => series.buckets.front(),
                         HistoryPreservation::PreserveOldest => series.buckets.back(),
                     };
@@ -649,7 +654,7 @@ impl SuppressedLocalRateLimiter {
                         break;
                     };
 
-                    let bucket_count = bucket.count.load(Ordering::Acquire);
+                    bucket_count = bucket.count.load(Ordering::Acquire);
 
                     if bucket_count <= to_remove {
                         to_remove -= bucket_count;
@@ -664,9 +669,9 @@ impl SuppressedLocalRateLimiter {
                             }
                         }
                     } else {
-                        let declined_count = bucket.declined_count.load(Ordering::Acquire);
-                        let retained_count = bucket_count - to_remove;
-                        let retained_declined_count =
+                        declined_count = bucket.declined_count.load(Ordering::Acquire);
+                        retained_count = bucket_count - to_remove;
+                        retained_declined_count =
                             ((declined_count as u128 * retained_count as u128)
                                 / bucket_count as u128) as u64;
 
