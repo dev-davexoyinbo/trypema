@@ -164,12 +164,48 @@ impl SuppressedRedisRateLimiter {
         }
     } // end method inc
 
+    async fn set_if_with_history_mode(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        mode: HistoryUpdateMode,
+    ) -> Result<(u64, u64), TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+        let (comparator_op, comparator_operand) = comparator.redis_args();
+
+        let (new_total, old_total, _changed): (u64, u64, u64) = self
+            .set_if_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_suppression_factor_key(key))
+            .key(self.key_generator.get_total_declined_key(key))
+            .key(self.key_generator.get_hash_declined_key(key))
+            .arg(key.to_string())
+            .arg(*self.window_size_seconds)
+            .arg(*self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor)
+            .arg(comparator_op)
+            .arg(comparator_operand)
+            .arg(count)
+            .arg(mode.redis_arg())
+            .arg(0_u64)
+            .arg(0_u64)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok((new_total, old_total))
+    }
+
     /// Get the current suppression factor for `key`.
     ///
     /// Returns a value in the range `[0.0, 1.0]`:
     /// - `0.0` — no suppression (below capacity or key not found)
     /// - `0.0 < sf < 1.0` — partial suppression (at capacity)
-    /// - `1.0` — full suppression (over hard limit)
+    /// - `1.0` — full suppression (cached at the hard boundary or on a forecast above it)
     ///
     /// This method is read-only with respect to request counts — it does not record any
     /// increment. It is useful for exporting metrics, building dashboards, or debugging
@@ -179,6 +215,8 @@ impl SuppressedRedisRateLimiter {
     /// directly. Otherwise, this recomputes the factor via the same algorithm used in `inc()`
     /// and writes it back to Redis with a `suppression_factor_cache_ms` TTL. If the cached
     /// value is outside `[0.0, 1.0]`, it is treated as stale and recomputed.
+    /// Unknown keys return `0.0` without creating cache or active-entity state. Evicting
+    /// expired history invalidates any factor cached from that history.
     ///
     /// # Examples
     ///
@@ -266,6 +304,102 @@ impl SuppressedRedisRateLimiter {
             suppression_factor,
         })
     } // end method get
+
+    /// Conditionally replace the window total for `key` (atomic on Redis).
+    ///
+    /// Executes an atomic Lua script that computes the live total without writing,
+    /// evaluates `comparator`, and — on a match — prunes expired buckets and replaces
+    /// the window contents with a single current-timestamp bucket holding `count`,
+    /// with **no declines** recorded against it. On a match the key's hard window
+    /// limit is (re)defined as `window_size_seconds × rate_limit × hard_limit_factor`
+    /// and the cached suppression factor is deleted so it is recomputed from the new
+    /// state on the next call. A comparator miss leaves history, limit, TTL, and
+    /// cached suppression metadata untouched. A matched `count` of zero removes all
+    /// count, decline, limit, cache, history, and active-entity state for the key.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Validated [`RedisKey`] identifying the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit used to (re)define the hard window limit
+    /// - `comparator`: Guard evaluated against the current window total
+    /// - `count`: The total to write when the guard matches
+    ///
+    /// # Returns
+    ///
+    /// `(new_total, old_total)` — `old_total` is the post-eviction total the
+    /// comparator was evaluated against; `new_total` is `count` when the guard
+    /// matched, `old_total` otherwise.
+    ///
+    /// # Priming Idiom
+    ///
+    /// `set_if(key, rate, RateLimitComparator::Lt(count), count)` raises the window
+    /// total to at least `count` and never lowers it — idempotent and safe to retry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitComparator};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    ///
+    /// // Prime the window to 40.
+    /// let (new_total, old_total) = rl
+    ///     .redis()
+    ///     .suppressed()
+    ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!((new_total, old_total), (40, 0));
+    ///
+    /// // Re-priming is a no-op: the guard no longer matches.
+    /// let (new_total, old_total) = rl
+    ///     .redis()
+    ///     .suppressed()
+    ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!((new_total, old_total), (40, 40));
+    /// # });
+    /// ```
+    pub async fn set_if(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+    ) -> Result<(u64, u64), TrypemaError> {
+        self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Replace,
+        )
+        .await
+    } // end method set_if
+
+    /// Conditionally set the observed total while retaining the selected side of
+    /// the Redis sliding-window history.
+    pub async fn set_if_preserve_history(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        preservation: HistoryPreservation,
+    ) -> Result<(u64, u64), TrypemaError> {
+        self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Preserve(preservation),
+        )
+        .await
+    } // end method set_if_preserve_history
 
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
