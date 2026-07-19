@@ -37,6 +37,7 @@ const COMMON_LUA_HELPERS: &str = r#"
         elseif comparator_op == "ne" then
             return value ~= comparator_operand
         end
+
         return nil
     end
 
@@ -310,6 +311,153 @@ pub(crate) const ABSOLUTE_GET_TOTAL_LUA: &str = r#"
     end
 
     return total_count
+"#;
+
+/// Conditionally update an absolute sliding window's total and history.
+///
+/// Shared by the Redis and hybrid absolute limiters. Comparator misses perform no writes, and
+/// hybrid callers may include pending local counts in the atomic comparison.
+pub(crate) const ABSOLUTE_SET_IF_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local hash_key = KEYS[1]
+    local active_keys = KEYS[2]
+    local window_limit_key = KEYS[3]
+    local total_count_key = KEYS[4]
+    local active_entities_key = KEYS[5]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local window_limit = tonumber(ARGV[3])
+    local comparator_op = ARGV[4]
+    local comparator_operand = tonumber(ARGV[5])
+    local count = tonumber(ARGV[6])
+    local history_mode = ARGV[7]
+    local pending_count = tonumber(ARGV[8]) or 0
+
+    local expired_keys = expired_bucket_keys(active_keys, timestamp_ms, window_size_seconds * 1000)
+    local expired_sum = 0
+
+    if #expired_keys > 0 then
+        local expired_counts = redis.call("HMGET", hash_key, unpack(expired_keys))
+        expired_sum = sum_values(expired_counts)
+    end
+
+    local redis_total = (tonumber(redis.call("GET", total_count_key)) or 0) - expired_sum
+
+    if redis_total < 0 then
+        redis_total = 0
+    end
+
+    local old_total = redis_total + pending_count
+    local matched = comparator_matches(old_total, comparator_op, comparator_operand)
+
+    if matched == nil then
+        return redis.error_reply("trypema: unknown comparator op: " .. tostring(comparator_op))
+    end
+
+    if not matched then
+        return {old_total, old_total, 0}
+    end
+
+    if not valid_history_mode(history_mode) then
+        return redis.error_reply("trypema: unknown history mode: " .. tostring(history_mode))
+    end
+
+    local entity_exists = redis.call("EXISTS", hash_key, active_keys, window_limit_key, total_count_key) > 0
+        or redis.call("ZSCORE", active_entities_key, entity) ~= false
+
+    if not entity_exists and pending_count == 0 and count == 0 then
+        return {0, 0, 0}
+    end
+
+    if count == 0 then
+        redis.call("DEL", hash_key, active_keys, window_limit_key, total_count_key)
+        redis.call("ZREM", active_entities_key, entity)
+
+        return {0, old_total, 1}
+    end
+
+    local existing_limit = tonumber(redis.call("GET", window_limit_key))
+
+    if history_mode ~= "replace" and #expired_keys == 0 and pending_count == 0 and count == old_total and existing_limit == window_limit then
+        return {old_total, old_total, 0}
+    end
+
+    if history_mode == "replace" then
+        redis.call("DEL", hash_key, active_keys)
+
+        if count > 0 then
+            local field = tostring(timestamp_ms)
+
+            redis.call("HSET", hash_key, field, count)
+            redis.call("ZADD", active_keys, timestamp_ms, field)
+        end
+    else
+        if #expired_keys > 0 then
+            redis.call("HDEL", hash_key, unpack(expired_keys))
+            redis.call("ZREM", active_keys, unpack(expired_keys))
+        end
+
+        if pending_count > 0 then
+            local pending_field = tostring(timestamp_ms)
+
+            redis.call("HINCRBY", hash_key, pending_field, pending_count)
+            redis.call("ZADD", active_keys, timestamp_ms, pending_field)
+        end
+
+        if count > old_total then
+            local delta = count - old_total
+            local edge
+
+            if history_mode == "preserve_newest" then
+                edge = redis.call("ZRANGE", active_keys, 0, 0, "REV")[1]
+            else
+                edge = redis.call("ZRANGE", active_keys, 0, 0)[1]
+            end
+
+            if not edge then
+                edge = tostring(timestamp_ms)
+                redis.call("ZADD", active_keys, timestamp_ms, edge)
+            end
+
+            redis.call("HINCRBY", hash_key, edge, delta)
+        elseif count < old_total then
+            local remaining = old_total - count
+            local ordered
+
+            if history_mode == "preserve_newest" then
+                ordered = redis.call("ZRANGE", active_keys, 0, -1)
+            else
+                ordered = redis.call("ZRANGE", active_keys, 0, -1, "REV")
+            end
+
+            for i = 1, #ordered do
+                if remaining <= 0 then break end
+
+                local field = ordered[i]
+                local bucket_count = tonumber(redis.call("HGET", hash_key, field)) or 0
+
+                if bucket_count <= remaining then
+                    remaining = remaining - bucket_count
+
+                    redis.call("HDEL", hash_key, field)
+                    redis.call("ZREM", active_keys, field)
+                else
+                    redis.call("HSET", hash_key, field, bucket_count - remaining)
+                    remaining = 0
+                end
+            end
+        end
+    end
+
+    redis.call("SET", total_count_key, count)
+
+    redis.call("SET", window_limit_key, window_limit)
+    redis.call("EXPIRE", window_limit_key, window_size_seconds)
+    redis.call("ZADD", active_entities_key, timestamp_ms, entity)
+
+    return {count, old_total, 1}
 "#;
 
 "#;
