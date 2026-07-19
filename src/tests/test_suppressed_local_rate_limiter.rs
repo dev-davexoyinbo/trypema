@@ -4,11 +4,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+use dashmap::DashMap;
+
 use crate::{
     HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
     RateLimitComparator, RateLimitDecision, SuppressedLocalRateLimiter,
-    SuppressedRateLimitSnapshot, SuppressionFactorCacheMs, WindowSizeSeconds,
+    SuppressedRateLimitSnapshot, SuppressionFactorCacheMs, WindowSizeSeconds, common::RandomState,
+    local::suppressed_local_rate_limiter::RateLimitSeries,
 };
+
+impl SuppressedLocalRateLimiter {
+    pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries, RandomState> {
+        &self.series
+    }
+
+    pub(crate) fn test_set_suppression_factor(&self, key: &str, at: Instant, value: f64) {
+        self.suppression_factors
+            .insert(key.to_string(), (at, value));
+    }
+
+    pub(crate) fn test_get_suppression_factor(&self, key: &str) -> Option<(Instant, f64)> {
+        self.suppression_factors.get(key).map(|value| *value)
+    }
+}
 
 fn limiter(
     window_size_seconds: u64,
@@ -64,8 +82,11 @@ fn fill_to_soft_window_limit(
     );
     assert_eq!(limiter.get(key).total, soft_window_limit);
     let series = limiter.series().get(key).expect("series should exist");
-    assert_eq!(series.total.load(Ordering::Acquire), soft_window_limit);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+    assert_eq!(
+        series.total_count.load(Ordering::Acquire),
+        soft_window_limit
+    );
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
     drop(series);
 
     // Overwrite the suppression factor with the desired test value (fresh TTL).
@@ -93,7 +114,7 @@ fn does_not_suppress_when_soft_window_limit_not_exceeded() {
 
     assert_eq!(limiter.get(key).total, soft_window_limit);
     let series = limiter.series().get(key).expect("series should exist");
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -208,8 +229,8 @@ fn reaching_shared_soft_and_hard_limit_is_allowed_then_suppresses() {
     );
 
     let series = limiter.series().get(key).expect("series should exist");
-    assert_eq!(series.total.load(Ordering::Acquire), 11);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 1);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 11);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -239,7 +260,7 @@ fn fractional_limits_use_truncated_soft_and_hard_window_boundaries() {
                 is_allowed: false,
             } if (suppression_factor - 1.0).abs() < 1e-12
         ),
-        "the increment after the truncated hard limit must be declined: {over_hard:?}"
+        "the increment after the truncated hard limit must be declined_count: {over_hard:?}"
     );
     assert_eq!(
         limiter.get("k"),
@@ -277,7 +298,7 @@ fn batch_crossing_hard_limit_is_fully_declined_without_consuming_accepted_capaci
                 is_allowed: false,
             } if (suppression_factor - 1.0).abs() < 1e-12
         ),
-        "the whole batch crossing the hard limit must be declined: {crossing:?}"
+        "the whole batch crossing the hard limit must be declined_count: {crossing:?}"
     );
 
     let snapshot = limiter.get("k");
@@ -317,13 +338,13 @@ fn suppressed_inc_denied_returns_suppressed_and_does_not_increment_accepted() {
     );
 
     let series = limiter.series().get(key).expect("series should exist");
-    assert_eq!(series.total.load(Ordering::Acquire), 6);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 1);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 6);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 1);
     assert_eq!(
         series
-            .total
+            .total_count
             .load(Ordering::Acquire)
-            .saturating_sub(series.total_declined.load(Ordering::Acquire)),
+            .saturating_sub(series.total_declined_count.load(Ordering::Acquire)),
         5,
         "a denied increment must not increase accepted usage"
     );
@@ -365,8 +386,8 @@ fn suppressed_inc_allowed_returns_suppressed_is_allowed_true_and_increments_acce
     );
 
     let series = limiter.series().get(key).expect("series should exist");
-    assert_eq!(series.total.load(Ordering::Acquire), 6);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 6);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
     drop(series);
     assert_eq!(
         limiter.get(key),
@@ -430,8 +451,8 @@ fn hard_limit_is_enforced_after_suppression_factor_cache_expires() {
 
     assert!((limiter.get_suppression_factor(key) - 1.0).abs() < 1e-12);
     let series = limiter.series().get(key).expect("series should exist");
-    assert_eq!(series.total.load(Ordering::Acquire), 21);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 1);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 21);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -803,8 +824,8 @@ fn suppressed_is_fully_denied_after_hard_limit_observed() {
     );
 
     let series = limiter.series().get(key).expect("series should exist");
-    assert_eq!(series.total.load(Ordering::Acquire), 21);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 1);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 21);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -887,11 +908,11 @@ fn get_evicts_expired_buckets_and_updates_declined_total() {
     );
 
     let series = limiter.series().get("k").expect("series should exist");
-    assert_eq!(series.series.len(), 1);
-    assert_eq!(series.series[0].count.load(Ordering::Acquire), 7);
-    assert_eq!(series.series[0].declined.load(Ordering::Acquire), 7);
-    assert_eq!(series.total.load(Ordering::Acquire), 7);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 7);
+    assert_eq!(series.buckets.len(), 1);
+    assert_eq!(series.buckets[0].count.load(Ordering::Acquire), 7);
+    assert_eq!(series.buckets[0].declined_count.load(Ordering::Acquire), 7);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 7);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 7);
     drop(series);
     assert!(matches!(
         limiter.test_get_suppression_factor("k"),
@@ -901,9 +922,9 @@ fn get_evicts_expired_buckets_and_updates_declined_total() {
     assert_eq!(limiter.get("k2"), SuppressedRateLimitSnapshot::default());
 
     let series = limiter.series().get("k2").expect("series should exist");
-    assert!(series.series.is_empty());
-    assert_eq!(series.total.load(Ordering::Acquire), 0);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+    assert!(series.buckets.is_empty());
+    assert_eq!(series.total_count.load(Ordering::Acquire), 0);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
     drop(series);
     assert!(matches!(
         limiter.test_get_suppression_factor("k2"),
@@ -1066,8 +1087,8 @@ fn set_if_zero_count_resets_declines_and_suppression_state() {
         );
     }
     let series = limiter.series().get("k").expect("series should exist");
-    assert_eq!(series.total.load(Ordering::Acquire), 33);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 3);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 33);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 3);
     drop(series);
     assert_eq!(limiter.get_suppression_factor("k"), 1.0);
     assert!(limiter.test_get_suppression_factor("k").is_some());
@@ -1111,11 +1132,11 @@ fn set_if_replacement_resets_declined_history_and_cached_factor() {
         (5, 33)
     );
     let series = limiter.series().get("k").expect("series should exist");
-    assert_eq!(series.series.len(), 1);
-    assert_eq!(series.series[0].count.load(Ordering::Acquire), 5);
-    assert_eq!(series.series[0].declined.load(Ordering::Acquire), 0);
-    assert_eq!(series.total.load(Ordering::Acquire), 5);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+    assert_eq!(series.buckets.len(), 1);
+    assert_eq!(series.buckets[0].count.load(Ordering::Acquire), 5);
+    assert_eq!(series.buckets[0].declined_count.load(Ordering::Acquire), 0);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 5);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
     drop(series);
     assert!(limiter.test_get_suppression_factor("k").is_none());
 }
@@ -1163,11 +1184,11 @@ fn set_if_replacement_with_unchanged_total_still_replaces_history() {
     );
 
     let series = limiter.series().get("k").expect("series should exist");
-    assert_eq!(series.series.len(), 1, "replacement must collapse history");
-    assert_eq!(series.series[0].count.load(Ordering::Acquire), 27);
-    assert_eq!(series.series[0].declined.load(Ordering::Acquire), 0);
-    assert_eq!(series.total.load(Ordering::Acquire), 27);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+    assert_eq!(series.buckets.len(), 1, "replacement must collapse history");
+    assert_eq!(series.buckets[0].count.load(Ordering::Acquire), 27);
+    assert_eq!(series.buckets[0].declined_count.load(Ordering::Acquire), 0);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 27);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
     drop(series);
     assert!(
         limiter.test_get_suppression_factor("k").is_none(),
@@ -1247,23 +1268,27 @@ fn set_if_preserve_history_scales_partial_declines_proportionally() {
     {
         let series = limiter.series().get("k").expect("series should exist");
         let counts = series
-            .series
+            .buckets
             .iter()
             .map(|bucket| bucket.count.load(Ordering::Acquire))
             .collect::<Vec<_>>();
 
         let declined = series
-            .series
+            .buckets
             .iter()
-            .map(|bucket| bucket.declined.load(Ordering::Acquire))
+            .map(|bucket| bucket.declined_count.load(Ordering::Acquire))
             .collect::<Vec<_>>();
 
         assert_eq!(counts, vec![4, 23], "wrong count edge for");
         assert_eq!(declined, vec![0, 7], "wrong declined for");
 
-        assert_eq!(series.total.load(Ordering::Acquire), 27, "wrong total ");
         assert_eq!(
-            series.total_declined.load(Ordering::Acquire),
+            series.total_count.load(Ordering::Acquire),
+            27,
+            "wrong total "
+        );
+        assert_eq!(
+            series.total_declined_count.load(Ordering::Acquire),
             7,
             "wrong declined total"
         );
@@ -1282,20 +1307,24 @@ fn set_if_preserve_history_scales_partial_declines_proportionally() {
     );
 
     let series = limiter.series().get("k").unwrap();
-    assert_eq!(series.series.len(), 1, "wrong series length");
+    assert_eq!(series.buckets.len(), 1, "wrong series length");
     assert_eq!(
-        series.series[0].count.load(Ordering::Acquire),
+        series.buckets[0].count.load(Ordering::Acquire),
         10,
         "wrong count"
     );
     assert_eq!(
-        series.series[0].declined.load(Ordering::Acquire),
+        series.buckets[0].declined_count.load(Ordering::Acquire),
         3,
         "wrong declined"
     );
-    assert_eq!(series.total.load(Ordering::Acquire), 10, "wrong total");
     assert_eq!(
-        series.total_declined.load(Ordering::Acquire),
+        series.total_count.load(Ordering::Acquire),
+        10,
+        "wrong total"
+    );
+    assert_eq!(
+        series.total_declined_count.load(Ordering::Acquire),
         3,
         "wrong declined total"
     );
@@ -1358,10 +1387,10 @@ fn set_if_preserve_history_keeps_exact_decline_ratio_for_large_counters() {
     assert_eq!(snapshot.total, TARGET);
     assert_eq!(snapshot.total_declined, expected_retained_declined);
     let series = limiter.series().get("k").expect("series should exist");
-    assert_eq!(series.series.len(), 1);
-    assert_eq!(series.series[0].count.load(Ordering::Acquire), TARGET);
+    assert_eq!(series.buckets.len(), 1);
+    assert_eq!(series.buckets[0].count.load(Ordering::Acquire), TARGET);
     assert_eq!(
-        series.series[0].declined.load(Ordering::Acquire),
+        series.buckets[0].declined_count.load(Ordering::Acquire),
         expected_retained_declined
     );
 }
@@ -1394,19 +1423,19 @@ fn set_if_preserve_oldest_keeps_oldest_suppressed_history() {
     {
         let series = limiter.series().get("k").expect("series should exist");
         let counts = series
-            .series
+            .buckets
             .iter()
             .map(|bucket| bucket.count.load(Ordering::Acquire))
             .collect::<Vec<_>>();
         let declined = series
-            .series
+            .buckets
             .iter()
-            .map(|bucket| bucket.declined.load(Ordering::Acquire))
+            .map(|bucket| bucket.declined_count.load(Ordering::Acquire))
             .collect::<Vec<_>>();
         assert_eq!(counts, vec![32, 6]);
         assert_eq!(declined, vec![12, 6]);
-        assert_eq!(series.total.load(Ordering::Acquire), 38);
-        assert_eq!(series.total_declined.load(Ordering::Acquire), 18);
+        assert_eq!(series.total_count.load(Ordering::Acquire), 38);
+        assert_eq!(series.total_declined_count.load(Ordering::Acquire), 18);
     }
 
     assert_eq!(
@@ -1421,14 +1450,14 @@ fn set_if_preserve_oldest_keeps_oldest_suppressed_history() {
     );
     let series = limiter.series().get("k").unwrap();
     let counts = series
-        .series
+        .buckets
         .iter()
         .map(|bucket| bucket.count.load(Ordering::Acquire))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![7]);
-    assert_eq!(series.series[0].declined.load(Ordering::Acquire), 2);
-    assert_eq!(series.total.load(Ordering::Acquire), 7);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 2);
+    assert_eq!(series.buckets[0].declined_count.load(Ordering::Acquire), 2);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 7);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 2);
 }
 
 #[test]
@@ -1477,19 +1506,19 @@ fn set_if_preserve_history_increases_the_selected_edge_bucket() {
     for (key, expected_counts) in [("newest", vec![4, 6]), ("oldest", vec![6, 4])] {
         let series = limiter.series().get(key).expect("series should exist");
         let counts = series
-            .series
+            .buckets
             .iter()
             .map(|bucket| bucket.count.load(Ordering::Acquire))
             .collect::<Vec<_>>();
         let declined = series
-            .series
+            .buckets
             .iter()
-            .map(|bucket| bucket.declined.load(Ordering::Acquire))
+            .map(|bucket| bucket.declined_count.load(Ordering::Acquire))
             .collect::<Vec<_>>();
         assert_eq!(counts, expected_counts, "wrong retained edge for {key}");
         assert_eq!(declined, vec![0, 0]);
-        assert_eq!(series.total.load(Ordering::Acquire), 10);
-        assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+        assert_eq!(series.total_count.load(Ordering::Acquire), 10);
+        assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
         drop(series);
         assert!(
             limiter.test_get_suppression_factor(key).is_none(),
@@ -1519,11 +1548,11 @@ fn set_if_preserve_history_creates_missing_positive_targets() {
         );
 
         let series = limiter.series().get(key).expect("series should exist");
-        assert_eq!(series.series.len(), 1);
-        assert_eq!(series.series[0].count.load(Ordering::Acquire), 9);
-        assert_eq!(series.series[0].declined.load(Ordering::Acquire), 0);
-        assert_eq!(series.total.load(Ordering::Acquire), 9);
-        assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+        assert_eq!(series.buckets.len(), 1);
+        assert_eq!(series.buckets[0].count.load(Ordering::Acquire), 9);
+        assert_eq!(series.buckets[0].declined_count.load(Ordering::Acquire), 0);
+        assert_eq!(series.total_count.load(Ordering::Acquire), 9);
+        assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
         assert!((series.hard_window_limit - 90.0).abs() < f64::EPSILON);
     }
 }
@@ -1555,11 +1584,11 @@ fn set_if_preserve_history_prunes_expired_buckets_before_matching_update() {
         );
 
         let series = limiter.series().get(key).expect("series should exist");
-        assert_eq!(series.series.len(), 1);
-        assert_eq!(series.series[0].count.load(Ordering::Acquire), 3);
-        assert_eq!(series.series[0].declined.load(Ordering::Acquire), 0);
-        assert_eq!(series.total.load(Ordering::Acquire), 3);
-        assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+        assert_eq!(series.buckets.len(), 1);
+        assert_eq!(series.buckets[0].count.load(Ordering::Acquire), 3);
+        assert_eq!(series.buckets[0].declined_count.load(Ordering::Acquire), 0);
+        assert_eq!(series.total_count.load(Ordering::Acquire), 3);
+        assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
         drop(series);
         assert!(limiter.test_get_suppression_factor(key).is_none());
     }
@@ -1632,9 +1661,9 @@ fn unchanged_total_with_a_new_limit_updates_limit_and_invalidates_cache() {
     );
 
     let series = limiter.series().get("k").expect("series should exist");
-    assert_eq!(series.series.len(), 1);
-    assert_eq!(series.series[0].count.load(Ordering::Acquire), 3);
-    assert_eq!(series.series[0].declined.load(Ordering::Acquire), 0);
+    assert_eq!(series.buckets.len(), 1);
+    assert_eq!(series.buckets[0].count.load(Ordering::Acquire), 3);
+    assert_eq!(series.buckets[0].declined_count.load(Ordering::Acquire), 0);
     assert!((series.hard_window_limit - 90.0).abs() < f64::EPSILON);
     drop(series);
     assert!(limiter.test_get_suppression_factor("k").is_none());
@@ -1672,8 +1701,8 @@ fn inc_keeps_the_first_hard_window_limit_for_the_key() {
         } if (suppression_factor - 1.0).abs() < 1e-12
     ));
     let series = limiter.series().get("k").expect("series should exist");
-    assert_eq!(series.total.load(Ordering::Acquire), 10);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 1);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 10);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -1718,19 +1747,19 @@ fn concurrent_increments_record_every_observation() {
 
     let series = limiter.series().get("k").expect("series should exist");
     let bucket_total = series
-        .series
+        .buckets
         .iter()
         .map(|bucket| bucket.count.load(Ordering::Acquire))
         .sum::<u64>();
     let bucket_declined = series
-        .series
+        .buckets
         .iter()
-        .map(|bucket| bucket.declined.load(Ordering::Acquire))
+        .map(|bucket| bucket.declined_count.load(Ordering::Acquire))
         .sum::<u64>();
     assert_eq!(bucket_total, expected);
     assert_eq!(bucket_declined, 0);
-    assert_eq!(series.total.load(Ordering::Acquire), expected);
-    assert_eq!(series.total_declined.load(Ordering::Acquire), 0);
+    assert_eq!(series.total_count.load(Ordering::Acquire), expected);
+    assert_eq!(series.total_declined_count.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -1804,9 +1833,9 @@ fn conditional_set_guard_miss_leaves_expired_history_untouched() {
     );
 
     let series = limiter.series().get("k").expect("series should remain");
-    assert_eq!(series.series.len(), 2, "miss must not prune history");
+    assert_eq!(series.buckets.len(), 2, "miss must not prune history");
     assert_eq!(
-        series.total.load(Ordering::Acquire),
+        series.total_count.load(Ordering::Acquire),
         9,
         "miss must not rewrite stored counters"
     );

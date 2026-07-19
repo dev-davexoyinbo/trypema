@@ -490,12 +490,17 @@ fn evicts_oldest_bucket_but_keeps_newer_bucket_window_2_with_grouping() {
     ));
 
     let series = limiter.series().get(key).expect("series should remain");
-    assert_eq!(series.series.len(), 1);
+    assert_eq!(series.buckets.len(), 1);
     assert_eq!(
-        series.series.front().unwrap().count.load(Ordering::Relaxed),
+        series
+            .buckets
+            .front()
+            .unwrap()
+            .count
+            .load(Ordering::Acquire),
         1
     );
-    assert_eq!(series.total.load(Ordering::Relaxed), 1);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -519,12 +524,21 @@ fn rate_grouping_merges_within_group() {
     ));
 
     let series = limiter.series().get(key).expect("series should exist");
-    assert_eq!(series.series.len(), 1, "increments should share one bucket");
     assert_eq!(
-        series.series.front().unwrap().count.load(Ordering::Relaxed),
+        series.buckets.len(),
+        1,
+        "increments should share one bucket"
+    );
+    assert_eq!(
+        series
+            .buckets
+            .front()
+            .unwrap()
+            .count
+            .load(Ordering::Acquire),
         6
     );
-    assert_eq!(series.total.load(Ordering::Relaxed), 6);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 6);
 }
 
 #[test]
@@ -547,14 +561,14 @@ fn rate_grouping_separates_beyond_group() {
         .series()
         .get(key)
         .expect("expected key to exist in limiter");
-    assert_eq!(series.series.len(), 2);
+    assert_eq!(series.buckets.len(), 2);
     let counts = series
-        .series
+        .buckets
         .iter()
-        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Acquire))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![2, 3]);
-    assert_eq!(series.total.load(Ordering::Relaxed), 5);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 5);
     drop(series);
     assert!(matches!(
         limiter.is_allowed(key),
@@ -933,18 +947,23 @@ fn get_excludes_and_evicts_expired_buckets() {
     assert_eq!(limiter.get("k"), 3, "expired bucket must be ignored");
     {
         let series = limiter.series().get("k").expect("series should remain");
-        assert_eq!(series.series.len(), 1, "expired history must be evicted");
+        assert_eq!(series.buckets.len(), 1, "expired history must be evicted");
         assert_eq!(
-            series.series.front().unwrap().count.load(Ordering::Relaxed),
+            series
+                .buckets
+                .front()
+                .unwrap()
+                .count
+                .load(Ordering::Acquire),
             3
         );
-        assert_eq!(series.total.load(Ordering::Relaxed), 3);
+        assert_eq!(series.total_count.load(Ordering::Acquire), 3);
     }
 
     assert_eq!(limiter.get("k2"), 0);
     let series = limiter.series().get("k2").expect("series should remain");
-    assert!(series.series.is_empty(), "expired history must be evicted");
-    assert_eq!(series.total.load(Ordering::Relaxed), 0);
+    assert!(series.buckets.is_empty(), "expired history must be evicted");
+    assert_eq!(series.total_count.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -1056,9 +1075,9 @@ fn conditional_set_guard_miss_leaves_expired_history_untouched() {
     );
 
     let series = limiter.series().get("k").expect("series should remain");
-    assert_eq!(series.series.len(), 2, "miss must not prune history");
+    assert_eq!(series.buckets.len(), 2, "miss must not prune history");
     assert_eq!(
-        series.total.load(Ordering::Relaxed),
+        series.total_count.load(Ordering::Acquire),
         9,
         "miss must not rewrite stored counters"
     );
@@ -1094,12 +1113,17 @@ fn set_if_lt_with_lower_target_is_noop() {
     assert_eq!((new_total, old_total), (100, 100));
     assert_eq!(limiter.get("k"), 100);
     let series = limiter.series().get("k").expect("series should exist");
-    assert_eq!(series.series.len(), 1);
+    assert_eq!(series.buckets.len(), 1);
     assert_eq!(
-        series.series.front().unwrap().count.load(Ordering::Relaxed),
+        series
+            .buckets
+            .front()
+            .unwrap()
+            .count
+            .load(Ordering::Acquire),
         100
     );
-    assert_eq!(series.total.load(Ordering::Relaxed), 100);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 100);
 }
 
 #[test]
@@ -1117,12 +1141,17 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
     assert_eq!(limiter.get("k"), 30);
     {
         let series = limiter.series().get("k").expect("series should exist");
-        assert_eq!(series.series.len(), 1);
+        assert_eq!(series.buckets.len(), 1);
         assert_eq!(
-            series.series.front().unwrap().count.load(Ordering::Relaxed),
+            series
+                .buckets
+                .front()
+                .unwrap()
+                .count
+                .load(Ordering::Acquire),
             30
         );
-        assert_eq!(series.total.load(Ordering::Relaxed), 30);
+        assert_eq!(series.total_count.load(Ordering::Acquire), 30);
     }
 
     // Overwriting to 0 removes the key entirely; admission resumes from empty.
@@ -1258,12 +1287,17 @@ fn set_if_redefines_sticky_rate_limit() {
             window_limit(window_size_seconds, &rate_ten),
             "matched set_if must redefine the stored window limit"
         );
-        assert_eq!(series.series.len(), 1);
+        assert_eq!(series.buckets.len(), 1);
         assert_eq!(
-            series.series.front().unwrap().count.load(Ordering::Relaxed),
+            series
+                .buckets
+                .front()
+                .unwrap()
+                .count
+                .load(Ordering::Acquire),
             1
         );
-        assert_eq!(series.total.load(Ordering::Relaxed), 1);
+        assert_eq!(series.total_count.load(Ordering::Acquire), 1);
     }
 
     // The old capacity of 6 no longer applies (the inc rate argument is still
@@ -1293,12 +1327,17 @@ fn set_if_evicts_expired_buckets_before_comparing() {
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 9);
     assert_eq!((new_total, old_total), (9, 0));
     let series = limiter.series().get("k").expect("series should exist");
-    assert_eq!(series.series.len(), 1);
+    assert_eq!(series.buckets.len(), 1);
     assert_eq!(
-        series.series.front().unwrap().count.load(Ordering::Relaxed),
+        series
+            .buckets
+            .front()
+            .unwrap()
+            .count
+            .load(Ordering::Acquire),
         9
     );
-    assert_eq!(series.total.load(Ordering::Relaxed), 9);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 9);
 }
 
 #[test]
@@ -1342,12 +1381,12 @@ fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
 
     let series = limiter.series().get("k").unwrap();
     let counts = series
-        .series
+        .buckets
         .iter()
-        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Acquire))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![2, 6]);
-    assert_eq!(series.total.load(Ordering::Relaxed), 8);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 8);
     assert_eq!(series.window_limit, window_limit(10, &rate));
     drop(series);
 
@@ -1361,12 +1400,12 @@ fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
     assert_eq!(result, (11, 8));
     let series = limiter.series().get("k").unwrap();
     let counts = series
-        .series
+        .buckets
         .iter()
-        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Acquire))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![2, 9]);
-    assert_eq!(series.total.load(Ordering::Relaxed), 11);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 11);
 }
 
 #[test]
@@ -1400,12 +1439,12 @@ fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
     );
     let series = limiter.series().get("k").unwrap();
     let counts = series
-        .series
+        .buckets
         .iter()
-        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Acquire))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![4, 4]);
-    assert_eq!(series.total.load(Ordering::Relaxed), 8);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 8);
     assert_eq!(series.window_limit, window_limit(10, &rate));
     drop(series);
 
@@ -1421,12 +1460,12 @@ fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
     );
     let series = limiter.series().get("k").unwrap();
     let counts = series
-        .series
+        .buckets
         .iter()
-        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Acquire))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![7, 4]);
-    assert_eq!(series.total.load(Ordering::Relaxed), 11);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 11);
 }
 
 #[test]
@@ -1462,12 +1501,12 @@ fn set_if_preserve_history_redefines_limit_even_when_total_is_unchanged() {
         "matched preserve must redefine the stored window limit"
     );
     let counts = series
-        .series
+        .buckets
         .iter()
-        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Acquire))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![2, 3], "unchanged total must preserve history");
-    assert_eq!(series.total.load(Ordering::Relaxed), 5);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 5);
 }
 
 #[test]
@@ -1503,12 +1542,12 @@ fn set_if_preserve_history_prunes_expired_before_directional_reduction() {
 
     let series = limiter.series().get("k").expect("series should exist");
     let counts = series
-        .series
+        .buckets
         .iter()
-        .map(|bucket| bucket.count.load(Ordering::Relaxed))
+        .map(|bucket| bucket.count.load(Ordering::Acquire))
         .collect::<Vec<_>>();
     assert_eq!(counts, vec![2, 6]);
-    assert_eq!(series.total.load(Ordering::Relaxed), 8);
+    assert_eq!(series.total_count.load(Ordering::Acquire), 8);
 }
 
 #[test]
@@ -1619,11 +1658,16 @@ fn set_if_preserve_history_creates_missing_positive_target_for_both_directions()
 
         let series = limiter.series().get(key).expect("series should be created");
         assert_eq!(series.window_limit, window_limit(6, &rate));
-        assert_eq!(series.series.len(), 1);
+        assert_eq!(series.buckets.len(), 1);
         assert_eq!(
-            series.series.front().unwrap().count.load(Ordering::Relaxed),
+            series
+                .buckets
+                .front()
+                .unwrap()
+                .count
+                .load(Ordering::Acquire),
             9
         );
-        assert_eq!(series.total.load(Ordering::Relaxed), 9);
+        assert_eq!(series.total_count.load(Ordering::Acquire), 9);
     }
 }
