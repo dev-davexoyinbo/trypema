@@ -630,4 +630,46 @@ impl SuppressedHybridRateLimiter {
             .await
     } // end fn inc_with_rng
 
+    pub(super) fn should_cleanup_local_state(
+        state: &SuppressedRedisLimitingState,
+        stale_after_ms: u64,
+    ) -> bool {
+        match state {
+            SuppressedRedisLimitingState::Undefined => true,
+            SuppressedRedisLimitingState::Accepting { last_modified, .. } => {
+                let last_modified = match last_modified.lock() {
+                    Ok(last_modified) => last_modified,
+                    Err(err) => {
+                        tracing::warn!("last_modified is poisoned: {err:?}");
+                        return true;
+                    }
+                };
+
+                last_modified.elapsed().as_millis() >= stale_after_ms as u128
+            }
+            SuppressedRedisLimitingState::Suppressing {
+                time_instant,
+                suppression_factor_ttl_ms,
+                ..
+            } => {
+                let elapsed_ms = match time_instant.lock() {
+                    Ok(time_instant) => time_instant.elapsed().as_millis(),
+                    Err(err) => {
+                        tracing::warn!("time_instant is poisoned: {err:?}");
+                        return true;
+                    }
+                };
+                let cache_ttl_ms = match suppression_factor_ttl_ms.lock() {
+                    Ok(suppression_factor_ttl_ms) => *suppression_factor_ttl_ms as u128,
+                    Err(err) => {
+                        tracing::warn!("suppression_factor_ttl_ms is poisoned: {err:?}");
+                        return true;
+                    }
+                };
+
+                elapsed_ms.saturating_sub(cache_ttl_ms) >= stale_after_ms as u128
+            }
+        }
+    }
+
 } // end impl

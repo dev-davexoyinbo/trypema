@@ -615,11 +615,12 @@ fn test_hybrid_cleanup_loop_fresh_requests_allowed_after_cleanup() {
             .unwrap()
             .as_millis();
         let prefix = RedisKey::try_from(format!("test_hybrid_loop_fresh_{unique}")).unwrap();
+        let window_size_seconds = 1_u64;
         let sync_interval_ms = 25_u64;
 
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
-                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
                 suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
@@ -627,7 +628,7 @@ fn test_hybrid_cleanup_loop_fresh_requests_allowed_after_cleanup() {
             redis: crate::RedisRateLimiterOptions {
                 connection_manager,
                 prefix: Some(prefix.clone()),
-                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
+                window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
                 rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
                 suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
@@ -639,16 +640,20 @@ fn test_hybrid_cleanup_loop_fresh_requests_allowed_after_cleanup() {
 
         let rate_limit = RateLimit::try_from(2.0).unwrap();
         let k = RedisKey::try_from(format!("k_{unique}")).unwrap();
-        let cap = 5_u64 * 2;
+        let cap = window_size_seconds * 2;
 
         // Overflow — entity ends up in Rejecting state.
         for _ in 0..cap {
-            let _ = rl
+            let decision = rl
                 .hybrid()
                 .absolute()
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "cleanup setup increment must be allowed: {decision:?}"
+            );
         }
         let rejected = rl
             .hybrid()
@@ -662,10 +667,10 @@ fn test_hybrid_cleanup_loop_fresh_requests_allowed_after_cleanup() {
         );
         runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
 
-        // Start cleanup loop with stale_after_ms=150, interval=75.
-        // The entity should be cleaned after roughly 150 + 75 ms from loop start.
+        // Start cleanup loop with stale_after_ms=150, interval=75. Rejecting local state is
+        // retained through its retry TTL and the following stale horizon.
         rl.run_cleanup_loop_with_config(150, 75);
-        runtime::async_sleep(Duration::from_millis(400)).await;
+        runtime::async_sleep(Duration::from_millis(1300)).await;
         rl.stop_cleanup_loop();
 
         let total_key = key_gen(&prefix, RateType::HybridAbsolute).get_total_count_key(&k);
@@ -681,7 +686,7 @@ fn test_hybrid_cleanup_loop_fresh_requests_allowed_after_cleanup() {
             "hybrid absolute total key must be deleted after cleanup loop"
         );
 
-        // Next request must be allowed — stale in-memory Rejecting state must have been cleared.
+        // Next request must be allowed after the post-TTL stale horizon has elapsed.
         let decision = rl
             .hybrid()
             .absolute()

@@ -464,359 +464,41 @@ impl SuppressedHybridRateLimiter {
         Ok(decision)
     } // end method inc
 
-    pub(crate) async fn inc_with_rng(
-        &self,
-        key: &RedisKey,
-        increment: u64,
-        rate_limit: Option<&RateLimit>,
-        random_bool: &mut impl FnMut(f64) -> bool,
-    ) -> Result<RateLimitDecision, TrypemaError> {
-        self.send_epoch_change_if_needed();
+    /// Remove stale Redis state and local state stale since its suppression cache expired.
+    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+        self.redis_proxy.cleanup(stale_after_ms).await?;
 
-        let state_entry = match self.limiting_state.get(key) {
-            Some(state) => state,
-            None => {
-                self.limiting_state
-                    .entry(key.clone())
-                    .or_insert_with(|| SuppressedRedisLimitingState::Undefined);
+        let candidates = self
+            .limiting_state
+            .iter()
+            .filter(|state| Self::should_cleanup_local_state(state.value(), stale_after_ms))
+            .map(|state| state.key().clone())
+            .collect::<Vec<_>>();
 
-                self.limiting_state.get(key).expect("Key should be present")
-            }
-        };
+        for key in candidates {
+            let lock = self.get_or_create_reset_lock(&key);
+            let _guard = lock.lock().await;
 
-        if let SuppressedRedisLimitingState::Suppressing {
-            time_instant,
-            suppression_factor_ttl_ms,
-            suppression_factor,
-            count,
-            declined_count,
-            starting_count,
-            window_limit,
-            ..
-        } = state_entry.deref()
-        {
-            let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
-            let mut suppression_factor =
-                *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
-            let elapsed_ms = mutex_lock(time_instant, "suppressing.time_instant")?
-                .elapsed()
-                .as_millis();
-            let ttl_ms = *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? as u128;
-            let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
+            let should_remove = self.limiting_state.get(&key).is_some_and(|state| {
+                Self::should_cleanup_local_state(state.value(), stale_after_ms)
+            });
 
-            // Guard hard limit
-            if starting_count.saturating_add(count.load(Ordering::Acquire)) > window_limit {
-                suppression_factor = 1f64;
+            if !should_remove {
+                continue;
             }
 
-            if elapsed_ms < ttl_ms {
-                let should_allow = if suppression_factor == 0f64 {
-                    true
-                } else if suppression_factor == 1f64 {
-                    false
-                } else {
-                    random_bool(1f64 - suppression_factor)
-                };
-
-                count.fetch_add(increment, Ordering::AcqRel);
-
-                if !should_allow {
-                    declined_count.fetch_add(increment, Ordering::AcqRel);
-                }
-
-                return Ok(RateLimitDecision::Suppressed {
-                    suppression_factor,
-                    is_allowed: should_allow,
-                });
-            }
-        } else if let SuppressedRedisLimitingState::Accepting {
-            window_limit,
-            starting_count,
-            count,
-            // declined_count,
-            last_modified,
-            ..
-        } = state_entry.deref()
-        {
-            let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
-            let window_limit = *mutex_lock(window_limit, "accepting.accept_limit")?;
-            // let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
-            let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
-
-            if starting_count
-                .saturating_add(count.load(Ordering::Acquire))
-                // .saturating_sub(declined)
-                .saturating_add(increment)
-                <= soft_window_limit
-            {
-                *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
-                count.fetch_add(increment, Ordering::AcqRel);
-                return Ok(RateLimitDecision::Allowed);
-            }
-        }
-
-        drop(state_entry);
-
-        self.reset_state_from_redis_read_result_and_get_decision(
-            key,
-            increment,
-            increment,
-            rate_limit,
-            random_bool,
-        )
-        .await
-    } // end method 
-
-    async fn reset_state_from_redis_read_result_and_get_decision(
-        &self,
-        key: &RedisKey,
-        check_count: u64,
-        increment: u64,
-        rate_limit: Option<&RateLimit>,
-        random_bool: &mut impl FnMut(f64) -> bool,
-    ) -> Result<RateLimitDecision, TrypemaError> {
-        // Acquire the per-key lock so that only one task at a time runs the
-        // Redis read + state update for this key.  All other tasks wait here
-        // and then re-check the (now-updated) state via the fast path below.
-        let lock = self.get_or_create_reset_lock(key);
-        let _guard = lock.lock().await;
-
-        // Re-check the current state now that we hold the lock.  If another
-        // task already transitioned us to Accepting while we were waiting, we
-        // can serve the request from the local counter without another Redis
-        // read.
-        {
-            let state_entry = self.limiting_state.get(key);
-            if let Some(ref state_entry) = state_entry
-                && let SuppressedRedisLimitingState::Accepting {
-                    window_limit,
-                    count,
-                    starting_count,
-                    // declined_count,
-                    last_modified,
-                    ..
-                } = state_entry.deref()
-            {
-                let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
-                let window_limit = *mutex_lock(window_limit, "accepting.accept_limit")?;
-                // let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
-                let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
-
-                if starting_count
-                    .saturating_add(count.load(Ordering::Acquire))
-                    // .saturating_sub(declined)
-                    .saturating_add(increment)
-                    <= soft_window_limit
+            match self.limiting_state.entry(key) {
+                Entry::Occupied(entry)
+                    if Self::should_cleanup_local_state(entry.get(), stale_after_ms) =>
                 {
-                    *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
-                    count.fetch_add(increment, Ordering::AcqRel);
-                    return Ok(RateLimitDecision::Allowed);
+                    entry.remove();
                 }
-                // Still over limit after lock — fall through to Redis read.
-            } else if let Some(state_entry) = state_entry
-                && let SuppressedRedisLimitingState::Suppressing {
-                    time_instant,
-                    suppression_factor_ttl_ms,
-                    suppression_factor,
-                    count,
-                    declined_count,
-                    starting_count,
-                    window_limit,
-                    ..
-                } = state_entry.deref()
-            {
-                let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
-                let mut suppression_factor =
-                    *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
-                let elapsed_ms = mutex_lock(time_instant, "suppressing.time_instant")?
-                    .elapsed()
-                    .as_millis();
-                let ttl_ms = *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? as u128;
-                let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
-
-                // Guard hard limit
-                if starting_count.saturating_add(count.load(Ordering::Acquire)) > window_limit {
-                    suppression_factor = 1f64;
-                }
-
-                if elapsed_ms < ttl_ms {
-                    let should_allow = if suppression_factor == 0f64 {
-                        true
-                    } else if suppression_factor == 1f64 {
-                        false
-                    } else {
-                        random_bool(1f64 - suppression_factor)
-                    };
-
-                    count.fetch_add(increment, Ordering::AcqRel);
-
-                    if !should_allow {
-                        declined_count.fetch_add(increment, Ordering::AcqRel);
-                    }
-
-                    return Ok(RateLimitDecision::Suppressed {
-                        suppression_factor,
-                        is_allowed: should_allow,
-                    });
-                }
-                // Suppression has expired - fail through to Redis read.
+                Entry::Occupied(_) | Entry::Vacant(_) => {}
             }
         }
-
-        let read_state_result =
-            self.redis_proxy.read_state(key).await.map_err(|err| {
-                TrypemaError::CustomError(format!("Failed to read state: {err:?}"))
-            })?;
-
-        self.reset_single_state_from_read_result(
-            read_state_result,
-            check_count,
-            increment,
-            rate_limit,
-            random_bool,
-        )
-        .await
-    } // end method reset_state_from_redis_read_result
-
-    async fn send_commit(&self, commit: SuppressedHybridCommit) -> Result<(), TrypemaError> {
-        self.commiter_sender
-            .send(commit.into())
-            .await
-            .map_err(|err| TrypemaError::CustomError(format!("Failed to send commit: {err:?}")))?;
 
         Ok(())
-    } // end method send_commit
-
-    async fn reset_single_state_from_read_result(
-        &self,
-        read_state_result: SuppressedHybridRedisProxyReadStateResult,
-        check_count: u64,
-        increment: u64,
-        rate_limit: Option<&RateLimit>,
-        random_bool: &mut impl FnMut(f64) -> bool,
-    ) -> Result<RateLimitDecision, TrypemaError> {
-        let mut current_total_count = read_state_result.current_total_count;
-        let mut current_declined_count = read_state_result.current_total_declined;
-
-        let mut current_suppression_factor_ttl_ms = read_state_result.suppression_factor_ttl_ms;
-        let current_suppression_factor = read_state_result.suppression_factor;
-
-        let mut hard_window_limit = read_state_result.window_limit;
-        let key = &read_state_result.key;
-
-        let state = match self.limiting_state.get(key) {
-            Some(state) => state,
-            None => {
-                self.limiting_state
-                    .entry(key.clone())
-                    .or_insert_with(|| SuppressedRedisLimitingState::Undefined);
-
-                self.limiting_state.get(key).expect("Key should be present")
-            }
-        };
-
-        let state = match state.deref() {
-            SuppressedRedisLimitingState::Undefined => state,
-            SuppressedRedisLimitingState::Suppressing {
-                suppression_factor_ttl_ms,
-                count,
-                declined_count,
-                window_limit,
-                ..
-            } => {
-                if current_suppression_factor_ttl_ms.is_none() {
-                    current_suppression_factor_ttl_ms = Some(*mutex_lock(
-                        suppression_factor_ttl_ms,
-                        "suppressing.suppression_factor_ttl_ms",
-                    )?);
-                }
-
-                if hard_window_limit.is_none() {
-                    hard_window_limit = Some(*mutex_lock(window_limit, "accepting.window_limit")?);
-                }
-
-                let count = count.load(Ordering::Acquire);
-                let declined = declined_count.load(Ordering::Acquire);
-
-                current_total_count = current_total_count.saturating_add(count);
-                current_declined_count = current_declined_count.saturating_add(declined);
-
-                if count > 0 || declined > 0 {
-                    let commit = SuppressedHybridCommit {
-                        key: key.clone(),
-                        window_limit: hard_window_limit.expect("Window limit should be set"),
-                        count,
-                        declined_count: declined,
-                    };
-
-                    drop(state);
-                    self.send_commit(commit).await?;
-
-                    self.limiting_state.get(key).expect("Key should be present")
-                } else {
-                    state
-                }
-            }
-
-            SuppressedRedisLimitingState::Accepting {
-                window_limit,
-                count,
-                ..
-            } => {
-                let count = count.load(Ordering::Acquire);
-
-                if hard_window_limit.is_none() {
-                    hard_window_limit = Some(*mutex_lock(window_limit, "accepting.window_limit")?);
-                }
-
-                current_total_count = current_total_count.saturating_add(count);
-
-                if count > 0 {
-                    let commit = SuppressedHybridCommit {
-                        key: key.clone(),
-                        window_limit: hard_window_limit.expect("Window limit should be set"),
-                        count,
-                        declined_count: 0,
-                    };
-
-                    drop(state);
-                    self.send_commit(commit).await?;
-
-                    self.limiting_state.get(key).expect("Key should be present")
-                } else {
-                    state
-                }
-            }
-        };
-
-        let hard_window_limit = match hard_window_limit {
-            Some(window_limit) => window_limit,
-            None => {
-                let Some(rate_limit) = rate_limit else {
-                    let is_undefined =
-                        matches!(state.deref(), SuppressedRedisLimitingState::Undefined);
-
-                    if !is_undefined {
-                        drop(state);
-                        let mut state = self
-                            .limiting_state
-                            .get_mut(key)
-                            .expect("Key should be present");
-                        *state = SuppressedRedisLimitingState::Undefined;
-                    }
-
-                    return Ok(RateLimitDecision::Allowed);
-                };
-
-                ((*self.window_size_seconds as f64) * **rate_limit * *self.hard_limit_factor) as u64
-            }
-        };
-
-        let soft_window_limit = (hard_window_limit as f64 / *self.hard_limit_factor) as u64;
-        let new_ttl_ms =
-            current_suppression_factor_ttl_ms.unwrap_or(*self.suppression_factor_cache_ms);
-
-        let new_time_instant = Instant::now();
+    } // end fn cleanup
 
         if current_total_count
             .saturating_sub(current_declined_count)

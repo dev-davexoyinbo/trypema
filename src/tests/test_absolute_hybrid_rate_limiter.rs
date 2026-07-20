@@ -1032,6 +1032,100 @@ fn get_returns_zero_for_untouched_key() {
 }
 
 #[test]
+fn cleanup_keeps_rejecting_state_while_retry_ttl_is_live() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let stale_after_ms = 50_u64;
+        let window_size_ms = 1_000_u64;
+        let rl = build_limiter_with_prefix(&url, 1, 1_000, 2_000, unique_prefix()).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(10f64).unwrap();
+
+        assert_allowed(
+            rl.hybrid()
+                .absolute()
+                .inc(&k, &rate, window_capacity(1, &rate))
+                .await
+                .unwrap(),
+            "fill rejection setup capacity",
+        );
+        assert_rejected(
+            rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+            "create rejection cache",
+        );
+        assert_eq!(rl.hybrid().absolute().local_state_count(), 1);
+
+        runtime::async_sleep(Duration::from_millis(100)).await;
+        rl.hybrid()
+            .absolute()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+        assert_eq!(
+            rl.hybrid().absolute().local_state_count(),
+            1,
+            "live rejection TTL must outlive the shorter stale horizon"
+        );
+
+        runtime::async_sleep(Duration::from_millis(window_size_ms)).await;
+        rl.hybrid()
+            .absolute()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+        assert_eq!(rl.hybrid().absolute().local_state_count(), 0);
+    });
+}
+
+#[test]
+fn cleanup_keeps_rejecting_state_until_stale_horizon_after_retry_ttl_expiry() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let stale_after_ms = 300_u64;
+        let window_size_ms = 1_000_u64;
+        let rl = build_limiter_with_prefix(&url, 1, 1_000, 2_000, unique_prefix()).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(10f64).unwrap();
+
+        assert_allowed(
+            rl.hybrid()
+                .absolute()
+                .inc(&k, &rate, window_capacity(1, &rate))
+                .await
+                .unwrap(),
+            "fill rejection setup capacity",
+        );
+        assert_rejected(
+            rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+            "create rejection cache",
+        );
+        assert_eq!(rl.hybrid().absolute().local_state_count(), 1);
+
+        runtime::async_sleep(Duration::from_millis(window_size_ms + 100)).await;
+        rl.hybrid()
+            .absolute()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+        assert_eq!(
+            rl.hybrid().absolute().local_state_count(),
+            1,
+            "the stale horizon must begin after the retry TTL expires"
+        );
+
+        runtime::async_sleep(Duration::from_millis(stale_after_ms)).await;
+        rl.hybrid()
+            .absolute()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+        assert_eq!(rl.hybrid().absolute().local_state_count(), 0);
+    });
+}
+
+#[test]
 fn get_inferred_refreshes_undefined_state_then_uses_local_snapshot() {
     let url = redis_url();
 

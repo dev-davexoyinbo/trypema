@@ -1,4 +1,4 @@
-use std::{env, thread, time::Duration};
+use std::{env, time::Duration};
 
 use super::runtime;
 
@@ -1150,13 +1150,15 @@ fn hybrid_suppressed_full_denial_seeded_from_hybrid_redis_keyspace_does_not_call
 }
 
 #[test]
-fn hybrid_suppressed_usage_is_committed_to_redis_and_visible_to_others() {
+fn hybrid_suppressed_refresh_commit_is_visible_to_other_instances() {
     let url = redis_url();
 
     runtime::block_on(async {
         let prefix = unique_prefix();
 
-        let window_size_seconds = 1_u64;
+        // Long window prevents unrelated parallel test load from expiring committed state while
+        // this test polls another instance. Fractional rate keeps setup capacity small.
+        let window_size_seconds = 60_u64;
         let rate_group_size_ms = 1_000_u64;
         let sync_interval_ms = 25_u64;
         let cache_ms = 5_u64;
@@ -1184,7 +1186,7 @@ fn hybrid_suppressed_usage_is_committed_to_redis_and_visible_to_others() {
         .await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let rate_limit = RateLimit::try_from(0.1f64).unwrap();
         let cap = (window_size_seconds as f64 * *rate_limit) as u64;
 
         // Fill local budget.
@@ -1201,7 +1203,8 @@ fn hybrid_suppressed_usage_is_committed_to_redis_and_visible_to_others() {
             );
         }
 
-        // Crossing the local hard window limit queues a commit.
+        // The hard-boundary refresh commits the previously pending local count. The boundary
+        // request and this overflow remain local until a later refresh or background flush.
         let d1 = rl_a
             .hybrid()
             .suppressed()
@@ -1219,35 +1222,23 @@ fn hybrid_suppressed_usage_is_committed_to_redis_and_visible_to_others() {
             "d1: {d1:?}"
         );
 
-        // Poll until HYBRID_SUPPRESSED Redis reflects the committed state.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let sf = rl_b
-                .hybrid()
-                .suppressed()
-                .get_suppression_factor(&k)
-                .await
-                .unwrap();
-
-            if (sf - 1.0).abs() < 1e-12 {
-                break;
+        assert_eq!(
+            rl_b.hybrid().suppressed().get(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: cap - 1,
+                total_declined: 0,
+                suppression_factor: 0.0,
             }
-
-            if std::time::Instant::now() >= deadline {
-                panic!("timed out waiting for commit to become visible; sf={sf}");
-            }
-
-            thread::sleep(Duration::from_millis(10));
-        }
+        );
     });
 }
 
 #[test]
-fn hybrid_suppressed_concurrent_smoke_does_not_panic() {
+fn hybrid_suppressed_concurrent_increments_preserve_exact_total() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let rl = build_limiter_with_prefix(&url, 1, 1000, 2.0, 25, 25, unique_prefix()).await;
+        let rl = build_limiter_with_prefix(&url, 60, 1_000, 2.0, 25, 25, unique_prefix()).await;
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(10f64).unwrap();
@@ -1278,6 +1269,10 @@ fn hybrid_suppressed_concurrent_smoke_does_not_panic() {
         for t in tasks {
             runtime::join(t).await;
         }
+
+        let snapshot = rl.hybrid().suppressed().get(&k).await.unwrap();
+        assert_eq!(snapshot.total, 16 * 50);
+        assert!(snapshot.total_declined <= snapshot.total);
     });
 }
 
@@ -1634,8 +1629,261 @@ fn get_returns_empty_snapshot_for_untouched_key() {
     runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 25, unique_prefix()).await;
 
-        let snapshot = rl.hybrid().suppressed().get(&key("k")).await.unwrap();
+        let k = key("k");
+        let snapshot = rl.hybrid().suppressed().get(&k).await.unwrap();
         assert_eq!(snapshot, SuppressedRateLimitSnapshot::default());
+        assert_eq!(rl.hybrid().suppressed().local_state_count(), 0);
+    });
+}
+
+#[test]
+fn cleanup_keeps_suppressing_state_while_cache_ttl_is_live() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let cache_ttl_ms = 500_u64;
+        let stale_after_ms = 50_u64;
+        let rl =
+            build_limiter_with_prefix(&url, 6, 1_000, 1.0, cache_ttl_ms, 2_000, unique_prefix())
+                .await;
+        let k = key("k");
+        let rate = RateLimit::try_from(5f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 30)
+                .await
+                .unwrap(),
+            (30, 0)
+        );
+        assert!(matches!(
+            rl.hybrid().suppressed().inc(&k, &rate, 1).await.unwrap(),
+            RateLimitDecision::Suppressed {
+                is_allowed: false,
+                ..
+            }
+        ));
+        assert_eq!(rl.hybrid().suppressed().local_state_count(), 1);
+
+        runtime::async_sleep(Duration::from_millis(100)).await;
+        rl.hybrid()
+            .suppressed()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+        assert_eq!(
+            rl.hybrid().suppressed().local_state_count(),
+            1,
+            "live suppression cache must outlive the shorter stale horizon"
+        );
+
+        runtime::async_sleep(Duration::from_millis(cache_ttl_ms)).await;
+        rl.hybrid()
+            .suppressed()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+        assert_eq!(rl.hybrid().suppressed().local_state_count(), 0);
+    });
+}
+
+#[test]
+fn cleanup_keeps_suppressing_state_until_stale_horizon_after_cache_expiry() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let cache_ttl_ms = 500_u64;
+        let stale_after_ms = 300_u64;
+        let rl =
+            build_limiter_with_prefix(&url, 6, 1_000, 1.0, cache_ttl_ms, 2_000, unique_prefix())
+                .await;
+        let k = key("k");
+        let rate = RateLimit::try_from(5f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 30)
+                .await
+                .unwrap(),
+            (30, 0)
+        );
+        assert!(matches!(
+            rl.hybrid().suppressed().inc(&k, &rate, 1).await.unwrap(),
+            RateLimitDecision::Suppressed {
+                is_allowed: false,
+                ..
+            }
+        ));
+        assert_eq!(rl.hybrid().suppressed().local_state_count(), 1);
+
+        runtime::async_sleep(Duration::from_millis(cache_ttl_ms + 100)).await;
+        rl.hybrid()
+            .suppressed()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+        assert_eq!(
+            rl.hybrid().suppressed().local_state_count(),
+            1,
+            "the stale horizon must begin after the suppression cache expires"
+        );
+
+        runtime::async_sleep(Duration::from_millis(stale_after_ms)).await;
+        rl.hybrid()
+            .suppressed()
+            .cleanup(stale_after_ms)
+            .await
+            .unwrap();
+        assert_eq!(rl.hybrid().suppressed().local_state_count(), 0);
+    });
+}
+
+#[test]
+fn get_does_not_resurrect_an_expired_local_baseline() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 1, 100, 2.0, 25, 2_000, unique_prefix()).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(10f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 5)
+                .await
+                .unwrap(),
+            (5, 0)
+        );
+        assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 5);
+
+        runtime::async_sleep(Duration::from_millis(1_100)).await;
+
+        assert_eq!(
+            rl.hybrid().suppressed().get(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot::default(),
+            "expired Redis history must not be restored from the local committed baseline"
+        );
+    });
+}
+
+#[test]
+fn get_inferred_refreshes_once_then_uses_local_snapshot() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let writer =
+            build_limiter_with_prefix(&url, 6, 1_000, 1.5, 100, 2_000, prefix.clone()).await;
+        let reader = build_limiter_with_prefix(&url, 6, 1_000, 1.5, 100, 2_000, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        assert_eq!(
+            writer
+                .hybrid()
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 5)
+                .await
+                .unwrap(),
+            (5, 0)
+        );
+        assert_eq!(
+            reader
+                .hybrid()
+                .suppressed()
+                .get_inferred(&k)
+                .await
+                .unwrap()
+                .total,
+            5
+        );
+
+        assert_eq!(
+            writer
+                .hybrid()
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 9)
+                .await
+                .unwrap(),
+            (9, 5)
+        );
+
+        assert_eq!(
+            reader
+                .hybrid()
+                .suppressed()
+                .get_inferred(&k)
+                .await
+                .unwrap()
+                .total,
+            5,
+            "usable local state must stay on the inference fast path"
+        );
+        assert_eq!(reader.hybrid().suppressed().get(&k).await.unwrap().total, 9);
+    });
+}
+
+#[test]
+fn get_does_not_hide_newer_redis_suppression_with_local_accepting_state() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let writer =
+            build_limiter_with_prefix(&url, 6, 1_000, 1.0, 100, 2_000, prefix.clone()).await;
+        let reader = build_limiter_with_prefix(&url, 6, 1_000, 1.0, 100, 2_000, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(1f64).unwrap();
+
+        assert_eq!(
+            writer
+                .hybrid()
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 5)
+                .await
+                .unwrap(),
+            (5, 0)
+        );
+        assert_eq!(
+            reader
+                .hybrid()
+                .suppressed()
+                .get_inferred(&k)
+                .await
+                .unwrap()
+                .total,
+            5
+        );
+
+        assert_eq!(
+            writer
+                .hybrid()
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 6)
+                .await
+                .unwrap(),
+            (6, 5)
+        );
+
+        assert_eq!(
+            reader.hybrid().suppressed().get_inferred(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: 5,
+                total_declined: 0,
+                suppression_factor: 0.0,
+            }
+        );
+        assert_eq!(
+            reader.hybrid().suppressed().get(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: 6,
+                total_declined: 0,
+                suppression_factor: 1.0,
+            }
+        );
     });
 }
 
@@ -1669,6 +1917,43 @@ fn get_snapshot_includes_local_pending_increments() {
                 suppression_factor: 0.0,
             }
         );
+
+        assert_eq!(
+            rl.hybrid().suppressed().get_inferred(&k).await.unwrap(),
+            snapshot
+        );
+    });
+}
+
+#[test]
+fn get_methods_keep_the_exact_snapshot_during_background_sync() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let sync_interval_ms = 500_u64;
+        let rl =
+            build_limiter_with_prefix(&url, 60, 1_000, 1.5, 100, sync_interval_ms, unique_prefix())
+                .await;
+        let k = key("k");
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        assert!(matches!(
+            rl.hybrid().suppressed().inc(&k, &rate, 3).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+
+        runtime::async_sleep(Duration::from_millis(sync_interval_ms + 100)).await;
+
+        let expected = SuppressedRateLimitSnapshot {
+            total: 3,
+            total_declined: 0,
+            suppression_factor: 0.0,
+        };
+        assert_eq!(
+            rl.hybrid().suppressed().get_inferred(&k).await.unwrap(),
+            expected
+        );
+        assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap(), expected);
     });
 }
 
@@ -1734,6 +2019,70 @@ fn set_if_folds_pending_local_increments_before_comparing() {
         assert_eq!((new_total, old_total), (5, 5));
 
         assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 5);
+    });
+}
+
+#[test]
+fn set_if_preserves_declined_increment_racing_after_pending_snapshot() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 2_000, unique_prefix()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 30)
+                .await
+                .unwrap(),
+            (30, 0)
+        );
+        assert!(matches!(
+            rl.hybrid()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap(),
+            RateLimitDecision::Suppressed {
+                is_allowed: false,
+                ..
+            }
+        ));
+
+        let hook = rl.hybrid().suppressed().install_set_if_test_hook().unwrap();
+        let set_limiter = std::sync::Arc::clone(&rl);
+        let set_key = k.clone();
+        let set_rate_limit = rate_limit;
+        let set_task = runtime::spawn(async move {
+            set_limiter
+                .hybrid()
+                .suppressed()
+                .set_if(&set_key, &set_rate_limit, RateLimitComparator::Nil, 10)
+                .await
+        });
+
+        hook.snapshot_taken.notified().await;
+        let racing_decision = rl.hybrid().suppressed().inc(&k, &rate_limit, 2).await;
+        hook.resume.notify_one();
+
+        assert!(matches!(
+            racing_decision.unwrap(),
+            RateLimitDecision::Suppressed {
+                is_allowed: false,
+                ..
+            }
+        ));
+        assert_eq!(runtime::join(set_task).await.unwrap(), (10, 31));
+        assert_eq!(
+            rl.hybrid().suppressed().get(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: 12,
+                total_declined: 2,
+                suppression_factor: 0.0,
+            }
+        );
     });
 }
 

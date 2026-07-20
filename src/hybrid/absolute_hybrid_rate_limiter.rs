@@ -531,26 +531,50 @@ impl AbsoluteHybridRateLimiter {
         .await
     } // end method set_if_preserve_history
 
+    #[cfg(test)]
+    pub(crate) fn local_state_count(&self) -> usize {
+        self.limiting_state.len()
+    }
+
     fn should_cleanup_local_state(state: &AbsoluteRedisLimitingState, stale_after_ms: u64) -> bool {
         match state {
             AbsoluteRedisLimitingState::Undefined => true,
-            AbsoluteRedisLimitingState::Accepting {
-                last_modified: time_instant,
-                ..
+            AbsoluteRedisLimitingState::Accepting { last_modified, .. } => {
+                let last_modified = match last_modified.lock() {
+                    Ok(last_modified) => last_modified,
+                    Err(err) => {
+                        tracing::warn!("last_modified is poisoned: {err:?}");
+                        return true;
+                    }
+                };
+
+                last_modified.elapsed().as_millis() >= stale_after_ms as u128
             }
-            | AbsoluteRedisLimitingState::Rejecting { time_instant, .. } => {
-                let time_instant = match time_instant.lock() {
-                    Ok(time_instant) => time_instant,
+            AbsoluteRedisLimitingState::Rejecting {
+                time_instant,
+                ttl_ms,
+                ..
+            } => {
+                let elapsed_ms = match time_instant.lock() {
+                    Ok(time_instant) => time_instant.elapsed().as_millis(),
                     Err(err) => {
                         tracing::warn!("time_instant is poisoned: {err:?}");
                         return true;
                     }
                 };
 
-                time_instant.elapsed().as_millis() >= stale_after_ms as u128
+                let retry_ttl_ms = match ttl_ms.lock() {
+                    Ok(ttl_ms) => *ttl_ms as u128,
+                    Err(err) => {
+                        tracing::warn!("ttl_ms is poisoned: {err:?}");
+                        return true;
+                    }
+                };
+
+                elapsed_ms.saturating_sub(retry_ttl_ms) >= stale_after_ms as u128
             }
         }
-    } // end method should_cleanup_local_state
+    } // end fn should_cleanup_local_state
 
     async fn set_if_with_history_mode(
         &self,
@@ -615,7 +639,7 @@ impl AbsoluteHybridRateLimiter {
         Ok((new_total, old_total))
     }
 
-    /// Evict expired buckets and update the total count.
+    /// Remove stale Redis state and local state stale since its rejection TTL elapsed.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         self.redis_proxy.cleanup(stale_after_ms).await?;
 

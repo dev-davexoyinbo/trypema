@@ -981,8 +981,8 @@ fn redis_state_hybrid_suppressed_cleanup_allows_fresh_requests_after_cleanup() {
         );
         wait_for_hybrid_sync(sync_interval_ms).await;
 
-        // Wait until entity is stale, then clean up.
-        runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
+        // Wait until the cache TTL and its following stale horizon have elapsed.
+        runtime::async_sleep(Duration::from_millis(cache_ms + stale_after_ms + 50)).await;
         rl.hybrid()
             .suppressed()
             .cleanup(stale_after_ms)
@@ -998,7 +998,7 @@ fn redis_state_hybrid_suppressed_cleanup_allows_fresh_requests_after_cleanup() {
         let t_exists: bool = conn.exists(redis_key(&prefix, &k, "t")).await.unwrap();
         assert!(!t_exists, "total count key must be deleted after cleanup");
 
-        // The next request must be allowed — stale in-memory Suppressing state must be cleared.
+        // The next request must be allowed after the post-cache stale horizon has elapsed.
         let decision = rl
             .hybrid()
             .suppressed()

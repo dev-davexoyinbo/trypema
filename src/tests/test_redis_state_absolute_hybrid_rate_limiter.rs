@@ -820,7 +820,7 @@ fn redis_state_hybrid_absolute_cleanup_allows_fresh_requests_after_cleanup() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 5_u64;
+        let window_size_seconds = 1_u64;
         let sync_interval_ms = 25_u64;
         let stale_after_ms = 150_u64;
 
@@ -834,7 +834,7 @@ fn redis_state_hybrid_absolute_cleanup_allows_fresh_requests_after_cleanup() {
         .await;
         let k = key("k");
         let rate_limit = RateLimit::try_from(2f64).unwrap();
-        let cap = (window_size_seconds as f64 * *rate_limit) as u64; // 10
+        let cap = (window_size_seconds as f64 * *rate_limit) as u64;
 
         // Fill capacity then overflow — entity ends up in Rejecting state.
         for _ in 0..cap {
@@ -859,8 +859,11 @@ fn redis_state_hybrid_absolute_cleanup_allows_fresh_requests_after_cleanup() {
         );
         wait_for_hybrid_sync(sync_interval_ms).await;
 
-        // Wait until entity is stale, then clean up.
-        runtime::async_sleep(Duration::from_millis(stale_after_ms + 50)).await;
+        // Wait until the retry TTL and its following stale horizon have elapsed.
+        runtime::async_sleep(Duration::from_millis(
+            window_size_seconds * 1000 + stale_after_ms + 100,
+        ))
+        .await;
         rl.hybrid()
             .absolute()
             .cleanup(stale_after_ms)
@@ -876,7 +879,7 @@ fn redis_state_hybrid_absolute_cleanup_allows_fresh_requests_after_cleanup() {
         let t_exists: bool = conn.exists(redis_key(&prefix, &k, "t")).await.unwrap();
         assert!(!t_exists, "total count key must be deleted after cleanup");
 
-        // The next request must be allowed — stale in-memory Rejecting state must be cleared.
+        // The next request must be allowed after the post-TTL stale horizon has elapsed.
         let decision = rl
             .hybrid()
             .absolute()
