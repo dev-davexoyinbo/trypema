@@ -17,8 +17,8 @@ mod enabled {
     use super::common::{LimiterConfig, redis::build_limiter};
     use super::runtime;
 
-    pub fn bench_conditional_set(c: &mut Criterion) {
-        let mut group = c.benchmark_group("hybrid_suppressed/conditional_set");
+    pub fn bench_public_api(c: &mut Criterion) {
+        let mut group = c.benchmark_group("hybrid_suppressed");
         group.sample_size(40);
         let rt = runtime::build();
         let rl = runtime::block_on(
@@ -29,7 +29,46 @@ mod enabled {
                 ..LimiterConfig::default()
             }),
         );
-        let rate = RateLimit::try_from(100.0).unwrap();
+        let rate = RateLimit::max();
+        let hot_key = RedisKey::try_from("hot_key".to_string()).unwrap();
+        runtime::block_on(&rt, async {
+            rl.hybrid()
+                .suppressed()
+                .inc(&hot_key, &rate, 1)
+                .await
+                .unwrap();
+        });
+
+        group.bench_function("inc/hot_key", |b| {
+            b.iter(|| {
+                black_box(runtime::block_on(&rt, async {
+                    rl.hybrid()
+                        .suppressed()
+                        .inc(black_box(&hot_key), black_box(&rate), black_box(1))
+                        .await
+                }))
+            });
+        });
+
+        group.bench_function("get/hot_key", |b| {
+            b.iter(|| {
+                black_box(runtime::block_on(&rt, async {
+                    rl.hybrid().suppressed().get(black_box(&hot_key)).await
+                }))
+            });
+        });
+
+        group.bench_function("get_suppression_factor/hot_key", |b| {
+            b.iter(|| {
+                black_box(runtime::block_on(&rt, async {
+                    rl.hybrid()
+                        .suppressed()
+                        .get_suppression_factor(black_box(&hot_key))
+                        .await
+                }))
+            });
+        });
+
         let guard_key = RedisKey::try_from("guard".to_string()).unwrap();
         runtime::block_on(&rt, async {
             rl.hybrid()
@@ -111,12 +150,12 @@ mod enabled {
 }
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-fn bench_conditional_set(c: &mut Criterion) {
-    enabled::bench_conditional_set(c)
+fn bench_public_api(c: &mut Criterion) {
+    enabled::bench_public_api(c)
 }
 
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-fn bench_conditional_set(_: &mut Criterion) {}
+fn bench_public_api(_: &mut Criterion) {}
 
-criterion_group!(benches, bench_conditional_set);
+criterion_group!(benches, bench_public_api);
 criterion_main!(benches);
