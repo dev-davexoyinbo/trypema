@@ -167,6 +167,10 @@ Use words consistently across Rust, Lua, tests, benches, and documentation.
 - Keep `RateGroupSizeMs` and `rate_group_size_ms` for the public configuration interval. Internal
   state that describes a concrete bucket uses `bucket`, for example `oldest_bucket_ttl` and
   `oldest_bucket_count`, rather than `last_rate_group_ttl` or `last_rate_group_count`.
+- `retry_after_ms` is the remaining wait until the oldest live bucket expires.
+  `remaining_after_waiting` is the capacity released at that point and therefore equals
+  `oldest_bucket_count`; it is not the count still in the window and must not be calculated as
+  `total_count - oldest_bucket_count`. For a full window with buckets `3` then `7`, it is `3`.
 
 Do not shorten `window_limit`, `hard_window_limit`, or `soft_window_limit` to `limit` in code that
 could refer to more than one of them. Shared physical Redis-key functions may retain the generic
@@ -463,6 +467,15 @@ Benchmarks measure a named mechanism; they should not mix setup work into the me
 - Keep guard-miss, replacement, `PreserveNewest`, and `PreserveOldest` cases separate.
 - Do not assert performance thresholds in unit tests.
 - Do not commit Criterion reports or other generated benchmark artifacts.
+- Keep Redis client and limiter construction in `benches/common.rs`; do not make benchmark
+  binaries responsible for starting services or interpreting runtime feature flags.
+- Public Make targets for Redis-backed benchmark suites must be self-contained. A target such as
+  `bench-redis-tokio` or `bench-hybrid-smol` must start a ready Redis 7.2+ service before running
+  Criterion and stop the managed service on success, command failure, `SIGINT`, or `SIGTERM`.
+- Aggregate Make targets should compose the self-contained runtime-specific targets rather than
+  depending on an undocumented Redis process left running by another command.
+- Direct `cargo bench` invocations may use an externally managed Redis instance through
+  `REDIS_URL`; document that distinction in `BENCH.md` whenever benchmark entry points change.
 
 Stress tests may trade determinism for load realism, but their command-line parameters, key
 distribution, provider, strategy, duration, and runtime must be visible in output so results are
@@ -623,6 +636,7 @@ git diff --check
 - [ ] Lua guard misses perform no writes.
 - [ ] Tests arrange state through public APIs and assert their setup.
 - [ ] Cross-provider and runtime variants were audited where applicable.
+- [ ] Rejected metadata reports the oldest-bucket wait and the capacity released when it expires.
 - [ ] Benchmarks isolate the mechanism they claim to measure.
 - [ ] Public documentation is current, linked, runnable, and warning-clean.
 - [ ] Markdown has one H1, descriptive headings, fenced language-tagged code, and no trailing

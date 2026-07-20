@@ -74,7 +74,7 @@ trypema = { version = "1", features = ["redis-smol"] }
 `RateLimit` is the per-second limit value used by all providers. `RedisKey` is the validated key
 type required by the Redis and hybrid providers. `RateLimitDecision` is the result returned by
 `inc()` and `is_allowed()`, and `RateLimiter` is the top-level entry point used throughout the
-examples.
+examples. `SuppressedRateLimitSnapshot` is returned by `get()` on each suppressed provider.
 
 ```rust,no_run
 use trypema::RateLimit;
@@ -212,6 +212,60 @@ assert!(matches!(
 ));
 ```
 
+### Read and Conditionally Adjust Current Totals
+
+Every strategy exposes `get()`. Absolute strategies return the live sliding-window total directly.
+Suppressed strategies return a `SuppressedRateLimitSnapshot` containing the observed total,
+declined total, and current suppression factor. Unknown keys return zero-valued results without
+creating limiter state. Reads may lazily evict expired buckets; hybrid snapshots also include
+pending increments and declines from the current instance.
+
+Hybrid absolute also exposes `get_inferred()`. It uses initialized local limiting state when that
+state can answer the read. Undefined state and expired rejection caches refresh from Redis first,
+then the method infers the total from the updated state. The local fast path can lag later remote
+commits and Redis-side expiration. Use `get()` when every read must consult Redis and overlay this
+instance's pending increments.
+
+`set_if()` replaces the total only when its `RateLimitComparator` matches the current live total.
+A comparator miss changes nothing. A match replaces history, recomputes the stored window limit
+(the hard window limit for suppressed strategies) from the supplied rate limit, and returns
+`(new_total, old_total)`. A matched target of zero deletes the key completely.
+
+`set_if_preserve_history()` keeps history instead of replacing it. `PreserveNewest` reductions
+consume oldest buckets and increases extend the newest bucket. `PreserveOldest` does the reverse.
+Redis and hybrid variants use the same contract asynchronously.
+
+```rust
+use trypema::{
+    HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, RateLimiter,
+};
+
+let rl = RateLimiter::builder().build().unwrap();
+let limiter = rl.local().absolute();
+let rate = RateLimit::try_from(10.0).unwrap();
+assert!(matches!(limiter.inc("user_123", &rate, 2), RateLimitDecision::Allowed));
+assert_eq!(limiter.get("user_123"), 2);
+
+assert_eq!(
+    limiter.set_if("user_123", &rate, RateLimitComparator::Eq(2), 5),
+    (5, 2)
+);
+assert_eq!(
+    limiter.set_if_preserve_history(
+        "user_123",
+        &rate,
+        RateLimitComparator::Nil,
+        3,
+        HistoryPreservation::PreserveNewest,
+    ),
+    (3, 5)
+);
+assert_eq!(
+    limiter.set_if("user_123", &rate, RateLimitComparator::Nil, 0),
+    (0, 3)
+);
+```
+
 ### Read Current Suppression State
 
 ```rust
@@ -219,8 +273,10 @@ use trypema::RateLimiter;
 
 let rl = RateLimiter::builder().build().unwrap();
 
-let sf = rl.local().suppressed().get_suppression_factor("user_123");
-assert_eq!(sf, 0.0);
+let snapshot = rl.local().suppressed().get("user_123");
+assert_eq!(snapshot.total, 0);
+assert_eq!(snapshot.total_declined, 0);
+assert_eq!(snapshot.suppression_factor, 0.0);
 ```
 
 ### Redis Absolute
@@ -265,7 +321,10 @@ async fn example() -> Result<(), trypema::TrypemaError> {
     let rl = RateLimiter::builder(connection_manager).build()?;
     let key = RedisKey::try_from("user_123".to_string())?;
 
-    assert_eq!(rl.redis().suppressed().get_suppression_factor(&key).await?, 0.0);
+    let snapshot = rl.redis().suppressed().get(&key).await?;
+    assert_eq!(snapshot.total, 0);
+    assert_eq!(snapshot.total_declined, 0);
+    assert_eq!(snapshot.suppression_factor, 0.0);
 
     Ok(())
 }
@@ -292,6 +351,8 @@ async fn example() -> Result<(), trypema::TrypemaError> {
         rl.hybrid().absolute().inc(&key, &rate, 1).await?,
         RateLimitDecision::Allowed
     ));
+    assert_eq!(rl.hybrid().absolute().get_inferred(&key).await?, 1);
+    assert_eq!(rl.hybrid().absolute().get(&key).await?, 1);
 
     Ok(())
 }
@@ -302,14 +363,15 @@ async fn example() -> Result<(), trypema::TrypemaError> {
 Every strategy returns `RateLimitDecision`:
 
 - `Allowed` means the request should proceed.
-- `Rejected` means the absolute strategy denied the request and includes best-effort backoff
-  hints.
+- `Rejected` means the absolute strategy denied the request. Its best-effort hints report the
+  remaining wait until the oldest live bucket expires and the capacity released at that point.
 - `Suppressed` means the suppressed strategy is active; check `is_allowed` for the admission
   result.
 
 ## Notes
 
-- Rate limits are sticky per key: the first `inc()` stores the key's rate limit.
+- Rate limits are sticky per key: the first `inc()` computes and stores the key's window limit
+  (the hard window limit for suppressed strategies).
 - Bucket coalescing trades timing precision for lower overhead.
 - Redis and hybrid modes provide best-effort distributed limiting, not strict linearizability.
 

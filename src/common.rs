@@ -70,7 +70,7 @@ pub(crate) struct Bucket {
 ///     }
 ///     RateLimitDecision::Rejected { retry_after_ms, remaining_after_waiting, .. } => {
 ///         println!("Rate limited, retry in {}ms", retry_after_ms);
-///         println!("Estimated remaining: {}", remaining_after_waiting);
+///         println!("Capacity after waiting: {}", remaining_after_waiting);
 ///     }
 ///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
 ///         if is_allowed {
@@ -105,15 +105,16 @@ pub enum RateLimitDecision {
         /// Use as a backoff hint, not a guarantee.
         retry_after_ms: u128,
 
-        /// **Best-effort** estimate of how many requests will still be counted in the
-        /// window after `retry_after_ms` elapses.
+        /// **Best-effort** estimate of how much capacity becomes available after
+        /// `retry_after_ms` elapses.
         ///
-        /// Computed as `total_count - oldest_bucket_count`. This represents the number of
-        /// requests that will remain in the window once the oldest bucket expires. May be:
-        /// - `0` if all activity is heavily coalesced into the oldest bucket
-        /// - Inaccurate if concurrent activity modifies buckets
+        /// This is the count released when the oldest live bucket expires. For example, if a
+        /// full window contains buckets with counts `3` and `7`, this value is `3`: the caller
+        /// can send three count units after waiting. If grouping coalesced all usage into the
+        /// oldest bucket, this is the full grouped count. It may be inaccurate if concurrent
+        /// activity modifies the buckets.
         ///
-        /// Use for rough capacity indication only.
+        /// Use as a capacity hint, not a guarantee.
         remaining_after_waiting: u64,
     },
 

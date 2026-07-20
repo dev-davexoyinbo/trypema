@@ -158,8 +158,9 @@ For `is_allowed`:
 - Rejected decisions expose best-effort metadata:
   - `retry_after_ms` is the remaining wait until the oldest live bucket expires, not the bucket's
     elapsed age.
-  - `remaining_after_waiting` is the count released when that oldest bucket expires. For buckets
-    containing `3` then `7`, this value is `3`, not `7`.
+  - `remaining_after_waiting` is the capacity released when that oldest bucket expires: the
+    amount the caller can send after `retry_after_ms`. For a full window with buckets containing
+    `3` then `7`, this value is `3`, not `7` and not the `7` count units still in the window.
   - If grouping merged all usage into the oldest bucket, `remaining_after_waiting` is the full
     merged bucket count.
 
@@ -764,7 +765,8 @@ Before handing work back, confirm all applicable items:
 - [ ] Absolute `get` returns a `u64`; suppressed `get` returns a snapshot whose total, declined
       total, and suppression factor all reflect live state and provider-specific pending overlays.
 - [ ] `retry_after_ms` is remaining time, not elapsed age.
-- [ ] `remaining_after_waiting` reflects the oldest bucket released.
+- [ ] `remaining_after_waiting` is the oldest live bucket count: the capacity available after
+      `retry_after_ms`, not the count that remains in the window.
 - [ ] Conditional-set comparator semantics use the live total.
 - [ ] Absolute values use `window_limit`; suppressed values use `hard_window_limit`; neither uses
       an ambiguous `limit` alias.
@@ -797,6 +799,7 @@ Before handing work back, confirm all applicable items:
 - Requiring expired-key reads to remain compatible with an artificially held shared guard.
 - Returning elapsed bucket age as `retry_after_ms`.
 - Treating the newest bucket count as `remaining_after_waiting`.
+- Computing `remaining_after_waiting` as `total_count - oldest_bucket_count`.
 - Ignoring setup `inc` decisions and accidentally testing a rejected increment.
 - Fabricating buckets or timestamps through private test helpers.
 - Leaving an empty map entry after a successful zero-target conditional set.

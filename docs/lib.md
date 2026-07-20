@@ -263,6 +263,12 @@ zero-valued results without creating limiter state. A read may lazily evict expi
 repair stored totals; hybrid snapshots also include pending increments and declines from the
 current instance.
 
+Hybrid absolute also provides `AbsoluteHybridRateLimiter::get_inferred`. It uses initialized local
+limiting state when possible. Undefined state and expired rejection caches refresh from Redis
+first, then the method infers the total from the updated state. Its local fast path can lag later
+remote commits and Redis-side expiration. `AbsoluteHybridRateLimiter::get` consults Redis on every
+call and overlays this instance's pending increments.
+
 Use [`AbsoluteLocalRateLimiter::set_if`](crate::AbsoluteLocalRateLimiter::set_if) to replace a
 total only when a [`RateLimitComparator`](crate::RateLimitComparator) matches the current live
 total. A comparator miss is a true no-op: it does not prune history, redefine the limit, refresh a
@@ -385,6 +391,11 @@ assert!(matches!(
     rl.hybrid().absolute().inc(&key, &rate, 1).await.unwrap(),
     RateLimitDecision::Allowed
 ));
+assert_eq!(
+    rl.hybrid().absolute().get_inferred(&key).await.unwrap(),
+    1
+);
+assert_eq!(rl.hybrid().absolute().get(&key).await.unwrap(), 1);
 # });
 # }
 ```
@@ -394,8 +405,9 @@ assert!(matches!(
 All strategies return [`RateLimitDecision`]:
 
 - [`Allowed`](crate::RateLimitDecision::Allowed): the request should proceed
-- [`Rejected`](crate::RateLimitDecision::Rejected): the absolute strategy denied the request and
-  includes best-effort backoff hints
+- [`Rejected`](crate::RateLimitDecision::Rejected): the absolute strategy denied the request; its
+  best-effort hints report the remaining wait until the oldest live bucket expires and the
+  capacity released at that point
 - [`Suppressed`](crate::RateLimitDecision::Suppressed): the suppressed strategy is active; check
   `is_allowed` for the admission decision
 
