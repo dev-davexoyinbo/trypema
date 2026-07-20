@@ -7,14 +7,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry, mapref::one::Ref};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError,
-    WindowSizeSeconds,
+    HistoryPreservation, RateGroupSizeMs, RateLimit, RateLimitComparator, RateLimitDecision,
+    RedisKey, RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
+    common::{HistoryUpdateMode, RandomState},
     hybrid::{
-        AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, SyncIntervalMs,
+        AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
+        SyncIntervalMs,
         absolute_hybrid_redis_proxy::{
             AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyOptions,
             AbsoluteHybridRedisProxyReadStateResult,
@@ -25,6 +27,8 @@ use crate::{
     runtime,
 };
 
+mod helpers;
+
 #[derive(Debug)]
 enum AbsoluteRedisLimitingState {
     Accepting {
@@ -33,8 +37,8 @@ enum AbsoluteRedisLimitingState {
         starting_count: Mutex<u64>,
         count: AtomicU64,
         time_instant: Mutex<Instant>,
-        last_rate_group_ttl: Mutex<Option<u64>>,
-        last_rate_group_count: Mutex<Option<u64>>,
+        oldest_bucket_ttl: Mutex<Option<u64>>,
+        oldest_bucket_count: Mutex<Option<u64>>,
         last_modified: Mutex<Instant>,
     },
     Undefined,
@@ -86,11 +90,11 @@ pub struct AbsoluteHybridRateLimiter {
     rate_group_size_ms: RateGroupSizeMs,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
-    limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
+    limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState, RandomState>,
     /// Per-key async mutex that serializes the "Redis read + state update" operation.
     /// Only one tokio task at a time may perform the read+update for a given key;
     /// all other tasks wait on this lock and then re-check the (now-updated) state.
-    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
+    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>, RandomState>,
     sync_interval_ms: SyncIntervalMs,
     epoch: AtomicU64,
     last_commited_epoch: AtomicU64,
@@ -126,8 +130,8 @@ impl AbsoluteHybridRateLimiter {
             rate_group_size_ms: options.rate_group_size_ms,
             commiter_sender,
             redis_proxy,
-            limiting_state: DashMap::new(),
-            reset_locks: DashMap::new(),
+            limiting_state: DashMap::default(),
+            reset_locks: DashMap::default(),
             sync_interval_ms: options.sync_interval_ms,
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
@@ -143,7 +147,7 @@ impl AbsoluteHybridRateLimiter {
     } // end method with_rate_type
 
     fn epoch_change_task(self: &Arc<Self>) {
-        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         let limiter = Arc::downgrade(self);
 
         spawn_task(async move {
@@ -152,7 +156,8 @@ impl AbsoluteHybridRateLimiter {
                 let Some(limiter) = limiter.upgrade() else {
                     break;
                 };
-                limiter.epoch.fetch_add(1, Ordering::Relaxed);
+
+                limiter.epoch.fetch_add(1, Ordering::AcqRel);
             }
         });
     }
@@ -180,13 +185,13 @@ impl AbsoluteHybridRateLimiter {
         });
     } // end method listen_for_committer_signals
 
-    #[inline(always)]
+    // #[inline(always)]
     fn send_epoch_change_if_needed(&self) {
-        let epoch = self.epoch.load(Ordering::Relaxed);
+        let epoch = self.epoch.load(Ordering::Acquire);
 
-        if self.last_commited_epoch.load(Ordering::Relaxed) < epoch {
+        if self.last_commited_epoch.load(Ordering::Acquire) < epoch {
             let _ = self.is_active_watch.send(epoch);
-            self.last_commited_epoch.store(epoch, Ordering::Relaxed);
+            self.last_commited_epoch.store(epoch, Ordering::Release);
         }
     }
 
@@ -195,10 +200,26 @@ impl AbsoluteHybridRateLimiter {
         if let Some(lock) = self.reset_locks.get(key) {
             return Arc::clone(&lock);
         }
+
         self.reset_locks
             .entry(key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .downgrade()
             .clone()
+    }
+
+    fn get_or_create_limiting_state(
+        &self,
+        key: &RedisKey,
+    ) -> Ref<'_, RedisKey, AbsoluteRedisLimitingState> {
+        match self.limiting_state.get(key) {
+            Some(state) => state,
+            None => self
+                .limiting_state
+                .entry(key.clone())
+                .or_insert_with(|| AbsoluteRedisLimitingState::Undefined)
+                .downgrade(),
+        }
     }
 
     /// Check admission and, if allowed, record the increment for `key`.

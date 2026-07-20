@@ -1,166 +1,17 @@
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    RateGroupSizeMs, TrypemaError, WindowSizeSeconds,
-    common::RateType,
+    RateGroupSizeMs, RateLimitComparator, TrypemaError, WindowSizeSeconds,
+    common::{HistoryUpdateMode, RateType},
     hybrid::RedisProxyCommitter,
-    redis::{RedisKey, RedisKeyGenerator},
+    redis::{
+        RedisKey, RedisKeyGenerator,
+        scripts::{
+            ABSOLUTE_CLEANUP_LUA, ABSOLUTE_HYBRID_COMMIT_STATE_LUA, ABSOLUTE_HYBRID_READ_STATE_LUA,
+            ABSOLUTE_SET_IF_LUA, absolute_lua_script,
+        },
+    },
 };
-
-const ABSOLUTE_CLEANUP_LUA: &str = r#"
-    local time_array = redis.call("TIME")
-    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-
-    local prefix = KEYS[1]
-    local rate_type = KEYS[2]
-    local active_entities_key = KEYS[3]
-
-    local stale_after_ms = tonumber(ARGV[1]) or 0
-    local hash_suffix = ARGV[2]
-    local window_limit_suffix = ARGV[3]
-    local total_count_suffix = ARGV[4]
-    local active_keys_suffix = ARGV[5]
-    local suppression_factor_key_suffix = ARGV[6]
-
-
-    local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
-
-    if #active_entities == 0 then
-        return 
-    end
-
-    local remove_keys = {}
-
-    local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
-    for i = 1, #active_entities do
-        local entity = active_entities[i]
-
-        for i = 1, #suffixes do
-            table.insert(remove_keys, prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
-        end
-    end
-
-    if #remove_keys > 0 then
-        redis.call("DEL", unpack(remove_keys))
-        redis.call("ZREM", active_entities_key, unpack(active_entities))
-    end
-
-    return
-"#;
-
-const COMMIT_STATE_SCRIPT: &str = r#"
-    local time_array = redis.call("TIME")
-    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-
-    local hash_key = KEYS[1]
-    local active_keys = KEYS[2]
-    local window_limit_key = KEYS[3]
-    local total_count_key = KEYS[4]
-    local active_entities_key = KEYS[5]
-
-    local entity = ARGV[1]
-    local window_size_seconds = tonumber(ARGV[2])
-    local window_limit = tonumber(ARGV[3])
-    local rate_group_size_ms = tonumber(ARGV[4])
-    local count = tonumber(ARGV[5])
-
-
-    -- evict expired buckets
-    local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
-    if #to_remove_keys > 0 then
-        local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
-        redis.call("HDEL", hash_key, unpack(to_remove_keys))
-
-        local remove_sum = 0
-
-        for i = 1, #to_remove do
-            remove_sum = remove_sum + (tonumber(to_remove[i]) or 0)
-        end
-
-        redis.call("DECRBY", total_count_key, remove_sum)
-        redis.call("ZREM", active_keys, unpack(to_remove_keys))
-    end
-
-    --group bucketing
-    local latest_hash_field_entry = redis.call("ZRANGE", active_keys, 0, 0, "REV", "WITHSCORES")
-    if #latest_hash_field_entry > 0 then
-        local age_ms = timestamp_ms - tonumber(latest_hash_field_entry[2])
-        
-        if age_ms > 0 and age_ms < rate_group_size_ms then
-            timestamp_ms = tonumber(latest_hash_field_entry[1])
-        end
-    end
-
-    local hash_field = tostring(timestamp_ms)
-    local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
-    redis.call("INCRBY", total_count_key, count)
-
-    if new_count == count then
-        redis.call("ZADD", active_keys, timestamp_ms, hash_field)
-        redis.call("SET", window_limit_key, window_limit)
-    end
-
-
-    local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
-    local oldest_ttl = nil
-    local oldest_count = nil
-
-    if #oldest_hash_fields > 0 then
-        oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_fields[1])) or 0
-        oldest_ttl = (window_size_seconds * 1000) - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
-    end
-
-    redis.call("EXPIRE", window_limit_key, window_size_seconds)
-    redis.call("ZADD", active_entities_key, timestamp_ms, entity)
-"#;
-
-const READ_STATE_SCRIPT: &str = r#"
-    local time_array = redis.call("TIME")
-    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-
-    local hash_key = KEYS[1]
-    local active_keys = KEYS[2]
-    local window_limit_key = KEYS[3]
-    local total_count_key = KEYS[4]
-    local active_entities_key = KEYS[5]
-
-    local entity = ARGV[1]
-    local window_size_ms = tonumber(ARGV[2])
-
-    local res = redis.call("MGET", window_limit_key, total_count_key)
-
-    local window_limit = tonumber(res[1])
-    local total_count = tonumber(res[2]) or 0
-
-    -- evict expired buckets
-    local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_ms, "BYSCORE")
-    if #to_remove_keys > 0 then
-        local to_remove = redis.call("HMGET", hash_key, unpack(to_remove_keys))
-        redis.call("HDEL", hash_key, unpack(to_remove_keys))
-
-        local remove_sum = 0
-
-        for i = 1, #to_remove do
-            remove_sum = remove_sum + (tonumber(to_remove[i]) or 0)
-        end
-
-        total_count = redis.call("DECRBY", total_count_key, remove_sum)
-        redis.call("ZREM", active_keys, unpack(to_remove_keys))
-    end
-
-    local oldest_hash_fields = redis.call("ZRANGE", active_keys, 0, 0, "WITHSCORES")
-    local oldest_ttl = nil
-    local oldest_count = nil
-
-    if #oldest_hash_fields > 0 then
-        oldest_count = tonumber(redis.call("HGET", hash_key, oldest_hash_fields[1])) or 0
-        oldest_ttl = window_size_ms - timestamp_ms + (tonumber(oldest_hash_fields[2]) or 0)
-    end
-
-    redis.call("ZADD", active_entities_key, timestamp_ms, entity)
-
-    return {entity, total_count, window_limit or -1, oldest_ttl or -1, oldest_count or -1}
-"#;
 
 #[derive(Debug)]
 pub(crate) struct AbsoluteHybridCommit {
@@ -174,8 +25,8 @@ pub(crate) struct AbsoluteHybridRedisProxyReadStateResult {
     pub key: RedisKey,
     pub current_total_count: u64,
     pub window_limit: Option<u64>,
-    pub last_rate_group_ttl: Option<u64>,
-    pub last_rate_group_count: Option<u64>,
+    pub oldest_bucket_ttl: Option<u64>,
+    pub oldest_bucket_count: Option<u64>,
 }
 
 pub(crate) struct AbsoluteHybridRedisProxyOptions {
@@ -190,6 +41,7 @@ pub(crate) struct AbsoluteHybridRedisProxy {
     key_generator: RedisKeyGenerator,
     read_state_script: Script,
     commit_state_script: Script,
+    set_if_script: Script,
     cleanup_script: Script,
     connection_manager: ConnectionManager,
     read_chunk_size: usize,
@@ -211,9 +63,10 @@ impl AbsoluteHybridRedisProxy {
 
         Self {
             key_generator: RedisKeyGenerator::new(prefix, RateType::HybridAbsolute),
-            read_state_script: Script::new(READ_STATE_SCRIPT),
-            commit_state_script: Script::new(COMMIT_STATE_SCRIPT),
-            cleanup_script: Script::new(ABSOLUTE_CLEANUP_LUA),
+            read_state_script: absolute_lua_script(ABSOLUTE_HYBRID_READ_STATE_LUA),
+            commit_state_script: absolute_lua_script(ABSOLUTE_HYBRID_COMMIT_STATE_LUA),
+            set_if_script: absolute_lua_script(ABSOLUTE_SET_IF_LUA),
+            cleanup_script: absolute_lua_script(ABSOLUTE_CLEANUP_LUA),
             connection_manager,
             read_chunk_size: 100,
             window_size_seconds,
@@ -348,6 +201,50 @@ impl AbsoluteHybridRedisProxy {
         pipe
     }
 
+    /// Conditionally replace the window total for `key`.
+    ///
+    /// Atomically computes the logical live total without writing and evaluates the
+    /// comparator. On a match, the script prunes expired buckets and applies the
+    /// requested history mode; `window_limit` is (re)written and its TTL refreshed.
+    /// A miss performs no writes.
+    ///
+    /// Returns `(new_total, old_total)` where `old_total` is the post-eviction total
+    /// the comparator was evaluated against and `new_total` is the total after the
+    /// operation (`count` when matched, `old_total` otherwise).
+    pub(crate) async fn set_if(
+        &self,
+        key: &RedisKey,
+        window_limit: u64,
+        comparator: RateLimitComparator,
+        count: u64,
+        mode: HistoryUpdateMode,
+        pending_count: u64,
+    ) -> Result<(u64, u64, bool), TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let (comparator_op, comparator_operand) = comparator.redis_args();
+
+        let (new_total, old_total, changed): (u64, u64, u64) = self
+            .set_if_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .arg(key.as_str())
+            .arg(*self.window_size_seconds)
+            .arg(window_limit)
+            .arg(comparator_op)
+            .arg(comparator_operand)
+            .arg(count)
+            .arg(mode.redis_arg())
+            .arg(pending_count)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok((new_total, old_total, changed != 0))
+    } // end method set_if
+
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
@@ -415,7 +312,7 @@ fn map_redis_read_result_to_state(
         key: RedisKey::from(entity),
         current_total_count: total_count,
         window_limit: map_negative_to_none(window_limit),
-        last_rate_group_ttl: map_negative_to_none(oldest_ttl),
-        last_rate_group_count: map_negative_to_none(oldest_count),
+        oldest_bucket_ttl: map_negative_to_none(oldest_ttl),
+        oldest_bucket_count: map_negative_to_none(oldest_count),
     }
 }
