@@ -7,42 +7,53 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry, mapref::one::Ref};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    HardLimitFactor, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions,
-    SuppressionFactorCacheMs, TrypemaError, WindowSizeSeconds,
+    HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
+    RedisKey, RedisRateLimiterOptions, SuppressedRateLimitSnapshot, SuppressionFactorCacheMs,
+    TrypemaError, WindowSizeSeconds,
+    common::{HistoryUpdateMode, RandomState},
     hybrid::{
-        AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions,
-        SuppressedHybridCommit, SuppressedHybridRedisProxy, SuppressedHybridRedisProxyOptions,
-        SuppressedHybridRedisProxyReadStateResult,
+        AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
+        SuppressedHybridCommit, SuppressedHybridPendingState, SuppressedHybridRedisProxy,
+        SuppressedHybridRedisProxyOptions, SuppressedHybridRedisProxyReadStateResult,
         common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal},
     },
     redis::{mutex_lock, spawn_task},
     runtime,
 };
 
+mod helpers;
+
 #[derive(Debug)]
 enum SuppressedRedisLimitingState {
     Accepting {
-        window_limit: Mutex<u64>,
+        hard_window_limit: Mutex<f64>,
         starting_count: Mutex<u64>,
         count: AtomicU64,
         declined_count: Mutex<u64>,
-        time_instant: Mutex<Instant>,
         last_modified: Mutex<Instant>,
     },
     Undefined,
     Suppressing {
         time_instant: Mutex<Instant>,
-        window_limit: Mutex<u64>,
+        hard_window_limit: Mutex<f64>,
         suppression_factor: Mutex<f64>,
         suppression_factor_ttl_ms: Mutex<u64>,
         starting_count: Mutex<u64>,
+        starting_declined_count: Mutex<u64>,
         count: AtomicU64,
         declined_count: AtomicU64,
     },
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SuppressedHybridSetIfTestHook {
+    pub snapshot_taken: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
 }
 
 /// Probabilistic suppression rate limiter with a local fast-path and periodic Redis sync.
@@ -73,13 +84,15 @@ pub struct SuppressedHybridRateLimiter {
     window_size_seconds: WindowSizeSeconds,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<SuppressedHybridCommit>>,
     redis_proxy: SuppressedHybridRedisProxy,
-    limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState>,
+    limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState, RandomState>,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_ms: SuppressionFactorCacheMs,
     epoch: AtomicU64,
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
-    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
+    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>, RandomState>,
+    #[cfg(test)]
+    set_if_test_hook: Mutex<Option<Arc<SuppressedHybridSetIfTestHook>>>,
 }
 
 impl SuppressedHybridRateLimiter {
@@ -118,13 +131,15 @@ impl SuppressedHybridRateLimiter {
             window_size_seconds,
             commiter_sender,
             redis_proxy,
-            limiting_state: DashMap::new(),
+            limiting_state: DashMap::default(),
             hard_limit_factor,
             suppression_factor_cache_ms,
             is_active_watch,
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
-            reset_locks: DashMap::new(),
+            reset_locks: DashMap::default(),
+            #[cfg(test)]
+            set_if_test_hook: Mutex::new(None),
         };
 
         let limiter = Arc::new(limiter);
@@ -133,7 +148,7 @@ impl SuppressedHybridRateLimiter {
         limiter.epoch_change_task();
 
         limiter
-    } // end method with_rate_type
+    } // end constructor
 
     fn listen_for_committer_signals(
         self: &Arc<Self>,
@@ -156,10 +171,10 @@ impl SuppressedHybridRateLimiter {
                 }
             }
         });
-    } // end method listen_for_committer_signals
+    } // end fn listen_for_committer_signals
 
     fn epoch_change_task(self: &Arc<Self>) {
-        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         let limiter = Arc::downgrade(self);
 
         spawn_task(async move {
@@ -168,20 +183,20 @@ impl SuppressedHybridRateLimiter {
                 let Some(limiter) = limiter.upgrade() else {
                     break;
                 };
-                limiter.epoch.fetch_add(1, Ordering::Relaxed);
+                limiter.epoch.fetch_add(1, Ordering::AcqRel);
             }
         });
-    }
+    } // end fn epoch_change_task
 
     #[inline(always)]
     fn send_epoch_change_if_needed(&self) {
-        let epoch = self.epoch.load(Ordering::Relaxed);
+        let epoch = self.epoch.load(Ordering::Acquire);
 
-        if self.last_commited_epoch.load(Ordering::Relaxed) < epoch {
+        if self.last_commited_epoch.load(Ordering::Acquire) < epoch {
             let _ = self.is_active_watch.send(epoch);
-            self.last_commited_epoch.store(epoch, Ordering::Relaxed);
+            self.last_commited_epoch.store(epoch, Ordering::Release);
         }
-    }
+    } // end fn send_epoch_change_if_needed
 
     /// Acquire (or create) the per-key reset lock and return an `Arc` to it.
     fn get_or_create_reset_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -191,7 +206,22 @@ impl SuppressedHybridRateLimiter {
         self.reset_locks
             .entry(key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .downgrade()
             .clone()
+    }
+
+    fn get_or_create_limiting_state(
+        &self,
+        key: &RedisKey,
+    ) -> Ref<'_, RedisKey, SuppressedRedisLimitingState> {
+        match self.limiting_state.get(key) {
+            Some(state) => state,
+            None => self
+                .limiting_state
+                .entry(key.clone())
+                .or_insert_with(|| SuppressedRedisLimitingState::Undefined)
+                .downgrade(),
+        }
     }
 
     /// Get the current suppression factor for `key`.
@@ -199,11 +229,12 @@ impl SuppressedHybridRateLimiter {
     /// Returns a value in the range `[0.0, 1.0]`:
     /// - `0.0` — no suppression (below capacity or key not found)
     /// - `0.0 < sf < 1.0` — partial suppression (at capacity)
-    /// - `1.0` — full suppression (over hard limit)
+    /// - `1.0` — full suppression (cached at the hard boundary or on a forecast above it)
     ///
     /// On the fast-path (key in `Suppressing` state with a fresh cached factor), this is
     /// served entirely from local state with no Redis I/O. Otherwise, it performs a Redis
-    /// read to refresh the state.
+    /// read to refresh the state. Unknown keys remain absent, and Redis history eviction
+    /// invalidates a factor cached from the expired history.
     ///
     /// This method is read-only with respect to request counts. It is useful for metrics
     /// and observability dashboards.
@@ -322,12 +353,15 @@ impl SuppressedHybridRateLimiter {
     ///
     /// # Returns
     ///
-    /// - `Ok(Allowed)` — below capacity, no suppression active
-    /// - `Ok(Suppressed { is_allowed, suppression_factor })` — at/above capacity, check `is_allowed`
+    /// - `Ok(Allowed)` — the increment remains within soft capacity or reaches the hard limit
+    ///   exactly
+    /// - `Ok(Suppressed { is_allowed, suppression_factor })` — the forecasted accepted total is
+    ///   above soft capacity without landing exactly on the hard limit; check `is_allowed`
     /// - `Err(TrypemaError)` — Redis error during state refresh
     ///
-    /// The total observed counter is always incremented. If `is_allowed` is `false`,
-    /// the declined counter is also incremented.
+    /// The total observed counter is always incremented. If the increment reaches the hard limit
+    /// exactly, it is admitted and local full suppression is cached for subsequent calls. If
+    /// `is_allowed` is `false`, the declined counter is also incremented.
     ///
     /// # Examples
     ///
