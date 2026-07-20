@@ -774,4 +774,80 @@ impl SuppressedHybridRateLimiter {
         }
     }
 
+    pub(super) fn is_stale_for_flush(
+        &self,
+        state: &SuppressedRedisLimitingState,
+    ) -> Result<bool, TrypemaError> {
+        let elapsed_ms = match state {
+            SuppressedRedisLimitingState::Undefined => return Ok(false),
+            SuppressedRedisLimitingState::Accepting { last_modified, .. } => {
+                mutex_lock(last_modified, "accepting.last_modified")?
+                    .elapsed()
+                    .as_millis()
+            }
+            SuppressedRedisLimitingState::Suppressing { time_instant, .. } => {
+                mutex_lock(time_instant, "suppressing.time_instant")?
+                    .elapsed()
+                    .as_millis()
+            }
+        };
+
+        Ok(elapsed_ms > (*self.window_size_seconds * 1_000) as u128)
+    } // end fn is_stale_for_flush
+
+    pub(super) fn has_pending_counts(state: &SuppressedRedisLimitingState) -> bool {
+        match state {
+            SuppressedRedisLimitingState::Accepting { count, .. } => {
+                count.load(Ordering::Acquire) > 0
+            }
+            SuppressedRedisLimitingState::Suppressing {
+                count,
+                declined_count,
+                ..
+            } => count.load(Ordering::Acquire) > 0 || declined_count.load(Ordering::Acquire) > 0,
+            SuppressedRedisLimitingState::Undefined => false,
+        }
+    } // end fn has_pending_counts
+
+    pub(super) fn collect_flush_candidates(&self) -> (Vec<RedisKey>, Vec<RedisKey>) {
+        let mut resets: Vec<RedisKey> = Vec::new();
+        let mut stale: Vec<RedisKey> = Vec::new();
+
+        for state in self.limiting_state.iter() {
+            let is_stale = match self.is_stale_for_flush(state.value()) {
+                Ok(is_stale) => is_stale,
+                Err(err) => {
+                    tracing::warn!(error = ?err, "failed to inspect local state for flush");
+                    continue;
+                }
+            };
+
+            if is_stale {
+                stale.push(state.key().clone());
+            } else if Self::has_pending_counts(state.value()) {
+                resets.push(state.key().clone());
+            }
+        }
+
+        (resets, stale)
+    } // end fn collect_flush_candidates
+
+    pub(super) fn reset_stale_local_state(&self, key: &RedisKey) -> Result<(), TrypemaError> {
+        let should_reset = self
+            .limiting_state
+            .get(key)
+            .is_some_and(|state| self.is_stale_for_flush(state.value()).unwrap_or(false));
+
+        if !should_reset {
+            return Ok(());
+        }
+
+        if let Some(mut state) = self.limiting_state.get_mut(key)
+            && self.is_stale_for_flush(state.value())?
+        {
+            *state = SuppressedRedisLimitingState::Undefined;
+        }
+
+        Ok(())
+    } // end fn reset_stale_local_state
 } // end impl
