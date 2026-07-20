@@ -337,6 +337,77 @@ impl SuppressedHybridRateLimiter {
 
         Ok(self.local_snapshot(state.deref())?.unwrap_or_default())
     } // end method get_inferred
+
+    /// Current live window state for `key` (best-effort).
+    ///
+    /// Returns Redis state after lazily evicting expired buckets, overlaid with this instance's
+    /// pending local increments and declines. The observed total includes accepted and declined
+    /// calls, matching the counter that suppression decisions are based on. Pending increments
+    /// held by other instances are not visible until their next flush, so the result may lag the
+    /// true global state by up to `sync_interval_ms`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::RateLimit;
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let snapshot = rl.hybrid().suppressed().get(&key).await.unwrap();
+    /// assert_eq!(snapshot.total, 0);
+    /// assert_eq!(snapshot.total_declined, 0);
+    /// assert_eq!(snapshot.suppression_factor, 0.0);
+    ///
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// rl.hybrid().suppressed().inc(&key, &rate, 3).await.unwrap();
+    /// assert_eq!(rl.hybrid().suppressed().get(&key).await.unwrap().total, 3);
+    /// # });
+    /// ```
+    pub async fn get(&self, key: &RedisKey) -> Result<SuppressedRateLimitSnapshot, TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        let lock = self.get_or_create_reset_lock(key);
+        let _guard = lock.lock().await;
+
+        let read_state_result = self.redis_proxy.read_state(key).await?;
+
+        let mut total = read_state_result.current_total_count;
+        let mut total_declined = read_state_result.current_total_declined;
+        let mut suppression_factor = read_state_result.suppression_factor;
+
+        if let Some(state_entry) = self.limiting_state.get(key) {
+            if let Some(local_suppression_factor) =
+                self.local_suppression_factor(state_entry.deref())?
+            {
+                suppression_factor = suppression_factor.max(local_suppression_factor);
+            }
+
+            match state_entry.deref() {
+                SuppressedRedisLimitingState::Accepting { count, .. } => {
+                    total = total.saturating_add(count.load(Ordering::Acquire));
+                }
+                SuppressedRedisLimitingState::Suppressing {
+                    count,
+                    declined_count,
+                    ..
+                } => {
+                    total = total.saturating_add(count.load(Ordering::Acquire));
+                    total_declined = total_declined
+                        .saturating_add(declined_count.load(Ordering::Acquire))
+                        .min(total);
+                }
+                SuppressedRedisLimitingState::Undefined => {}
+            }
+        }
+
+        Ok(SuppressedRateLimitSnapshot {
+            total,
+            total_declined,
+            suppression_factor,
+        })
+    } // end method get
+
     /// Check admission and record the increment for `key` using probabilistic suppression.
     ///
     /// On the fast-path (key in `Accepting` state with capacity remaining), this is a
