@@ -11,12 +11,11 @@ use dashmap::{DashMap, mapref::entry::Entry, mapref::one::Ref};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    HistoryPreservation, RateGroupSizeMs, RateLimit, RateLimitComparator, RateLimitDecision,
-    RedisKey, RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
+    HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, RedisKey,
+    RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
     common::{HistoryUpdateMode, RandomState},
     hybrid::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
-        SyncIntervalMs,
         absolute_hybrid_redis_proxy::{
             AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyOptions,
             AbsoluteHybridRedisProxyReadStateResult,
@@ -87,7 +86,6 @@ enum AbsoluteRedisLimitingState {
 #[derive(Debug)]
 pub struct AbsoluteHybridRateLimiter {
     window_size_seconds: WindowSizeSeconds,
-    rate_group_size_ms: RateGroupSizeMs,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState, RandomState>,
@@ -95,7 +93,6 @@ pub struct AbsoluteHybridRateLimiter {
     /// Only one tokio task at a time may perform the read+update for a given key;
     /// all other tasks wait on this lock and then re-check the (now-updated) state.
     reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>, RandomState>,
-    sync_interval_ms: SyncIntervalMs,
     epoch: AtomicU64,
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
@@ -127,12 +124,10 @@ impl AbsoluteHybridRateLimiter {
 
         let limiter = Self {
             window_size_seconds: options.window_size_seconds,
-            rate_group_size_ms: options.rate_group_size_ms,
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::default(),
             reset_locks: DashMap::default(),
-            sync_interval_ms: options.sync_interval_ms,
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
             is_active_watch,

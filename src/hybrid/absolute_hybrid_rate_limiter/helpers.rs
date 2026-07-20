@@ -82,16 +82,16 @@ impl AbsoluteHybridRateLimiter {
 
                 let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
                 let committed_total = starting_count.saturating_add(local_count);
-                let oldest_bucket_ttl =
-                    (*mutex_lock(oldest_bucket_ttl, "accepting.oldest_bucket_ttl")?)
-                        .map(|ttl| ttl as u128)
-                        .unwrap_or((*self.sync_interval_ms).min(*self.rate_group_size_ms) as u128);
                 let elapsed_ms = mutex_lock(time_instant, "accepting.time_instant")?
                     .elapsed()
                     .as_millis();
-                let retry_after_ms = oldest_bucket_ttl
-                    .saturating_sub(elapsed_ms)
-                    .max(*self.sync_interval_ms as u128);
+                let retry_after_ms =
+                    match *mutex_lock(oldest_bucket_ttl, "accepting.oldest_bucket_ttl")? {
+                        Some(oldest_bucket_ttl) => {
+                            (oldest_bucket_ttl as u128).saturating_sub(elapsed_ms)
+                        }
+                        None => (*self.window_size_seconds as u128).saturating_mul(1_000),
+                    };
                 let remaining_after_waiting =
                     (*mutex_lock(oldest_bucket_count, "accepting.oldest_bucket_count")?)
                         .unwrap_or(committed_total);
@@ -406,10 +406,7 @@ impl AbsoluteHybridRateLimiter {
         };
 
         if state.current_total.saturating_add(check_count) > window_limit {
-            let retry_after_ms = state
-                .oldest_bucket_ttl
-                .unwrap_or((*self.sync_interval_ms).min(*self.rate_group_size_ms))
-                .max(*self.sync_interval_ms);
+            let retry_after_ms = state.oldest_bucket_ttl.unwrap_or(0);
             let remaining_after_waiting = state.oldest_bucket_count.unwrap_or(0);
 
             self.store_rejecting_state(&state, retry_after_ms, remaining_after_waiting)?;
