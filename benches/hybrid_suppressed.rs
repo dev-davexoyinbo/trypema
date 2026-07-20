@@ -10,7 +10,7 @@ mod common;
 mod enabled {
     use std::{hint::black_box, time::Duration};
 
-    use criterion::Criterion;
+    use criterion::{BatchSize, Criterion};
     use trypema::redis::RedisKey;
     use trypema::{HistoryPreservation, RateLimit, RateLimitComparator};
 
@@ -50,12 +50,47 @@ mod enabled {
             });
         });
 
-        group.bench_function("get/hot_key", |b| {
+        group.bench_function("get/redis_synchronized", |b| {
             b.iter(|| {
                 black_box(runtime::block_on(&rt, async {
                     rl.hybrid().suppressed().get(black_box(&hot_key)).await
                 }))
             });
+        });
+
+        group.bench_function("get_inferred/local_fast_path", |b| {
+            b.iter(|| {
+                black_box(runtime::block_on(&rt, async {
+                    rl.hybrid()
+                        .suppressed()
+                        .get_inferred(black_box(&hot_key))
+                        .await
+                }))
+            });
+        });
+
+        let refresh_key = RedisKey::try_from("refresh_key".to_string()).unwrap();
+        group.bench_function("get_inferred/redis_refresh", |b| {
+            b.iter_batched(
+                || {
+                    runtime::block_on(&rt, async {
+                        rl.hybrid()
+                            .suppressed()
+                            .set_if(&refresh_key, &rate, RateLimitComparator::Nil, 1)
+                            .await
+                            .unwrap();
+                    });
+                },
+                |_| {
+                    black_box(runtime::block_on(&rt, async {
+                        rl.hybrid()
+                            .suppressed()
+                            .get_inferred(black_box(&refresh_key))
+                            .await
+                    }))
+                },
+                BatchSize::SmallInput,
+            );
         });
 
         group.bench_function("get_suppression_factor/hot_key", |b| {
