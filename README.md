@@ -358,6 +358,34 @@ async fn example() -> Result<(), trypema::TrypemaError> {
 }
 ```
 
+### Hybrid Suppressed
+
+```rust,no_run
+use trypema::{RateLimit, RateLimitDecision, RateLimiter};
+use trypema::redis::RedisKey;
+
+async fn example() -> Result<(), trypema::TrypemaError> {
+    let url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    let connection_manager = redis::Client::open(url)?
+        .get_connection_manager()
+        .await?;
+
+    let rl = RateLimiter::builder(connection_manager).build()?;
+    let key = RedisKey::try_from("user_123".to_string())?;
+    let rate = RateLimit::try_from(10.0).unwrap();
+
+    assert!(matches!(
+        rl.hybrid().suppressed().inc(&key, &rate, 1).await?,
+        RateLimitDecision::Allowed
+    ));
+    assert_eq!(rl.hybrid().suppressed().get_inferred(&key).await?.total, 1);
+    assert_eq!(rl.hybrid().suppressed().get(&key).await?.total, 1);
+
+    Ok(())
+}
+```
+
 ## Rate Limit Decisions
 
 Every strategy returns `RateLimitDecision`:

@@ -396,6 +396,20 @@ assert_eq!(
     1
 );
 assert_eq!(rl.hybrid().absolute().get(&key).await.unwrap(), 1);
+
+let suppressed_key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+assert!(matches!(
+    rl.hybrid().suppressed().inc(&suppressed_key, &rate, 1).await.unwrap(),
+    RateLimitDecision::Allowed
+));
+assert_eq!(
+    rl.hybrid().suppressed().get_inferred(&suppressed_key).await.unwrap().total,
+    1
+);
+assert_eq!(
+    rl.hybrid().suppressed().get(&suppressed_key).await.unwrap().total,
+    1
+);
 # });
 # }
 ```
