@@ -630,6 +630,108 @@ impl SuppressedHybridRateLimiter {
             .await
     } // end fn inc_with_rng
 
+    pub(super) fn snapshot_pending_state(&self, key: &RedisKey) -> SuppressedHybridPendingState {
+        self.limiting_state
+            .get(key)
+            .map_or_else(SuppressedHybridPendingState::default, |state| {
+                match state.deref() {
+                    SuppressedRedisLimitingState::Accepting { count, .. } => {
+                        SuppressedHybridPendingState {
+                            pending_count: count.load(Ordering::Acquire),
+                            pending_declined_count: 0,
+                        }
+                    }
+                    SuppressedRedisLimitingState::Suppressing {
+                        count,
+                        declined_count,
+                        ..
+                    } => SuppressedHybridPendingState {
+                        pending_count: count.load(Ordering::Acquire),
+                        pending_declined_count: declined_count.load(Ordering::Acquire),
+                    },
+                    SuppressedRedisLimitingState::Undefined => {
+                        SuppressedHybridPendingState::default()
+                    }
+                }
+            })
+    } // end fn snapshot_pending_state
+
+    pub(super) async fn reconcile_post_set_increments(
+        &self,
+        key: &RedisKey,
+        hard_window_limit: f64,
+        pending_state: SuppressedHybridPendingState,
+    ) -> Result<(), TrypemaError> {
+        let Some((_, state)) = self.limiting_state.remove(key) else {
+            return Ok(());
+        };
+
+        let (actual_count, actual_declined_count) = match state {
+            SuppressedRedisLimitingState::Accepting { count, .. } => (count.into_inner(), 0),
+            SuppressedRedisLimitingState::Suppressing {
+                count,
+                declined_count,
+                ..
+            } => (count.into_inner(), declined_count.into_inner()),
+            SuppressedRedisLimitingState::Undefined => return Ok(()),
+        };
+
+        let extra_count = actual_count.saturating_sub(pending_state.pending_count);
+
+        if extra_count == 0 {
+            return Ok(());
+        }
+
+        let extra_declined_count = actual_declined_count
+            .saturating_sub(pending_state.pending_declined_count)
+            .min(extra_count);
+
+        let commit = SuppressedHybridCommit {
+            key: key.clone(),
+            hard_window_limit,
+            count: extra_count,
+            declined_count: extra_declined_count,
+        };
+
+        if let Err(err) = self
+            .redis_proxy
+            .batch_commit_state(std::slice::from_ref(&commit))
+            .await
+        {
+            tracing::warn!(error = ?err, "direct post-set commit failed; queued for retry");
+            self.send_commit(commit).await?;
+        }
+
+        Ok(())
+    } // end fn reconcile_post_set_increments
+
+    pub(super) async fn send_commit(
+        &self,
+        commit: SuppressedHybridCommit,
+    ) -> Result<(), TrypemaError> {
+        self.commiter_sender
+            .send(commit.into())
+            .await
+            .map_err(|err| TrypemaError::CustomError(format!("Failed to send commit: {err:?}")))?;
+
+        Ok(())
+    } // end fn send_commit
+
+    #[cfg(test)]
+    pub(crate) fn local_state_count(&self) -> usize {
+        self.limiting_state.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_set_if_test_hook(
+        &self,
+    ) -> Result<Arc<SuppressedHybridSetIfTestHook>, TrypemaError> {
+        let hook = Arc::new(SuppressedHybridSetIfTestHook::default());
+        *mutex_lock(&self.set_if_test_hook, "set_if_test_hook")? = Some(Arc::clone(&hook));
+
+        Ok(hook)
+    }
+
     pub(super) fn should_cleanup_local_state(
         state: &SuppressedRedisLimitingState,
         stale_after_ms: u64,

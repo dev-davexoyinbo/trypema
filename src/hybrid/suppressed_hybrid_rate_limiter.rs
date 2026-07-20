@@ -292,6 +292,54 @@ impl SuppressedHybridRateLimiter {
         }
     } // end method get_suppression_factor
 
+    async fn set_if_with_history_mode(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        mode: HistoryUpdateMode,
+    ) -> Result<(u64, u64), TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        let lock = self.get_or_create_reset_lock(key);
+        let _guard = lock.lock().await;
+
+        let pending_state = self.snapshot_pending_state(key);
+
+        #[cfg(test)]
+        {
+            let hook = mutex_lock(&self.set_if_test_hook, "set_if_test_hook")?.take();
+            if let Some(hook) = hook {
+                hook.snapshot_taken.notify_one();
+                hook.resume.notified().await;
+            }
+        }
+
+        let hard_window_limit =
+            *self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor;
+
+        let (new_total, old_total, changed) = self
+            .redis_proxy
+            .set_if(
+                key,
+                hard_window_limit,
+                comparator,
+                count,
+                mode,
+                pending_state,
+            )
+            .await?;
+
+        if !changed {
+            return Ok((new_total, old_total));
+        }
+
+        self.reconcile_post_set_increments(key, hard_window_limit, pending_state)
+            .await?;
+
+        Ok((new_total, old_total))
+    } // end fn set_if_with_history_mode
 
     /// Infer current window state from this instance's local limiting state.
     ///
@@ -408,6 +456,111 @@ impl SuppressedHybridRateLimiter {
         })
     } // end method get
 
+    /// Conditionally replace the window total for `key` (atomic on Redis).
+    ///
+    /// When `comparator` matches the key's current post-eviction window total, the
+    /// window contents are replaced by a single current-timestamp bucket holding
+    /// `count`, with **no declines** recorded against it; otherwise nothing is
+    /// written. On a match the key's hard window limit is (re)defined as
+    /// `window_size_seconds × rate_limit × hard_limit_factor` and the cached
+    /// suppression factor is deleted so it is recomputed from the new state.
+    /// A matched target of zero removes committed count, decline, limit, cache, and
+    /// history state; increments racing after the pending snapshot are retained.
+    ///
+    /// This instance's pending local increments and declines are included in the
+    /// atomic comparison as a newest virtual bucket. Local state remains untouched
+    /// on a miss. After a match it is invalidated, and increments that arrived after
+    /// the snapshot are committed on top of the requested target. Pending increments
+    /// on **other** instances flush
+    /// later (within `sync_interval_ms`) and land on top of a matched write — with a
+    /// `Lt(count)` guard the total can drift above `count` but is never lowered below
+    /// it by those flushes.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Validated [`RedisKey`] identifying the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit used to (re)define the hard window limit
+    /// - `comparator`: Guard evaluated against the current window total
+    /// - `count`: The total to write when the guard matches
+    ///
+    /// # Returns
+    ///
+    /// `(new_total, old_total)` — `old_total` is the post-eviction total the
+    /// comparator was evaluated against; `new_total` is `count` when the guard
+    /// matched, `old_total` otherwise.
+    ///
+    /// # Priming Idiom
+    ///
+    /// `set_if(key, rate, RateLimitComparator::Lt(count), count)` raises the window
+    /// total to at least `count` and never lowers it — idempotent and safe to retry,
+    /// e.g. for seeding a quota window from an external usage store.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::{RateLimit, RateLimitComparator};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    ///
+    /// // Prime the window to 40.
+    /// let (new_total, old_total) = rl
+    ///     .hybrid()
+    ///     .suppressed()
+    ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!((new_total, old_total), (40, 0));
+    ///
+    /// // Re-priming is a no-op: the guard no longer matches.
+    /// let (new_total, old_total) = rl
+    ///     .hybrid()
+    ///     .suppressed()
+    ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!((new_total, old_total), (40, 40));
+    /// # });
+    /// ```
+    pub async fn set_if(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+    ) -> Result<(u64, u64), TrypemaError> {
+        self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Replace,
+        )
+        .await
+    } // end method set_if
+
+    /// Conditionally set the observed total while retaining the selected side of
+    /// the shared Redis sliding-window history.
+    pub async fn set_if_preserve_history(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        preservation: HistoryPreservation,
+    ) -> Result<(u64, u64), TrypemaError> {
+        self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Preserve(preservation),
+        )
+        .await
+    } // end method set_if_preserve_history
+
     /// Check admission and record the increment for `key` using probabilistic suppression.
     ///
     /// On the fast-path (key in `Accepting` state with capacity remaining), this is a
@@ -500,67 +653,8 @@ impl SuppressedHybridRateLimiter {
         Ok(())
     } // end fn cleanup
 
-        if current_total_count
-            .saturating_sub(current_declined_count)
-            .saturating_add(check_count)
-            > soft_window_limit
-        {
-            let current_suppression_factor = if current_total_count
-                .saturating_sub(current_declined_count)
-                >= hard_window_limit
-            {
-                1f64
-            } else {
-                current_suppression_factor
-            };
-
-            let should_allow = if current_suppression_factor == 0f64 {
-                true
-            } else if current_suppression_factor == 1f64 {
-                false
-            } else {
-                random_bool(1f64 - current_suppression_factor)
-            };
-
-            let new_declined = if should_allow { 0 } else { increment };
-
-            if let SuppressedRedisLimitingState::Suppressing {
-                time_instant,
-                suppression_factor,
-                suppression_factor_ttl_ms,
-                starting_count,
-                count,
-                declined_count,
-                ..
-            } = state.deref()
-            {
-                *mutex_lock(time_instant, "suppressing.time_instant")? = new_time_instant;
-                *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? = new_ttl_ms;
-                *mutex_lock(suppression_factor, "suppressing.suppression_factor")? =
-                    current_suppression_factor;
-                *mutex_lock(starting_count, "suppressing.starting_count")? = current_total_count;
-                count.store(increment, Ordering::Release);
-                declined_count.store(new_declined, Ordering::Release);
-
-                drop(state);
-            } else {
-                drop(state);
-
-                let mut state = self
-                    .limiting_state
-                    .get_mut(key)
-                    .expect("Key should be present");
-
-                *state = SuppressedRedisLimitingState::Suppressing {
-                    time_instant: Mutex::new(new_time_instant),
-                    window_limit: Mutex::new(hard_window_limit),
-                    suppression_factor: Mutex::new(current_suppression_factor),
-                    suppression_factor_ttl_ms: Mutex::new(new_ttl_ms),
-                    starting_count: Mutex::new(current_total_count),
-                    count: AtomicU64::new(increment),
-                    declined_count: AtomicU64::new(new_declined),
-                };
-            }
+    async fn flush(&self) -> Result<(), TrypemaError> {
+        let (mut resets, stale) = self.collect_flush_candidates();
 
             return Ok(RateLimitDecision::Suppressed {
                 suppression_factor: current_suppression_factor,
