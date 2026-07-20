@@ -271,23 +271,23 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let rl = build_limiter(&url, 6, 200).await;
+        let rl = build_limiter(&url, 10, 200).await;
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
 
         // Create two buckets.
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap(),
+            rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "creating the oldest bucket",
         );
         thread::sleep(Duration::from_millis(250));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 4).await.unwrap(),
+            rl.redis().absolute().inc(&k, &rate_limit, 7).await.unwrap(),
             "creating the newest bucket",
         );
 
-        // At capacity (6 * 1 = 6). Next increment should be rejected.
+        // At capacity (10 * 1 = 10). Next increment should be rejected.
         let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
         let RateLimitDecision::Rejected {
             window_size_seconds,
@@ -298,15 +298,15 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
             panic!("expected rejected decision");
         };
 
-        assert_eq!(window_size_seconds, 6, "window size should be 6");
+        assert_eq!(window_size_seconds, 10, "window size should be 10");
         assert!(
-            retry_after_ms >= 4_500 && retry_after_ms <= 6_000,
+            retry_after_ms >= 8_500 && retry_after_ms <= 10_000,
             "retry after should be the remaining lifetime of the oldest bucket, got {retry_after_ms}"
         );
         // The oldest bucket releases exactly its count when it expires.
         assert_eq!(
-            remaining_after_waiting, 2,
-            "remaining after waiting should be 2, got {remaining_after_waiting}"
+            remaining_after_waiting, 3,
+            "three count units should become available, got {remaining_after_waiting}"
         );
     });
 }
@@ -352,6 +352,38 @@ fn rejected_inc_does_not_consume_capacity() {
             matches!(decision2, RateLimitDecision::Allowed),
             "should be allowed, received decision: {decision2:?}"
         );
+    });
+}
+
+#[test]
+fn oversized_request_on_empty_key_has_no_backoff_wait() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 1_u64;
+        let rl = build_limiter(&url, window_size_seconds, 1_000).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+
+        let decision = rl
+            .redis()
+            .absolute()
+            .inc(&k, &rate_limit, capacity + 1)
+            .await
+            .unwrap();
+        let RateLimitDecision::Rejected {
+            retry_after_ms,
+            remaining_after_waiting,
+            ..
+        } = decision
+        else {
+            panic!("expected oversized request to be rejected, got {decision:?}");
+        };
+
+        assert_eq!(retry_after_ms, 0, "no existing bucket needs to expire");
+        assert_eq!(remaining_after_waiting, 0, "no bucket releases capacity");
+        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 0);
     });
 }
 
@@ -461,18 +493,18 @@ fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let rl = build_limiter(&url, 6, 200).await;
+        let rl = build_limiter(&url, 10, 200).await;
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap(),
+            rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "creating the oldest bucket",
         );
         thread::sleep(Duration::from_millis(250));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 4).await.unwrap(),
+            rl.redis().absolute().inc(&k, &rate_limit, 7).await.unwrap(),
             "creating the newest bucket",
         );
 
@@ -487,16 +519,16 @@ fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
         };
 
         assert_eq!(
-            window_size_seconds, 6,
-            "window size should be 6 instead got {window_size_seconds}"
+            window_size_seconds, 10,
+            "window size should be 10 instead got {window_size_seconds}"
         );
         assert!(
-            retry_after_ms >= 4_500 && retry_after_ms <= 6_000,
+            retry_after_ms >= 8_500 && retry_after_ms <= 10_000,
             "retry after should be the remaining lifetime of the oldest bucket, got {retry_after_ms}"
         );
         assert_eq!(
-            remaining_after_waiting, 2,
-            "remaining after waiting should be 2 instead got {remaining_after_waiting}"
+            remaining_after_waiting, 3,
+            "three count units should become available, got {remaining_after_waiting}"
         );
     });
 }

@@ -355,6 +355,49 @@ fn verify_hard_limit_rejects() {
 }
 
 #[test]
+fn public_suppressed_decisions_never_return_absolute_rejection_metadata() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter(&url, 1, 1_000, 1.0).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+        for observed_after in 1..=10_u64 {
+            let decision = rl
+                .redis()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+
+            match decision {
+                RateLimitDecision::Allowed if observed_after <= 5 => {}
+                RateLimitDecision::Suppressed {
+                    suppression_factor: 1.0,
+                    is_allowed: false,
+                } if observed_after > 5 => {}
+                RateLimitDecision::Rejected { .. } => {
+                    panic!("suppressed strategy returned absolute rejection metadata: {decision:?}")
+                }
+                _ => {
+                    panic!("unexpected decision after observation {observed_after}: {decision:?}")
+                }
+            }
+        }
+
+        assert_eq!(
+            rl.redis().suppressed().get(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: 10,
+                total_declined: 5,
+                suppression_factor: 1.0,
+            }
+        );
+    });
+}
+
+#[test]
 fn suppressed_is_deterministically_allowed_until_base_capacity_boundary_redis() {
     let url = redis_url();
 

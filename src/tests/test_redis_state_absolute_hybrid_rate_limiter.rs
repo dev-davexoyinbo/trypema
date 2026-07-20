@@ -27,8 +27,9 @@ use super::runtime;
 use crate::common::{RateType, SuppressionFactorCacheMs};
 use crate::hybrid::SyncIntervalMs;
 use crate::{
-    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
+    HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
+    RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions, RedisKey,
+    RedisRateLimiterOptions, WindowSizeSeconds,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +79,13 @@ fn redis_key(prefix: &RedisKey, user_key: &RedisKey, suffix: &str) -> String {
     }
 }
 
+fn assert_allowed(decision: RateLimitDecision, context: &str) {
+    assert!(
+        matches!(decision, RateLimitDecision::Allowed),
+        "{context}: expected allowed decision, got {decision:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -121,13 +129,19 @@ fn redis_state_hybrid_absolute_no_redis_keys_before_overflow() {
             .unwrap();
 
         // No commit should have happened yet.
-        let total: Option<u64> = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
+        let key_generator = key_gen(&prefix, RateType::HybridAbsolute);
+        for entity_key in key_generator.get_all_entity_keys(&k) {
+            let exists: bool = conn.exists(&entity_key).await.unwrap();
+            assert!(!exists, "local-only usage created {entity_key}");
+        }
+        let active_score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
         assert!(
-            total.is_none(),
-            "total count key should not exist before the local budget overflows"
+            active_score.is_none(),
+            "local-only usage marked the key active"
         );
-        let hash_len: u64 = conn.hlen(redis_key(&prefix, &k, "h")).await.unwrap();
-        assert_eq!(hash_len, 0, "hash should be empty before overflow");
     });
 }
 
@@ -165,7 +179,7 @@ fn redis_state_hybrid_absolute_commit_writes_total_count_after_overflow() {
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
-        // Trigger overflow — this queues the commit.
+        // Trigger overflow — the accepted capacity is committed synchronously.
         let d_overflow = rl
             .hybrid()
             .absolute()
@@ -187,28 +201,15 @@ fn redis_state_hybrid_absolute_commit_writes_total_count_after_overflow() {
             .unwrap();
 
         let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
-        assert!(
-            total > 0,
-            "total count should be > 0 after overflow commit, got {total}"
-        );
-        assert!(
-            total <= cap,
-            "total count ({total}) should not exceed capacity ({cap})"
-        );
+        assert_eq!(total, cap, "the rejected overflow must not be committed");
 
         // The hash must have at least one bucket.
         let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
-        assert!(
-            !hash.is_empty(),
-            "hash must have at least one bucket after commit"
-        );
+        assert_eq!(hash.values().sum::<u64>(), cap);
 
         // The active sorted set must have at least one member.
         let active_count: u64 = conn.zcard(redis_key(&prefix, &k, "a")).await.unwrap();
-        assert!(
-            active_count > 0,
-            "active sorted set must be non-empty after commit"
-        );
+        assert_eq!(active_count, 1, "one grouped commit must create one bucket");
     });
 }
 
@@ -236,20 +237,23 @@ fn redis_state_hybrid_absolute_window_limit_key_is_set_after_commit() {
         let expected_window_limit = 6_u64;
 
         for _ in 0..expected_window_limit {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "window-limit setup increment",
+            );
         }
         // Overflow to trigger commit.
-        let _ = rl
+        let overflow = rl
             .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(matches!(overflow, RateLimitDecision::Rejected { .. }));
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -291,19 +295,22 @@ fn redis_state_hybrid_absolute_committed_state_is_visible_to_another_instance() 
 
         // A fills and overflows.
         for _ in 0..cap {
-            let _ = rl_a
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl_a.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "shared-prefix setup increment",
+            );
         }
-        let _ = rl_a
+        let overflow = rl_a
             .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(matches!(overflow, RateLimitDecision::Rejected { .. }));
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -313,10 +320,7 @@ fn redis_state_hybrid_absolute_committed_state_is_visible_to_another_instance() 
             .unwrap();
 
         let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
-        assert!(
-            total > 0,
-            "total must be visible in Redis after A commits, got {total}"
-        );
+        assert_eq!(total, cap, "the complete accepted volume must be visible");
     });
 }
 
@@ -343,19 +347,22 @@ fn redis_state_hybrid_absolute_hash_sum_matches_total_count_after_commit() {
         let cap = (window_size_seconds as f64 * *rate_limit) as u64;
 
         for _ in 0..cap {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "hash-total setup increment",
+            );
         }
-        let _ = rl
+        let overflow = rl
             .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(matches!(overflow, RateLimitDecision::Rejected { .. }));
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -368,6 +375,10 @@ fn redis_state_hybrid_absolute_hash_sum_matches_total_count_after_commit() {
         let hash: HashMap<String, u64> = conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
         let hash_sum: u64 = hash.values().sum();
 
+        assert_eq!(
+            total, cap,
+            "the rejected overflow must not change the total"
+        );
         assert_eq!(
             hash_sum, total,
             "hash sum ({hash_sum}) must equal total count ({total}) after commit"
@@ -400,19 +411,22 @@ fn redis_state_hybrid_absolute_evicts_expired_buckets_on_next_commit() {
 
         // First burst: fill and overflow to commit.
         for _ in 0..cap {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "expiry setup increment",
+            );
         }
-        let _ = rl
+        let overflow = rl
             .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(matches!(overflow, RateLimitDecision::Rejected { .. }));
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         // Wait for the window to expire.
@@ -439,10 +453,7 @@ fn redis_state_hybrid_absolute_evicts_expired_buckets_on_next_commit() {
             .unwrap();
 
         let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
-        assert!(
-            total <= cap,
-            "total count ({total}) after window expiry must not exceed capacity ({cap})"
-        );
+        assert_eq!(total, 1, "expired usage must be fully evicted");
     });
 }
 
@@ -481,19 +492,22 @@ fn redis_state_hybrid_absolute_different_prefixes_are_isolated() {
 
         // Overflow A to trigger commit.
         for _ in 0..cap {
-            let _ = rl_a
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl_a.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "prefix A setup increment",
+            );
         }
-        let _ = rl_a
+        let overflow = rl_a
             .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(matches!(overflow, RateLimitDecision::Rejected { .. }));
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -544,21 +558,25 @@ fn redis_state_hybrid_absolute_active_sorted_set_scores_are_ordered() {
         let k = key("k");
         let rate_limit = RateLimit::try_from(10f64).unwrap();
 
-        // Trigger two separate overflow+commit cycles with a gap between them.
+        // Trigger two separate periodic commit cycles with a gap between them.
         for _ in 0..10 {
-            let _ = rl
-                .hybrid()
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "first ordered-bucket setup increment",
+            );
+        }
+        assert_allowed(
+            rl.hybrid()
                 .absolute()
                 .inc(&k, &rate_limit, 1)
                 .await
-                .unwrap();
-        }
-        let _ = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+                .unwrap(),
+            "first ordered-bucket final increment",
+        );
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         // A brief pause ensures the next commit lands in a later ms bucket.
@@ -574,19 +592,23 @@ fn redis_state_hybrid_absolute_active_sorted_set_scores_are_ordered() {
         )
         .await;
         for _ in 0..10 {
-            let _ = rl2
-                .hybrid()
+            assert_allowed(
+                rl2.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "second ordered-bucket setup increment",
+            );
+        }
+        assert_allowed(
+            rl2.hybrid()
                 .absolute()
                 .inc(&k, &rate_limit, 1)
                 .await
-                .unwrap();
-        }
-        let _ = rl2
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+                .unwrap(),
+            "second ordered-bucket final increment",
+        );
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let mut conn = redis::Client::open(url.as_str())
@@ -600,16 +622,17 @@ fn redis_state_hybrid_absolute_active_sorted_set_scores_are_ordered() {
             .await
             .unwrap();
 
-        assert!(
-            !members_with_scores.is_empty(),
-            "active sorted set should not be empty after commits"
+        assert_eq!(
+            members_with_scores.len(),
+            2,
+            "the two separated commits must create two ordered buckets"
         );
 
         let scores: Vec<f64> = members_with_scores.iter().map(|(_, s)| *s).collect();
         for i in 1..scores.len() {
             assert!(
-                scores[i] >= scores[i - 1],
-                "scores must be non-decreasing: {scores:?}"
+                scores[i] > scores[i - 1],
+                "separated bucket scores must be strictly increasing: {scores:?}"
             );
         }
     });
@@ -645,19 +668,22 @@ fn redis_state_hybrid_absolute_cleanup_removes_all_redis_keys_for_stale_entity()
 
         // Overflow to trigger a Redis commit.
         for _ in 0..cap {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "stale cleanup setup increment",
+            );
         }
-        let _ = rl
+        let overflow = rl
             .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(matches!(overflow, RateLimitDecision::Rejected { .. }));
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         let active_entities_key =
@@ -739,19 +765,22 @@ fn redis_state_hybrid_absolute_cleanup_does_not_remove_active_entity() {
 
         // Overflow and sync — entity is recent.
         for _ in 0..cap {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "active cleanup setup increment",
+            );
         }
-        let _ = rl
+        let overflow = rl
             .hybrid()
             .absolute()
             .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(matches!(overflow, RateLimitDecision::Rejected { .. }));
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         // Immediately cleanup with a long threshold — nothing should be removed.
@@ -809,12 +838,14 @@ fn redis_state_hybrid_absolute_cleanup_allows_fresh_requests_after_cleanup() {
 
         // Fill capacity then overflow — entity ends up in Rejecting state.
         for _ in 0..cap {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "cleanup reset setup increment",
+            );
         }
         let rejected = rl
             .hybrid()
@@ -886,19 +917,22 @@ fn redis_state_hybrid_absolute_cleanup_multiple_entities_mixed() {
 
         // Overflow stale_user and sync.
         for _ in 0..cap {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&stale, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&stale, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "stale entity setup increment",
+            );
         }
-        let _ = rl
+        let stale_overflow = rl
             .hybrid()
             .absolute()
             .inc(&stale, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(matches!(stale_overflow, RateLimitDecision::Rejected { .. }));
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         // Wait for stale_user to become stale.
@@ -914,19 +948,25 @@ fn redis_state_hybrid_absolute_cleanup_multiple_entities_mixed() {
         )
         .await;
         for _ in 0..cap {
-            let _ = rl2
-                .hybrid()
-                .absolute()
-                .inc(&active, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl2.hybrid()
+                    .absolute()
+                    .inc(&active, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "active entity setup increment",
+            );
         }
-        let _ = rl2
+        let active_overflow = rl2
             .hybrid()
             .absolute()
             .inc(&active, &rate_limit, 1)
             .await
             .unwrap();
+        assert!(matches!(
+            active_overflow,
+            RateLimitDecision::Rejected { .. }
+        ));
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         rl2.hybrid()
@@ -972,6 +1012,409 @@ fn redis_state_hybrid_absolute_cleanup_multiple_entities_mixed() {
 
 /// A limiter that has not yet overflowed writes nothing to the hybrid_absolute keyspace,
 /// while another limiter using the same prefix (but different rate type, e.g. redis absolute)
+/// A matched `set_if` replaces the window contents with exactly one bucket holding the
+/// written count, sets the running total to that count, and (re)defines the window limit.
+#[test]
+fn redis_state_hybrid_absolute_set_if_writes_single_bucket_total_and_window_limit() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 6_u64;
+
+        let rl = build_limiter(&url, window_size_seconds, 1000, 25, prefix.clone()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(10f64).unwrap();
+
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(40), 40)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (40, 0));
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
+        assert_eq!(total, 40, "running total must equal the written count");
+
+        let window_limit: u64 = conn.get(redis_key(&prefix, &k, "w")).await.unwrap();
+        assert_eq!(
+            window_limit, 60,
+            "window limit must be window_size_seconds * rate (6 * 10)"
+        );
+
+        let buckets: HashMap<String, u64> =
+            conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
+        assert_eq!(buckets.len(), 1, "exactly one bucket expected: {buckets:?}");
+        assert_eq!(
+            buckets.values().sum::<u64>(),
+            40,
+            "the single bucket must hold the written count"
+        );
+
+        let ordering_key = redis_key(&prefix, &k, "a");
+        let ordering: Vec<String> = conn.zrange(&ordering_key, 0, -1).await.unwrap();
+        assert_eq!(ordering.len(), 1, "exactly one active bucket expected");
+        assert!(
+            buckets.contains_key(&ordering[0]),
+            "ordering member must reference the history bucket: {ordering:?} {buckets:?}"
+        );
+
+        let limit_ttl_ms: i64 = conn.pttl(redis_key(&prefix, &k, "w")).await.unwrap();
+        assert!(
+            limit_ttl_ms > 0 && limit_ttl_ms <= window_size_seconds as i64 * 1_000,
+            "window-limit TTL must be live and bounded by the window: {limit_ttl_ms}"
+        );
+
+        let active_score: Option<f64> = conn
+            .zscore(
+                key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key(),
+                k.as_str(),
+            )
+            .await
+            .unwrap();
+        assert!(active_score.is_some(), "entity must be marked active");
+    });
+}
+
+#[test]
+fn redis_state_hybrid_absolute_preserves_requested_history_edge() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let sync_interval_ms = 25_u64;
+        let rl = build_limiter(&url, 60, 1, sync_interval_ms, prefix.clone()).await;
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        for (name, preservation, expected_reduced, expected_increased) in [
+            (
+                "newest",
+                HistoryPreservation::PreserveNewest,
+                vec![2_u64, 6],
+                vec![2_u64, 9],
+            ),
+            (
+                "oldest",
+                HistoryPreservation::PreserveOldest,
+                vec![4_u64, 4],
+                vec![7_u64, 4],
+            ),
+        ] {
+            let k = key(name);
+            assert_eq!(
+                rl.hybrid()
+                    .absolute()
+                    .set_if(&k, &rate, RateLimitComparator::Nil, 4)
+                    .await
+                    .unwrap(),
+                (4, 0)
+            );
+            runtime::async_sleep(Duration::from_millis(3)).await;
+            assert!(matches!(
+                rl.hybrid().absolute().inc(&k, &rate, 5).await.unwrap(),
+                RateLimitDecision::Allowed
+            ));
+            assert_eq!(
+                rl.hybrid()
+                    .absolute()
+                    .set_if_preserve_history(
+                        &k,
+                        &rate,
+                        RateLimitComparator::Eq(9),
+                        9,
+                        preservation,
+                    )
+                    .await
+                    .unwrap(),
+                (9, 9)
+            );
+            runtime::async_sleep(Duration::from_millis(3)).await;
+            assert!(matches!(
+                rl.hybrid().absolute().inc(&k, &rate, 6).await.unwrap(),
+                RateLimitDecision::Allowed
+            ));
+            assert_eq!(
+                rl.hybrid()
+                    .absolute()
+                    .set_if_preserve_history(
+                        &k,
+                        &rate,
+                        RateLimitComparator::Eq(15),
+                        15,
+                        preservation,
+                    )
+                    .await
+                    .unwrap(),
+                (15, 15)
+            );
+            assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 15);
+
+            assert_eq!(
+                rl.hybrid()
+                    .absolute()
+                    .set_if_preserve_history(
+                        &k,
+                        &rate,
+                        RateLimitComparator::Eq(15),
+                        8,
+                        preservation,
+                    )
+                    .await
+                    .unwrap(),
+                (8, 15)
+            );
+
+            let mut conn = redis::Client::open(url.as_str())
+                .unwrap()
+                .get_multiplexed_async_connection()
+                .await
+                .unwrap();
+            let ordering_key = redis_key(&prefix, &k, "a");
+            let history_key = redis_key(&prefix, &k, "h");
+            let fields: Vec<String> = conn.zrange(&ordering_key, 0, -1).await.unwrap();
+            let counts: Vec<u64> = redis::cmd("HMGET")
+                .arg(&history_key)
+                .arg(&fields)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(counts, expected_reduced);
+
+            assert_eq!(
+                rl.hybrid()
+                    .absolute()
+                    .set_if_preserve_history(
+                        &k,
+                        &rate,
+                        RateLimitComparator::Eq(8),
+                        11,
+                        preservation,
+                    )
+                    .await
+                    .unwrap(),
+                (11, 8)
+            );
+            let fields: Vec<String> = conn.zrange(&ordering_key, 0, -1).await.unwrap();
+            let counts: Vec<u64> = redis::cmd("HMGET")
+                .arg(&history_key)
+                .arg(&fields)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(counts, expected_increased);
+            let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
+            assert_eq!(total, 11);
+        }
+    });
+}
+
+/// An unmatched `set_if` must leave buckets, totals, and the stored limit untouched.
+#[test]
+fn redis_state_hybrid_absolute_set_if_no_match_leaves_buckets_and_total_untouched() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 6_u64;
+
+        let rl = build_limiter(&url, window_size_seconds, 1000, 25, prefix.clone()).await;
+        let k = key("k");
+
+        // Seed exact state through set_if itself (single bucket of 17, window limit 6*10=60).
+        let rate_seed = RateLimit::try_from(10f64).unwrap();
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate_seed, RateLimitComparator::Nil, 17)
+                .await
+                .unwrap(),
+            (17, 0)
+        );
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let key_generator = key_gen(&prefix, RateType::HybridAbsolute);
+        let history_key = redis_key(&prefix, &k, "h");
+        let ordering_key = redis_key(&prefix, &k, "a");
+        let total_key = redis_key(&prefix, &k, "t");
+        let limit_key = redis_key(&prefix, &k, "w");
+        let history_before: HashMap<String, u64> = conn.hgetall(&history_key).await.unwrap();
+        let ordering_before: Vec<(String, f64)> =
+            conn.zrange_withscores(&ordering_key, 0, -1).await.unwrap();
+        let total_before: u64 = conn.get(&total_key).await.unwrap();
+        let limit_before: u64 = conn.get(&limit_key).await.unwrap();
+        let limit_ttl_before: i64 = conn.pttl(&limit_key).await.unwrap();
+        let active_score_before: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.to_string())
+            .await
+            .unwrap();
+
+        runtime::async_sleep(Duration::from_millis(50)).await;
+
+        // Guard cannot match (17 is not > 1000); a different rate is ignored.
+        let rate_new = RateLimit::try_from(20f64).unwrap();
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_new, RateLimitComparator::Gt(1000), 5)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (17, 17));
+
+        let history_after: HashMap<String, u64> = conn.hgetall(&history_key).await.unwrap();
+        let ordering_after: Vec<(String, f64)> =
+            conn.zrange_withscores(&ordering_key, 0, -1).await.unwrap();
+        let total_after: u64 = conn.get(&total_key).await.unwrap();
+        let limit_after: u64 = conn.get(&limit_key).await.unwrap();
+        let limit_ttl_after: i64 = conn.pttl(&limit_key).await.unwrap();
+        let active_score_after: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(history_after, history_before, "history changed on no-match");
+        assert_eq!(
+            ordering_after, ordering_before,
+            "ordering changed on no-match"
+        );
+        assert_eq!(total_after, total_before, "total changed on no-match");
+        assert_eq!(limit_after, limit_before, "limit changed on no-match");
+        assert_eq!(
+            active_score_after, active_score_before,
+            "active-entity score changed on no-match"
+        );
+        assert!(
+            limit_ttl_after > 0 && limit_ttl_after <= limit_ttl_before - 20,
+            "limit TTL was refreshed on no-match: before={limit_ttl_before}, after={limit_ttl_after}"
+        );
+    });
+}
+
+#[test]
+fn redis_state_hybrid_absolute_conditional_set_uses_live_history_before_mutating() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 2_u64;
+        let sync_interval_ms = 25_u64;
+        let rl = build_limiter(
+            &url,
+            window_size_seconds,
+            1,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+        let k = key("k");
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 4)
+                .await
+                .unwrap(),
+            (4, 0)
+        );
+        runtime::async_sleep(Duration::from_millis(1_000)).await;
+        assert_allowed(
+            rl.hybrid().absolute().inc(&k, &rate, 6).await.unwrap(),
+            "fresh bucket setup increment",
+        );
+        wait_for_hybrid_sync(sync_interval_ms).await;
+        runtime::async_sleep(Duration::from_millis(1_050)).await;
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let key_generator = key_gen(&prefix, RateType::HybridAbsolute);
+        let history_key = key_generator.get_hash_key(&k);
+        let ordering_key = key_generator.get_active_keys(&k);
+        let total_key = key_generator.get_total_count_key(&k);
+        let limit_key = key_generator.get_window_limit_key(&k);
+        let active_entities_key = key_generator.get_active_entities_key();
+
+        let history_before: HashMap<String, u64> = conn.hgetall(&history_key).await.unwrap();
+        let ordering_before: Vec<(String, f64)> =
+            conn.zrange_withscores(&ordering_key, 0, -1).await.unwrap();
+        let total_before: u64 = conn.get(&total_key).await.unwrap();
+        let limit_before: u64 = conn.get(&limit_key).await.unwrap();
+        let limit_ttl_before: i64 = conn.pttl(&limit_key).await.unwrap();
+        let active_score_before: Option<f64> =
+            conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert_eq!(history_before.len(), 2, "setup must create two buckets");
+        assert_eq!(ordering_before.len(), 2, "setup must order two buckets");
+        assert_eq!(
+            total_before, 10,
+            "stored total still includes expired history"
+        );
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Gt(100), 5)
+                .await
+                .unwrap(),
+            (6, 6),
+            "the comparator must see only the fresh six-unit bucket"
+        );
+
+        let history_after_miss: HashMap<String, u64> = conn.hgetall(&history_key).await.unwrap();
+        let ordering_after_miss: Vec<(String, f64)> =
+            conn.zrange_withscores(&ordering_key, 0, -1).await.unwrap();
+        let total_after_miss: u64 = conn.get(&total_key).await.unwrap();
+        let limit_after_miss: u64 = conn.get(&limit_key).await.unwrap();
+        let limit_ttl_after_miss: i64 = conn.pttl(&limit_key).await.unwrap();
+        let active_score_after_miss: Option<f64> =
+            conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert_eq!(history_after_miss, history_before);
+        assert_eq!(ordering_after_miss, ordering_before);
+        assert_eq!(total_after_miss, total_before);
+        assert_eq!(limit_after_miss, limit_before);
+        assert_eq!(active_score_after_miss, active_score_before);
+        assert!(
+            limit_ttl_after_miss > 0 && limit_ttl_after_miss <= limit_ttl_before,
+            "a guard miss must not refresh the limit TTL: before={limit_ttl_before}, after={limit_ttl_after_miss}"
+        );
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if_preserve_history(
+                    &k,
+                    &rate,
+                    RateLimitComparator::Eq(6),
+                    4,
+                    HistoryPreservation::PreserveNewest,
+                )
+                .await
+                .unwrap(),
+            (4, 6)
+        );
+
+        let history_after_match: HashMap<String, u64> = conn.hgetall(&history_key).await.unwrap();
+        let ordering_after_match: Vec<String> = conn.zrange(&ordering_key, 0, -1).await.unwrap();
+        let total_after_match: u64 = conn.get(&total_key).await.unwrap();
+        assert_eq!(history_after_match.len(), 1);
+        assert_eq!(ordering_after_match.len(), 1);
+        assert_eq!(history_after_match.get(&ordering_after_match[0]), Some(&4));
+        assert_eq!(total_after_match, 4);
+    });
+}
+
 /// must not contaminate the hybrid_absolute namespace.
 #[test]
 fn redis_state_hybrid_absolute_redis_absolute_keys_do_not_contaminate_hybrid_keyspace() {
@@ -995,7 +1438,10 @@ fn redis_state_hybrid_absolute_redis_absolute_keys_do_not_contaminate_hybrid_key
 
         // Use only the redis (non-hybrid) absolute limiter — this writes to `absolute:*` keys.
         for _ in 0..5 {
-            let _ = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            assert_allowed(
+                rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+                "pure Redis namespace setup increment",
+            );
         }
 
         let mut conn = redis::Client::open(url.as_str())
@@ -1010,5 +1456,163 @@ fn redis_state_hybrid_absolute_redis_absolute_keys_do_not_contaminate_hybrid_key
             hybrid_total.is_none(),
             "hybrid_absolute keyspace must not be contaminated by redis absolute writes"
         );
+    });
+}
+
+#[test]
+fn redis_state_hybrid_absolute_zero_target_removes_all_entity_state() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let rl = build_limiter(&url, 6, 1000, 25, prefix.clone()).await;
+        let rate = RateLimit::try_from(10f64).unwrap();
+        let key_generator = key_gen(&prefix, RateType::HybridAbsolute);
+
+        for (name, preservation) in [
+            ("replace", None),
+            ("preserve", Some(HistoryPreservation::PreserveNewest)),
+        ] {
+            let k = key(name);
+            let missing_result = match preservation {
+                Some(preservation) => rl
+                    .hybrid()
+                    .absolute()
+                    .set_if_preserve_history(&k, &rate, RateLimitComparator::Eq(0), 0, preservation)
+                    .await
+                    .unwrap(),
+                None => rl
+                    .hybrid()
+                    .absolute()
+                    .set_if(&k, &rate, RateLimitComparator::Eq(0), 0)
+                    .await
+                    .unwrap(),
+            };
+            assert_eq!(missing_result, (0, 0));
+
+            let mut conn = redis::Client::open(url.as_str())
+                .unwrap()
+                .get_multiplexed_async_connection()
+                .await
+                .unwrap();
+            for entity_key in key_generator.get_all_entity_keys(&k) {
+                let exists: bool = conn.exists(&entity_key).await.unwrap();
+                assert!(
+                    !exists,
+                    "missing zero target unexpectedly created {entity_key}"
+                );
+            }
+            let score: Option<f64> = conn
+                .zscore(key_generator.get_active_entities_key(), k.as_str())
+                .await
+                .unwrap();
+            assert!(score.is_none(), "missing zero target marked {name} active");
+
+            assert_eq!(
+                rl.hybrid()
+                    .absolute()
+                    .set_if(&k, &rate, RateLimitComparator::Nil, 17)
+                    .await
+                    .unwrap(),
+                (17, 0)
+            );
+
+            let result = match preservation {
+                Some(preservation) => rl
+                    .hybrid()
+                    .absolute()
+                    .set_if_preserve_history(&k, &rate, RateLimitComparator::Nil, 0, preservation)
+                    .await
+                    .unwrap(),
+                None => rl
+                    .hybrid()
+                    .absolute()
+                    .set_if(&k, &rate, RateLimitComparator::Nil, 0)
+                    .await
+                    .unwrap(),
+            };
+            assert_eq!(result, (0, 17));
+
+            for entity_key in key_generator.get_all_entity_keys(&k) {
+                let exists: bool = conn.exists(&entity_key).await.unwrap();
+                assert!(!exists, "unexpected entity key: {entity_key}");
+            }
+            let score: Option<f64> = conn
+                .zscore(key_generator.get_active_entities_key(), k.as_str())
+                .await
+                .unwrap();
+            assert!(score.is_none(), "unexpected active membership for {name}");
+        }
+    });
+}
+
+#[test]
+fn redis_state_hybrid_absolute_get_keeps_unknown_entity_absent() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let rl = build_limiter(&url, 6, 1000, 25, prefix.clone()).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(10f64).unwrap();
+        let key_generator = key_gen(&prefix, RateType::HybridAbsolute);
+
+        assert_eq!(rl.hybrid().absolute().get_inferred(&k).await.unwrap(), 0);
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        for entity_key in key_generator.get_all_entity_keys(&k) {
+            let exists: bool = conn.exists(&entity_key).await.unwrap();
+            assert!(!exists, "unknown get created {entity_key}");
+        }
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(score.is_none());
+
+        rl.hybrid()
+            .absolute()
+            .set_if(&k, &rate, RateLimitComparator::Nil, 3)
+            .await
+            .unwrap();
+        let _: u64 = conn
+            .zrem(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+
+        assert_eq!(rl.hybrid().absolute().get_inferred(&k).await.unwrap(), 3);
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(
+            score.is_some(),
+            "state refresh must restore active membership"
+        );
+
+        let _: u64 = conn
+            .zrem(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert_eq!(rl.hybrid().absolute().get_inferred(&k).await.unwrap(), 3);
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(
+            score.is_none(),
+            "local inference fast path must not read or mutate Redis"
+        );
+
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 3);
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(score.is_some(), "known get must refresh active membership");
     });
 }

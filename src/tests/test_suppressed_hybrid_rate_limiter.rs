@@ -4,8 +4,9 @@ use super::runtime;
 
 use crate::hybrid::SyncIntervalMs;
 use crate::{
-    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, SuppressionFactorCacheMs,
+    HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
+    RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions, RedisKey,
+    RedisRateLimiterOptions, SuppressedRateLimitSnapshot, SuppressionFactorCacheMs,
     WindowSizeSeconds,
 };
 
@@ -151,7 +152,7 @@ fn hybrid_suppressed_allows_until_base_capacity_boundary() {
         let base_cap = window_capacity(window_size_seconds, &rate_limit);
 
         // Deterministic regime: suppression does not start until base capacity is met.
-        for _ in 0..base_cap {
+        for accepted_after in 1..=base_cap {
             let mut rng = |_p: f64| panic!("rng must not be called before suppression begins");
             let d = rl
                 .hybrid()
@@ -160,30 +161,71 @@ fn hybrid_suppressed_allows_until_base_capacity_boundary() {
                 .await
                 .unwrap();
             assert!(
-                matches!(
-                    d,
-                    RateLimitDecision::Allowed
-                        | RateLimitDecision::Suppressed {
-                            suppression_factor: 0f64,
-                            is_allowed: true
-                        }
-                ),
-                "d: {d:?}"
+                matches!(d, RateLimitDecision::Allowed),
+                "accepted_after={accepted_after}, d={d:?}"
             );
         }
     });
 }
 
 #[test]
-fn hybrid_suppressed_crossing_base_capacity_does_not_call_rng_when_sf_is_zero() {
+fn hybrid_suppressed_fractional_hard_limit_preserves_local_soft_and_hard_boundaries() {
     let url = redis_url();
 
     runtime::block_on(async {
-        // When the hybrid suppressed limiter overflows its local accepting budget, it calls
-        // get_suppression_factor(). If local state is Accepting, get_suppression_factor() returns
-        // 0.0 immediately, so RNG is not consulted and the limiter returns a suppressed decision
-        // with suppression_factor == 0.0.
+        // raw soft window = 6 * 0.5 = 3; raw hard window = 3 * 1.5 = 4.5.
+        // Like suppressed-local, operational capacities are soft=3 and hard=4.
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.5, 60_000, 25, unique_prefix()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(0.5).unwrap();
 
+        for accepted_after in 1..=4_u64 {
+            let mut rng = |_p: f64| panic!("rng must not run through the hard boundary");
+            let decision = rl
+                .hybrid()
+                .suppressed()
+                .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
+                .await
+                .unwrap();
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "accepted_after={accepted_after}, decision={decision:?}"
+            );
+        }
+
+        let mut rng = |_p: f64| panic!("rng must not run for a cached factor of one");
+        let over_hard = rl
+            .hybrid()
+            .suppressed()
+            .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                over_hard,
+                RateLimitDecision::Suppressed {
+                    suppression_factor,
+                    is_allowed: false,
+                } if (suppression_factor - 1.0).abs() < 1e-12
+            ),
+            "over_hard={over_hard:?}"
+        );
+        assert_eq!(
+            rl.hybrid().suppressed().get(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: 5,
+                total_declined: 1,
+                suppression_factor: 1.0,
+            }
+        );
+    });
+}
+
+#[test]
+fn hybrid_suppressed_shared_soft_hard_boundary_is_allowed_then_fully_suppressed() {
+    let url = redis_url();
+
+    runtime::block_on(async {
         let window_size_seconds = 1_u64;
         let rate_group_size_ms = 1_000_u64;
         let sync_interval_ms = 25_u64;
@@ -205,8 +247,9 @@ fn hybrid_suppressed_crossing_base_capacity_does_not_call_rng_when_sf_is_zero() 
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = window_capacity(window_size_seconds, &rate_limit);
 
-        // Fill local accepting budget; RNG must not be called.
-        for _ in 0..cap {
+        // Every request through the exact shared soft/hard boundary is allowed. The boundary
+        // request also transitions local state to a cached factor of one.
+        for accepted_after in 1..=cap {
             let mut rng = |_p: f64| panic!("rng must not be called while accepting");
             let d = rl
                 .hybrid()
@@ -214,22 +257,22 @@ fn hybrid_suppressed_crossing_base_capacity_does_not_call_rng_when_sf_is_zero() 
                 .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
                 .await
                 .unwrap();
-            match d {
-                RateLimitDecision::Allowed => {}
-                // With hard_limit_factor=1.0, the final request that *reaches* soft==hard
-                // triggers a Redis-read. Redis may not yet reflect committed increments so
-                // sf can be 0.0 or 1.0; either way the request must be admitted (is_allowed: true).
-                RateLimitDecision::Suppressed {
-                    is_allowed: true, ..
-                } => {}
-                other => panic!("d: {other:?}"),
-            }
+            assert!(
+                matches!(d, RateLimitDecision::Allowed),
+                "accepted_after={accepted_after}, d={d:?}"
+            );
         }
 
-        // Overflow: local state is still Accepting so Redis-derived sf is 0.0; RNG is not
-        // consulted. With hard_limit_factor=1.0, this overflow also exceeds the hard cap so the
-        // decision reports suppression_factor=1.0 and denies.
-        let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
+        let factor = rl
+            .hybrid()
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+        assert!((factor - 1.0).abs() < 1e-12, "factor: {factor}");
+
+        // Crossing the now-cached hard boundary is fully suppressed without consulting RNG.
+        let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 1");
         let d1 = rl
             .hybrid()
             .suppressed()
@@ -259,21 +302,20 @@ fn hybrid_suppressed_calls_rng_when_redis_reports_mid_suppression_factor() {
         let rate_group_size_ms = 1_000_u64;
         let sync_interval_ms = 75_u64;
         let hard_limit_factor = 2.0_f64;
-        let cache_ms = 5_u64;
+        let cache_ms = 60_000_u64;
 
         let prefix = unique_prefix();
 
         let k = key("k");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
-        let soft_limit = window_capacity(window_size_seconds, &rate_limit);
-        assert_eq!(soft_limit, 10);
+        let soft_window_limit = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(soft_window_limit, 10);
 
         // Seed HYBRID_SUPPRESSED state through the public API.
         // With window_size=10, rate_limit=1, hard_limit_factor=2:
         // - soft limit = 10
         // - hard limit stored in Redis = 20
         // Choose a total strictly between soft and hard so 0 < suppression_factor < 1.
-        let seed_total = 11_u64;
         let rl_seed = build_limiter_with_prefix(
             &url,
             window_size_seconds,
@@ -285,33 +327,17 @@ fn hybrid_suppressed_calls_rng_when_redis_reports_mid_suppression_factor() {
         )
         .await;
 
-        for _ in 0..seed_total {
-            let d = rl_seed
+        // Seed one exact committed bucket through the public hybrid API. Conditional replacement
+        // leaves the factor cache absent, forcing the fresh instance below to calculate it.
+        assert_eq!(
+            rl_seed
                 .hybrid()
                 .suppressed()
-                .inc(&k, &rate_limit, 1)
+                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 11)
                 .await
-                .unwrap();
-            // Seeding may cross the soft limit and return a suppressed decision with
-            // suppression_factor == 0.0 (deterministic allow). For this test we only care that
-            // the observed volume is committed so that a fresh instance reads a mid-range factor.
-            assert!(
-                matches!(
-                    d,
-                    RateLimitDecision::Allowed
-                        | RateLimitDecision::Suppressed {
-                            is_allowed: true,
-                            ..
-                        }
-                ),
-                "d: {d:?}"
-            );
-        }
-
-        wait_for_hybrid_sync(sync_interval_ms).await;
-
-        // Let the suppression_factor cache expire so the next read uses the committed totals.
-        runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+                .unwrap(),
+            (11, 0)
+        );
 
         // New hybrid instance reads Redis state and should take the RNG path.
         let rl = build_limiter_with_prefix(
@@ -392,28 +418,22 @@ fn hybrid_suppressed_redis_suppressed_state_does_not_poison_hybrid_keyspace() {
 
         let k = key("k_poison");
         let rate_limit = RateLimit::try_from(1f64).unwrap();
-        let soft_limit = window_capacity(window_size_seconds, &rate_limit);
+        let soft_window_limit = window_capacity(window_size_seconds, &rate_limit);
 
         // Seed ONLY Redis suppressed keyspace through the public API.
-        for _ in 0..(soft_limit + 2) {
-            let d = rl
-                .redis()
+        assert_eq!(
+            rl.redis()
                 .suppressed()
-                .inc(&k, &rate_limit, 1)
+                .set_if(
+                    &k,
+                    &rate_limit,
+                    RateLimitComparator::Nil,
+                    soft_window_limit + 2,
+                )
                 .await
-                .unwrap();
-            assert!(
-                matches!(
-                    d,
-                    RateLimitDecision::Allowed
-                        | RateLimitDecision::Suppressed {
-                            is_allowed: true,
-                            ..
-                        }
-                ),
-                "d: {d:?}"
-            );
-        }
+                .unwrap(),
+            (soft_window_limit + 2, 0)
+        );
 
         // Hybrid suppressed should still see a fresh key (sf=0) because it uses a different
         // key namespace.
@@ -435,50 +455,15 @@ fn hybrid_suppressed_denies_100_percent_after_hard_limit() {
         // Use small limits to keep this integration test fast.
         let window_size_seconds = 1_u64;
         let rate_group_size_ms = 1_000_u64;
-        let sync_interval_ms = 75_u64;
+        let sync_interval_ms = 2_000_u64;
         let hard_limit_factor = 2.0_f64;
-        let cache_ms = 25_u64;
+        let cache_ms = 60_000_u64;
 
-        let prefix = unique_prefix();
         let k = key("k_hard");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let soft_limit = window_capacity(window_size_seconds, &rate_limit);
+        let soft_window_limit = window_capacity(window_size_seconds, &rate_limit);
 
-        // Seed at the hard limit and ensure suppression_factor reaches 1.0.
-        let hard_limit = (soft_limit as f64 * hard_limit_factor) as u64;
-        let rl_seed = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            hard_limit_factor,
-            cache_ms,
-            sync_interval_ms,
-            prefix.clone(),
-        )
-        .await;
-
-        for _ in 0..hard_limit {
-            let d = rl_seed
-                .hybrid()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
-
-            // Suppressed strategy starts returning Suppressed decisions once the soft limit is
-            // reached. During seeding, we only need to ensure the API never returns Rejected.
-            // Suppressed decisions may be allowed or denied depending on suppression_factor.
-            assert!(
-                matches!(
-                    d,
-                    RateLimitDecision::Allowed | RateLimitDecision::Suppressed { .. }
-                ),
-                "d: {d:?}"
-            );
-        }
-
-        wait_for_hybrid_sync(sync_interval_ms).await;
-
+        let hard_window_limit = (soft_window_limit as f64 * hard_limit_factor) as u64;
         let rl = build_limiter_with_prefix(
             &url,
             window_size_seconds,
@@ -486,11 +471,21 @@ fn hybrid_suppressed_denies_100_percent_after_hard_limit() {
             hard_limit_factor,
             cache_ms,
             sync_interval_ms,
-            prefix,
+            unique_prefix(),
         )
         .await;
 
-        runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+        let mut boundary_rng = |_p: f64| panic!("rng must not run at the exact hard boundary");
+        let reaches_hard = rl
+            .hybrid()
+            .suppressed()
+            .inc_with_rng(&k, hard_window_limit, Some(&rate_limit), &mut boundary_rng)
+            .await
+            .unwrap();
+        assert!(
+            matches!(reaches_hard, RateLimitDecision::Allowed),
+            "reaches_hard: {reaches_hard:?}"
+        );
 
         let sf = rl
             .hybrid()
@@ -544,11 +539,12 @@ fn hybrid_suppressed_denies_100_percent_after_hard_limit() {
 }
 
 #[test]
-fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_zero() {
+fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_one() {
     let url = redis_url();
 
     runtime::block_on(async {
-        // This test exercises the Suppressing fast-path with suppression_factor == 0.0.
+        // This test exercises the Suppressing fast path after the shared soft/hard boundary
+        // establishes suppression_factor == 1.0.
         let window_size_seconds = 1_u64;
         let rate_group_size_ms = 1_000_u64;
         let sync_interval_ms = 25_u64;
@@ -570,8 +566,8 @@ fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_zero() {
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = window_capacity(window_size_seconds, &rate_limit);
 
-        // Fill local budget.
-        for _ in 0..cap {
+        // Fill through the exact boundary. Every request must be an exact Allowed variant.
+        for accepted_after in 1..=cap {
             let mut rng = |_p: f64| panic!("rng must not be called while accepting");
             let d = rl
                 .hybrid()
@@ -579,19 +575,13 @@ fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_zero() {
                 .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
                 .await
                 .unwrap();
-            match d {
-                RateLimitDecision::Allowed => {}
-                // The final item (accepted == soft == hard) triggers a Redis-read; sf may be 0.0
-                // or 1.0 depending on Redis commit lag, but the request must be admitted.
-                RateLimitDecision::Suppressed {
-                    is_allowed: true, ..
-                } => {}
-                other => panic!("d: {other:?}"),
-            }
+            assert!(
+                matches!(d, RateLimitDecision::Allowed),
+                "accepted_after={accepted_after}, d={d:?}"
+            );
         }
 
-        // Overflow transitions to Suppressing. The hard-cap guard fires since
-        // current_total_count >= hard_window_limit, so suppression_factor=1.0 and denies.
+        // Crossing the cached hard boundary denies with factor one.
         let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 0 or 1");
 
         let d1 = rl
@@ -611,7 +601,7 @@ fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_zero() {
             "d1: {d1:?}"
         );
 
-        // While in Suppressing and TTL has not elapsed, it should return immediately without RNG.
+        // While in Suppressing and TTL has not elapsed, return immediately without RNG.
         let mut rng2 = |_p: f64| panic!("rng must not be called in suppressing fast path");
         let d2 = rl
             .hybrid()
@@ -659,8 +649,8 @@ fn hybrid_suppressed_per_key_state_is_independent() {
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = window_capacity(window_size_seconds, &rate_limit);
 
-        // Drive key `a` to the overflow boundary.
-        for _ in 0..cap {
+        // Drive key `a` to the exact shared soft/hard boundary.
+        for accepted_after in 1..=cap {
             let mut rng = |_p: f64| panic!("rng must not be called while accepting");
             let d = rl
                 .hybrid()
@@ -668,14 +658,10 @@ fn hybrid_suppressed_per_key_state_is_independent() {
                 .inc_with_rng(&a, 1, Some(&rate_limit), &mut rng)
                 .await
                 .unwrap();
-            match d {
-                RateLimitDecision::Allowed => {}
-                // Final item may trigger Redis-read with stale sf; must be admitted.
-                RateLimitDecision::Suppressed {
-                    is_allowed: true, ..
-                } => {}
-                other => panic!("d: {other:?}"),
-            }
+            assert!(
+                matches!(d, RateLimitDecision::Allowed),
+                "accepted_after={accepted_after}, d={d:?}"
+            );
         }
 
         let mut rng = |_p: f64| panic!("rng must not be called when suppression_factor == 0 or 1");
@@ -685,7 +671,16 @@ fn hybrid_suppressed_per_key_state_is_independent() {
             .inc_with_rng(&a, 1, Some(&rate_limit), &mut rng)
             .await
             .unwrap();
-        assert!(matches!(d_overflow, RateLimitDecision::Suppressed { .. }));
+        assert!(
+            matches!(
+                d_overflow,
+                RateLimitDecision::Suppressed {
+                    suppression_factor: 1f64,
+                    is_allowed: false,
+                }
+            ),
+            "d_overflow: {d_overflow:?}"
+        );
 
         // Key `b` should be unaffected.
         let mut rng_b = |_p: f64| panic!("rng must not be called below the rate limit");
@@ -744,20 +739,10 @@ fn hybrid_suppressed_batch_increment_respects_soft_limit_boundary() {
             .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng2)
             .await
             .unwrap();
-        assert!(
-            matches!(
-                d2,
-                RateLimitDecision::Allowed
-                    | RateLimitDecision::Suppressed {
-                        suppression_factor: 1f64,
-                        is_allowed: true
-                    }
-            ),
-            "d2: {d2:?}"
-        );
+        assert!(matches!(d2, RateLimitDecision::Allowed), "d2: {d2:?}");
 
-        // Crosses boundary -> suppression begins; sf is 0.0 on the local overflow path.
-        let mut rng3 = |_p: f64| panic!("rng must not be called when suppression_factor == 0");
+        // Crosses the shared soft/hard boundary, so the cached factor is one.
+        let mut rng3 = |_p: f64| panic!("rng must not be called when suppression_factor == 1");
         let d3 = rl
             .hybrid()
             .suppressed()
@@ -817,24 +802,20 @@ fn hybrid_suppressed_does_not_commit_before_soft_limit_overflow() {
         let cap = window_capacity(window_size_seconds, &rate_limit);
 
         // Fill to the soft limit exactly (no overflow, no queued commit).
-        for _ in 0..cap {
+        for accepted_after in 1..=cap {
             let d = rl_a
                 .hybrid()
                 .suppressed()
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            match d {
-                RateLimitDecision::Allowed => {}
-                // Final item may trigger Redis-read with stale sf; must be admitted.
-                RateLimitDecision::Suppressed {
-                    is_allowed: true, ..
-                } => {}
-                other => panic!("d: {other:?}"),
-            }
+            assert!(
+                matches!(d, RateLimitDecision::Allowed),
+                "accepted_after={accepted_after}, d={d:?}"
+            );
         }
 
-        // If `rl_a` had committed, Redis would have total_count==window_limit and report sf==1.0.
+        // If `rl_a` had committed, Redis would have total_count==hard_window_limit and report sf==1.0.
         let sf_b = rl_b
             .hybrid()
             .suppressed()
@@ -871,7 +852,7 @@ fn hybrid_suppressed_suppressing_hard_cap_guard_forces_full_denial_without_rng()
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = window_capacity(window_size_seconds, &rate_limit);
 
-        for _ in 0..cap {
+        for accepted_after in 1..=cap {
             let mut rng = |_p: f64| panic!("rng must not be called while accepting");
             let d = rl
                 .hybrid()
@@ -879,14 +860,10 @@ fn hybrid_suppressed_suppressing_hard_cap_guard_forces_full_denial_without_rng()
                 .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng)
                 .await
                 .unwrap();
-            match d {
-                RateLimitDecision::Allowed => {}
-                // Final item may trigger Redis-read with stale sf; must be admitted.
-                RateLimitDecision::Suppressed {
-                    is_allowed: true, ..
-                } => {}
-                other => panic!("d: {other:?}"),
-            }
+            assert!(
+                matches!(d, RateLimitDecision::Allowed),
+                "accepted_after={accepted_after}, d={d:?}"
+            );
         }
 
         // Overflow transitions to Suppressing. The hard-cap guard fires since
@@ -909,7 +886,7 @@ fn hybrid_suppressed_suppressing_hard_cap_guard_forces_full_denial_without_rng()
             "d0: {d0:?}"
         );
 
-        // Next call hits the hard-cap guard (starting_count + local_count > window_limit).
+        // Next call hits the hard-cap guard (starting_count + local_count > hard_window_limit).
         let mut rng1 = |_p: f64| panic!("rng must not be called when suppression_factor == 1");
         let d1 = rl
             .hybrid()
@@ -940,7 +917,7 @@ fn hybrid_suppressed_get_suppression_factor_returns_cached_value_in_suppressing_
         let rate_group_size_ms = 1_000_u64;
         let sync_interval_ms = 75_u64;
         let hard_limit_factor = 2.0_f64;
-        let cache_ms = 5_u64;
+        let cache_ms = 60_000_u64;
 
         let prefix = unique_prefix();
         let k = key("k");
@@ -958,16 +935,15 @@ fn hybrid_suppressed_get_suppression_factor_returns_cached_value_in_suppressing_
         )
         .await;
 
-        for _ in 0..11_u64 {
-            let _ = rl_seed
+        assert_eq!(
+            rl_seed
                 .hybrid()
                 .suppressed()
-                .inc(&k, &rate_limit, 1)
+                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 11)
                 .await
-                .unwrap();
-        }
-        wait_for_hybrid_sync(sync_interval_ms).await;
-        runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+                .unwrap(),
+            (11, 0)
+        );
 
         let rl = build_limiter_with_prefix(
             &url,
@@ -1040,13 +1016,17 @@ fn hybrid_suppressed_unblocks_after_window_expires() {
 
         // With hard_limit_factor=1.0, the hard limit equals base capacity.
         // Drive usage to capacity, then ensure commit is flushed and suppression factor recomputed.
-        for _ in 0..cap {
-            let _ = rl
+        for accepted_after in 1..=cap {
+            let decision = rl
                 .hybrid()
                 .suppressed()
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "accepted_after={accepted_after}, decision={decision:?}"
+            );
         }
         runtime::async_sleep(Duration::from_millis(sync_interval_ms * 4)).await;
         runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
@@ -1102,17 +1082,7 @@ fn hybrid_suppressed_unblocks_after_window_expires() {
             .inc_with_rng(&k, 1, Some(&rate_limit), &mut rng2)
             .await
             .unwrap();
-        match d2 {
-            RateLimitDecision::Allowed => {}
-            RateLimitDecision::Suppressed {
-                suppression_factor,
-                is_allowed: true,
-            } => assert!(
-                (suppression_factor - 0.0).abs() < 1e-12,
-                "suppression_factor: {suppression_factor}"
-            ),
-            other => panic!("d2: {other:?}"),
-        }
+        assert!(matches!(d2, RateLimitDecision::Allowed), "d2: {d2:?}");
     });
 }
 
@@ -1127,7 +1097,7 @@ fn hybrid_suppressed_full_denial_seeded_from_hybrid_redis_keyspace_does_not_call
         let sync_interval_ms = 25_u64;
 
         let cache_ms = 5_u64;
-        // With hard_limit_factor=1.0, window_limit == base capacity.
+        // With hard_limit_factor=1.0, hard_window_limit == base capacity.
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
         let cap = (window_size_seconds as f64 * *rate_limit) as u64;
@@ -1144,14 +1114,16 @@ fn hybrid_suppressed_full_denial_seeded_from_hybrid_redis_keyspace_does_not_call
         .await;
 
         // Drive the limiter to full denial (sf == 1.0) via the public API.
-        for _ in 0..cap {
-            let _ = rl_hybrid
-                .hybrid()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
-        }
+        let reaches_hard = rl_hybrid
+            .hybrid()
+            .suppressed()
+            .inc(&k, &rate_limit, cap)
+            .await
+            .unwrap();
+        assert!(
+            matches!(reaches_hard, RateLimitDecision::Allowed),
+            "reaches_hard: {reaches_hard:?}"
+        );
         runtime::async_sleep(Duration::from_millis(sync_interval_ms * 4)).await;
         runtime::async_sleep(Duration::from_millis(cache_ms + 25)).await;
 
@@ -1216,24 +1188,20 @@ fn hybrid_suppressed_usage_is_committed_to_redis_and_visible_to_others() {
         let cap = (window_size_seconds as f64 * *rate_limit) as u64;
 
         // Fill local budget.
-        for _ in 0..cap {
+        for accepted_after in 1..=cap {
             let d = rl_a
                 .hybrid()
                 .suppressed()
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            match d {
-                RateLimitDecision::Allowed => {}
-                // Final item may trigger Redis-read with stale sf; must be admitted.
-                RateLimitDecision::Suppressed {
-                    is_allowed: true, ..
-                } => {}
-                other => panic!("d: {other:?}"),
-            }
+            assert!(
+                matches!(d, RateLimitDecision::Allowed),
+                "accepted_after={accepted_after}, d={d:?}"
+            );
         }
 
-        // Crossing the local window limit queues a commit.
+        // Crossing the local hard window limit queues a commit.
         let d1 = rl_a
             .hybrid()
             .suppressed()
@@ -1241,7 +1209,13 @@ fn hybrid_suppressed_usage_is_committed_to_redis_and_visible_to_others() {
             .await
             .unwrap();
         assert!(
-            matches!(d1, RateLimitDecision::Suppressed { .. }),
+            matches!(
+                d1,
+                RateLimitDecision::Suppressed {
+                    suppression_factor: 1f64,
+                    is_allowed: false,
+                }
+            ),
             "d1: {d1:?}"
         );
 
@@ -1348,20 +1322,14 @@ fn hybrid_suppressed_prefix_isolation() {
         // soft_cap = floor(window_size_seconds * rate_limit * 1) = floor(5 * 2) = 10
         let soft_cap = window_capacity(window_size_seconds, &rate_limit);
 
-        // Send soft_cap + 1 increments so the (soft_cap+1)-th call overflows the local
-        // budget and queues a Redis commit for prefix_a.
-        for _ in 0..=soft_cap {
-            let _ = rl_a
-                .hybrid()
+        assert_eq!(
+            rl_a.hybrid()
                 .suppressed()
-                .inc(&k, &rate_limit, 1)
+                .set_if(&k, &rate_limit, RateLimitComparator::Nil, soft_cap + 1,)
                 .await
-                .unwrap();
-        }
-
-        // Flush prefix_a state to Redis, then let the sf cache expire.
-        wait_for_hybrid_sync(sync_interval_ms).await;
-        runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
+                .unwrap(),
+            (soft_cap + 1, 0)
+        );
 
         // prefix_a is now in the suppression zone (total > soft_cap).
         let sf_a = rl_a
@@ -1390,7 +1358,7 @@ fn hybrid_suppressed_prefix_isolation() {
 }
 
 #[test]
-fn hybrid_suppressed_never_returns_rejected_smoke() {
+fn hybrid_suppressed_public_decisions_never_return_absolute_rejection_metadata() {
     let url = redis_url();
 
     runtime::block_on(async {
@@ -1399,21 +1367,37 @@ fn hybrid_suppressed_never_returns_rejected_smoke() {
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
 
-        for _ in 0..25_u64 {
-            let d = rl
+        for observed_after in 1..=25_u64 {
+            let decision = rl
                 .hybrid()
                 .suppressed()
                 .inc(&k, &rate_limit, 1)
                 .await
                 .unwrap();
-            assert!(
-                matches!(
-                    d,
-                    RateLimitDecision::Allowed | RateLimitDecision::Suppressed { .. }
-                ),
-                "d: {d:?}"
-            );
+
+            match decision {
+                RateLimitDecision::Allowed if observed_after <= 5 => {}
+                RateLimitDecision::Suppressed {
+                    suppression_factor: 1.0,
+                    is_allowed: false,
+                } if observed_after > 5 => {}
+                RateLimitDecision::Rejected { .. } => {
+                    panic!("suppressed strategy returned absolute rejection metadata: {decision:?}")
+                }
+                _ => {
+                    panic!("unexpected decision after observation {observed_after}: {decision:?}")
+                }
+            }
         }
+
+        assert_eq!(
+            rl.hybrid().suppressed().get(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: 25,
+                total_declined: 20,
+                suppression_factor: 1.0,
+            }
+        );
     });
 }
 
@@ -1439,8 +1423,8 @@ fn hybrid_suppressed_window_eviction_allows_fresh_burst_after_expiry() {
         let window_size_seconds = 1_u64;
         let rate_group_size_ms = 100_u64;
         let sync_interval_ms = 25_u64;
-        // Use hard_limit_factor=2.0: soft_limit=5, hard_limit=10.
-        // We fill to hard_limit (10) and then sync, guaranteeing Redis sees total_count=hard_limit
+        // Use hard_limit_factor=2.0: soft_window_limit=5, hard_window_limit=10.
+        // We fill to hard_window_limit (10) and then sync, guaranteeing Redis sees total_count=hard_window_limit
         // and computes suppression_factor=1.0.
         let hard_limit_factor = 2.0_f64;
         let cache_ms = 5_u64;
@@ -1448,9 +1432,9 @@ fn hybrid_suppressed_window_eviction_allows_fresh_burst_after_expiry() {
         let prefix = unique_prefix();
         let k = key("k");
         let rate_limit = RateLimit::try_from(5f64).unwrap();
-        // soft_limit=5, hard_limit=10
-        let soft_limit = window_capacity(window_size_seconds, &rate_limit);
-        let hard_limit = (soft_limit as f64 * hard_limit_factor) as u64;
+        // soft_window_limit=5, hard_window_limit=10
+        let soft_window_limit = window_capacity(window_size_seconds, &rate_limit);
+        let hard_window_limit = (soft_window_limit as f64 * hard_limit_factor) as u64;
 
         let rl = build_limiter_with_prefix(
             &url,
@@ -1463,16 +1447,33 @@ fn hybrid_suppressed_window_eviction_allows_fresh_burst_after_expiry() {
         )
         .await;
 
-        // Fill past the hard limit: the overflow request commits everything to Redis and sets
-        // suppression_factor = 1.0 in the Redis cache.
-        for _ in 0..=hard_limit {
-            let _ = rl
-                .hybrid()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
-        }
+        let reaches_hard = rl
+            .hybrid()
+            .suppressed()
+            .inc(&k, &rate_limit, hard_window_limit)
+            .await
+            .unwrap();
+        assert!(
+            matches!(reaches_hard, RateLimitDecision::Allowed),
+            "reaches_hard: {reaches_hard:?}"
+        );
+
+        let declined = rl
+            .hybrid()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                declined,
+                RateLimitDecision::Suppressed {
+                    suppression_factor: 1f64,
+                    is_allowed: false,
+                }
+            ),
+            "declined: {declined:?}"
+        );
         // Wait for the committer to flush all queued counts to Redis (two ticks).
         wait_for_hybrid_sync(sync_interval_ms).await;
         // Let the suppression_factor Redis cache expire so the next read recomputes.
@@ -1539,14 +1540,7 @@ fn hybrid_suppressed_window_eviction_allows_fresh_burst_after_expiry() {
             .await
             .unwrap();
         assert!(
-            matches!(
-                d,
-                RateLimitDecision::Allowed
-                    | RateLimitDecision::Suppressed {
-                        suppression_factor: 0f64,
-                        is_allowed: true
-                    }
-            ),
+            matches!(d, RateLimitDecision::Allowed),
             "expected Allowed after window expiry, got {d:?}"
         );
     });
@@ -1556,7 +1550,7 @@ fn hybrid_suppressed_window_eviction_allows_fresh_burst_after_expiry() {
 /// admitted volume across all windows is close to `rate * num_windows`.
 ///
 /// If window eviction is broken (buckets accumulate), the hard limit is hit after the first
-/// window and every subsequent request is suppressed, so total_allowed ≈ window_limit rather
+/// window and every subsequent request is suppressed, so total_allowed ≈ hard_window_limit rather
 /// than ≈ rate * num_windows.
 #[test]
 fn hybrid_suppressed_throughput_over_multiple_windows_stays_at_rate_limit() {
@@ -1575,7 +1569,7 @@ fn hybrid_suppressed_throughput_over_multiple_windows_stays_at_rate_limit() {
         let rate_limit = RateLimit::try_from(10f64).unwrap();
         // soft_window_limit = window_size * rate = 10
         // hard_window_limit = soft * hard_limit_factor = 15
-        let soft_limit = window_capacity(window_size_seconds, &rate_limit); // 10
+        let soft_window_limit = window_capacity(window_size_seconds, &rate_limit); // 10
 
         let rl = build_limiter_with_prefix(
             &url,
@@ -1592,8 +1586,8 @@ fn hybrid_suppressed_throughput_over_multiple_windows_stays_at_rate_limit() {
 
         for _window in 0..num_windows {
             // Within each window, hammer at 10× the rate limit to ensure we hit the ceiling.
-            // The limiter should admit ≈ soft_limit requests and suppress the rest.
-            let burst = soft_limit * 10;
+            // The limiter should admit ≈ soft_window_limit requests and suppress the rest.
+            let burst = soft_window_limit * 10;
             for _ in 0..burst {
                 let d = rl
                     .hybrid()
@@ -1620,15 +1614,402 @@ fn hybrid_suppressed_throughput_over_multiple_windows_stays_at_rate_limit() {
             runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
         }
 
-        // Each window should admit at most hard_window_limit requests and at least soft_limit.
-        // Over num_windows windows the total must be at least soft_limit * num_windows.
+        // Each window should admit at most hard_window_limit requests and at least soft_window_limit.
+        // Over num_windows windows the total must be at least soft_window_limit * num_windows.
         // If eviction is broken, total_allowed ≈ hard_window_limit (15) instead of ≈ 30+.
-        let hard_limit = (soft_limit as f64 * hard_limit_factor) as u64; // 15
-        let expected_min = soft_limit * num_windows; // 30
+        let hard_window_limit = (soft_window_limit as f64 * hard_limit_factor) as u64; // 15
+        let expected_min = soft_window_limit * num_windows; // 30
         assert!(
             total_allowed >= expected_min,
             "total_allowed={total_allowed} but expected >= {expected_min} over {num_windows} windows \
-             (hard_limit={hard_limit}) — window eviction is likely broken"
+             (hard_window_limit={hard_window_limit}) — window eviction is likely broken"
         );
+    });
+}
+
+#[test]
+fn get_returns_empty_snapshot_for_untouched_key() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 25, unique_prefix()).await;
+
+        let snapshot = rl.hybrid().suppressed().get(&key("k")).await.unwrap();
+        assert_eq!(snapshot, SuppressedRateLimitSnapshot::default());
+    });
+}
+
+#[test]
+fn get_snapshot_includes_local_pending_increments() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        // Very slow sync tick so pending local increments are not flushed in the background.
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 2_000, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        for _ in 0..3 {
+            let d = rl
+                .hybrid()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+        }
+
+        let snapshot = rl.hybrid().suppressed().get(&k).await.unwrap();
+        assert_eq!(
+            snapshot,
+            SuppressedRateLimitSnapshot {
+                total: 3,
+                total_declined: 0,
+                suppression_factor: 0.0,
+            }
+        );
+    });
+}
+
+#[test]
+fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        let (new_total, old_total) = rl
+            .hybrid()
+            .suppressed()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (100, 0));
+
+        let (new_total, old_total) = rl
+            .hybrid()
+            .suppressed()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (100, 100));
+
+        assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 100);
+    });
+}
+
+#[test]
+fn set_if_folds_pending_local_increments_before_comparing() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        // Very slow sync tick: the 5 increments stay local until set_if folds them.
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 2_000, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        for _ in 0..5 {
+            let d = rl
+                .hybrid()
+                .suppressed()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+        }
+
+        // The pending 5 are included in the Redis comparison overlay, so Lt(3)
+        // sees 5 and the write is skipped — increments are never lost.
+        let (new_total, old_total) = rl
+            .hybrid()
+            .suppressed()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(3), 3)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (5, 5));
+
+        assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 5);
+    });
+}
+
+#[test]
+fn set_if_prime_below_soft_limit_allows_next_inc() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        // window 6 * rate 5 * factor 1.0 → hard = soft = 30.
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+        let (new_total, _) = rl
+            .hybrid()
+            .suppressed()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(27), 27)
+            .await
+            .unwrap();
+        assert_eq!(new_total, 27);
+
+        let d = rl
+            .hybrid()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+    });
+}
+
+#[test]
+fn set_if_prime_at_hard_limit_declines_next_inc() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+        let (new_total, _) = rl
+            .hybrid()
+            .suppressed()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(30), 30)
+            .await
+            .unwrap();
+        assert_eq!(new_total, 30);
+
+        let d = rl
+            .hybrid()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                d,
+                RateLimitDecision::Suppressed {
+                    is_allowed: false,
+                    ..
+                }
+            ),
+            "d: {d:?}"
+        );
+
+        assert_eq!(
+            rl.hybrid().suppressed().get(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: 31,
+                total_declined: 1,
+                suppression_factor: 1.0,
+            }
+        );
+    });
+}
+
+#[test]
+fn set_if_zero_count_reopens_admission() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 30)
+                .await
+                .unwrap(),
+            (30, 0)
+        );
+
+        let d = rl
+            .hybrid()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                d,
+                RateLimitDecision::Suppressed {
+                    is_allowed: false,
+                    ..
+                }
+            ),
+            "d: {d:?}"
+        );
+
+        // Clearing the window resets counts, declines, and the cached factor:
+        // admission resumes immediately on the same instance.
+        let (new_total, old_total) = rl
+            .hybrid()
+            .suppressed()
+            .set_if(&k, &rate_limit, RateLimitComparator::Nil, 0)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (0, 31));
+
+        let d = rl
+            .hybrid()
+            .suppressed()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+    });
+}
+
+#[test]
+fn conditional_set_zero_handles_missing_and_present_suppressed_keys() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.5, 100, 25, unique_prefix()).await;
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        for (key_name, preservation) in [
+            ("replace", None),
+            ("preserve", Some(HistoryPreservation::PreserveOldest)),
+        ] {
+            let k = key(key_name);
+            let missing_result = match preservation {
+                Some(preservation) => rl
+                    .hybrid()
+                    .suppressed()
+                    .set_if_preserve_history(&k, &rate, RateLimitComparator::Eq(0), 0, preservation)
+                    .await
+                    .unwrap(),
+                None => rl
+                    .hybrid()
+                    .suppressed()
+                    .set_if(&k, &rate, RateLimitComparator::Eq(0), 0)
+                    .await
+                    .unwrap(),
+            };
+            assert_eq!(missing_result, (0, 0));
+            assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 0);
+
+            assert_eq!(
+                rl.hybrid()
+                    .suppressed()
+                    .set_if(&k, &rate, RateLimitComparator::Nil, 9)
+                    .await
+                    .unwrap(),
+                (9, 0)
+            );
+
+            let present_result = match preservation {
+                Some(preservation) => rl
+                    .hybrid()
+                    .suppressed()
+                    .set_if_preserve_history(&k, &rate, RateLimitComparator::Nil, 0, preservation)
+                    .await
+                    .unwrap(),
+                None => rl
+                    .hybrid()
+                    .suppressed()
+                    .set_if(&k, &rate, RateLimitComparator::Nil, 0)
+                    .await
+                    .unwrap(),
+            };
+            assert_eq!(present_result, (0, 9));
+            assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 0);
+        }
+    });
+}
+
+#[test]
+fn set_if_and_get_do_not_cross_provider_keyspaces() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 1.0, 100, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        // Write through the hybrid suppressed provider only.
+        assert_eq!(
+            rl.hybrid()
+                .suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 40)
+                .await
+                .unwrap(),
+            (40, 0)
+        );
+
+        // The pure Redis suppressed provider (same prefix) uses a separate keyspace.
+        assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 0);
+        assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 40);
+
+        // And the reverse.
+        assert_eq!(
+            rl.redis()
+                .suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 7)
+                .await
+                .unwrap(),
+            (7, 0)
+        );
+        assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 40);
+        assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 7);
+    });
+}
+
+#[test]
+fn set_if_preserve_history_includes_suppressed_pending_and_noop_keeps_it() {
+    let url = redis_url();
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 60, 1000, 1.5, 100, 2_000, unique_prefix()).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        for _ in 0..4 {
+            assert!(matches!(
+                rl.hybrid().suppressed().inc(&k, &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ));
+        }
+
+        assert_eq!(
+            rl.hybrid()
+                .suppressed()
+                .set_if_preserve_history(
+                    &k,
+                    &rate,
+                    RateLimitComparator::Eq(99),
+                    10,
+                    HistoryPreservation::PreserveNewest,
+                )
+                .await
+                .unwrap(),
+            (4, 4)
+        );
+        assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 4);
+
+        assert_eq!(
+            rl.hybrid()
+                .suppressed()
+                .set_if_preserve_history(
+                    &k,
+                    &rate,
+                    RateLimitComparator::Nil,
+                    10,
+                    HistoryPreservation::PreserveNewest,
+                )
+                .await
+                .unwrap(),
+            (10, 4)
+        );
+        assert_eq!(rl.hybrid().suppressed().get(&k).await.unwrap().total, 10);
     });
 }

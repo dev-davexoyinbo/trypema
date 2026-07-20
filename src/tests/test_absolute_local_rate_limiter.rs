@@ -286,6 +286,21 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
     assert_eq!(window_size_seconds, 10);
     assert_eq!(remaining_after_waiting, 3);
     assert_retry_after_between(retry_after_ms, 9_000, 10_000);
+
+    let decision = limiter.inc(key, &rate_limit, 1);
+    let RateLimitDecision::Rejected {
+        remaining_after_waiting,
+        ..
+    } = decision
+    else {
+        panic!("expected rejected increment, got {decision:?}");
+    };
+    assert_eq!(remaining_after_waiting, 3);
+    assert_eq!(
+        limiter.get(key),
+        10,
+        "a rejected increment must not consume capacity"
+    );
 }
 
 #[test]

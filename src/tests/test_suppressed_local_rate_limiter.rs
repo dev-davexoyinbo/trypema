@@ -234,6 +234,38 @@ fn reaching_shared_soft_and_hard_limit_is_allowed_then_suppresses() {
 }
 
 #[test]
+fn public_suppressed_decisions_never_return_absolute_rejection_metadata() {
+    let limiter = limiter(1, 1_000, 1.0);
+    let key = "k";
+    let rate_limit = RateLimit::try_from(5f64).unwrap();
+
+    for observed_after in 1..=10_u64 {
+        let decision = limiter.inc(key, &rate_limit, 1);
+
+        match decision {
+            RateLimitDecision::Allowed if observed_after <= 5 => {}
+            RateLimitDecision::Suppressed {
+                suppression_factor: 1.0,
+                is_allowed: false,
+            } if observed_after > 5 => {}
+            RateLimitDecision::Rejected { .. } => {
+                panic!("suppressed strategy returned absolute rejection metadata: {decision:?}")
+            }
+            _ => panic!("unexpected decision after observation {observed_after}: {decision:?}"),
+        }
+    }
+
+    assert_eq!(
+        limiter.get(key),
+        SuppressedRateLimitSnapshot {
+            total: 10,
+            total_declined: 5,
+            suppression_factor: 1.0,
+        }
+    );
+}
+
+#[test]
 fn fractional_limits_use_truncated_soft_and_hard_window_boundaries() {
     // soft = floor(1s * 1.3) = 1; hard = floor(1s * 1.3 * 2) = 2.
     let limiter = limiter(1, 1000, 2.0);

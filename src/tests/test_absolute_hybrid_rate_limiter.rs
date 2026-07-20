@@ -5,8 +5,9 @@ use super::runtime;
 use crate::common::SuppressionFactorCacheMs;
 use crate::hybrid::SyncIntervalMs;
 use crate::{
-    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimitDecision,
-    RateLimiter, RateLimiterOptions, RedisKey, RedisRateLimiterOptions, WindowSizeSeconds,
+    HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
+    RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions, RedisKey,
+    RedisRateLimiterOptions, WindowSizeSeconds,
 };
 
 fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
@@ -34,6 +35,20 @@ fn record_decision(
             panic!("suppressed decision is not expected in absolute strategy")
         }
     }
+}
+
+fn assert_allowed(decision: RateLimitDecision, context: &str) {
+    assert!(
+        matches!(decision, RateLimitDecision::Allowed),
+        "{context}: expected allowed decision, got {decision:?}"
+    );
+}
+
+fn assert_rejected(decision: RateLimitDecision, context: &str) {
+    assert!(
+        matches!(decision, RateLimitDecision::Rejected { .. }),
+        "{context}: expected rejected decision, got {decision:?}"
+    );
 }
 
 fn redis_url() -> String {
@@ -85,8 +100,8 @@ async fn build_limiter_with_prefix(
 }
 
 async fn wait_for_hybrid_sync(sync_interval_ms: u64) {
-    // Commits are flushed on interval ticks. The limiter's flush handler can enqueue follow-up
-    // commits for accepting keys, which then require a second tick to be written.
+    // Wait past two interval boundaries so the assertion does not depend on where
+    // construction landed within the committer's current interval.
     runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
 }
 
@@ -158,7 +173,7 @@ fn hybrid_absolute_never_returns_suppressed() {
 }
 
 #[test]
-fn hybrid_absolute_retry_after_is_bounded_by_min_sync_or_group_when_ttl_unknown() {
+fn hybrid_absolute_pending_only_rejection_reports_window_ttl_and_full_released_capacity() {
     let url = redis_url();
 
     runtime::block_on(async {
@@ -181,12 +196,14 @@ fn hybrid_absolute_retry_after_is_bounded_by_min_sync_or_group_when_ttl_unknown(
         let cap = window_capacity(window_size_seconds, &rate_limit);
 
         for _ in 0..cap {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "capacity setup increment",
+            );
         }
 
         let d = rl
@@ -195,16 +212,108 @@ fn hybrid_absolute_retry_after_is_bounded_by_min_sync_or_group_when_ttl_unknown(
             .inc(&k, &rate_limit, 1)
             .await
             .unwrap();
-        let RateLimitDecision::Rejected { retry_after_ms, .. } = d else {
+        let RateLimitDecision::Rejected {
+            retry_after_ms,
+            remaining_after_waiting,
+            ..
+        } = d
+        else {
             panic!("expected rejected decision, got: {d:?}");
         };
 
-        let bound_ms = sync_interval_ms.min(rate_group_size_ms) as u128;
         assert!(
-            retry_after_ms <= bound_ms,
-            "retry_after_ms={retry_after_ms} bound_ms={bound_ms}"
+            retry_after_ms >= 900 && retry_after_ms <= 1_000,
+            "pending usage should retain approximately one window of TTL: {d:?}"
         );
-        assert!(retry_after_ms > 0, "retry_after_ms should be > 0");
+        assert_eq!(
+            remaining_after_waiting, cap,
+            "all locally pending usage is one releasable grouped bucket: {d:?}"
+        );
+    });
+}
+
+#[test]
+fn hybrid_absolute_oversized_request_on_empty_key_has_no_backoff_wait() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 1_u64;
+        let rl =
+            build_limiter_with_prefix(&url, window_size_seconds, 1_000, 25, unique_prefix()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+
+        let decision = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, capacity + 1)
+            .await
+            .unwrap();
+        let RateLimitDecision::Rejected {
+            retry_after_ms,
+            remaining_after_waiting,
+            ..
+        } = decision
+        else {
+            panic!("expected oversized request to be rejected, got {decision:?}");
+        };
+
+        assert_eq!(retry_after_ms, 0, "no existing bucket needs to expire");
+        assert_eq!(remaining_after_waiting, 0, "no bucket releases capacity");
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
+    });
+}
+
+#[test]
+fn hybrid_absolute_known_oldest_ttl_is_not_inflated_to_sync_interval() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 60_u64;
+        let sync_interval_ms = 120_000_u64;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+
+        let seed = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            1_000,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+        assert_eq!(
+            seed.hybrid()
+                .absolute()
+                .set_if(&k, &rate_limit, RateLimitComparator::Nil, capacity)
+                .await
+                .unwrap(),
+            (capacity, 0)
+        );
+
+        runtime::async_sleep(Duration::from_millis(50)).await;
+
+        let observer =
+            build_limiter_with_prefix(&url, window_size_seconds, 1_000, sync_interval_ms, prefix)
+                .await;
+        let decision = observer.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let RateLimitDecision::Rejected {
+            retry_after_ms,
+            remaining_after_waiting,
+            ..
+        } = decision
+        else {
+            panic!("expected rejected admission check, got {decision:?}");
+        };
+
+        assert!(
+            retry_after_ms >= 50_000 && retry_after_ms <= 60_000,
+            "Redis bucket TTL must not be inflated to the 120s sync interval: {decision:?}"
+        );
+        assert_eq!(remaining_after_waiting, capacity);
     });
 }
 
@@ -267,21 +376,9 @@ fn hybrid_usage_is_committed_to_redis_on_flush_and_then_visible_to_others() {
             "d1: {d1:?}"
         );
 
-        // Wait for the committer to flush the queued commit to Redis.
-        // We poll because timing depends on the interval tick schedule.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let d2 = rl_b.hybrid().absolute().is_allowed(&k).await.unwrap();
-            if matches!(d2, RateLimitDecision::Rejected { .. }) {
-                break;
-            }
-
-            if std::time::Instant::now() >= deadline {
-                panic!("timed out waiting for commit to become visible; last decision: {d2:?}");
-            }
-
-            thread::sleep(Duration::from_millis(10));
-        }
+        // Exhaustion commits synchronously before the rejecting decision returns.
+        let d2 = rl_b.hybrid().absolute().is_allowed(&k).await.unwrap();
+        assert_rejected(d2, "overflow commit must be visible to another instance");
     });
 }
 
@@ -359,12 +456,14 @@ fn hybrid_absolute_unblocks_after_window_expires() {
         let cap = window_capacity(window_size_seconds, &rate_limit);
 
         for _ in 0..cap {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "capacity setup increment",
+            );
         }
 
         let d = rl
@@ -409,12 +508,14 @@ fn hybrid_absolute_per_key_state_is_independent() {
         let cap = window_capacity(1, &rate_limit);
 
         for _ in 0..cap {
-            let _ = rl
-                .hybrid()
-                .absolute()
-                .inc(&a, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl.hybrid()
+                    .absolute()
+                    .inc(&a, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "key A capacity setup increment",
+            );
         }
 
         let da = rl
@@ -469,12 +570,14 @@ fn hybrid_absolute_prefix_isolation() {
         let cap = window_capacity(window_size_seconds, &rate_limit);
 
         for _ in 0..cap {
-            let _ = rl_a
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            assert_allowed(
+                rl_a.hybrid()
+                    .absolute()
+                    .inc(&k, &rate_limit, 1)
+                    .await
+                    .unwrap(),
+                "prefix A capacity setup increment",
+            );
         }
         let d = rl_a
             .hybrid()
@@ -523,19 +626,25 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
             prefix.clone(),
         )
         .await;
-        let _ = rl_seed
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 2)
-            .await
-            .unwrap();
+        assert_allowed(
+            rl_seed
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 2)
+                .await
+                .unwrap(),
+            "oldest bucket setup increment",
+        );
         wait_for_hybrid_sync(sync_interval_ms).await;
-        let _ = rl_seed
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 4)
-            .await
-            .unwrap();
+        assert_allowed(
+            rl_seed
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 4)
+                .await
+                .unwrap(),
+            "newest bucket setup increment",
+        );
         wait_for_hybrid_sync(sync_interval_ms).await;
 
         // Create a hybrid limiter that will read the current Redis state.
@@ -575,6 +684,85 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
             panic!("expected rejected decision, got: {d:?}");
         };
         assert_eq!(remaining_after_waiting, 6, "d: {d:?}");
+    });
+}
+
+#[test]
+fn hybrid_absolute_remaining_after_waiting_is_capacity_released_by_oldest_bucket() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 10_u64;
+        let rate_group_size_ms = 100_u64;
+        let sync_interval_ms = 200_u64;
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(1f64).unwrap();
+
+        let seed = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            sync_interval_ms,
+            prefix.clone(),
+        )
+        .await;
+        assert_allowed(
+            seed.hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 3)
+                .await
+                .unwrap(),
+            "oldest bucket setup increment",
+        );
+        wait_for_hybrid_sync(sync_interval_ms).await;
+        assert_allowed(
+            seed.hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 7)
+                .await
+                .unwrap(),
+            "newest bucket setup increment",
+        );
+        wait_for_hybrid_sync(sync_interval_ms).await;
+
+        let observer = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            rate_group_size_ms,
+            sync_interval_ms,
+            prefix,
+        )
+        .await;
+        let decision = observer.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let RateLimitDecision::Rejected {
+            remaining_after_waiting,
+            ..
+        } = decision
+        else {
+            panic!("expected rejected decision, got {decision:?}");
+        };
+
+        assert_eq!(
+            remaining_after_waiting, 3,
+            "the oldest bucket releases three count units: {decision:?}"
+        );
+
+        let cached_decision = observer
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        let RateLimitDecision::Rejected {
+            remaining_after_waiting,
+            ..
+        } = cached_decision
+        else {
+            panic!("expected cached rejected decision, got {cached_decision:?}");
+        };
+        assert_eq!(remaining_after_waiting, 3);
+        assert_eq!(observer.hybrid().absolute().get(&k).await.unwrap(), 10);
     });
 }
 
@@ -831,6 +1019,883 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
 }
 
 #[test]
+fn get_returns_zero_for_untouched_key() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
+
+        let k = key("k");
+        assert_eq!(rl.hybrid().absolute().get_inferred(&k).await.unwrap(), 0);
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
+    });
+}
+
+#[test]
+fn get_inferred_refreshes_undefined_state_then_uses_local_snapshot() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let writer = build_limiter_with_prefix(&url, 6, 1_000, 2_000, prefix.clone()).await;
+        let reader = build_limiter_with_prefix(&url, 6, 1_000, 2_000, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        assert_eq!(
+            writer
+                .hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 5)
+                .await
+                .unwrap(),
+            (5, 0)
+        );
+
+        assert_eq!(
+            reader.hybrid().absolute().get_inferred(&k).await.unwrap(),
+            5
+        );
+
+        assert_eq!(
+            writer
+                .hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 9)
+                .await
+                .unwrap(),
+            (9, 5)
+        );
+
+        assert_eq!(
+            reader.hybrid().absolute().get_inferred(&k).await.unwrap(),
+            5,
+            "usable local state must stay on the inference fast path"
+        );
+        assert_eq!(reader.hybrid().absolute().get(&k).await.unwrap(), 9);
+    });
+}
+
+#[test]
+fn get_includes_local_pending_increments() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        // Very slow sync tick so pending local increments are not flushed in the background.
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 2_000, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        for _ in 0..3 {
+            let d = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+        }
+
+        // Redis holds nothing yet; the 3 increments are local pending.
+        let inferred_total = rl.hybrid().absolute().get_inferred(&k).await.unwrap();
+        assert_eq!(inferred_total, 3);
+
+        let total = rl.hybrid().absolute().get(&k).await.unwrap();
+        assert_eq!(total, 3);
+    });
+}
+
+#[test]
+fn get_methods_keep_the_exact_total_during_background_sync() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let sync_interval_ms = 500_u64;
+        let rl =
+            build_limiter_with_prefix(&url, 60, 1_000, sync_interval_ms, unique_prefix()).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        assert_allowed(
+            rl.hybrid().absolute().inc(&k, &rate, 3).await.unwrap(),
+            "pending usage setup increment",
+        );
+
+        // The first tick refreshes local state. Historically it only queued the
+        // captured count, leaving a gap until the second tick wrote it to Redis.
+        runtime::async_sleep(Duration::from_millis(sync_interval_ms + 100)).await;
+        assert_eq!(rl.hybrid().absolute().get_inferred(&k).await.unwrap(), 3);
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 3);
+    });
+}
+
+#[test]
+fn get_inferred_refreshes_an_expired_rejection_cache() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let limiter = build_limiter_with_prefix(&url, 1, 1_000, 25, prefix.clone()).await;
+        let writer = build_limiter_with_prefix(&url, 1, 1_000, 25, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(10f64).unwrap();
+        let capacity = window_capacity(1, &rate);
+
+        assert_allowed(
+            limiter
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate, capacity)
+                .await
+                .unwrap(),
+            "rejection setup increment",
+        );
+        assert_rejected(
+            limiter.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+            "rejection cache setup",
+        );
+
+        runtime::async_sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(
+            writer
+                .hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 4)
+                .await
+                .unwrap(),
+            (4, 0)
+        );
+
+        assert_eq!(
+            limiter.hybrid().absolute().get_inferred(&k).await.unwrap(),
+            4
+        );
+    });
+}
+
+#[test]
+fn inc_keeps_the_first_rate_limit_for_an_existing_key() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1_000, 2_000, unique_prefix()).await;
+        let low_rate = RateLimit::try_from(1f64).unwrap();
+        let high_rate = RateLimit::try_from(10f64).unwrap();
+
+        let low_first = key("low_first");
+        assert_allowed(
+            rl.hybrid()
+                .absolute()
+                .inc(&low_first, &low_rate, 4)
+                .await
+                .unwrap(),
+            "initial low-rate increment",
+        );
+        assert_rejected(
+            rl.hybrid()
+                .absolute()
+                .inc(&low_first, &high_rate, 3)
+                .await
+                .unwrap(),
+            "later high rate must not expand the stored window limit",
+        );
+        assert_eq!(rl.hybrid().absolute().get(&low_first).await.unwrap(), 4);
+
+        let high_first = key("high_first");
+        assert_allowed(
+            rl.hybrid()
+                .absolute()
+                .inc(&high_first, &high_rate, 40)
+                .await
+                .unwrap(),
+            "initial high-rate increment",
+        );
+        assert_allowed(
+            rl.hybrid()
+                .absolute()
+                .inc(&high_first, &low_rate, 10)
+                .await
+                .unwrap(),
+            "later low rate must not shrink the stored window limit",
+        );
+        assert_eq!(rl.hybrid().absolute().get(&high_first).await.unwrap(), 50);
+    });
+}
+
+#[test]
+fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (100, 0));
+
+        // The guard no longer matches: idempotent re-prime.
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (100, 100));
+
+        let total = rl.hybrid().absolute().get(&k).await.unwrap();
+        assert_eq!(total, 100);
+    });
+}
+
+#[test]
+fn set_if_lt_with_lower_target_is_noop() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
+                .await
+                .unwrap(),
+            (100, 0)
+        );
+
+        // Raise-only: a lower target must never lower the total.
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(50), 50)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (100, 100));
+    });
+}
+
+#[test]
+fn set_if_nil_overwrites_unconditionally_including_lowering() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 100)
+                .await
+                .unwrap(),
+            (100, 0)
+        );
+
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Nil, 30)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (30, 100));
+
+        let total = rl.hybrid().absolute().get(&k).await.unwrap();
+        assert_eq!(total, 30);
+    });
+}
+
+#[test]
+fn set_if_eq_zero_sets_only_when_window_is_empty() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Eq(0), 25)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (25, 0));
+
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Eq(0), 99)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (25, 25));
+    });
+}
+
+#[test]
+fn set_if_gt_and_ne_compare_against_the_current_total() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1_000, 25, unique_prefix()).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Nil, 7)
+                .await
+                .unwrap(),
+            (7, 0)
+        );
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Gt(6), 9)
+                .await
+                .unwrap(),
+            (9, 7)
+        );
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Ne(9), 12)
+                .await
+                .unwrap(),
+            (9, 9)
+        );
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Ne(8), 11)
+                .await
+                .unwrap(),
+            (11, 9)
+        );
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 11);
+    });
+}
+
+#[test]
+fn preserve_history_creates_missing_positive_keys_in_both_directions() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1_000, 25, unique_prefix()).await;
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        for (name, preservation) in [
+            ("newest", HistoryPreservation::PreserveNewest),
+            ("oldest", HistoryPreservation::PreserveOldest),
+        ] {
+            let k = key(name);
+            assert_eq!(
+                rl.hybrid()
+                    .absolute()
+                    .set_if_preserve_history(
+                        &k,
+                        &rate,
+                        RateLimitComparator::Eq(0),
+                        4,
+                        preservation,
+                    )
+                    .await
+                    .unwrap(),
+                (4, 0)
+            );
+            assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 4);
+        }
+    });
+}
+
+#[test]
+fn unchanged_preserve_history_target_redefines_the_window_limit() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1_000, 25, unique_prefix()).await;
+        let k = key("k");
+        let high_rate = RateLimit::try_from(100f64).unwrap();
+        let low_rate = RateLimit::try_from(1f64).unwrap();
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &high_rate, RateLimitComparator::Nil, 5)
+                .await
+                .unwrap(),
+            (5, 0)
+        );
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if_preserve_history(
+                    &k,
+                    &low_rate,
+                    RateLimitComparator::Eq(5),
+                    5,
+                    HistoryPreservation::PreserveNewest,
+                )
+                .await
+                .unwrap(),
+            (5, 5)
+        );
+
+        assert_allowed(
+            rl.hybrid().absolute().inc(&k, &high_rate, 1).await.unwrap(),
+            "one unit remains under the redefined limit",
+        );
+        assert_rejected(
+            rl.hybrid().absolute().inc(&k, &high_rate, 1).await.unwrap(),
+            "the redefined six-unit window limit must be enforced",
+        );
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 6);
+    });
+}
+
+#[test]
+fn conditional_set_zero_handles_missing_and_present_keys() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        for (key_name, preservation) in [
+            ("replace", None),
+            ("preserve", Some(HistoryPreservation::PreserveOldest)),
+        ] {
+            let k = key(key_name);
+            let missing_result = match preservation {
+                Some(preservation) => rl
+                    .hybrid()
+                    .absolute()
+                    .set_if_preserve_history(&k, &rate, RateLimitComparator::Eq(0), 0, preservation)
+                    .await
+                    .unwrap(),
+                None => rl
+                    .hybrid()
+                    .absolute()
+                    .set_if(&k, &rate, RateLimitComparator::Eq(0), 0)
+                    .await
+                    .unwrap(),
+            };
+            assert_eq!(missing_result, (0, 0));
+            assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
+
+            assert_eq!(
+                rl.hybrid()
+                    .absolute()
+                    .set_if(&k, &rate, RateLimitComparator::Nil, 9)
+                    .await
+                    .unwrap(),
+                (9, 0)
+            );
+
+            let present_result = match preservation {
+                Some(preservation) => rl
+                    .hybrid()
+                    .absolute()
+                    .set_if_preserve_history(&k, &rate, RateLimitComparator::Nil, 0, preservation)
+                    .await
+                    .unwrap(),
+                None => rl
+                    .hybrid()
+                    .absolute()
+                    .set_if(&k, &rate, RateLimitComparator::Nil, 0)
+                    .await
+                    .unwrap(),
+            };
+            assert_eq!(present_result, (0, 9));
+            assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
+        }
+    });
+}
+
+#[test]
+fn set_if_prime_then_inc_enforces_remaining_budget() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 6_u64;
+        let rl =
+            build_limiter_with_prefix(&url, window_size_seconds, 1000, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 30);
+
+        // Prime 27 of 30: exactly 3 units of budget remain.
+        let (new_total, _) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(27), 27)
+            .await
+            .unwrap();
+        assert_eq!(new_total, 27);
+
+        for i in 0..3_u64 {
+            let d = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(d, RateLimitDecision::Allowed), "i: {i}, d: {d:?}");
+        }
+
+        let d = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
+
+        let d = rl.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let RateLimitDecision::Rejected {
+            remaining_after_waiting,
+            ..
+        } = d
+        else {
+            panic!("expected rejected admission check, got {d:?}");
+        };
+        assert_eq!(
+            remaining_after_waiting, 27,
+            "the set_if bucket is older than the three pending increments: {d:?}"
+        );
+    });
+}
+
+#[test]
+fn set_if_prime_at_capacity_rejects_next_inc() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 6_u64;
+        let rl =
+            build_limiter_with_prefix(&url, window_size_seconds, 1000, 25, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+
+        let (new_total, _) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(capacity), capacity)
+            .await
+            .unwrap();
+        assert_eq!(new_total, capacity);
+
+        let d = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
+
+        let d = rl.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let RateLimitDecision::Rejected {
+            remaining_after_waiting,
+            ..
+        } = d
+        else {
+            panic!("expected rejected admission check, got {d:?}");
+        };
+        assert_eq!(
+            remaining_after_waiting, capacity,
+            "set_if created one bucket containing the full capacity: {d:?}"
+        );
+    });
+}
+
+#[test]
+fn set_if_folds_pending_local_increments_before_comparing() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        // Very slow sync tick: the 5 increments stay local until set_if folds them.
+        let rl = build_limiter_with_prefix(&url, 6, 1000, 2_000, unique_prefix()).await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(100f64).unwrap();
+
+        for _ in 0..5 {
+            let d = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+        }
+
+        // The pending 5 are included in the Redis comparison overlay, so Lt(3)
+        // sees 5 and the write is skipped — increments are never lost.
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Lt(3), 3)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (5, 5));
+
+        let total = rl.hybrid().absolute().get(&k).await.unwrap();
+        assert_eq!(total, 5);
+    });
+}
+
+#[test]
+fn set_if_after_rejection_transition_has_no_stale_commit_to_land_later() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 6_u64;
+        let sync_interval_ms = 2_000_u64;
+        let rl = build_limiter_with_prefix(
+            &url,
+            window_size_seconds,
+            1_000,
+            sync_interval_ms,
+            unique_prefix(),
+        )
+        .await;
+        let k = key("k");
+        let rate = RateLimit::try_from(1f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate);
+
+        assert!(matches!(
+            rl.hybrid()
+                .absolute()
+                .inc(&k, &rate, capacity)
+                .await
+                .unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert!(matches!(
+            rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+            RateLimitDecision::Rejected { .. }
+        ));
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Eq(capacity), 2)
+                .await
+                .unwrap(),
+            (2, capacity)
+        );
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 2);
+
+        // A previously queued capacity commit must not arrive after the reset and
+        // raise the total again.
+        runtime::async_sleep(Duration::from_millis(sync_interval_ms + 100)).await;
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 2);
+    });
+}
+
+#[test]
+fn set_if_invalidates_local_state_so_next_inc_observes_written_total() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let window_size_seconds = 6_u64;
+        let rl = build_limiter_with_prefix(&url, window_size_seconds, 1000, 2_000, unique_prefix())
+            .await;
+
+        let k = key("k");
+        let rate_limit = RateLimit::try_from(4f64).unwrap();
+        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        assert_eq!(capacity, 24);
+
+        for _ in 0..2 {
+            let d = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
+        }
+
+        // Unconditional overwrite to 20 (the folded pending 2 are part of old_total).
+        let (new_total, old_total) = rl
+            .hybrid()
+            .absolute()
+            .set_if(&k, &rate_limit, RateLimitComparator::Nil, 20)
+            .await
+            .unwrap();
+        assert_eq!((new_total, old_total), (20, 2));
+
+        // No stale local fast-path: budget continues from the written total (4 left of 24).
+        for i in 0..4_u64 {
+            let d = rl
+                .hybrid()
+                .absolute()
+                .inc(&k, &rate_limit, 1)
+                .await
+                .unwrap();
+            assert!(matches!(d, RateLimitDecision::Allowed), "i: {i}, d: {d:?}");
+        }
+
+        let d = rl
+            .hybrid()
+            .absolute()
+            .inc(&k, &rate_limit, 1)
+            .await
+            .unwrap();
+        assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
+    });
+}
+
+#[test]
+fn set_if_window_limit_is_sticky_for_other_instances() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let window_size_seconds = 6_u64;
+
+        let rl_a =
+            build_limiter_with_prefix(&url, window_size_seconds, 1000, 25, prefix.clone()).await;
+        let rl_b =
+            build_limiter_with_prefix(&url, window_size_seconds, 1000, 25, prefix.clone()).await;
+
+        let k = key("k");
+
+        // Instance A defines the window limit via a positive set: 6s * 2/s = 12.
+        let rate_a = RateLimit::try_from(2f64).unwrap();
+        assert_eq!(
+            rl_a.hybrid()
+                .absolute()
+                .set_if(&k, &rate_a, RateLimitComparator::Nil, 1)
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+
+        // Instance B incs with a much higher rate, but the stored window limit wins.
+        let rate_b = RateLimit::try_from(100f64).unwrap();
+
+        for i in 0..11_u64 {
+            let d = rl_b.hybrid().absolute().inc(&k, &rate_b, 1).await.unwrap();
+            assert!(matches!(d, RateLimitDecision::Allowed), "i: {i}, d: {d:?}");
+        }
+
+        let d = rl_b.hybrid().absolute().inc(&k, &rate_b, 1).await.unwrap();
+        assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
+    });
+}
+
+#[test]
+fn set_if_preserve_history_includes_pending_and_guard_miss_keeps_local_state() {
+    let url = redis_url();
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 60, 1000, 2_000, unique_prefix()).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(100f64).unwrap();
+
+        for _ in 0..4 {
+            assert!(matches!(
+                rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ));
+        }
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if_preserve_history(
+                    &k,
+                    &rate,
+                    RateLimitComparator::Eq(99),
+                    10,
+                    HistoryPreservation::PreserveNewest,
+                )
+                .await
+                .unwrap(),
+            (4, 4)
+        );
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 4);
+
+        assert_eq!(
+            rl.hybrid()
+                .absolute()
+                .set_if_preserve_history(
+                    &k,
+                    &rate,
+                    RateLimitComparator::Nil,
+                    10,
+                    HistoryPreservation::PreserveNewest,
+                )
+                .await
+                .unwrap(),
+            (10, 4)
+        );
+        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 10);
+    });
+}
+
+#[test]
+fn concurrent_increments_remain_exact_across_background_refreshes() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let sync_interval_ms = 25_u64;
+        let rl = build_limiter_with_prefix(&url, 60, 1_000, sync_interval_ms, prefix.clone()).await;
+        let k = key("k");
+        let rate = RateLimit::try_from(1_000f64).unwrap();
+        let worker_count = 8_u64;
+        let increments_per_worker = 1_000_u64;
+
+        let mut tasks = Vec::new();
+        for _ in 0..worker_count {
+            let rl = rl.clone();
+            let k = k.clone();
+            let rate = rate.clone();
+            tasks.push(runtime::spawn(async move {
+                for index in 0..increments_per_worker {
+                    let decision = rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap();
+                    assert_allowed(decision, "concurrent increment");
+
+                    if index % 25 == 0 {
+                        runtime::async_sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            }));
+        }
+        for task in tasks {
+            runtime::join(task).await;
+        }
+
+        wait_for_hybrid_sync(sync_interval_ms).await;
+        let observer = build_limiter_with_prefix(&url, 60, 1_000, sync_interval_ms, prefix).await;
+        assert_eq!(
+            observer.hybrid().absolute().get(&k).await.unwrap(),
+            worker_count * increments_per_worker
+        );
+    });
+}
+
+#[test]
 fn volume_non_integer_rate_uses_truncating_capacity() {
     let url = redis_url();
 
@@ -866,6 +1931,12 @@ fn volume_non_integer_rate_uses_truncating_capacity() {
                 "decision: {decision:?}"
             );
         }
+
+        let decision = rl.hybrid().absolute().is_allowed(&k).await.unwrap();
+        assert!(
+            matches!(decision, RateLimitDecision::Rejected { .. }),
+            "the truncated capacity must be full: {decision:?}"
+        );
 
         let decision = rl
             .hybrid()
