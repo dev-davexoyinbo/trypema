@@ -108,7 +108,12 @@ impl RedisCommitter {
                     futures::select! {
                         _ = tick(&mut flush_interval).fuse() => {
                             if let Err(err) =
-                                Self::flush_to_redis(&redis_proxy, &mut batch, max_batch_size).await
+                                Self::flush_to_redis(
+                                    redis_proxy.as_ref(),
+                                    &mut batch,
+                                    max_batch_size,
+                                )
+                                .await
                             {
                                 tracing::error!(error = ?err, "Failed to flush to Redis");
                                 continue;
@@ -140,7 +145,9 @@ impl RedisCommitter {
 
             drop(is_active_cancel_task);
 
-            if let Err(err) = Self::flush_to_redis(&redis_proxy, &mut batch, max_batch_size).await {
+            if let Err(err) =
+                Self::flush_to_redis(redis_proxy.as_ref(), &mut batch, max_batch_size).await
+            {
                 tracing::error!(error = ?err, "Failed to flush to Redis");
             };
         });
@@ -149,7 +156,7 @@ impl RedisCommitter {
     } // end method run
 
     async fn flush_to_redis<T>(
-        redis_proxy: &Box<dyn RedisProxyCommitter<T> + Send + Sync>,
+        redis_proxy: &(dyn RedisProxyCommitter<T> + Send + Sync),
         batch: &mut Vec<T>,
         max_batch_size: usize,
     ) -> Result<(), TrypemaError>
