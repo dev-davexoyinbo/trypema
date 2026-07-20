@@ -292,6 +292,51 @@ impl SuppressedHybridRateLimiter {
         }
     } // end method get_suppression_factor
 
+
+    /// Infer current window state from this instance's local limiting state.
+    ///
+    /// An initialized state stays on local fast path. Undefined or expired suppression state is
+    /// refreshed from Redis first. Result can lag commits from other instances and Redis-side
+    /// expiration; use [`Self::get`] when every read must consult Redis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when required Redis or locally cached state cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// use trypema::RateLimit;
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// assert_eq!(
+    ///     rl.hybrid().suppressed().get_inferred(&key).await.unwrap().total,
+    ///     0
+    /// );
+    ///
+    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// rl.hybrid().suppressed().inc(&key, &rate, 3).await.unwrap();
+    /// assert_eq!(
+    ///     rl.hybrid().suppressed().get_inferred(&key).await.unwrap().total,
+    ///     3
+    /// );
+    /// # });
+    /// ```
+    pub async fn get_inferred(
+        &self,
+        key: &RedisKey,
+    ) -> Result<SuppressedRateLimitSnapshot, TrypemaError> {
+        // this triggers the state to be evaluated and cached
+        self.get_suppression_factor(key).await?;
+
+        let Some(state) = self.limiting_state.get(key) else {
+            return Ok(SuppressedRateLimitSnapshot::default());
+        };
+
+        Ok(self.local_snapshot(state.deref())?.unwrap_or_default())
+    } // end method get_inferred
     /// Check admission and record the increment for `key` using probabilistic suppression.
     ///
     /// On the fast-path (key in `Accepting` state with capacity remaining), this is a

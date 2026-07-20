@@ -278,6 +278,59 @@ impl SuppressedHybridRateLimiter {
             SuppressedRedisLimitingState::Undefined => Ok(None),
         }
     } // end fn local_suppression_factor
+
+    pub(super) fn local_snapshot(
+        &self,
+        state: &SuppressedRedisLimitingState,
+    ) -> Result<Option<SuppressedRateLimitSnapshot>, TrypemaError> {
+        let Some(suppression_factor) = self.local_suppression_factor(state)? else {
+            return Ok(None);
+        };
+
+        let (total, total_declined) = match state {
+            SuppressedRedisLimitingState::Accepting {
+                starting_count,
+                count,
+                declined_count,
+                ..
+            } => {
+                let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
+                let total = starting_count.saturating_add(count.load(Ordering::Acquire));
+                let total_declined =
+                    (*mutex_lock(declined_count, "accepting.declined_count")?).min(total);
+
+                (total, total_declined)
+            }
+            SuppressedRedisLimitingState::Suppressing {
+                starting_count,
+                starting_declined_count,
+                count,
+                declined_count,
+                ..
+            } => {
+                let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
+                let starting_declined_count = *mutex_lock(
+                    starting_declined_count,
+                    "suppressing.starting_declined_count",
+                )?;
+
+                let total = starting_count.saturating_add(count.load(Ordering::Acquire));
+                let total_declined = starting_declined_count
+                    .saturating_add(declined_count.load(Ordering::Acquire))
+                    .min(total);
+
+                (total, total_declined)
+            }
+            SuppressedRedisLimitingState::Undefined => return Ok(None),
+        };
+
+        Ok(Some(SuppressedRateLimitSnapshot {
+            total,
+            total_declined,
+            suppression_factor,
+        }))
+    } // end fn local_snapshot
+
     fn freeze_local_state(&self, key: &RedisKey) -> Result<FrozenLocalState, TrypemaError> {
         let state = match self.limiting_state.entry(key.clone()) {
             Entry::Occupied(mut entry) => Some(std::mem::replace(
