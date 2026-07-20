@@ -20,7 +20,6 @@ enum LocalAdmission {
 #[derive(Debug)]
 struct ResolvedRedisState {
     key: RedisKey,
-    redis_total: u64,
     current_total: u64,
     window_limit: Option<u64>,
     oldest_bucket_ttl: Option<u64>,
@@ -226,7 +225,6 @@ impl AbsoluteHybridRateLimiter {
 
         Ok(ResolvedRedisState {
             key,
-            redis_total,
             current_total,
             window_limit,
             oldest_bucket_ttl,
@@ -323,7 +321,9 @@ impl AbsoluteHybridRateLimiter {
         } = current.deref()
         {
             *mutex_lock(current_window_limit, "accepting.window_limit")? = window_limit;
-            *mutex_lock(starting_count, "accepting.starting_count")? = state.redis_total;
+            // Any pending local count was committed before this refresh. Keep it in the
+            // inferred baseline instead of falling back to the pre-commit Redis total.
+            *mutex_lock(starting_count, "accepting.starting_count")? = state.current_total;
             *mutex_lock(current_time_instant, "accepting.time_instant")? = time_instant;
             *mutex_lock(last_modified, "accepting.last_modified")? = time_instant;
             *mutex_lock(oldest_bucket_ttl, "accepting.oldest_bucket_ttl")? =
@@ -340,7 +340,7 @@ impl AbsoluteHybridRateLimiter {
         let accepting = AbsoluteRedisLimitingState::Accepting {
             window_limit: Mutex::new(window_limit),
             accept_limit: Mutex::new(accept_limit),
-            starting_count: Mutex::new(state.redis_total),
+            starting_count: Mutex::new(state.current_total),
             count: AtomicU64::new(increment),
             time_instant: Mutex::new(time_instant),
             oldest_bucket_ttl: Mutex::new(state.oldest_bucket_ttl),
@@ -530,7 +530,6 @@ impl AbsoluteHybridRateLimiter {
 
         let state = ResolvedRedisState {
             key: key.clone(),
-            redis_total: transition.committed_total,
             current_total: transition.committed_total,
             window_limit: Some(transition.commit.window_limit),
             oldest_bucket_ttl: Some(transition.retry_after_ms as u64),
