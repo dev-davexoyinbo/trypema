@@ -203,6 +203,7 @@ impl SuppressedHybridRateLimiter {
         if let Some(lock) = self.reset_locks.get(key) {
             return Arc::clone(&lock);
         }
+
         self.reset_locks
             .entry(key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -253,90 +254,43 @@ impl SuppressedHybridRateLimiter {
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         self.send_epoch_change_if_needed();
 
-        let state = match self.limiting_state.get(key) {
-            Some(state) => state,
-            None => {
-                self.limiting_state
-                    .entry(key.clone())
-                    .or_insert_with(|| SuppressedRedisLimitingState::Undefined);
-                self.limiting_state.get(key).expect("Key should be present")
-            }
-        };
-
-        if let SuppressedRedisLimitingState::Suppressing {
-            time_instant,
-            suppression_factor_ttl_ms,
-            suppression_factor,
-            count,
-            starting_count,
-            window_limit,
-            ..
-        } = state.deref()
+        if let Some(state) = self.limiting_state.get(key)
+            && let Some(suppression_factor) = self.local_suppression_factor(state.deref())?
         {
-            let window_limit = *mutex_lock(window_limit, "suppressing.window_limit")?;
-            let mut suppression_factor =
-                *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
-            let elapsed_ms = mutex_lock(time_instant, "suppressing.time_instant")?
-                .elapsed()
-                .as_millis();
-            let ttl_ms = *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? as u128;
-            let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
-
-            // Guard hard limit
-            if starting_count.saturating_add(count.load(Ordering::Acquire)) > window_limit {
-                suppression_factor = 1f64;
-            }
-
-            if elapsed_ms < ttl_ms {
-                return Ok(suppression_factor);
-            }
-        } else if let SuppressedRedisLimitingState::Accepting {
-            window_limit,
-            count,
-            starting_count,
-            declined_count,
-            ..
-        } = state.deref()
-        {
-            let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
-            let soft_window_limit = (window_limit as f64 / *self.hard_limit_factor) as u64;
-            let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
-            let declined = *mutex_lock(declined_count, "accepting.declined_count")?;
-            let effective_total = starting_count
-                .saturating_add(count.load(Ordering::Acquire))
-                .saturating_sub(declined);
-
-            let suppression_factor = if effective_total < soft_window_limit {
-                0f64
-            } else if effective_total == soft_window_limit && soft_window_limit == window_limit {
-                // soft == hard: full suppression.
-                1f64
-            } else {
-                // soft < hard: local state hasn't been committed to Redis yet so we return 0 as a
-                // conservative approximation (Redis read will give the accurate value).
-                0f64
-            };
             return Ok(suppression_factor);
         }
 
-        drop(state);
+        let lock = self.get_or_create_reset_lock(key);
+        let _guard = lock.lock().await;
+
+        if let Some(state) = self.limiting_state.get(key)
+            && let Some(suppression_factor) = self.local_suppression_factor(state.deref())?
+        {
+            return Ok(suppression_factor);
+        }
 
         let mut rng = |p: f64| rand::random_bool(p);
-
+        let read_state_result = self.redis_proxy.read_state(key).await?;
         let decision = self
-            .reset_state_from_redis_read_result_and_get_decision(key, 0, 0, None, &mut rng)
+            .reset_single_state_from_read_result(read_state_result, 0, 0, None, &mut rng)
             .await?;
+
+        if let Some(state) = self.limiting_state.get(key)
+            && let Some(suppression_factor) = self.local_suppression_factor(state.deref())?
+        {
+            return Ok(suppression_factor);
+        }
 
         match decision {
             RateLimitDecision::Allowed => Ok(0f64),
-            RateLimitDecision::Rejected { .. } => {
-                unreachable!("rejected should not be possible when using the suppressed strategy")
-            }
+            RateLimitDecision::Rejected { .. } => Err(TrypemaError::CustomError(
+                "suppressed hybrid returned an absolute rejection decision".to_string(),
+            )),
             RateLimitDecision::Suppressed {
                 suppression_factor, ..
             } => Ok(suppression_factor),
         }
-    }
+    } // end method get_suppression_factor
 
     /// Check admission and record the increment for `key` using probabilistic suppression.
     ///

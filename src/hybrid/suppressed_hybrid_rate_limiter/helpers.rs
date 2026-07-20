@@ -212,6 +212,72 @@ impl SuppressedHybridRateLimiter {
         Ok(())
     } // end fn cache_full_suppression
 
+    pub(super) fn local_suppression_factor(
+        &self,
+        state: &SuppressedRedisLimitingState,
+    ) -> Result<Option<f64>, TrypemaError> {
+        match state {
+            SuppressedRedisLimitingState::Suppressing {
+                time_instant,
+                suppression_factor_ttl_ms,
+                suppression_factor,
+                count,
+                starting_count,
+                starting_declined_count,
+                hard_window_limit,
+                declined_count,
+            } => {
+                let hard_window_limit =
+                    *mutex_lock(hard_window_limit, "suppressing.hard_window_limit")?;
+                let mut suppression_factor =
+                    *mutex_lock(suppression_factor, "suppressing.suppression_factor")?;
+                let elapsed_ms = mutex_lock(time_instant, "suppressing.time_instant")?
+                    .elapsed()
+                    .as_millis();
+                let ttl_ms = *mutex_lock(suppression_factor_ttl_ms, "suppressing.ttl_ms")? as u128;
+                let starting_count = *mutex_lock(starting_count, "suppressing.starting_count")?;
+                let starting_declined_count = *mutex_lock(
+                    starting_declined_count,
+                    "suppressing.starting_declined_count",
+                )?;
+
+                let observed_count = starting_count.saturating_add(count.load(Ordering::Acquire));
+                let accepted_count = observed_count.saturating_sub(
+                    starting_declined_count.saturating_add(declined_count.load(Ordering::Acquire)),
+                );
+
+                if observed_count >= hard_window_limit as u64 {
+                    suppression_factor = 1f64;
+                } else if accepted_count < (hard_window_limit / *self.hard_limit_factor) as u64 {
+                    suppression_factor = 0f64;
+                }
+
+                Ok((elapsed_ms < ttl_ms).then_some(suppression_factor))
+            }
+
+            SuppressedRedisLimitingState::Accepting {
+                hard_window_limit,
+                count,
+                starting_count,
+                ..
+            } => {
+                let hard_window_limit =
+                    *mutex_lock(hard_window_limit, "accepting.hard_window_limit")?;
+                let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
+                let observed_count = starting_count.saturating_add(count.load(Ordering::Acquire));
+
+                let suppression_factor = if observed_count >= hard_window_limit as u64 {
+                    1f64
+                } else {
+                    0f64
+                };
+
+                Ok(Some(suppression_factor))
+            }
+
+            SuppressedRedisLimitingState::Undefined => Ok(None),
+        }
+    } // end fn local_suppression_factor
     fn freeze_local_state(&self, key: &RedisKey) -> Result<FrozenLocalState, TrypemaError> {
         let state = match self.limiting_state.entry(key.clone()) {
             Entry::Occupied(mut entry) => Some(std::mem::replace(
