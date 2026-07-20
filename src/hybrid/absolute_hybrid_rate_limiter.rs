@@ -536,42 +536,26 @@ impl AbsoluteHybridRateLimiter {
         .await
     } // end method set_if_preserve_history
 
-        if let AbsoluteRedisLimitingState::Rejecting {
-            time_instant,
-            ttl_ms,
-            count_after_release,
-            ..
-        } = state_entry.deref()
-        {
-            let elapsed_ms = mutex_lock(time_instant, "rejecting.time_instant")?
-                .elapsed()
-                .as_millis();
-            let ttl_ms_val = *mutex_lock(ttl_ms, "rejecting.ttl_ms")? as u128;
-
-            if elapsed_ms < ttl_ms_val {
-                let remaining_after_waiting =
-                    *mutex_lock(count_after_release, "rejecting.count_after_release")?;
-                return Ok(RateLimitDecision::Rejected {
-                    window_size_seconds: *self.window_size_seconds,
-                    retry_after_ms: ttl_ms_val.saturating_sub(elapsed_ms),
-                    remaining_after_waiting,
-                });
+    fn should_cleanup_local_state(state: &AbsoluteRedisLimitingState, stale_after_ms: u64) -> bool {
+        match state {
+            AbsoluteRedisLimitingState::Undefined => true,
+            AbsoluteRedisLimitingState::Accepting {
+                last_modified: time_instant,
+                ..
             }
+            | AbsoluteRedisLimitingState::Rejecting { time_instant, .. } => {
+                let time_instant = match time_instant.lock() {
+                    Ok(time_instant) => time_instant,
+                    Err(err) => {
+                        tracing::warn!("time_instant is poisoned: {err:?}");
+                        return true;
+                    }
+                };
 
-            drop(state_entry);
-        } else if let AbsoluteRedisLimitingState::Accepting {
-            accept_limit,
-            count,
-            last_modified,
-            ..
-        } = state_entry.deref()
-        {
-            let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
-            if count.load(Ordering::Acquire) + check_count <= accept_limit {
-                *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
-                count.fetch_add(increment, Ordering::AcqRel);
-                return Ok(RateLimitDecision::Allowed);
+                time_instant.elapsed().as_millis() >= stale_after_ms as u128
             }
+        }
+    }// end method should_cleanup_local_state
 
     async fn set_if_with_history_mode(
         &self,
@@ -639,24 +623,35 @@ impl AbsoluteHybridRateLimiter {
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         self.redis_proxy.cleanup(stale_after_ms).await?;
-        self.limiting_state.retain(|_, state| match state {
-            AbsoluteRedisLimitingState::Undefined => false,
-            AbsoluteRedisLimitingState::Accepting {
-                last_modified: time_instant,
-                ..
-            }
-            | AbsoluteRedisLimitingState::Rejecting { time_instant, .. } => {
-                let time_instant = match time_instant.get_mut() {
-                    Ok(time_instant) => time_instant,
-                    Err(err) => {
-                        tracing::warn!("time_instant is poisoned: {err:?}");
-                        return false;
-                    }
-                };
 
-                time_instant.elapsed().as_millis() < stale_after_ms as u128
+        let candidates = self
+            .limiting_state
+            .iter()
+            .filter(|state| Self::should_cleanup_local_state(state.value(), stale_after_ms))
+            .map(|state| state.key().clone())
+            .collect::<Vec<_>>();
+
+        for key in candidates {
+            let lock = self.get_or_create_reset_lock(&key);
+            let _guard = lock.lock().await;
+
+            let should_remove = self.limiting_state.get(&key).is_some_and(|state| {
+                Self::should_cleanup_local_state(state.value(), stale_after_ms)
+            });
+
+            if !should_remove {
+                continue;
             }
-        });
+
+            match self.limiting_state.entry(key) {
+                Entry::Occupied(entry)
+                    if Self::should_cleanup_local_state(entry.get(), stale_after_ms) =>
+                {
+                    entry.remove();
+                }
+                Entry::Occupied(_) | Entry::Vacant(_) => {}
+            }
+        }
 
         Ok(())
     }
