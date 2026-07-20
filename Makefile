@@ -32,14 +32,9 @@ help: ## Show available commands
 
 redis-up: redis-up-test ## Start local redis for tests (alias for redis-up-test)
 
-redis-up-test: ## Start redis:6.2-alpine for tests (profile: test)
+redis-up-test: ## Start redis:7.2-alpine for tests and benches (profile: test)
 	@docker info >/dev/null 2>&1 || (echo "docker daemon not running" >&2; exit 1)
-	@REDIS_PORT="$(REDIS_PORT)" docker compose --profile test up -d redis-test
-	@sh -c 'for i in $$(seq 1 60); do \
-		if docker compose --profile test exec -T redis-test redis-cli ping >/dev/null 2>&1; then exit 0; fi; \
-		sleep 0.25; \
-	done; \
-	echo "redis did not become ready in time" >&2; exit 1'
+	@REDIS_PORT="$(REDIS_PORT)" docker compose --profile test up -d --wait
 
 redis-up-compare: ## Start redis-with-cell for compare/stress targets (profile: compare)
 	@docker info >/dev/null 2>&1 || (echo "docker daemon not running" >&2; exit 1)
@@ -118,39 +113,45 @@ bench-local: ## Run local benches (no Redis)
 	@cargo bench -p trypema --bench local_suppressed
 
 bench-redis: ## Run Redis benches (tokio + smol)
-	@set -e; \
-	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
-	REDIS_URL="$(REDIS_URL)" $(MAKE) -s bench-redis-tokio; \
-	REDIS_URL="$(REDIS_URL)" $(MAKE) -s bench-redis-smol
+	@$(MAKE) -s bench-redis-tokio
+	@$(MAKE) -s bench-redis-smol
 
 bench-redis-tokio: ## Run Redis benches (tokio)
 	@set -e; \
+	trap 'exit 130' INT TERM; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_absolute; \
 	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench redis_suppressed
 
 bench-redis-smol: ## Run Redis benches (smol)
 	@set -e; \
+	trap 'exit 130' INT TERM; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench redis_absolute; \
 	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench redis_suppressed
 
 bench-hybrid: ## Run hybrid benches (tokio + smol)
-	@set -e; \
-	trap "$(MAKE) -s redis-down" EXIT; \
-	$(MAKE) -s redis-up; \
-	REDIS_URL="$(REDIS_URL)" $(MAKE) -s bench-hybrid-tokio; \
-	REDIS_URL="$(REDIS_URL)" $(MAKE) -s bench-hybrid-smol
+	@$(MAKE) -s bench-hybrid-tokio
+	@$(MAKE) -s bench-hybrid-smol
 
 bench-hybrid-tokio: ## Run hybrid benches (tokio)
 	@set -e; \
+	trap 'exit 130' INT TERM; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench hybrid_absolute; \
 	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-tokio --bench hybrid_suppressed
 
 bench-hybrid-smol: ## Run hybrid benches (smol)
 	@set -e; \
+	trap 'exit 130' INT TERM; \
+	trap "$(MAKE) -s redis-down" EXIT; \
+	$(MAKE) -s redis-up; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench hybrid_absolute; \
 	sleep 10; \
 	REDIS_URL="$(REDIS_URL)" cargo bench -p trypema --features redis-smol --bench hybrid_suppressed
@@ -189,7 +190,7 @@ stress-local-uniform: ## Stress local provider (uniform keys)
 # Notes:
 # - Runs in max-throughput mode (no pacing).
 # - For `trypema` we run both `absolute` and `suppressed` strategies.
-# - For `burster` and `governor`, `--strategy suppressed` is ignored by the harness.
+# - `burster` and `governor` support only `absolute`; invalid strategy combinations are rejected.
 #
 # Override any of these from your shell, e.g.
 #   STRESS_UNIFORM_KEY_SPACES='1 10 100' STRESS_UNIFORM_RATES='64 128 256' make stress-local-uniform-matrix
