@@ -555,7 +555,7 @@ impl AbsoluteHybridRateLimiter {
                 time_instant.elapsed().as_millis() >= stale_after_ms as u128
             }
         }
-    }// end method should_cleanup_local_state
+    } // end method should_cleanup_local_state
 
     async fn set_if_with_history_mode(
         &self,
@@ -658,8 +658,9 @@ impl AbsoluteHybridRateLimiter {
 
     async fn flush(&self) -> Result<(), TrypemaError> {
         let mut resets: Vec<RedisKey> = Vec::new();
+        let mut stale: Vec<RedisKey> = Vec::new();
 
-        for mut state in self.limiting_state.iter_mut() {
+        for state in self.limiting_state.iter() {
             let key = state.key();
 
             if let AbsoluteRedisLimitingState::Accepting {
@@ -681,8 +682,7 @@ impl AbsoluteHybridRateLimiter {
                 };
 
                 if elapsed.as_millis() > (*self.window_size_seconds * 1000) as u128 {
-                    *state = AbsoluteRedisLimitingState::Undefined;
-
+                    stale.push(key.clone());
                     continue;
                 }
 
@@ -692,6 +692,56 @@ impl AbsoluteHybridRateLimiter {
 
                 resets.push(key.clone());
             }
+        }
+
+        let mut guards = Vec::with_capacity(resets.len() + stale.len());
+        for key in resets.iter().chain(&stale) {
+            guards.push(self.get_or_create_reset_lock(key).lock_owned().await);
+        }
+
+        for key in stale {
+            let should_reset = self.limiting_state.get(&key).is_some_and(|state| {
+                matches!(
+                    state.deref(),
+                    AbsoluteRedisLimitingState::Accepting { last_modified, .. }
+                        if mutex_lock(last_modified, "accepting.last_modified")
+                            .is_ok_and(|last_modified| {
+                                last_modified.elapsed().as_millis()
+                                    > (*self.window_size_seconds * 1_000) as u128
+                            })
+                )
+            });
+
+            if !should_reset {
+                continue;
+            }
+
+            if let Some(mut state) = self.limiting_state.get_mut(&key)
+                && let AbsoluteRedisLimitingState::Accepting { last_modified, .. } = state.deref()
+            {
+                let is_stale = mutex_lock(last_modified, "accepting.last_modified")?
+                    .elapsed()
+                    .as_millis()
+                    > (*self.window_size_seconds * 1_000) as u128;
+
+                if is_stale {
+                    *state = AbsoluteRedisLimitingState::Undefined;
+                }
+            }
+        }
+
+        resets.retain(|key| {
+            self.limiting_state.get(key).is_some_and(|state| {
+                matches!(
+                    state.deref(),
+                    AbsoluteRedisLimitingState::Accepting { count, .. }
+                        if count.load(Ordering::Acquire) > 0
+                )
+            })
+        });
+
+        if resets.is_empty() {
+            return Ok(());
         }
 
         let read_state_results = self.redis_proxy.batch_read_state(&resets).await?;
