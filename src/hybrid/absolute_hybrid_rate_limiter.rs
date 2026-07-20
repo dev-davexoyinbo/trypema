@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, RedisKey,
-    RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
+    RedisRateLimiterOptions, TrypemaError, WindowSize,
     common::{HistoryUpdateMode, RandomState},
     hybrid::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
@@ -82,10 +82,10 @@ enum AbsoluteRedisLimitingState {
 ///
 /// Use this over the pure Redis provider when per-request Redis latency is unacceptable.
 /// The trade-off is that admission decisions may lag behind the true Redis state by up
-/// to `sync_interval_ms`.
+/// to `sync_interval`.
 #[derive(Debug)]
 pub struct AbsoluteHybridRateLimiter {
-    window_size_seconds: WindowSizeSeconds,
+    window_size: WindowSize,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState, RandomState>,
@@ -107,14 +107,14 @@ impl AbsoluteHybridRateLimiter {
         let redis_proxy = AbsoluteHybridRedisProxy::new(AbsoluteHybridRedisProxyOptions {
             prefix: prefix.clone(),
             connection_manager: options.connection_manager,
-            window_size_seconds: options.window_size_seconds,
-            rate_group_size_ms: options.rate_group_size_ms,
+            window_size: options.window_size,
+            bucket_size: options.bucket_size,
         });
 
         let is_active_watch = watch::Sender::new(0u64);
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
-            sync_interval: Duration::from_millis(*options.sync_interval_ms),
+            sync_interval: Duration::from_millis(*options.sync_interval),
             channel_capacity: 8192,
             max_batch_size: 4,
             limiter_sender: tx,
@@ -123,7 +123,7 @@ impl AbsoluteHybridRateLimiter {
         });
 
         let limiter = Self {
-            window_size_seconds: options.window_size_seconds,
+            window_size: options.window_size,
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::default(),
@@ -244,7 +244,7 @@ impl AbsoluteHybridRateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// assert!(matches!(
     ///     rl.hybrid().absolute().inc(&key, &rate, 1).await.unwrap(),
     ///     RateLimitDecision::Allowed
@@ -324,7 +324,7 @@ impl AbsoluteHybridRateLimiter {
     ///     0
     /// );
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// rl.hybrid().absolute().inc(&key, &rate, 3).await.unwrap();
     /// assert_eq!(
     ///     rl.hybrid().absolute().get_inferred(&key).await.unwrap(),
@@ -356,7 +356,7 @@ impl AbsoluteHybridRateLimiter {
                 committed_count,
                 committed_at,
                 ..
-            } if committed_at.elapsed() < Duration::from_secs(*self.window_size_seconds) => {
+            } if committed_at.elapsed() < Duration::from_secs(*self.window_size) => {
                 Ok(*committed_count)
             }
             AbsoluteRedisLimitingState::Undefined
@@ -370,7 +370,7 @@ impl AbsoluteHybridRateLimiter {
     /// instance's pending local increments for the key (increments accepted on the
     /// fast-path that have not been flushed yet). Pending increments held by
     /// **other** instances are not visible until their next flush, so the result
-    /// may lag the true global total by up to `sync_interval_ms`.
+    /// may lag the true global total by up to `sync_interval`.
     ///
     /// Unlike [`Self::get_inferred`], this method performs a Redis round-trip on every call rather
     /// than using a valid local state.
@@ -389,7 +389,7 @@ impl AbsoluteHybridRateLimiter {
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
     /// assert_eq!(rl.hybrid().absolute().get(&key).await.unwrap(), 0);
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// rl.hybrid().absolute().inc(&key, &rate, 3).await.unwrap();
     /// assert_eq!(rl.hybrid().absolute().get(&key).await.unwrap(), 3);
     /// # });
@@ -413,7 +413,7 @@ impl AbsoluteHybridRateLimiter {
                     committed_count,
                     committed_at,
                     ..
-                } if committed_at.elapsed() < Duration::from_secs(*self.window_size_seconds) => {
+                } if committed_at.elapsed() < Duration::from_secs(*self.window_size) => {
                     total_count = total_count.max(*committed_count);
                 }
                 AbsoluteRedisLimitingState::Undefined
@@ -429,7 +429,7 @@ impl AbsoluteHybridRateLimiter {
     /// When `comparator` matches the key's current post-eviction window total, the
     /// window contents are replaced by a single current-timestamp bucket holding
     /// `count`; otherwise nothing is written. On a match the key's window limit is
-    /// (re)defined as `window_size_seconds × rate_limit` and its TTL refreshed.
+    /// (re)defined as `window_size × rate_limit` and its TTL refreshed.
     /// A matched target of zero removes the committed entity state; increments that
     /// race after the protected pending snapshot are committed on top of that reset.
     ///
@@ -442,7 +442,7 @@ impl AbsoluteHybridRateLimiter {
     /// - the next `inc` on this instance re-reads Redis and observes the new total.
     ///
     /// Pending increments on **other** instances flush later (within
-    /// `sync_interval_ms`) and land *on top of* the written value, so after a
+    /// `sync_interval`) and land *on top of* the written value, so after a
     /// matched write the total may drift above `count` — it is never lowered below
     /// it by those flushes.
     ///
@@ -473,7 +473,7 @@ impl AbsoluteHybridRateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Prime the window to 40.
     /// let (new_total, old_total) = rl
@@ -600,7 +600,7 @@ impl AbsoluteHybridRateLimiter {
             })
             .unwrap_or(0);
 
-        let window_limit = ((*self.window_size_seconds as f64) * **rate_limit) as u64;
+        let window_limit = ((*self.window_size as f64) * **rate_limit) as u64;
         let (new_total, old_total, changed) = self
             .redis_proxy
             .set_if(key, window_limit, comparator, count, mode, pending_count)
@@ -700,7 +700,7 @@ impl AbsoluteHybridRateLimiter {
                     last_modified.elapsed()
                 };
 
-                if elapsed.as_millis() > (*self.window_size_seconds * 1000) as u128 {
+                if elapsed.as_millis() > (*self.window_size * 1000) as u128 {
                     stale.push(key.clone());
                     continue;
                 }
@@ -726,7 +726,7 @@ impl AbsoluteHybridRateLimiter {
                         if mutex_lock(last_modified, "accepting.last_modified")
                             .is_ok_and(|last_modified| {
                                 last_modified.elapsed().as_millis()
-                                    > (*self.window_size_seconds * 1_000) as u128
+                                    > (*self.window_size * 1_000) as u128
                             })
                 )
             });
@@ -741,7 +741,7 @@ impl AbsoluteHybridRateLimiter {
                 let is_stale = mutex_lock(last_modified, "accepting.last_modified")?
                     .elapsed()
                     .as_millis()
-                    > (*self.window_size_seconds * 1_000) as u128;
+                    > (*self.window_size * 1_000) as u128;
 
                 if is_stale {
                     *state = AbsoluteRedisLimitingState::Undefined;

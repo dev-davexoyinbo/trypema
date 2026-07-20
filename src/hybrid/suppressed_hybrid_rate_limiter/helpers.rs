@@ -205,7 +205,7 @@ impl SuppressedHybridRateLimiter {
         *mutex_lock(
             state.suppression_factor_ttl_ms,
             "suppressing.suppression_factor_ttl_ms",
-        )? = *self.suppression_factor_cache_ms;
+        )? = *self.suppression_factor_cache_period;
         *mutex_lock(state.time_instant, "suppressing.time_instant")? = Instant::now();
         *mutex_lock(state.suppression_factor, "suppressing.suppression_factor")? = 1f64;
 
@@ -492,7 +492,7 @@ impl SuppressedHybridRateLimiter {
                     return Ok(RateLimitDecision::Allowed);
                 };
 
-                *self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor
+                *self.window_size as f64 * **rate_limit * *self.hard_limit_factor
             }
         };
 
@@ -522,11 +522,11 @@ impl SuppressedHybridRateLimiter {
             let declined_count = if should_allow { 0 } else { increment };
 
             let suppression_factor_ttl_ms = if suppression_factor == 1f64 {
-                *self.suppression_factor_cache_ms
+                *self.suppression_factor_cache_period
             } else {
                 state
                     .suppression_factor_ttl_ms
-                    .unwrap_or(*self.suppression_factor_cache_ms)
+                    .unwrap_or(*self.suppression_factor_cache_period)
             };
 
             self.store_local_state(
@@ -792,7 +792,7 @@ impl SuppressedHybridRateLimiter {
             }
         };
 
-        Ok(elapsed_ms > (*self.window_size_seconds * 1_000) as u128)
+        Ok(elapsed_ms > (*self.window_size * 1_000) as u128)
     } // end fn is_stale_for_flush
 
     pub(super) fn has_pending_counts(state: &SuppressedRedisLimitingState) -> bool {

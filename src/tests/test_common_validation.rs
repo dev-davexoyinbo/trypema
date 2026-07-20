@@ -1,42 +1,239 @@
-use crate::{HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitComparator, WindowSizeSeconds};
+use crate::{
+    BucketSize, HardLimitFactor, RateLimit, RateLimitComparator, SuppressionFactorCachePeriod,
+    TrypemaError, WindowSize,
+};
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use crate::hybrid::SyncInterval;
+
+type RateConstructor = fn(f64) -> Result<RateLimit, TrypemaError>;
+type PanicRateConstructor = fn(f64) -> RateLimit;
+type WindowConstructor = fn(u64) -> Result<WindowSize, TrypemaError>;
+type PanicWindowConstructor = fn(u64) -> WindowSize;
+type BucketConstructor = fn(u64) -> Result<BucketSize, TrypemaError>;
+type PanicBucketConstructor = fn(u64) -> BucketSize;
+type CacheConstructor = fn(u64) -> Result<SuppressionFactorCachePeriod, TrypemaError>;
+type PanicCacheConstructor = fn(u64) -> SuppressionFactorCachePeriod;
 
 #[test]
-fn rate_limit_try_from_validates_positive() {
-    let rl = RateLimit::try_from(1f64).unwrap();
-    assert_eq!(*rl, 1f64);
+fn rate_limit_period_helpers_convert_to_per_second() {
+    let cases: [(RateConstructor, PanicRateConstructor, f64); 6] = [
+        (RateLimit::per_second, RateLimit::per_second_or_panic, 1.0),
+        (RateLimit::per_minute, RateLimit::per_minute_or_panic, 60.0),
+        (RateLimit::per_hour, RateLimit::per_hour_or_panic, 3_600.0),
+        (RateLimit::per_day, RateLimit::per_day_or_panic, 86_400.0),
+        (RateLimit::per_week, RateLimit::per_week_or_panic, 604_800.0),
+        (
+            RateLimit::per_month,
+            RateLimit::per_month_or_panic,
+            2_592_000.0,
+        ),
+    ];
 
-    assert_eq!(
-        RateLimit::try_from(0f64).unwrap_err().to_string(),
-        "invalid rate limit: rate limit must be greater than 0"
-    );
-    assert_eq!(
-        RateLimit::try_from(-1f64).unwrap_err().to_string(),
-        "invalid rate limit: rate limit must be greater than 0"
-    );
+    for (constructor, panic_constructor, value) in cases {
+        assert_eq!(*constructor(value).unwrap(), 1.0);
+        assert_eq!(*panic_constructor(value), 1.0);
+        assert!(std::panic::catch_unwind(|| panic_constructor(0.0)).is_err());
+    }
 
-    assert!(*RateLimit::max() > 0f64);
+    assert!(matches!(
+        RateLimit::per_second(0.0),
+        Err(TrypemaError::InvalidRateLimit(_))
+    ));
+    assert!(matches!(
+        RateLimit::per_second(-1.0),
+        Err(TrypemaError::InvalidRateLimit(_))
+    ));
+    assert!(*RateLimit::max() > 0.0);
 }
 
 #[test]
-fn window_size_seconds_try_from_validates_min_1() {
-    let w = WindowSizeSeconds::try_from(1u64).unwrap();
-    assert_eq!(*w, 1u64);
+fn semantic_rate_and_window_units_preserve_window_capacity() {
+    let per_second = RateLimit::per_second_or_panic(1.0);
+    let per_minute = RateLimit::per_minute_or_panic(60.0);
+    let seconds = WindowSize::seconds_or_panic(60);
+    let minutes = WindowSize::minutes_or_panic(1);
 
-    assert_eq!(
-        WindowSizeSeconds::try_from(0u64).unwrap_err().to_string(),
-        "invalid window size: Window size must be at least 1"
-    );
+    let per_second_capacity = (*seconds as f64 * *per_second) as u64;
+    let per_minute_capacity = (*minutes as f64 * *per_minute) as u64;
+
+    assert_eq!(per_second_capacity, 60);
+    assert_eq!(per_minute_capacity, per_second_capacity);
 }
 
 #[test]
-fn rate_group_size_ms_try_from_validates_nonzero() {
-    let g = RateGroupSizeMs::try_from(1u64).unwrap();
-    assert_eq!(*g, 1u64);
+fn window_size_helpers_store_seconds() {
+    let cases: [(WindowConstructor, PanicWindowConstructor, u64, u64); 6] = [
+        (WindowSize::seconds, WindowSize::seconds_or_panic, 1, 1),
+        (WindowSize::minutes, WindowSize::minutes_or_panic, 1, 60),
+        (WindowSize::hours, WindowSize::hours_or_panic, 1, 3_600),
+        (WindowSize::days, WindowSize::days_or_panic, 1, 86_400),
+        (WindowSize::weeks, WindowSize::weeks_or_panic, 1, 604_800),
+        (
+            WindowSize::months,
+            WindowSize::months_or_panic,
+            1,
+            2_592_000,
+        ),
+    ];
 
-    assert_eq!(
-        RateGroupSizeMs::try_from(0u64).unwrap_err().to_string(),
-        "invalid rate group size: Rate group size must be greater than 0"
-    );
+    for (constructor, panic_constructor, value, expected) in cases {
+        assert_eq!(*constructor(value).unwrap(), expected);
+        assert_eq!(*panic_constructor(value), expected);
+        assert!(std::panic::catch_unwind(|| panic_constructor(0)).is_err());
+    }
+
+    assert!(matches!(
+        WindowSize::seconds(0),
+        Err(TrypemaError::InvalidWindowSize(_))
+    ));
+    assert!(matches!(
+        WindowSize::minutes(u64::MAX),
+        Err(TrypemaError::InvalidWindowSize(_))
+    ));
+}
+
+#[test]
+fn bucket_size_helpers_store_milliseconds() {
+    let cases: [(BucketConstructor, PanicBucketConstructor, u64, u64); 7] = [
+        (
+            BucketSize::milliseconds,
+            BucketSize::milliseconds_or_panic,
+            1,
+            1,
+        ),
+        (BucketSize::seconds, BucketSize::seconds_or_panic, 1, 1_000),
+        (BucketSize::minutes, BucketSize::minutes_or_panic, 1, 60_000),
+        (BucketSize::hours, BucketSize::hours_or_panic, 1, 3_600_000),
+        (BucketSize::days, BucketSize::days_or_panic, 1, 86_400_000),
+        (
+            BucketSize::weeks,
+            BucketSize::weeks_or_panic,
+            1,
+            604_800_000,
+        ),
+        (
+            BucketSize::months,
+            BucketSize::months_or_panic,
+            1,
+            2_592_000_000,
+        ),
+    ];
+
+    for (constructor, panic_constructor, value, expected) in cases {
+        assert_eq!(*constructor(value).unwrap(), expected);
+        assert_eq!(*panic_constructor(value), expected);
+        assert!(std::panic::catch_unwind(|| panic_constructor(0)).is_err());
+    }
+
+    assert!(matches!(
+        BucketSize::milliseconds(0),
+        Err(TrypemaError::InvalidBucketSize(_))
+    ));
+    assert!(matches!(
+        BucketSize::seconds(u64::MAX),
+        Err(TrypemaError::InvalidBucketSize(_))
+    ));
+}
+
+#[test]
+fn suppression_factor_cache_period_helpers_store_milliseconds() {
+    let cases: [(CacheConstructor, PanicCacheConstructor, u64, u64); 5] = [
+        (
+            SuppressionFactorCachePeriod::milliseconds,
+            SuppressionFactorCachePeriod::milliseconds_or_panic,
+            1,
+            1,
+        ),
+        (
+            SuppressionFactorCachePeriod::seconds,
+            SuppressionFactorCachePeriod::seconds_or_panic,
+            1,
+            1_000,
+        ),
+        (
+            SuppressionFactorCachePeriod::minutes,
+            SuppressionFactorCachePeriod::minutes_or_panic,
+            1,
+            60_000,
+        ),
+        (
+            SuppressionFactorCachePeriod::hours,
+            SuppressionFactorCachePeriod::hours_or_panic,
+            1,
+            3_600_000,
+        ),
+        (
+            SuppressionFactorCachePeriod::days,
+            SuppressionFactorCachePeriod::days_or_panic,
+            1,
+            86_400_000,
+        ),
+    ];
+
+    for (constructor, panic_constructor, value, expected) in cases {
+        assert_eq!(*constructor(value).unwrap(), expected);
+        assert_eq!(*panic_constructor(value), expected);
+        assert!(std::panic::catch_unwind(|| panic_constructor(0)).is_err());
+    }
+
+    assert!(matches!(
+        SuppressionFactorCachePeriod::milliseconds(0),
+        Err(TrypemaError::InvalidSuppressionFactorCachePeriod(_))
+    ));
+    assert!(matches!(
+        SuppressionFactorCachePeriod::seconds(u64::MAX),
+        Err(TrypemaError::InvalidSuppressionFactorCachePeriod(_))
+    ));
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn sync_interval_helpers_store_milliseconds() {
+    type Constructor = fn(u64) -> Result<SyncInterval, TrypemaError>;
+    type PanicConstructor = fn(u64) -> SyncInterval;
+
+    let cases: [(Constructor, PanicConstructor, u64, u64); 4] = [
+        (
+            SyncInterval::milliseconds,
+            SyncInterval::milliseconds_or_panic,
+            1,
+            1,
+        ),
+        (
+            SyncInterval::seconds,
+            SyncInterval::seconds_or_panic,
+            1,
+            1_000,
+        ),
+        (
+            SyncInterval::minutes,
+            SyncInterval::minutes_or_panic,
+            1,
+            60_000,
+        ),
+        (
+            SyncInterval::hours,
+            SyncInterval::hours_or_panic,
+            1,
+            3_600_000,
+        ),
+    ];
+
+    for (constructor, panic_constructor, value, expected) in cases {
+        assert_eq!(*constructor(value).unwrap(), expected);
+        assert_eq!(*panic_constructor(value), expected);
+        assert!(std::panic::catch_unwind(|| panic_constructor(0)).is_err());
+    }
+
+    assert!(matches!(
+        SyncInterval::milliseconds(0),
+        Err(TrypemaError::InvalidSyncInterval(_))
+    ));
+    assert!(matches!(
+        SyncInterval::seconds(u64::MAX),
+        Err(TrypemaError::InvalidSyncInterval(_))
+    ));
 }
 
 #[test]

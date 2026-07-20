@@ -39,7 +39,7 @@ async fn run_async(args: Args) {
         local: crate::args::build_local_options(&args),
         redis: crate::args::build_redis_options(&args, connection_manager),
     }));
-    let rate_limit = RateLimit::try_from(args.rate_limit_per_s).unwrap();
+    let rate_limit = RateLimit::per_second(args.rate_limit_per_s).unwrap();
 
     warmup(&args, &rate_limiter, &rate_limit).await;
 

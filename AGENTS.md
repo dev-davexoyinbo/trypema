@@ -76,7 +76,7 @@ feature configuration.
 
 ### 3.1 Capacity and sticky limits
 
-- Window capacity is calculated as `window_size_seconds * rate_limit`, converted to `u64` using
+- Window capacity is calculated as `*window_size * rate_limit`, converted to `u64` using
   the existing truncating behavior.
 - Per-key limiter state stores the computed per-window limit, not the raw per-second
   [`RateLimit`]. Absolute code names this value `window_limit`; suppressed code names it
@@ -85,7 +85,7 @@ feature configuration.
   same key do not redefine that stored limit.
 - A matched conditional set recomputes and redefines the stored window limit from the supplied
   rate limit.
-- Increments within `rate_group_size_ms` of the newest bucket are coalesced into that bucket.
+- Increments within `bucket_size` of the newest bucket are coalesced into that bucket.
 - A bucket remains live while its age is within the configured window. Expiration and boundary
   comparisons must stay consistent across all operations.
 - Absolute admission is best-effort under concurrency. Concurrent callers may all observe an
@@ -124,8 +124,9 @@ Naming and initialization are part of this contract:
   between shared, mutable, entry, and downgraded guards rather than introducing
   `rate_limit_series`, `series_guard`, or `series_entry`.
 - Name `RateLimitDecision` values `decision`; reserve `is_*` and `should_*` locals for booleans.
-- Keep the public `RateGroupSizeMs` and `rate_group_size_ms` configuration names. Internal state
-  for a concrete bucket uses `_bucket_`, such as `oldest_bucket_ttl` and
+- Keep the public `WindowSize`, `BucketSize`, `SuppressionFactorCachePeriod`, and `SyncInterval`
+  types with their unit-neutral configuration field names. Raw internal time values retain unit
+  suffixes. Internal state for a concrete bucket uses `_bucket_`, such as `oldest_bucket_ttl` and
   `oldest_bucket_count`.
 
 ### 3.2 Public read behavior
@@ -244,7 +245,7 @@ let series = match map.get(key) {
     None => map
         .entry(key.to_string())
         .or_insert_with(|| {
-            RateLimitSeries::new(**rate_limit * *window_size_seconds as f64)
+            RateLimitSeries::new(**rate_limit * *window_size as f64)
         })
         .downgrade(),
 };
@@ -269,7 +270,7 @@ Do not write this pattern:
 if map.get(key).is_none() {
     map.entry(key.to_string())
         .or_insert_with(|| {
-            RateLimitSeries::new(**rate_limit * *window_size_seconds as f64)
+            RateLimitSeries::new(**rate_limit * *window_size as f64)
         });
 }
 
@@ -555,7 +556,7 @@ Minimize test-only helpers in production impl blocks:
 - Do not use `(min_ms..=max_ms).contains(&retry_after_ms)` for these assertions.
 - Keep waits as short as the public configuration allows. A one-second window is usually enough
   for expiry tests.
-- For separate buckets, sleep beyond `rate_group_size_ms` while staying comfortably inside the
+- For separate buckets, sleep beyond `bucket_size` while staying comfortably inside the
   window.
 - For mixed expired/fresh history, create both buckets first, then wait until only the oldest has
   crossed the window.

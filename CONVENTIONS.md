@@ -164,9 +164,10 @@ Use words consistently across Rust, Lua, tests, benches, and documentation.
 - `pending` means hybrid state not yet committed to Redis.
 - `live` means not expired at the operation's comparison point.
 - `stale` is reserved for entity cleanup based on inactivity, not bucket expiration.
-- Keep `RateGroupSizeMs` and `rate_group_size_ms` for the public configuration interval. Internal
-  state that describes a concrete bucket uses `bucket`, for example `oldest_bucket_ttl` and
-  `oldest_bucket_count`, rather than `last_rate_group_ttl` or `last_rate_group_count`.
+- Keep `WindowSize`, `BucketSize`, `SuppressionFactorCachePeriod`, and `SyncInterval` for public
+  time configuration, with unit-neutral option fields. Raw internal values retain unit suffixes.
+  Internal state that describes a concrete bucket uses `bucket`, for example
+  `oldest_bucket_ttl` and `oldest_bucket_count`.
 - `retry_after_ms` is the remaining wait until the oldest live bucket expires.
   `remaining_after_waiting` is the capacity released at that point and therefore equals
   `oldest_bucket_count`; it is not the count still in the window and must not be calculated as
@@ -189,8 +190,10 @@ Use `absolute` and `suppressed` consistently. Do not introduce synonyms such as 
 
 ### 5.3 Method names
 
-- Constructors use `new`, `default`, `try_from`, or `new_or_panic` according to their behavior.
-- Fallible conversion should use standard traits such as `TryFrom` where appropriate.
+- Time and rate newtypes use unit-explicit constructors such as `seconds`, `milliseconds`, and
+  `per_minute`; each fallible constructor has a matching `_or_panic` form.
+- Use `new`, `TryFrom`, or `new_or_panic` for values without unit ambiguity, such as
+  `HardLimitFactor` and `RedisKey`.
 - Borrowed accessors normally omit `get_`; retain established public names such as limiter `get`
   and Redis key builders such as `get_window_limit_key` unless intentionally making a breaking
   API change.
@@ -211,8 +214,8 @@ over a name tied to the exact Redis commands used internally.
 Public APIs should be predictable, type-safe, documented, and difficult to misuse.
 
 - Preserve source compatibility unless the task explicitly authorizes a breaking change.
-- Use domain newtypes for validated quantities such as `RateLimit`, `WindowSizeSeconds`, and
-  `RateGroupSizeMs`.
+- Use domain newtypes for validated quantities such as `RateLimit`, `WindowSize`, and
+  `BucketSize`.
 - Prefer an enum over a boolean parameter when both values express distinct policies. For
   example, use `HistoryPreservation`, not `preserve_newest: bool`.
 - Keep public struct fields private unless direct construction and future compatibility have been
@@ -257,7 +260,7 @@ Calculation conventions:
 - Use checked or saturating arithmetic when overflow is possible under valid inputs and ordinary
   arithmetic would violate an invariant.
 - Keep time-boundary operators consistent across all providers. A grouping interval uses the
-  inclusive comparison `age_ms <= rate_group_size_ms`; expiration must match the documented
+  inclusive comparison `age_ms <= *bucket_size as u128`; expiration must match the documented
   live-window boundary.
 
 Never encode a unit only in a comment. Put it in the type or identifier.
@@ -534,8 +537,7 @@ Examples should:
 - Be runnable doctests where practical.
 - Show the simplest useful case first.
 - Use hidden scaffolding in `docs/lib.md` when it improves readability.
-- Show multiple constructors such as `new`, `try_from`, and `new_or_panic` when the choice is
-  caller-relevant.
+- Show unit-explicit fallible and `_or_panic` constructors when the choice is caller-relevant.
 - Show defaults plus one useful override for option and builder types.
 - Prefer `?` in fallible examples; use `unwrap` only when the example is explicitly demonstrating
   infallible validated input and surrounding repository conventions already do so.

@@ -23,21 +23,21 @@ use redis::AsyncCommands;
 use super::common::{key, key_gen, redis_url, unique_prefix};
 use super::runtime;
 
-use crate::common::{RateType, SuppressionFactorCacheMs};
-use crate::hybrid::SyncIntervalMs;
+use crate::common::{RateType, SuppressionFactorCachePeriod};
+use crate::hybrid::SyncInterval;
 use crate::{
-    HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
+    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
     RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions, RedisKey,
-    RedisRateLimiterOptions, WindowSizeSeconds,
+    RedisRateLimiterOptions, WindowSize,
 };
 
 /// Build a rate limiter and return its unique prefix.
 async fn build_limiter(
     url: &str,
-    window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    window_size: u64,
+    bucket_size: u64,
     hard_limit_factor: f64,
-    suppression_factor_cache_ms: u64,
+    suppression_factor_cache_period: u64,
 ) -> (std::sync::Arc<RateLimiter>, RedisKey) {
     let client = redis::Client::open(url).unwrap();
     let cm = client.get_connection_manager().await.unwrap();
@@ -45,25 +45,25 @@ async fn build_limiter(
 
     let options = RateLimiterOptions {
         local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+            window_size: WindowSize::seconds(window_size).unwrap(),
+            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
             hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
-                suppression_factor_cache_ms,
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
+                suppression_factor_cache_period,
             )
             .unwrap(),
         },
         redis: RedisRateLimiterOptions {
             connection_manager: cm,
             prefix: Some(prefix.clone()),
-            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+            window_size: WindowSize::seconds(window_size).unwrap(),
+            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
             hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
-                suppression_factor_cache_ms,
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
+                suppression_factor_cache_period,
             )
             .unwrap(),
-            sync_interval_ms: SyncIntervalMs::default(),
+            sync_interval: SyncInterval::default(),
         },
     };
 
@@ -103,7 +103,7 @@ fn redis_state_suppressed_allowed_inc_sets_total_count_and_zero_declined() {
         // hard_limit_factor=2 => soft_window_limit=10, hard_window_limit=20.
         let (rl, prefix) = build_limiter(&url, 10, 1000, 2.0, 100).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         let d = rl
             .redis()
@@ -149,7 +149,7 @@ fn redis_state_suppressed_exact_hard_caches_one_and_next_call_records_decline() 
         let cache_ms = 60_000_u64;
         let (rl, prefix) = build_limiter(&url, 10, 1000, 2.0, cache_ms).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
         let hard_window_limit = 20_u64;
 
         let reaches_hard = rl
@@ -242,7 +242,7 @@ fn redis_state_suppressed_sf_cache_key_is_set_in_suppression_zone() {
         let cache_ms = 500_u64;
         let (rl, prefix) = build_limiter(&url, 10, 100, 2.0, cache_ms).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         for accepted_after in 1..=10_u64 {
             let decision = rl
@@ -328,7 +328,7 @@ fn redis_state_suppressed_sf_cache_key_has_ttl() {
         let cache_ms = 500_u64;
         let (rl, prefix) = build_limiter(&url, 10, 100, 2.0, cache_ms).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         for accepted_after in 1..=10_u64 {
             let decision = rl
@@ -389,7 +389,7 @@ fn redis_state_suppressed_invalid_cached_factors_are_recomputed() {
         let cache_ms = 60_000_u64;
         let (rl, prefix) = build_limiter(&url, 10, 100, 2.0, cache_ms).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         assert_eq!(
             rl.redis()
@@ -437,16 +437,15 @@ fn redis_state_suppressed_window_limit_key_equals_hard_limit() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 6_u64;
+        let window_size = 6_u64;
         let rate_limit_value = 0.5_f64;
         let hard_limit_factor = 1.5_f64;
         // raw hard window = 6 * 0.5 * 1.5 = 4.5; capacities are soft=3 and hard=4.
         let expected_hard_limit = 4.5_f64;
 
-        let (rl, prefix) =
-            build_limiter(&url, window_size_seconds, 1000, hard_limit_factor, 100).await;
+        let (rl, prefix) = build_limiter(&url, window_size, 1000, hard_limit_factor, 100).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(rate_limit_value).unwrap();
+        let rate_limit = RateLimit::per_second(rate_limit_value).unwrap();
 
         let decision = rl
             .redis()
@@ -477,8 +476,8 @@ fn redis_state_suppressed_inc_retains_first_hard_window_limit() {
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 1, 1000, 1.0, 60_000).await;
         let k = key("k");
-        let initial_rate = RateLimit::try_from(2f64).unwrap();
-        let later_rate = RateLimit::try_from(10f64).unwrap();
+        let initial_rate = RateLimit::per_second(2f64).unwrap();
+        let later_rate = RateLimit::per_second(10f64).unwrap();
 
         let decision = rl
             .redis()
@@ -525,7 +524,7 @@ fn redis_state_suppressed_hash_sums_match_counter_keys() {
         let k = key("k");
         // With hard_limit_factor=10 and rate=1: hard_window_limit = 100.
         // We'll drive past the hard limit so some calls are denied.
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         let reaches_hard = rl
             .redis()
@@ -593,11 +592,11 @@ fn redis_state_suppressed_evicts_expired_buckets_from_both_hashes() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
+        let window_size = 1_u64;
         // hard_limit_factor=10 so the hard limit is 10×rate = 10.
-        let (rl, prefix) = build_limiter(&url, window_size_seconds, 1000, 10.0, 1).await;
+        let (rl, prefix) = build_limiter(&url, window_size, 1000, 10.0, 1).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         let reaches_hard = rl
             .redis()
@@ -625,7 +624,7 @@ fn redis_state_suppressed_evicts_expired_buckets_from_both_hashes() {
         );
 
         // Wait for the window to expire.
-        thread::sleep(Duration::from_millis(window_size_seconds * 1000 + 50));
+        thread::sleep(Duration::from_millis(window_size * 1000 + 50));
         runtime::async_sleep(Duration::from_millis(10)).await;
 
         // A fresh inc triggers eviction inside the Lua script.
@@ -715,7 +714,7 @@ fn redis_state_suppressed_per_key_state_is_independent() {
         let (rl, prefix) = build_limiter(&url, 10, 1000, 2.0, 100).await;
         let a = key("a");
         let b = key("b");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         let decision = rl
             .redis()
@@ -754,7 +753,7 @@ fn redis_state_suppressed_active_entities_updated_on_inc() {
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 10, 1000, 2.0, 100).await;
         let k = key("entity");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         let ae_key = active_entities_key(&prefix);
 
@@ -797,7 +796,7 @@ fn redis_state_suppressed_set_if_writes_single_bucket_and_resets_declines() {
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 6, 1000, 2.0, 100).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(10f64).unwrap();
+        let rate_limit = RateLimit::per_second(10f64).unwrap();
 
         let (new_total, old_total) = rl
             .redis()
@@ -871,7 +870,7 @@ fn redis_state_suppressed_set_if_no_match_is_true_noop() {
         let (rl, prefix) = build_limiter(&url, 6, 1000, 1.0, 60_000).await;
         let k = key("k");
 
-        let rate_seed = RateLimit::try_from(10f64).unwrap();
+        let rate_seed = RateLimit::per_second(10f64).unwrap();
         assert_eq!(
             rl.redis()
                 .suppressed()
@@ -938,7 +937,7 @@ fn redis_state_suppressed_set_if_no_match_is_true_noop() {
 
         runtime::async_sleep(Duration::from_millis(50)).await;
 
-        let rate_new = RateLimit::try_from(20f64).unwrap();
+        let rate_new = RateLimit::per_second(20f64).unwrap();
         let (new_total, old_total) = rl
             .redis()
             .suppressed()
@@ -1002,7 +1001,7 @@ fn redis_state_suppressed_set_if_handles_expired_history_only_after_a_match() {
 
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 2, 100, 1.0, 60_000).await;
-        let rate = RateLimit::try_from(10f64).unwrap();
+        let rate = RateLimit::per_second(10f64).unwrap();
         let miss_key = key("miss");
         let match_key = key("match");
 
@@ -1166,9 +1165,9 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
     let url = redis_url();
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 1, 100, 1.0, 1).await;
-        let low_rate = RateLimit::try_from(4f64).unwrap();
-        let medium_rate = RateLimit::try_from(12f64).unwrap();
-        let high_rate = RateLimit::try_from(100f64).unwrap();
+        let low_rate = RateLimit::per_second(4f64).unwrap();
+        let medium_rate = RateLimit::per_second(12f64).unwrap();
+        let high_rate = RateLimit::per_second(100f64).unwrap();
 
         for (
             name,
@@ -1430,7 +1429,7 @@ fn redis_state_suppressed_missing_zero_and_guard_miss_write_nothing() {
 
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 60, 10, 1.0, 100).await;
-        let rate = RateLimit::try_from(100f64).unwrap();
+        let rate = RateLimit::per_second(100f64).unwrap();
 
         for (name, preserve) in [("replace", false), ("preserve", true)] {
             let k = key(name);
@@ -1504,7 +1503,7 @@ fn redis_state_suppressed_conditional_set_zero_removes_entity_state() {
 
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 6, 1000, 1.0, 100).await;
-        let rate_limit = RateLimit::try_from(10f64).unwrap();
+        let rate_limit = RateLimit::per_second(10f64).unwrap();
 
         for (name, preserve) in [("replace", false), ("preserve", true)] {
             let k = key(name);
@@ -1564,7 +1563,7 @@ fn redis_state_suppressed_get_only_registers_existing_entity_as_active() {
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 6, 1000, 1.0, 100).await;
         let k = key("k");
-        let rate = RateLimit::try_from(10f64).unwrap();
+        let rate = RateLimit::per_second(10f64).unwrap();
 
         assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 0);
 
@@ -1610,7 +1609,7 @@ fn redis_state_suppressed_get_eviction_invalidates_cached_factor() {
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 1, 1_000, 1.0, 5_000).await;
         let k = key("k");
-        let rate = RateLimit::try_from(1f64).unwrap();
+        let rate = RateLimit::per_second(1f64).unwrap();
 
         assert_eq!(
             rl.redis()
@@ -1661,7 +1660,7 @@ fn redis_state_suppressed_cleanup_removes_only_stale_entities() {
 
     runtime::block_on(async {
         let (rl, prefix) = build_limiter(&url, 10, 1000, 1.0, 60_000).await;
-        let rate = RateLimit::try_from(1f64).unwrap();
+        let rate = RateLimit::per_second(1f64).unwrap();
         let stale_key = key("stale");
         let active_key = key("active");
 

@@ -10,10 +10,10 @@
 //! | [`RateLimitDecision`] | The admission decision returned by every `inc()` and `is_allowed()` call |
 //! | [`SuppressedRateLimitSnapshot`] | Live counters and suppression factor returned by suppressed `get()` calls |
 //! | [`RateLimit`] | Per-second rate limit (positive `f64`, supports non-integer rates) |
-//! | [`WindowSizeSeconds`] | Sliding window duration in seconds (≥ 1) |
-//! | [`RateGroupSizeMs`] | Bucket coalescing interval in milliseconds (≥ 1, default 100ms) |
+//! | [`WindowSize`] | Sliding window duration in seconds (≥ 1) |
+//! | [`BucketSize`] | Bucket coalescing interval in milliseconds (≥ 1, default 100ms) |
 //! | [`HardLimitFactor`] | Hard cutoff multiplier for the suppressed strategy (≥ 1.0, default 1.0) |
-//! | [`SuppressionFactorCacheMs`] | Cache duration for suppression factor recomputation (≥ 1, default 100ms) |
+//! | [`SuppressionFactorCachePeriod`] | Cache duration for suppression factor recomputation (≥ 1, default 100ms) |
 //! | [`RateLimitComparator`] | Guard condition for conditional writes (`set_if`) against the current window total |
 
 use std::{
@@ -23,6 +23,32 @@ use std::{
 };
 
 use crate::TrypemaError;
+
+pub(crate) const MILLISECONDS_PER_SECOND: u64 = 1_000;
+pub(crate) const SECONDS_PER_MINUTE: u64 = 60;
+const MINUTES_PER_HOUR: u64 = 60;
+const HOURS_PER_DAY: u64 = 24;
+const DAYS_PER_WEEK: u64 = 7;
+const DAYS_PER_MONTH: u64 = 30;
+pub(crate) const SECONDS_PER_HOUR: u64 = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
+const SECONDS_PER_DAY: u64 = SECONDS_PER_HOUR * HOURS_PER_DAY;
+const SECONDS_PER_WEEK: u64 = SECONDS_PER_DAY * DAYS_PER_WEEK;
+const SECONDS_PER_MONTH: u64 = SECONDS_PER_DAY * DAYS_PER_MONTH;
+
+pub(crate) fn checked_duration(
+    value: u64,
+    multiplier: u64,
+    name: &str,
+    error: fn(String) -> TrypemaError,
+) -> Result<u64, TrypemaError> {
+    if value == 0 {
+        return Err(error(format!("{name} must be greater than 0")));
+    }
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| error(format!("{name} is too large")))
+}
 
 /// Hash builder used by Trypema's internal concurrent maps.
 ///
@@ -62,7 +88,7 @@ pub(crate) struct Bucket {
 /// # let rl = trypema::__doctest_helpers::rate_limiter();
 /// use trypema::{RateLimitDecision, RateLimit};
 ///
-/// let rate = RateLimit::try_from(10.0).unwrap();
+/// let rate = RateLimit::per_second(10.0).unwrap();
 ///
 /// match rl.local().absolute().inc("user_123", &rate, 1) {
 ///     RateLimitDecision::Allowed => {
@@ -166,7 +192,7 @@ pub struct SuppressedRateLimitSnapshot {
 /// Wraps a positive `f64` so Trypema can express non-integer limits such as `0.5` or `5.5`
 /// requests per second.
 ///
-/// Window capacity is computed as `window_size_seconds × rate_limit`.
+/// Window capacity is computed as `window_size in seconds × per-second rate limit`.
 ///
 /// # Implementation Notes
 ///
@@ -179,18 +205,18 @@ pub struct SuppressedRateLimitSnapshot {
 /// ```
 /// use trypema::RateLimit;
 ///
-/// let rate = RateLimit::new(10.0).unwrap();
+/// let rate = RateLimit::per_second(10.0).unwrap();
 /// assert_eq!(*rate, 10.0);
 ///
-/// let rate = RateLimit::try_from(5.5).unwrap();
+/// let rate = RateLimit::per_second(5.5).unwrap();
 /// assert_eq!(*rate, 5.5);
 ///
-/// let rate = RateLimit::new_or_panic(2.5);
+/// let rate = RateLimit::per_second_or_panic(2.5);
 /// assert_eq!(*rate, 2.5);
 ///
 /// // Invalid: must be positive
-/// assert!(RateLimit::try_from(0.0).is_err());
-/// assert!(RateLimit::try_from(-1.0).is_err());
+/// assert!(RateLimit::per_second(0.0).is_err());
+/// assert!(RateLimit::per_second(-1.0).is_err());
 ///
 /// // Unbounded rate (for testing)
 /// let unlimited = RateLimit::max();
@@ -216,14 +242,102 @@ impl RateLimit {
         Self(f64::MAX)
     }
 
-    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
-    pub fn new(value: f64) -> Result<Self, TrypemaError> {
-        Self::try_from(value)
+    /// Create a rate limit expressed as count per second.
+    pub fn per_second(value: f64) -> Result<Self, TrypemaError> {
+        Self::from_per_second(value)
     }
 
-    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
-    pub fn new_or_panic(value: f64) -> Self {
-        Self::try_from(value).expect("RateLimit value must be greater than 0")
+    /// Create a rate limit expressed as count per second.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    pub fn per_second_or_panic(value: f64) -> Self {
+        Self::per_second(value).unwrap()
+    }
+
+    /// Create a rate limit expressed as count per minute.
+    pub fn per_minute(value: f64) -> Result<Self, TrypemaError> {
+        Self::from_period(value, SECONDS_PER_MINUTE)
+    }
+
+    /// Create a rate limit expressed as count per minute.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    pub fn per_minute_or_panic(value: f64) -> Self {
+        Self::per_minute(value).unwrap()
+    }
+
+    /// Create a rate limit expressed as count per hour.
+    pub fn per_hour(value: f64) -> Result<Self, TrypemaError> {
+        Self::from_period(value, SECONDS_PER_HOUR)
+    }
+
+    /// Create a rate limit expressed as count per hour.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    pub fn per_hour_or_panic(value: f64) -> Self {
+        Self::per_hour(value).unwrap()
+    }
+
+    /// Create a rate limit expressed as count per day.
+    pub fn per_day(value: f64) -> Result<Self, TrypemaError> {
+        Self::from_period(value, SECONDS_PER_DAY)
+    }
+
+    /// Create a rate limit expressed as count per day.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    pub fn per_day_or_panic(value: f64) -> Self {
+        Self::per_day(value).unwrap()
+    }
+
+    /// Create a rate limit expressed as count per week.
+    pub fn per_week(value: f64) -> Result<Self, TrypemaError> {
+        Self::from_period(value, SECONDS_PER_WEEK)
+    }
+
+    /// Create a rate limit expressed as count per week.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    pub fn per_week_or_panic(value: f64) -> Self {
+        Self::per_week(value).unwrap()
+    }
+
+    /// Create a rate limit expressed as count per 30-day month.
+    pub fn per_month(value: f64) -> Result<Self, TrypemaError> {
+        Self::from_period(value, SECONDS_PER_MONTH)
+    }
+
+    /// Create a rate limit expressed as count per 30-day month.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    pub fn per_month_or_panic(value: f64) -> Self {
+        Self::per_month(value).unwrap()
+    }
+
+    fn from_period(value: f64, period_seconds: u64) -> Result<Self, TrypemaError> {
+        Self::from_per_second(value / (period_seconds as f64))
+    }
+
+    fn from_per_second(value: f64) -> Result<Self, TrypemaError> {
+        if value <= 0f64 {
+            Err(TrypemaError::InvalidRateLimit(
+                "rate limit must be greater than 0".to_string(),
+            ))
+        } else {
+            Ok(Self(value))
+        }
     }
 }
 
@@ -235,27 +349,13 @@ impl Deref for RateLimit {
     }
 }
 
-impl TryFrom<f64> for RateLimit {
-    type Error = TrypemaError;
-
-    fn try_from(value: f64) -> Result<Self, Self::Error> {
-        if value <= 0f64 {
-            Err(TrypemaError::InvalidRateLimit(
-                "rate limit must be greater than 0".to_string(),
-            ))
-        } else {
-            Ok(Self(value))
-        }
-    }
-}
-
 impl DerefMut for RateLimit {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-/// Sliding window size in seconds.
+/// Sliding window size stored in seconds.
 ///
 /// Validated newtype ensuring window size is at least 1 second.
 ///
@@ -270,40 +370,124 @@ impl DerefMut for RateLimit {
 /// # Examples
 ///
 /// ```
-/// use trypema::WindowSizeSeconds;
+/// use trypema::WindowSize;
 ///
-/// let window = WindowSizeSeconds::new(60).unwrap();
+/// let window = WindowSize::seconds(60).unwrap();
 /// assert_eq!(*window, 60);
 ///
-/// let window = WindowSizeSeconds::new_or_panic(30);
+/// let window = WindowSize::seconds_or_panic(30);
 /// assert_eq!(*window, 30);
 ///
 /// // Invalid: too small
-/// assert!(WindowSizeSeconds::try_from(0).is_err());
+/// assert!(WindowSize::seconds(0).is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct WindowSizeSeconds(u64);
+pub struct WindowSize(u64);
 
-impl Default for WindowSizeSeconds {
+impl Default for WindowSize {
     /// Returns a window size of 10 seconds.
     fn default() -> Self {
         Self(10)
     }
 }
 
-impl WindowSizeSeconds {
-    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
-    pub fn new(value: u64) -> Result<Self, TrypemaError> {
-        Self::try_from(value)
+impl WindowSize {
+    /// Create a window size expressed in seconds.
+    pub fn seconds(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_seconds(value, 1)
     }
 
-    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
-    pub fn new_or_panic(value: u64) -> Self {
-        Self::try_from(value).expect("WindowSizeSeconds must be at least 1")
+    /// Create a window size expressed in seconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero.
+    pub fn seconds_or_panic(value: u64) -> Self {
+        Self::seconds(value).unwrap()
+    }
+
+    /// Create a window size expressed in minutes.
+    pub fn minutes(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_seconds(value, SECONDS_PER_MINUTE)
+    }
+
+    /// Create a window size expressed in minutes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn minutes_or_panic(value: u64) -> Self {
+        Self::minutes(value).unwrap()
+    }
+
+    /// Create a window size expressed in hours.
+    pub fn hours(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_seconds(value, SECONDS_PER_HOUR)
+    }
+
+    /// Create a window size expressed in hours.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn hours_or_panic(value: u64) -> Self {
+        Self::hours(value).unwrap()
+    }
+
+    /// Create a window size expressed in days.
+    pub fn days(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_seconds(value, SECONDS_PER_DAY)
+    }
+
+    /// Create a window size expressed in days.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn days_or_panic(value: u64) -> Self {
+        Self::days(value).unwrap()
+    }
+
+    /// Create a window size expressed in weeks.
+    pub fn weeks(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_seconds(value, SECONDS_PER_WEEK)
+    }
+
+    /// Create a window size expressed in weeks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn weeks_or_panic(value: u64) -> Self {
+        Self::weeks(value).unwrap()
+    }
+
+    /// Create a window size expressed in 30-day months.
+    pub fn months(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_seconds(value, SECONDS_PER_MONTH)
+    }
+
+    /// Create a window size expressed in 30-day months.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn months_or_panic(value: u64) -> Self {
+        Self::months(value).unwrap()
+    }
+
+    fn from_seconds(value: u64, multiplier: u64) -> Result<Self, TrypemaError> {
+        checked_duration(
+            value,
+            multiplier,
+            "window size",
+            TrypemaError::InvalidWindowSize,
+        )
+        .map(Self)
     }
 }
 
-impl Deref for WindowSizeSeconds {
+impl Deref for WindowSize {
     type Target = u64;
 
     fn deref(&self) -> &Self::Target {
@@ -311,27 +495,13 @@ impl Deref for WindowSizeSeconds {
     }
 }
 
-impl DerefMut for WindowSizeSeconds {
+impl DerefMut for WindowSize {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl TryFrom<u64> for WindowSizeSeconds {
-    type Error = TrypemaError;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        if value < 1 {
-            Err(TrypemaError::InvalidWindowSizeSeconds(
-                "Window size must be at least 1".to_string(),
-            ))
-        } else {
-            Ok(Self(value))
-        }
-    }
-}
-
-/// Bucket coalescing interval in milliseconds.
+/// Bucket coalescing interval stored in milliseconds.
 ///
 /// Validated newtype controlling how aggressively increments are merged into buckets.
 ///
@@ -358,41 +528,139 @@ impl TryFrom<u64> for WindowSizeSeconds {
 /// # Examples
 ///
 /// ```
-/// use trypema::RateGroupSizeMs;
+/// use trypema::BucketSize;
 ///
-/// let coalescing = RateGroupSizeMs::new(10).unwrap();
+/// let coalescing = BucketSize::milliseconds(10).unwrap();
 /// assert_eq!(*coalescing, 10);
 ///
-/// let aggressive = RateGroupSizeMs::try_from(100).unwrap();
-/// let precise = RateGroupSizeMs::new_or_panic(1);
+/// let aggressive = BucketSize::milliseconds(100).unwrap();
+/// let precise = BucketSize::milliseconds_or_panic(1);
 /// let _ = (aggressive, precise);
 ///
 /// // Invalid
-/// assert!(RateGroupSizeMs::try_from(0).is_err());
+/// assert!(BucketSize::milliseconds(0).is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct RateGroupSizeMs(u64);
+pub struct BucketSize(u64);
 
-impl Default for RateGroupSizeMs {
+impl Default for BucketSize {
     /// Returns a rate group size of 100 ms.
     fn default() -> Self {
         Self(100)
     }
 }
 
-impl RateGroupSizeMs {
-    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
-    pub fn new(value: u64) -> Result<Self, TrypemaError> {
-        Self::try_from(value)
+impl BucketSize {
+    /// Create a bucket size expressed in milliseconds.
+    pub fn milliseconds(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, 1)
     }
 
-    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
-    pub fn new_or_panic(value: u64) -> Self {
-        Self::try_from(value).expect("RateGroupSizeMs must be greater than 0")
+    /// Create a bucket size expressed in milliseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero.
+    pub fn milliseconds_or_panic(value: u64) -> Self {
+        Self::milliseconds(value).unwrap()
+    }
+
+    /// Create a bucket size expressed in seconds.
+    pub fn seconds(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND)
+    }
+
+    /// Create a bucket size expressed in seconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn seconds_or_panic(value: u64) -> Self {
+        Self::seconds(value).unwrap()
+    }
+
+    /// Create a bucket size expressed in minutes.
+    pub fn minutes(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_MINUTE)
+    }
+
+    /// Create a bucket size expressed in minutes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn minutes_or_panic(value: u64) -> Self {
+        Self::minutes(value).unwrap()
+    }
+
+    /// Create a bucket size expressed in hours.
+    pub fn hours(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_HOUR)
+    }
+
+    /// Create a bucket size expressed in hours.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn hours_or_panic(value: u64) -> Self {
+        Self::hours(value).unwrap()
+    }
+
+    /// Create a bucket size expressed in days.
+    pub fn days(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_DAY)
+    }
+
+    /// Create a bucket size expressed in days.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn days_or_panic(value: u64) -> Self {
+        Self::days(value).unwrap()
+    }
+
+    /// Create a bucket size expressed in weeks.
+    pub fn weeks(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_WEEK)
+    }
+
+    /// Create a bucket size expressed in weeks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn weeks_or_panic(value: u64) -> Self {
+        Self::weeks(value).unwrap()
+    }
+
+    /// Create a bucket size expressed in 30-day months.
+    pub fn months(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_MONTH)
+    }
+
+    /// Create a bucket size expressed in 30-day months.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn months_or_panic(value: u64) -> Self {
+        Self::months(value).unwrap()
+    }
+
+    fn from_milliseconds(value: u64, multiplier: u64) -> Result<Self, TrypemaError> {
+        checked_duration(
+            value,
+            multiplier,
+            "bucket size",
+            TrypemaError::InvalidBucketSize,
+        )
+        .map(Self)
     }
 }
 
-impl Deref for RateGroupSizeMs {
+impl Deref for BucketSize {
     type Target = u64;
 
     fn deref(&self) -> &Self::Target {
@@ -400,23 +668,9 @@ impl Deref for RateGroupSizeMs {
     }
 }
 
-impl DerefMut for RateGroupSizeMs {
+impl DerefMut for BucketSize {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
-    }
-}
-
-impl TryFrom<u64> for RateGroupSizeMs {
-    type Error = TrypemaError;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        if value == 0 {
-            Err(TrypemaError::InvalidRateGroupSizeMs(
-                "Rate group size must be greater than 0".to_string(),
-            ))
-        } else {
-            Ok(Self(value))
-        }
     }
 }
 
@@ -453,7 +707,7 @@ impl TryFrom<u64> for RateGroupSizeMs {
 /// assert_eq!(*factor, 1.0);
 ///
 /// let factor = HardLimitFactor::new(1.5).unwrap();
-/// let rate = RateLimit::try_from(10.0).unwrap();
+/// let rate = RateLimit::per_second(10.0).unwrap();
 /// let bursty = HardLimitFactor::new_or_panic(2.0);
 /// let _ = (rate, bursty);
 ///
@@ -521,12 +775,12 @@ pub(crate) enum RateType {
     HybridSuppressed,
 }
 
-/// Cache duration (milliseconds) for suppression factor recomputation.
+/// Suppression-factor cache period stored in milliseconds.
 ///
 /// The suppressed strategy computes a suppression factor based on the current perceived rate
 /// relative to the rate limit. This computation involves iterating over recent buckets and
 /// can be non-trivial under high throughput. To amortise this cost, the computed factor is
-/// cached per key for up to `SuppressionFactorCacheMs`.
+/// cached per key for up to `SuppressionFactorCachePeriod`.
 ///
 /// # Trade-offs
 ///
@@ -537,64 +791,120 @@ pub(crate) enum RateType {
 ///
 /// # Validation
 ///
-/// Must be ≥ 1. A value of `0` returns [`TrypemaError::InvalidSuppressionFactorCacheMs`].
+/// Must be ≥ 1. A value of `0` returns [`TrypemaError::InvalidSuppressionFactorCachePeriod`].
 ///
 /// # Examples
 ///
 /// ```
-/// use trypema::SuppressionFactorCacheMs;
+/// use trypema::SuppressionFactorCachePeriod;
 ///
-/// let cache = SuppressionFactorCacheMs::default();
+/// let cache = SuppressionFactorCachePeriod::default();
 /// assert_eq!(*cache, 100);
 ///
-/// let cache = SuppressionFactorCacheMs::new(50).unwrap();
-/// let fast = SuppressionFactorCacheMs::new_or_panic(10);
+/// let cache = SuppressionFactorCachePeriod::milliseconds(50).unwrap();
+/// let fast = SuppressionFactorCachePeriod::milliseconds_or_panic(10);
 /// let _ = (cache, fast);
 ///
 /// // Invalid: 0ms
-/// assert!(SuppressionFactorCacheMs::try_from(0).is_err());
+/// assert!(SuppressionFactorCachePeriod::milliseconds(0).is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct SuppressionFactorCacheMs(u64);
+pub struct SuppressionFactorCachePeriod(u64);
 
-impl Default for SuppressionFactorCacheMs {
+impl Default for SuppressionFactorCachePeriod {
     /// Returns a suppression factor cache duration of 100 ms.
     fn default() -> Self {
         Self(100)
     }
 }
 
-impl SuppressionFactorCacheMs {
-    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
-    pub fn new(value: u64) -> Result<Self, TrypemaError> {
-        Self::try_from(value)
+impl SuppressionFactorCachePeriod {
+    /// Create a suppression-factor cache period expressed in milliseconds.
+    pub fn milliseconds(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, 1)
     }
 
-    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
-    pub fn new_or_panic(value: u64) -> Self {
-        Self::try_from(value).expect("SuppressionFactorCacheMs must be greater than 0")
+    /// Create a suppression-factor cache period expressed in milliseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero.
+    pub fn milliseconds_or_panic(value: u64) -> Self {
+        Self::milliseconds(value).unwrap()
+    }
+
+    /// Create a suppression-factor cache period expressed in seconds.
+    pub fn seconds(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND)
+    }
+
+    /// Create a suppression-factor cache period expressed in seconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn seconds_or_panic(value: u64) -> Self {
+        Self::seconds(value).unwrap()
+    }
+
+    /// Create a suppression-factor cache period expressed in minutes.
+    pub fn minutes(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_MINUTE)
+    }
+
+    /// Create a suppression-factor cache period expressed in minutes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn minutes_or_panic(value: u64) -> Self {
+        Self::minutes(value).unwrap()
+    }
+
+    /// Create a suppression-factor cache period expressed in hours.
+    pub fn hours(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_HOUR)
+    }
+
+    /// Create a suppression-factor cache period expressed in hours.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn hours_or_panic(value: u64) -> Self {
+        Self::hours(value).unwrap()
+    }
+
+    /// Create a suppression-factor cache period expressed in days.
+    pub fn days(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_DAY)
+    }
+
+    /// Create a suppression-factor cache period expressed in days.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn days_or_panic(value: u64) -> Self {
+        Self::days(value).unwrap()
+    }
+
+    fn from_milliseconds(value: u64, multiplier: u64) -> Result<Self, TrypemaError> {
+        checked_duration(
+            value,
+            multiplier,
+            "suppression-factor cache period",
+            TrypemaError::InvalidSuppressionFactorCachePeriod,
+        )
+        .map(Self)
     }
 }
 
-impl Deref for SuppressionFactorCacheMs {
+impl Deref for SuppressionFactorCachePeriod {
     type Target = u64;
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-impl TryFrom<u64> for SuppressionFactorCacheMs {
-    type Error = TrypemaError;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        if value == 0 {
-            Err(TrypemaError::InvalidSuppressionFactorCacheMs(
-                "Suppression factor cache must be greater than 0".to_string(),
-            ))
-        } else {
-            Ok(Self(value))
-        }
     }
 }
 

@@ -20,7 +20,7 @@
 //! let rl = trypema::__doctest_helpers::rate_limiter();
 //! rl.run_cleanup_loop();
 //!
-//! let rate = RateLimit::try_from(10.0).unwrap();
+//! let rate = RateLimit::per_second(10.0).unwrap();
 //! let decision = rl.local().absolute().inc("user_123", &rate, 1);
 //! ```
 
@@ -35,8 +35,8 @@ use std::{
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use crate::hybrid::HybridRateLimiterProvider;
 use crate::{
-    HardLimitFactor, LocalRateLimiterOptions, LocalRateLimiterProvider, RateGroupSizeMs,
-    SuppressionFactorCacheMs, TrypemaError, WindowSizeSeconds,
+    BucketSize, HardLimitFactor, LocalRateLimiterOptions, LocalRateLimiterProvider,
+    SuppressionFactorCachePeriod, TrypemaError, WindowSize,
 };
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -44,7 +44,7 @@ use crate::{
 use crate::redis::{RedisKey, RedisRateLimiterOptions, RedisRateLimiterProvider};
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-use crate::hybrid::SyncIntervalMs;
+use crate::hybrid::SyncInterval;
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use redis::aio::ConnectionManager;
@@ -62,15 +62,15 @@ use redis::aio::ConnectionManager;
 /// ```
 /// # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 /// # {
-/// use trypema::{HardLimitFactor, RateGroupSizeMs, RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds};
+/// use trypema::{HardLimitFactor, BucketSize, RateLimiterOptions, SuppressionFactorCachePeriod, WindowSize};
 /// use trypema::local::LocalRateLimiterOptions;
 ///
 /// let _options = RateLimiterOptions {
 ///     local: LocalRateLimiterOptions {
-///         window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),
-///         rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),
+///         window_size: WindowSize::seconds(60).unwrap(),
+///         bucket_size: BucketSize::milliseconds(10).unwrap(),
 ///         hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),
-///         suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+///         suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
 ///     },
 /// };
 /// # }
@@ -127,7 +127,7 @@ impl Default for RateLimiterOptions {
 /// let rl = trypema::__doctest_helpers::rate_limiter();
 /// rl.run_cleanup_loop();
 ///
-/// let rate = RateLimit::try_from(5.0).unwrap();
+/// let rate = RateLimit::per_second(5.0).unwrap();
 /// let decision = rl.local().absolute().inc("user_123", &rate, 1);
 /// ```
 pub struct RateLimiter {
@@ -312,7 +312,7 @@ impl RateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// let decision = rl.redis().absolute().inc(&key, &rate, 1).await.unwrap();
     /// assert!(matches!(decision, RateLimitDecision::Allowed));
     /// # });
@@ -340,7 +340,7 @@ impl RateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// assert!(matches!(
     ///     rl.hybrid().absolute().inc(&key, &rate, 1).await.unwrap(),
     ///     RateLimitDecision::Allowed
@@ -361,7 +361,7 @@ impl RateLimiter {
     /// # let rl = trypema::__doctest_helpers::rate_limiter();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// let decision = rl.local().absolute().inc("user_123", &rate, 1);
     /// assert!(matches!(decision, RateLimitDecision::Allowed));
     /// ```
@@ -389,16 +389,16 @@ impl RateLimiter {
 /// ```
 /// # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 /// # {
-/// use trypema::{RateLimit, RateLimitDecision, RateLimiterBuilder};
+/// use trypema::{BucketSize, RateLimit, RateLimitDecision, RateLimiterBuilder, WindowSize};
 ///
 /// let rl = RateLimiterBuilder::default()
-///     .window_size_seconds(60)
-///     .rate_group_size_ms(10)
+///     .window_size(WindowSize::seconds_or_panic(60))
+///     .bucket_size(BucketSize::milliseconds_or_panic(10))
 ///     .hard_limit_factor(1.5)
 ///     .build()
 ///     .unwrap();
 ///
-/// let rate = RateLimit::try_from(5.0).unwrap();
+/// let rate = RateLimit::per_second(5.0).unwrap();
 /// assert!(matches!(
 ///     rl.local().absolute().inc("user_123", &rate, 1),
 ///     RateLimitDecision::Allowed
@@ -412,7 +412,8 @@ impl RateLimiter {
 /// # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 /// # {
 /// # trypema::__doctest_helpers::with_redis_rate_limiter(|_rl| async move {
-/// use trypema::{RateLimit, RateLimitDecision, RateLimiter};
+/// use trypema::{BucketSize, RateLimit, RateLimitDecision, RateLimiter, WindowSize};
+/// use trypema::hybrid::SyncInterval;
 /// use trypema::redis::RedisKey;
 ///
 /// let url = std::env::var("REDIS_URL")
@@ -424,15 +425,15 @@ impl RateLimiter {
 ///     .unwrap();
 ///
 /// let rl = RateLimiter::builder(connection_manager)
-///     .window_size_seconds(60)
-///     .rate_group_size_ms(10)
+///     .window_size(WindowSize::seconds_or_panic(60))
+///     .bucket_size(BucketSize::milliseconds_or_panic(10))
 ///     .redis_prefix(RedisKey::new_or_panic("docs".to_string()))
-///     .sync_interval_ms(10)
+///     .sync_interval(SyncInterval::milliseconds_or_panic(10))
 ///     .build()
 ///     .unwrap();
 ///
 /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-/// let rate = RateLimit::try_from(5.0).unwrap();
+/// let rate = RateLimit::per_second(5.0).unwrap();
 /// assert!(matches!(
 ///     rl.redis().absolute().inc(&key, &rate, 1).await.unwrap(),
 ///     RateLimitDecision::Allowed
@@ -442,10 +443,10 @@ impl RateLimiter {
 /// # }
 /// ```
 pub struct RateLimiterBuilder {
-    window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    window_size: WindowSize,
+    bucket_size: BucketSize,
     hard_limit_factor: f64,
-    suppression_factor_cache_ms: u64,
+    suppression_factor_cache_period: SuppressionFactorCachePeriod,
     stale_after_ms: u64,
     cleanup_interval_ms: u64,
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -453,19 +454,19 @@ pub struct RateLimiterBuilder {
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     redis_prefix: Option<RedisKey>,
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    sync_interval_ms: u64,
+    sync_interval: SyncInterval,
 }
 
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 impl Default for RateLimiterBuilder {
     /// Create a local-only [`RateLimiterBuilder`] seeded from the defaults of the validated
-    /// option types such as [`WindowSizeSeconds`] and [`RateGroupSizeMs`].
+    /// option types such as [`WindowSize`] and [`BucketSize`].
     fn default() -> Self {
         Self {
-            window_size_seconds: *WindowSizeSeconds::default(),
-            rate_group_size_ms: *RateGroupSizeMs::default(),
+            window_size: WindowSize::default(),
+            bucket_size: BucketSize::default(),
             hard_limit_factor: *HardLimitFactor::default(),
-            suppression_factor_cache_ms: *SuppressionFactorCacheMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
             stale_after_ms: 10 * 60 * 1000,
             cleanup_interval_ms: 30 * 1000,
         }
@@ -487,15 +488,15 @@ impl RateLimiter {
 impl RateLimiterBuilder {
     fn new_with_connection_manager(connection_manager: ConnectionManager) -> Self {
         Self {
-            window_size_seconds: *WindowSizeSeconds::default(),
-            rate_group_size_ms: *RateGroupSizeMs::default(),
+            window_size: WindowSize::default(),
+            bucket_size: BucketSize::default(),
             hard_limit_factor: *HardLimitFactor::default(),
-            suppression_factor_cache_ms: *SuppressionFactorCacheMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
             stale_after_ms: 10 * 60 * 1000,
             cleanup_interval_ms: 30 * 1000,
             connection_manager,
             redis_prefix: None,
-            sync_interval_ms: *SyncIntervalMs::default(),
+            sync_interval: SyncInterval::default(),
         }
     }
 }
@@ -507,7 +508,7 @@ impl RateLimiter {
     ///
     /// The `connection_manager` is required because it has no default.
     /// All other options default to sensible values. Redis-only builder methods such as
-    /// [`RateLimiterBuilder::redis_prefix`] and [`RateLimiterBuilder::sync_interval_ms`] are only
+    /// [`RateLimiterBuilder::redis_prefix`] and [`RateLimiterBuilder::sync_interval`] are only
     /// available with `redis-tokio` or `redis-smol`.
     pub fn builder(connection_manager: ConnectionManager) -> RateLimiterBuilder {
         RateLimiterBuilder::new_with_connection_manager(connection_manager)
@@ -515,19 +516,19 @@ impl RateLimiter {
 }
 
 impl RateLimiterBuilder {
-    /// Set the sliding window duration in seconds.
+    /// Set the sliding window duration.
     ///
-    /// Default: [`WindowSizeSeconds::default()`].
-    pub fn window_size_seconds(mut self, v: u64) -> Self {
-        self.window_size_seconds = v;
+    /// Default: [`WindowSize::default()`].
+    pub fn window_size(mut self, window_size: WindowSize) -> Self {
+        self.window_size = window_size;
         self
     }
 
-    /// Set the bucket coalescing interval in milliseconds.
+    /// Set the bucket coalescing interval.
     ///
-    /// Default: [`RateGroupSizeMs::default()`].
-    pub fn rate_group_size_ms(mut self, v: u64) -> Self {
-        self.rate_group_size_ms = v;
+    /// Default: [`BucketSize::default()`].
+    pub fn bucket_size(mut self, bucket_size: BucketSize) -> Self {
+        self.bucket_size = bucket_size;
         self
     }
 
@@ -539,11 +540,14 @@ impl RateLimiterBuilder {
         self
     }
 
-    /// Set the suppression factor cache duration in milliseconds.
+    /// Set the suppression-factor cache period.
     ///
-    /// Default: [`SuppressionFactorCacheMs::default()`].
-    pub fn suppression_factor_cache_ms(mut self, v: u64) -> Self {
-        self.suppression_factor_cache_ms = v;
+    /// Default: [`SuppressionFactorCachePeriod::default()`].
+    pub fn suppression_factor_cache_period(
+        mut self,
+        suppression_factor_cache_period: SuppressionFactorCachePeriod,
+    ) -> Self {
+        self.suppression_factor_cache_period = suppression_factor_cache_period;
         self
     }
 
@@ -567,11 +571,11 @@ impl RateLimiterBuilder {
         self
     }
 
-    /// Set the hybrid provider sync interval in milliseconds. Default: [`SyncIntervalMs::default()`].
+    /// Set the hybrid provider sync interval. Default: [`SyncInterval::default()`].
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
-    pub fn sync_interval_ms(mut self, v: u64) -> Self {
-        self.sync_interval_ms = v;
+    pub fn sync_interval(mut self, sync_interval: SyncInterval) -> Self {
+        self.sync_interval = sync_interval;
         self
     }
 
@@ -582,24 +586,20 @@ impl RateLimiterBuilder {
     pub fn build(self) -> Result<Arc<RateLimiter>, TrypemaError> {
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
-                window_size_seconds: WindowSizeSeconds::try_from(self.window_size_seconds)?,
-                rate_group_size_ms: RateGroupSizeMs::try_from(self.rate_group_size_ms)?,
+                window_size: self.window_size,
+                bucket_size: self.bucket_size,
                 hard_limit_factor: HardLimitFactor::try_from(self.hard_limit_factor)?,
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
-                    self.suppression_factor_cache_ms,
-                )?,
+                suppression_factor_cache_period: self.suppression_factor_cache_period,
             },
             #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
             redis: RedisRateLimiterOptions {
                 connection_manager: self.connection_manager,
                 prefix: self.redis_prefix,
-                window_size_seconds: WindowSizeSeconds::try_from(self.window_size_seconds)?,
-                rate_group_size_ms: RateGroupSizeMs::try_from(self.rate_group_size_ms)?,
+                window_size: self.window_size,
+                bucket_size: self.bucket_size,
                 hard_limit_factor: HardLimitFactor::try_from(self.hard_limit_factor)?,
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
-                    self.suppression_factor_cache_ms,
-                )?,
-                sync_interval_ms: SyncIntervalMs::try_from(self.sync_interval_ms)?,
+                suppression_factor_cache_period: self.suppression_factor_cache_period,
+                sync_interval: self.sync_interval,
             },
         };
         let rl = Arc::new(RateLimiter::new(options));

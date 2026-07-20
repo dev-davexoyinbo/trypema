@@ -5,17 +5,17 @@ use std::{
 };
 
 use crate::common::{
-    HardLimitFactor, HistoryPreservation, RateGroupSizeMs, RateLimit, RateLimitComparator,
-    RateLimitDecision, SuppressionFactorCacheMs, WindowSizeSeconds,
+    BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
+    RateLimitDecision, SuppressionFactorCachePeriod, WindowSize,
 };
 use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};
 
-fn window_limit(window_size_seconds: u64, rate_limit: &RateLimit) -> f64 {
-    window_size_seconds as f64 * **rate_limit
+fn window_limit(window_size: u64, rate_limit: &RateLimit) -> f64 {
+    window_size as f64 * **rate_limit
 }
 
-fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
-    window_limit(window_size_seconds, rate_limit) as u64
+fn window_capacity(window_size: u64, rate_limit: &RateLimit) -> u64 {
+    window_limit(window_size, rate_limit) as u64
 }
 
 fn record_decision(
@@ -41,12 +41,12 @@ fn record_decision(
     }
 }
 
-fn limiter(window_size_seconds: u64, rate_group_size_ms: u64) -> AbsoluteLocalRateLimiter {
+fn limiter(window_size: u64, bucket_size: u64) -> AbsoluteLocalRateLimiter {
     AbsoluteLocalRateLimiter::new(LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-        rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+        window_size: WindowSize::seconds(window_size).unwrap(),
+        bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
         hard_limit_factor: HardLimitFactor::default(),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+        suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
     })
 }
 
@@ -71,7 +71,7 @@ fn is_allowed_unknown_key_is_allowed() {
 fn rejects_at_exact_window_limit() {
     let limiter = limiter(1, 1000);
     let key = "k";
-    let rate_limit = RateLimit::try_from(2f64).unwrap();
+    let rate_limit = RateLimit::per_second(2f64).unwrap();
 
     assert!(matches!(
         limiter.inc(key, &rate_limit, 1),
@@ -96,7 +96,7 @@ fn rejects_at_exact_window_limit() {
 fn rejects_at_exact_window_limit_window_6() {
     let limiter = limiter(6, 1000);
     let key = "k";
-    let rate_limit = RateLimit::try_from(2f64).unwrap();
+    let rate_limit = RateLimit::per_second(2f64).unwrap();
 
     // window_limit = 6 * 2 = 12
     assert!(matches!(
@@ -122,7 +122,7 @@ fn rejects_at_exact_window_limit_window_6() {
 fn rejects_at_exact_window_limit_window_10() {
     let limiter = limiter(10, 1000);
     let key = "k";
-    let rate_limit = RateLimit::try_from(2f64).unwrap();
+    let rate_limit = RateLimit::per_second(2f64).unwrap();
 
     // window_limit = 10 * 2 = 20
     assert!(matches!(
@@ -147,7 +147,7 @@ fn rejects_at_exact_window_limit_window_10() {
 #[test]
 fn per_key_state_is_independent() {
     let limiter = limiter(1, 1000);
-    let rate_limit = RateLimit::try_from(2f64).unwrap();
+    let rate_limit = RateLimit::per_second(2f64).unwrap();
 
     assert!(matches!(
         limiter.inc("a", &rate_limit, 2),
@@ -166,11 +166,11 @@ fn per_key_state_is_independent() {
 
 #[test]
 fn window_limit_for_key_is_not_updated_after_first_inc() {
-    let window_size_seconds = 6;
-    let limiter = limiter(window_size_seconds, 1000);
+    let window_size = 6;
+    let limiter = limiter(window_size, 1000);
     let key = "k";
-    let strict_rate_limit = RateLimit::try_from(1f64).unwrap();
-    let loose_rate_limit = RateLimit::try_from(100f64).unwrap();
+    let strict_rate_limit = RateLimit::per_second(1f64).unwrap();
+    let loose_rate_limit = RateLimit::per_second(100f64).unwrap();
 
     // Seed key with a strict limit.
     assert!(matches!(
@@ -179,7 +179,7 @@ fn window_limit_for_key_is_not_updated_after_first_inc() {
     ));
     assert_eq!(
         limiter.series().get(key).unwrap().window_limit,
-        window_limit(window_size_seconds, &strict_rate_limit),
+        window_limit(window_size, &strict_rate_limit),
         "the series must store the computed window limit, not the per-second rate"
     );
 
@@ -199,7 +199,7 @@ fn window_limit_for_key_is_not_updated_after_first_inc() {
 fn rejected_includes_retry_after_and_remaining_after_waiting() {
     let limiter = limiter(1, 10);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     assert!(matches!(
         limiter.inc(key, &rate_limit, 1),
@@ -213,7 +213,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds,
+        window_size_seconds: window_size,
         retry_after_ms,
         remaining_after_waiting,
     } = decision
@@ -221,7 +221,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size_seconds, 1);
+    assert_eq!(window_size, 1);
     assert_eq!(remaining_after_waiting, 1);
     assert_retry_after_between(retry_after_ms, 800, 1_000);
 }
@@ -230,7 +230,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
 fn rejected_includes_retry_after_and_remaining_after_waiting_window_6() {
     let limiter = limiter(6, 1);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     assert!(matches!(
         limiter.inc(key, &rate_limit, 2),
@@ -244,7 +244,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_6() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds,
+        window_size_seconds: window_size,
         retry_after_ms,
         remaining_after_waiting,
     } = decision
@@ -252,7 +252,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_6() {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size_seconds, 6);
+    assert_eq!(window_size, 6);
     assert_eq!(remaining_after_waiting, 2);
     assert_retry_after_between(retry_after_ms, 5_000, 6_000);
 }
@@ -261,7 +261,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_6() {
 fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
     let limiter = limiter(10, 1);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     assert!(matches!(
         limiter.inc(key, &rate_limit, 3),
@@ -275,7 +275,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds,
+        window_size_seconds: window_size,
         retry_after_ms,
         remaining_after_waiting,
     } = decision
@@ -283,7 +283,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size_seconds, 10);
+    assert_eq!(window_size, 10);
     assert_eq!(remaining_after_waiting, 3);
     assert_retry_after_between(retry_after_ms, 9_000, 10_000);
 
@@ -307,7 +307,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
 fn rejected_metadata_window_6_with_nonzero_grouping_separates_buckets() {
     let limiter = limiter(6, 200);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     // Two buckets (sleep > group size). window_limit = 6 * 1 = 6
     assert!(matches!(
@@ -322,7 +322,7 @@ fn rejected_metadata_window_6_with_nonzero_grouping_separates_buckets() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds,
+        window_size_seconds: window_size,
         retry_after_ms,
         remaining_after_waiting,
     } = decision
@@ -330,7 +330,7 @@ fn rejected_metadata_window_6_with_nonzero_grouping_separates_buckets() {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size_seconds, 6);
+    assert_eq!(window_size, 6);
     assert_eq!(remaining_after_waiting, 2);
     assert_retry_after_between(retry_after_ms, 5_000, 6_000);
 }
@@ -339,7 +339,7 @@ fn rejected_metadata_window_6_with_nonzero_grouping_separates_buckets() {
 fn rejected_metadata_window_10_with_nonzero_grouping_separates_buckets() {
     let limiter = limiter(10, 200);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     // Two buckets (sleep > group size). window_limit = 10 * 1 = 10
     assert!(matches!(
@@ -354,7 +354,7 @@ fn rejected_metadata_window_10_with_nonzero_grouping_separates_buckets() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds,
+        window_size_seconds: window_size,
         retry_after_ms,
         remaining_after_waiting,
     } = decision
@@ -362,7 +362,7 @@ fn rejected_metadata_window_10_with_nonzero_grouping_separates_buckets() {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size_seconds, 10);
+    assert_eq!(window_size, 10);
     assert_eq!(remaining_after_waiting, 3);
     assert_retry_after_between(retry_after_ms, 9_000, 10_000);
 }
@@ -371,7 +371,7 @@ fn rejected_metadata_window_10_with_nonzero_grouping_separates_buckets() {
 fn rejected_metadata_window_6_with_nonzero_grouping_merges_within_group() {
     let limiter = limiter(6, 200);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     // Same bucket (sleep < group size). window_limit = 6 * 1 = 6
     assert!(matches!(
@@ -402,7 +402,7 @@ fn rejected_metadata_window_6_with_nonzero_grouping_merges_within_group() {
 fn rejected_metadata_window_10_with_nonzero_grouping_merges_within_group() {
     let limiter = limiter(10, 200);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     // Same bucket (sleep < group size). window_limit = 10 * 1 = 10
     assert!(matches!(
@@ -433,7 +433,7 @@ fn rejected_metadata_window_10_with_nonzero_grouping_merges_within_group() {
 fn unblocks_after_window_expires() {
     let limiter = limiter(1, 1000);
     let key = "k";
-    let rate_limit = RateLimit::try_from(3f64).unwrap();
+    let rate_limit = RateLimit::per_second(3f64).unwrap();
 
     assert!(matches!(
         limiter.inc(key, &rate_limit, 3),
@@ -458,7 +458,7 @@ fn unblocks_after_window_expires() {
 fn unblocks_after_window_expires_window_2_with_nonzero_grouping() {
     let limiter = limiter(2, 200);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     // window_limit = 2 * 1 = 2
     assert!(matches!(
@@ -484,7 +484,7 @@ fn unblocks_after_window_expires_window_2_with_nonzero_grouping() {
 fn evicts_oldest_bucket_but_keeps_newer_bucket_window_2_with_grouping() {
     let limiter = limiter(2, 200);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     assert!(matches!(
         limiter.inc(key, &rate_limit, 1),
@@ -522,7 +522,7 @@ fn evicts_oldest_bucket_but_keeps_newer_bucket_window_2_with_grouping() {
 fn rate_grouping_merges_within_group() {
     let limiter = limiter(1, 50);
     let key = "k";
-    let rate_limit = RateLimit::try_from(6f64).unwrap();
+    let rate_limit = RateLimit::per_second(6f64).unwrap();
 
     assert!(matches!(
         limiter.inc(key, &rate_limit, 3),
@@ -560,7 +560,7 @@ fn rate_grouping_merges_within_group() {
 fn rate_grouping_separates_beyond_group() {
     let limiter = limiter(1, 50);
     let key = "k";
-    let rate_limit = RateLimit::try_from(10f64).unwrap();
+    let rate_limit = RateLimit::per_second(10f64).unwrap();
 
     assert!(matches!(
         limiter.inc(key, &rate_limit, 2),
@@ -595,7 +595,7 @@ fn rate_grouping_separates_beyond_group() {
 fn concurrent_inc_eventually_rejects_without_panicking() {
     let limiter = Arc::new(limiter(1, 1000));
     let key = "k";
-    let rate_limit = RateLimit::try_from(10f64).unwrap();
+    let rate_limit = RateLimit::per_second(10f64).unwrap();
 
     let threads: Vec<_> = (0..8)
         .map(|_| {
@@ -623,7 +623,7 @@ fn concurrent_inc_eventually_rejects_without_panicking() {
 #[test]
 fn cleanup_removes_stale_keys_by_last_activity() {
     let limiter = limiter(60, 1000);
-    let limit = RateLimit::try_from(1f64).unwrap();
+    let limit = RateLimit::per_second(1f64).unwrap();
 
     assert!(matches!(
         limiter.inc("stale", &limit, 1),
@@ -639,7 +639,7 @@ fn cleanup_removes_stale_keys_by_last_activity() {
 #[test]
 fn cleanup_keeps_fresh_keys() {
     let limiter = limiter(60, 1000);
-    let limit = RateLimit::try_from(1f64).unwrap();
+    let limit = RateLimit::per_second(1f64).unwrap();
 
     assert!(matches!(
         limiter.inc("fresh", &limit, 1),
@@ -652,7 +652,7 @@ fn cleanup_keeps_fresh_keys() {
 #[test]
 fn cleanup_uses_most_recent_bucket_not_oldest() {
     let limiter = limiter(60, 1000);
-    let limit = RateLimit::try_from(1f64).unwrap();
+    let limit = RateLimit::per_second(1f64).unwrap();
 
     assert!(matches!(
         limiter.inc("mixed", &limit, 1),
@@ -672,7 +672,7 @@ fn cleanup_uses_most_recent_bucket_not_oldest() {
 fn cleanup_removal_makes_key_unknown_and_allowed() {
     let limiter = limiter(60, 1000);
     let key = "k";
-    let limit = RateLimit::try_from(1f64).unwrap();
+    let limit = RateLimit::per_second(1f64).unwrap();
 
     // window_limit = 60 * 1 = 60.
     assert!(matches!(
@@ -696,7 +696,7 @@ fn cleanup_removal_makes_key_unknown_and_allowed() {
 #[test]
 fn cleanup_is_millisecond_granularity() {
     let limiter = limiter(60, 1000);
-    let limit = RateLimit::try_from(1f64).unwrap();
+    let limit = RateLimit::per_second(1f64).unwrap();
 
     assert!(matches!(
         limiter.inc("ms", &limit, 1),
@@ -710,7 +710,7 @@ fn cleanup_is_millisecond_granularity() {
 #[test]
 fn cleanup_concurrent_is_allowed_smoke_does_not_panic() {
     let limiter = Arc::new(limiter(60, 1));
-    let limit = RateLimit::try_from(1f64).unwrap();
+    let limit = RateLimit::per_second(1f64).unwrap();
 
     // Seed some state through the limiter API.
     assert!(matches!(
@@ -752,12 +752,12 @@ fn cleanup_concurrent_is_allowed_smoke_does_not_panic() {
 
 #[test]
 fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
-    let window_size_seconds = 1_u64;
-    let limiter = limiter(window_size_seconds, 1000);
+    let window_size = 1_u64;
+    let limiter = limiter(window_size, 1000);
 
     let k = "k";
-    let rate_limit = RateLimit::try_from(50f64).unwrap();
-    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    let rate_limit = RateLimit::per_second(50f64).unwrap();
+    let capacity = window_capacity(window_size, &rate_limit);
     assert_eq!(capacity, 50);
 
     let mut accepted_volume = 0_u64;
@@ -786,12 +786,12 @@ fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
 
 #[test]
 fn volume_batch_increment_matches_expected_volumes_under_local_semantics() {
-    let window_size_seconds = 1_u64;
-    let limiter = limiter(window_size_seconds, 1000);
+    let window_size = 1_u64;
+    let limiter = limiter(window_size, 1000);
 
     let k = "k";
-    let rate_limit = RateLimit::try_from(10f64).unwrap();
-    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    let rate_limit = RateLimit::per_second(10f64).unwrap();
+    let capacity = window_capacity(window_size, &rate_limit);
     assert_eq!(capacity, 10);
 
     let mut accepted_volume = 0_u64;
@@ -843,12 +843,12 @@ fn volume_batch_increment_matches_expected_volumes_under_local_semantics() {
 
 #[test]
 fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
-    let window_size_seconds = 1_u64;
-    let limiter = limiter(window_size_seconds, 1000);
+    let window_size = 1_u64;
+    let limiter = limiter(window_size, 1000);
 
     let k = "k";
-    let rate_limit = RateLimit::try_from(2f64).unwrap();
-    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    let rate_limit = RateLimit::per_second(2f64).unwrap();
+    let capacity = window_capacity(window_size, &rate_limit);
     assert_eq!(capacity, 2);
 
     // Fill capacity.
@@ -890,12 +890,12 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
 
 #[test]
 fn volume_non_integer_rate_uses_truncating_capacity() {
-    let window_size_seconds = 1_u64;
-    let limiter = limiter(window_size_seconds, 1000);
+    let window_size = 1_u64;
+    let limiter = limiter(window_size, 1000);
 
     let k = "k";
-    let rate_limit = RateLimit::try_from(2.9f64).unwrap();
-    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    let rate_limit = RateLimit::per_second(2.9f64).unwrap();
+    let capacity = window_capacity(window_size, &rate_limit);
     assert_eq!(capacity, 2);
 
     for _ in 0..capacity {
@@ -925,7 +925,7 @@ fn get_unknown_key_returns_zero() {
 #[test]
 fn get_returns_current_window_total() {
     let limiter = limiter(6, 1000);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     for _ in 0..3 {
         let decision = limiter.inc("k", &rate_limit, 1);
@@ -937,9 +937,9 @@ fn get_returns_current_window_total() {
 
 #[test]
 fn get_excludes_and_evicts_expired_buckets() {
-    let window_size_seconds = 1_u64;
-    let limiter = limiter(window_size_seconds, 50);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let window_size = 1_u64;
+    let limiter = limiter(window_size, 50);
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert!(matches!(
         limiter.inc("k2", &rate_limit, 5),
@@ -984,7 +984,7 @@ fn get_excludes_and_evicts_expired_buckets() {
 #[test]
 fn get_fresh_key_uses_shared_dashmap_lock() {
     let limiter = Arc::new(limiter(6, 1000));
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
     assert!(matches!(
         limiter.inc("k", &rate_limit, 3),
         RateLimitDecision::Allowed
@@ -1021,7 +1021,7 @@ fn get_fresh_key_uses_shared_dashmap_lock() {
 #[test]
 fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
     let limiter = Arc::new(limiter(6, 1000));
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
     assert!(matches!(
         limiter.inc("k", &rate, 3),
         RateLimitDecision::Allowed
@@ -1062,7 +1062,7 @@ fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
 #[test]
 fn conditional_set_guard_miss_leaves_expired_history_untouched() {
     let limiter = limiter(1, 1);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
     assert!(matches!(
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
@@ -1101,7 +1101,7 @@ fn conditional_set_guard_miss_leaves_expired_history_untouched() {
 #[test]
 fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
     let limiter = limiter(6, 1000);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     let (new_total, old_total) =
         limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
@@ -1117,7 +1117,7 @@ fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
 #[test]
 fn set_if_lt_with_lower_target_is_noop() {
     let limiter = limiter(6, 1000);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100),
@@ -1144,7 +1144,7 @@ fn set_if_lt_with_lower_target_is_noop() {
 #[test]
 fn set_if_nil_overwrites_unconditionally_including_lowering() {
     let limiter = limiter(6, 1000);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 100),
@@ -1182,7 +1182,7 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
 #[test]
 fn set_if_eq_zero_sets_only_when_window_is_empty() {
     let limiter = limiter(6, 1000);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 25);
     assert_eq!((new_total, old_total), (25, 0));
@@ -1195,7 +1195,7 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
 #[test]
 fn set_if_gt_and_ne_guards_follow_current_total() {
     let limiter = limiter(6, 1000);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 10),
@@ -1218,10 +1218,10 @@ fn set_if_gt_and_ne_guards_follow_current_total() {
 
 #[test]
 fn set_if_prime_then_inc_enforces_remaining_budget() {
-    let window_size_seconds = 6_u64;
-    let limiter = limiter(window_size_seconds, 1000);
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
-    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    let window_size = 6_u64;
+    let limiter = limiter(window_size, 1000);
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
+    let capacity = window_capacity(window_size, &rate_limit);
     assert_eq!(capacity, 30);
 
     // Prime 27 of 30: exactly 3 units of budget remain.
@@ -1247,10 +1247,10 @@ fn set_if_prime_then_inc_enforces_remaining_budget() {
 
 #[test]
 fn set_if_prime_at_capacity_rejects_next_inc() {
-    let window_size_seconds = 6_u64;
-    let limiter = limiter(window_size_seconds, 1000);
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
-    let capacity = window_capacity(window_size_seconds, &rate_limit);
+    let window_size = 6_u64;
+    let limiter = limiter(window_size, 1000);
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
+    let capacity = window_capacity(window_size, &rate_limit);
 
     let (new_total, _) = limiter.set_if(
         "k",
@@ -1276,11 +1276,11 @@ fn set_if_prime_at_capacity_rejects_next_inc() {
 
 #[test]
 fn set_if_redefines_sticky_rate_limit() {
-    let window_size_seconds = 6_u64;
-    let limiter = limiter(window_size_seconds, 1000);
+    let window_size = 6_u64;
+    let limiter = limiter(window_size, 1000);
 
     // Fill to the original capacity (6 * 1 = 6); the key is now rejecting.
-    let rate_one = RateLimit::try_from(1f64).unwrap();
+    let rate_one = RateLimit::per_second(1f64).unwrap();
     for _ in 0..6 {
         let decision = limiter.inc("k", &rate_one, 1);
         assert!(matches!(decision, RateLimitDecision::Allowed));
@@ -1289,7 +1289,7 @@ fn set_if_redefines_sticky_rate_limit() {
     assert!(matches!(decision, RateLimitDecision::Rejected { .. }));
 
     // Unlike inc (sticky limit), set_if redefines the stored window limit: 6 * 10 = 60.
-    let rate_ten = RateLimit::try_from(10f64).unwrap();
+    let rate_ten = RateLimit::per_second(10f64).unwrap();
     assert_eq!(
         limiter.set_if("k", &rate_ten, RateLimitComparator::Nil, 1),
         (1, 6)
@@ -1299,7 +1299,7 @@ fn set_if_redefines_sticky_rate_limit() {
         let series = limiter.series().get("k").expect("series should remain");
         assert_eq!(
             series.window_limit,
-            window_limit(window_size_seconds, &rate_ten),
+            window_limit(window_size, &rate_ten),
             "matched set_if must redefine the stored window limit"
         );
         assert_eq!(series.buckets.len(), 1);
@@ -1328,9 +1328,9 @@ fn set_if_redefines_sticky_rate_limit() {
 
 #[test]
 fn set_if_evicts_expired_buckets_before_comparing() {
-    let window_size_seconds = 1_u64;
-    let limiter = limiter(window_size_seconds, 1000);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let window_size = 1_u64;
+    let limiter = limiter(window_size, 1000);
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert!(matches!(
         limiter.inc("k", &rate_limit, 50),
@@ -1358,7 +1358,7 @@ fn set_if_evicts_expired_buckets_before_comparing() {
 #[test]
 fn set_if_unmatched_guard_on_unknown_key_writes_no_counts() {
     let limiter = limiter(6, 1000);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Gt(5), 9);
     assert_eq!((new_total, old_total), (0, 0));
@@ -1369,7 +1369,7 @@ fn set_if_unmatched_guard_on_unknown_key_writes_no_counts() {
 #[test]
 fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
     let limiter = limiter(10, 1);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
     assert!(matches!(
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
@@ -1426,7 +1426,7 @@ fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
 #[test]
 fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
     let limiter = limiter(10, 1);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
     assert!(matches!(
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
@@ -1486,8 +1486,8 @@ fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
 #[test]
 fn set_if_preserve_history_redefines_limit_even_when_total_is_unchanged() {
     let limiter = limiter(6, 1);
-    let old_rate = RateLimit::try_from(1f64).unwrap();
-    let new_rate = RateLimit::try_from(10f64).unwrap();
+    let old_rate = RateLimit::per_second(1f64).unwrap();
+    let new_rate = RateLimit::per_second(10f64).unwrap();
     assert!(matches!(
         limiter.inc("k", &old_rate, 2),
         RateLimitDecision::Allowed
@@ -1527,7 +1527,7 @@ fn set_if_preserve_history_redefines_limit_even_when_total_is_unchanged() {
 #[test]
 fn set_if_preserve_history_prunes_expired_before_directional_reduction() {
     let limiter = limiter(1, 1);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
     assert!(matches!(
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
@@ -1568,7 +1568,7 @@ fn set_if_preserve_history_prunes_expired_before_directional_reduction() {
 #[test]
 fn set_if_preserve_history_zero_removes_key() {
     let limiter = limiter(10, 1);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
     assert!(matches!(
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
@@ -1597,7 +1597,7 @@ fn set_if_preserve_history_zero_removes_key() {
 #[test]
 fn conditional_set_missing_zero_leaves_key_absent() {
     let limiter = limiter(6, 1000);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate, RateLimitComparator::Eq(0), 0),
@@ -1619,7 +1619,7 @@ fn conditional_set_missing_zero_leaves_key_absent() {
 #[test]
 fn conditional_set_present_zero_removes_key() {
     let limiter = limiter(6, 1);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
 
     assert!(matches!(
         limiter.inc("replace", &rate, 3),
@@ -1654,7 +1654,7 @@ fn conditional_set_present_zero_removes_key() {
 #[test]
 fn set_if_preserve_history_creates_missing_positive_target_for_both_directions() {
     let limiter = limiter(6, 1);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
 
     for (key, preservation) in [
         ("newest", HistoryPreservation::PreserveNewest),

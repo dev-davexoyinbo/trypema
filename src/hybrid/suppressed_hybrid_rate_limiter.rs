@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
-    RedisKey, RedisRateLimiterOptions, SuppressedRateLimitSnapshot, SuppressionFactorCacheMs,
-    TrypemaError, WindowSizeSeconds,
+    RedisKey, RedisRateLimiterOptions, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod,
+    TrypemaError, WindowSize,
     common::{HistoryUpdateMode, RandomState},
     hybrid::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
@@ -81,12 +81,12 @@ pub(crate) struct SuppressedHybridSetIfTestHook {
 /// Same per-key `tokio::sync::Mutex` mechanism as the absolute hybrid limiter.
 #[derive(Debug)]
 pub struct SuppressedHybridRateLimiter {
-    window_size_seconds: WindowSizeSeconds,
+    window_size: WindowSize,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<SuppressedHybridCommit>>,
     redis_proxy: SuppressedHybridRedisProxy,
     limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState, RandomState>,
     hard_limit_factor: HardLimitFactor,
-    suppression_factor_cache_ms: SuppressionFactorCacheMs,
+    suppression_factor_cache_period: SuppressionFactorCachePeriod,
     epoch: AtomicU64,
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
@@ -101,22 +101,22 @@ impl SuppressedHybridRateLimiter {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(1);
         let hard_limit_factor = options.hard_limit_factor;
-        let suppression_factor_cache_ms = options.suppression_factor_cache_ms;
-        let window_size_seconds = options.window_size_seconds;
-        let rate_group_size_ms = options.rate_group_size_ms;
+        let suppression_factor_cache_period = options.suppression_factor_cache_period;
+        let window_size = options.window_size;
+        let bucket_size = options.bucket_size;
 
         let redis_proxy = SuppressedHybridRedisProxy::new(SuppressedHybridRedisProxyOptions {
             prefix: prefix.clone(),
             connection_manager: options.connection_manager,
             hard_limit_factor,
-            suppression_factor_cache_ms,
-            rate_group_size_ms,
-            window_size_seconds,
+            suppression_factor_cache_period,
+            bucket_size,
+            window_size,
         });
 
         let is_active_watch = watch::Sender::new(0u64);
 
-        let sync_interval = Duration::from_millis(*options.sync_interval_ms);
+        let sync_interval = Duration::from_millis(*options.sync_interval);
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval,
@@ -128,12 +128,12 @@ impl SuppressedHybridRateLimiter {
         });
 
         let limiter = Self {
-            window_size_seconds,
+            window_size,
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::default(),
             hard_limit_factor,
-            suppression_factor_cache_ms,
+            suppression_factor_cache_period,
             is_active_watch,
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
@@ -316,8 +316,7 @@ impl SuppressedHybridRateLimiter {
             }
         }
 
-        let hard_window_limit =
-            *self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor;
+        let hard_window_limit = *self.window_size as f64 * **rate_limit * *self.hard_limit_factor;
 
         let (new_total, old_total, changed) = self
             .redis_proxy
@@ -364,7 +363,7 @@ impl SuppressedHybridRateLimiter {
     ///     0
     /// );
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// rl.hybrid().suppressed().inc(&key, &rate, 3).await.unwrap();
     /// assert_eq!(
     ///     rl.hybrid().suppressed().get_inferred(&key).await.unwrap().total,
@@ -392,7 +391,7 @@ impl SuppressedHybridRateLimiter {
     /// pending local increments and declines. The observed total includes accepted and declined
     /// calls, matching the counter that suppression decisions are based on. Pending increments
     /// held by other instances are not visible until their next flush, so the result may lag the
-    /// true global state by up to `sync_interval_ms`.
+    /// true global state by up to `sync_interval`.
     ///
     /// # Examples
     ///
@@ -407,7 +406,7 @@ impl SuppressedHybridRateLimiter {
     /// assert_eq!(snapshot.total_declined, 0);
     /// assert_eq!(snapshot.suppression_factor, 0.0);
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// rl.hybrid().suppressed().inc(&key, &rate, 3).await.unwrap();
     /// assert_eq!(rl.hybrid().suppressed().get(&key).await.unwrap().total, 3);
     /// # });
@@ -462,7 +461,7 @@ impl SuppressedHybridRateLimiter {
     /// window contents are replaced by a single current-timestamp bucket holding
     /// `count`, with **no declines** recorded against it; otherwise nothing is
     /// written. On a match the key's hard window limit is (re)defined as
-    /// `window_size_seconds × rate_limit × hard_limit_factor` and the cached
+    /// `window_size × rate_limit × hard_limit_factor` and the cached
     /// suppression factor is deleted so it is recomputed from the new state.
     /// A matched target of zero removes committed count, decline, limit, cache, and
     /// history state; increments racing after the pending snapshot are retained.
@@ -472,7 +471,7 @@ impl SuppressedHybridRateLimiter {
     /// on a miss. After a match it is invalidated, and increments that arrived after
     /// the snapshot are committed on top of the requested target. Pending increments
     /// on **other** instances flush
-    /// later (within `sync_interval_ms`) and land on top of a matched write — with a
+    /// later (within `sync_interval`) and land on top of a matched write — with a
     /// `Lt(count)` guard the total can drift above `count` but is never lowered below
     /// it by those flushes.
     ///
@@ -503,7 +502,7 @@ impl SuppressedHybridRateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Prime the window to 40.
     /// let (new_total, old_total) = rl
@@ -594,7 +593,7 @@ impl SuppressedHybridRateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// // Under limit → Allowed
     /// assert!(matches!(
     ///     rl.hybrid().suppressed().inc(&key, &rate, 1).await.unwrap(),

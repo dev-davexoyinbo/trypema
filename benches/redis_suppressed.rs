@@ -35,7 +35,7 @@ mod enabled {
         );
 
         let key = RedisKey::try_from("user_1".to_string()).unwrap();
-        let rate = RateLimit::try_from(5.0).unwrap();
+        let rate = RateLimit::per_second(5.0).unwrap();
 
         // Warm.
         runtime::block_on(&rt, async {

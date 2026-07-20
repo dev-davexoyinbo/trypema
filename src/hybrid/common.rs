@@ -1,7 +1,10 @@
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
-use crate::TrypemaError;
+use crate::{
+    TrypemaError,
+    common::{MILLISECONDS_PER_SECOND, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, checked_duration},
+};
 
 /// How often each hybrid rate limiter advances its epoch (used to detect activity periods).
 pub(crate) const EPOCH_CHANGE_INTERVAL: Duration = Duration::from_secs(15);
@@ -28,7 +31,7 @@ pub(crate) enum RedisRateLimiterSignal {
     Flush,
 }
 
-/// Sync interval (milliseconds) for the hybrid provider's background flush.
+/// Sync interval stored in milliseconds for the hybrid provider's background flush.
 ///
 /// The hybrid provider batches local increments and periodically commits them to Redis via a
 /// background actor. This value controls how often that flush occurs.
@@ -43,7 +46,7 @@ pub(crate) enum RedisRateLimiterSignal {
 /// # Recommendation
 ///
 /// Start with **10ms** (the default). It is generally recommended to keep
-/// `sync_interval_ms` ≤ `rate_group_size_ms`.
+/// `sync_interval` ≤ `bucket_size`.
 ///
 /// # Validation
 ///
@@ -52,40 +55,96 @@ pub(crate) enum RedisRateLimiterSignal {
 /// # Examples
 ///
 /// ```
-/// use trypema::hybrid::SyncIntervalMs;
+/// use trypema::hybrid::SyncInterval;
 ///
-/// let interval = SyncIntervalMs::new(10).unwrap();
+/// let interval = SyncInterval::milliseconds(10).unwrap();
 /// assert_eq!(*interval, 10);
 ///
-/// let interval = SyncIntervalMs::try_from(50).unwrap();
-/// let interval = SyncIntervalMs::new_or_panic(75);
+/// let interval = SyncInterval::milliseconds(50).unwrap();
+/// let interval = SyncInterval::milliseconds_or_panic(75);
 ///
 /// // Invalid: 0ms
-/// assert!(SyncIntervalMs::try_from(0).is_err());
+/// assert!(SyncInterval::milliseconds(0).is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct SyncIntervalMs(u64);
+pub struct SyncInterval(u64);
 
-impl Default for SyncIntervalMs {
+impl Default for SyncInterval {
     /// Returns a sync interval of 10 ms.
     fn default() -> Self {
         Self(10)
     }
 }
 
-impl SyncIntervalMs {
-    /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
-    pub fn new(value: u64) -> Result<Self, TrypemaError> {
-        Self::try_from(value)
+impl SyncInterval {
+    /// Create a sync interval expressed in milliseconds.
+    pub fn milliseconds(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, 1)
     }
 
-    /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
-    pub fn new_or_panic(value: u64) -> Self {
-        Self::try_from(value).expect("SyncIntervalMs must be greater than 0")
+    /// Create a sync interval expressed in milliseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero.
+    pub fn milliseconds_or_panic(value: u64) -> Self {
+        Self::milliseconds(value).unwrap()
+    }
+
+    /// Create a sync interval expressed in seconds.
+    pub fn seconds(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND)
+    }
+
+    /// Create a sync interval expressed in seconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn seconds_or_panic(value: u64) -> Self {
+        Self::seconds(value).unwrap()
+    }
+
+    /// Create a sync interval expressed in minutes.
+    pub fn minutes(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_MINUTE)
+    }
+
+    /// Create a sync interval expressed in minutes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn minutes_or_panic(value: u64) -> Self {
+        Self::minutes(value).unwrap()
+    }
+
+    /// Create a sync interval expressed in hours.
+    pub fn hours(value: u64) -> Result<Self, TrypemaError> {
+        Self::from_milliseconds(value, MILLISECONDS_PER_SECOND * SECONDS_PER_HOUR)
+    }
+
+    /// Create a sync interval expressed in hours.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `value` is zero or conversion overflows.
+    pub fn hours_or_panic(value: u64) -> Self {
+        Self::hours(value).unwrap()
+    }
+
+    fn from_milliseconds(value: u64, multiplier: u64) -> Result<Self, TrypemaError> {
+        checked_duration(
+            value,
+            multiplier,
+            "sync interval",
+            TrypemaError::InvalidSyncInterval,
+        )
+        .map(Self)
     }
 }
 
-impl Deref for SyncIntervalMs {
+impl Deref for SyncInterval {
     type Target = u64;
 
     fn deref(&self) -> &Self::Target {
@@ -93,22 +152,8 @@ impl Deref for SyncIntervalMs {
     }
 }
 
-impl DerefMut for SyncIntervalMs {
+impl DerefMut for SyncInterval {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
-    }
-}
-
-impl TryFrom<u64> for SyncIntervalMs {
-    type Error = TrypemaError;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        if value == 0 {
-            Err(TrypemaError::InvalidRateGroupSizeMs(
-                "Sync interval must be greater than 0".to_string(),
-            ))
-        } else {
-            Ok(Self(value))
-        }
     }
 }

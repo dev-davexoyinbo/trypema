@@ -3,10 +3,10 @@ use std::{sync::Arc, time::Duration};
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use crate::common::RateType;
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-use crate::hybrid::SyncIntervalMs;
+use crate::hybrid::SyncInterval;
 use crate::{
-    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit, RateLimiter,
-    RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
+    BucketSize, HardLimitFactor, LocalRateLimiterOptions, RateLimit, RateLimiter,
+    RateLimiterOptions, SuppressionFactorCachePeriod, WindowSize,
 };
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -24,17 +24,17 @@ fn test_local_cleanup_loop_runs() {
     // Create a rate limiter with local support only
     let options = RateLimiterOptions {
         local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+            window_size: WindowSize::seconds(1).unwrap(),
+            bucket_size: BucketSize::milliseconds(100).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
         },
     };
 
     let rl = Arc::new(RateLimiter::new(options));
 
     // Add some entries
-    let rate_limit = RateLimit::try_from(10.0).unwrap();
+    let rate_limit = RateLimit::per_second(10.0).unwrap();
     rl.local().absolute().inc("key1", &rate_limit, 1);
     rl.local().absolute().inc("key2", &rate_limit, 1);
     rl.local().absolute().inc("key3", &rate_limit, 1);
@@ -57,17 +57,17 @@ fn test_local_cleanup_loop_runs() {
 fn test_cleanup_loop_keeps_active_entries() {
     let options = RateLimiterOptions {
         local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+            window_size: WindowSize::seconds(1).unwrap(),
+            bucket_size: BucketSize::milliseconds(100).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
         },
     };
 
     let rl = Arc::new(RateLimiter::new(options));
 
     // Add initial entries
-    let rate_limit = RateLimit::try_from(10.0).unwrap();
+    let rate_limit = RateLimit::per_second(10.0).unwrap();
     rl.local().absolute().inc("key1", &rate_limit, 1);
 
     // Start cleanup with 500ms stale threshold, 100ms interval
@@ -88,16 +88,16 @@ fn test_cleanup_loop_keeps_active_entries() {
 fn test_stop_cleanup_loop_prevents_future_cleanup() {
     let options = RateLimiterOptions {
         local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+            window_size: WindowSize::seconds(1).unwrap(),
+            bucket_size: BucketSize::milliseconds(100).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
         },
     };
 
     let rl = Arc::new(RateLimiter::new(options));
 
-    let rate_limit = RateLimit::try_from(10.0).unwrap();
+    let rate_limit = RateLimit::per_second(10.0).unwrap();
     rl.local().absolute().inc("key1", &rate_limit, 1);
     assert_eq!(rl.local().absolute().series().len(), 1);
 
@@ -120,16 +120,16 @@ fn test_stop_cleanup_loop_prevents_future_cleanup() {
 fn test_run_cleanup_loop_with_config_is_idempotent() {
     let options = RateLimiterOptions {
         local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+            window_size: WindowSize::seconds(1).unwrap(),
+            bucket_size: BucketSize::milliseconds(100).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
         },
     };
 
     let rl = Arc::new(RateLimiter::new(options));
 
-    let rate_limit = RateLimit::try_from(10.0).unwrap();
+    let rate_limit = RateLimit::per_second(10.0).unwrap();
     rl.local().absolute().inc("key1", &rate_limit, 1);
     assert_eq!(rl.local().absolute().series().len(), 1);
 
@@ -151,16 +151,16 @@ fn test_run_cleanup_loop_with_config_is_idempotent() {
 fn test_stop_then_restart_cleanup_loop_works() {
     let options = RateLimiterOptions {
         local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+            window_size: WindowSize::seconds(1).unwrap(),
+            bucket_size: BucketSize::milliseconds(100).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
         },
     };
 
     let rl = Arc::new(RateLimiter::new(options));
 
-    let rate_limit = RateLimit::try_from(10.0).unwrap();
+    let rate_limit = RateLimit::per_second(10.0).unwrap();
     rl.local().absolute().inc("key1", &rate_limit, 1);
     assert_eq!(rl.local().absolute().series().len(), 1);
 
@@ -194,25 +194,25 @@ fn test_redis_cleanup_loop_runs() {
 
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
-                window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(1).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
             },
             redis: crate::RedisRateLimiterOptions {
                 connection_manager,
                 prefix: Some(RedisKey::try_from("test_cleanup".to_string()).unwrap()),
-                window_size_seconds: WindowSizeSeconds::try_from(1).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(1).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-                sync_interval_ms: SyncIntervalMs::default(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+                sync_interval: SyncInterval::default(),
             },
         };
 
         let rl = Arc::new(RateLimiter::new(options));
 
-        let rate_limit = RateLimit::try_from(10.0).unwrap();
+        let rate_limit = RateLimit::per_second(10.0).unwrap();
         let key = RedisKey::try_from("test_key".to_string()).unwrap();
         let _ = rl.redis().absolute().inc(&key, &rate_limit, 1).await;
 
@@ -242,30 +242,30 @@ fn test_redis_stop_cleanup_loop_prevents_cleanup() {
             .as_millis();
         let prefix = RedisKey::try_from(format!("test_stop_cleanup_{unique}")).unwrap();
 
-        let window_size_seconds = WindowSizeSeconds::try_from(5).unwrap();
-        let rate_group_size_ms = RateGroupSizeMs::try_from(100).unwrap();
+        let window_size = WindowSize::seconds(5).unwrap();
+        let bucket_size = BucketSize::milliseconds(100).unwrap();
 
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
-                window_size_seconds,
-                rate_group_size_ms,
+                window_size,
+                bucket_size,
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
             },
             redis: crate::RedisRateLimiterOptions {
                 connection_manager: connection_manager.clone(),
                 prefix: Some(prefix.clone()),
-                window_size_seconds,
-                rate_group_size_ms,
+                window_size,
+                bucket_size,
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-                sync_interval_ms: SyncIntervalMs::default(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+                sync_interval: SyncInterval::default(),
             },
         };
 
         let rl = Arc::new(RateLimiter::new(options));
 
-        let rate_limit = RateLimit::try_from(1.0).unwrap();
+        let rate_limit = RateLimit::per_second(1.0).unwrap();
         let key = RedisKey::try_from(format!("test_key_{unique}")).unwrap();
 
         // window_size=5s, rate=1/s => capacity=5.
@@ -324,29 +324,29 @@ fn test_hybrid_absolute_cleanup_loop_removes_stale_redis_keys() {
             .unwrap()
             .as_millis();
         let prefix = RedisKey::try_from(format!("test_hybrid_abs_cleanup_{unique}")).unwrap();
-        let sync_interval_ms = 25_u64;
+        let sync_interval = 25_u64;
 
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
-                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(5).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
             },
             redis: crate::RedisRateLimiterOptions {
                 connection_manager,
                 prefix: Some(prefix.clone()),
-                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(5).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-                sync_interval_ms: SyncIntervalMs::try_from(sync_interval_ms).unwrap(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+                sync_interval: SyncInterval::milliseconds(sync_interval).unwrap(),
             },
         };
 
         let rl = Arc::new(RateLimiter::new(options));
 
-        let rate_limit = RateLimit::try_from(2.0).unwrap();
+        let rate_limit = RateLimit::per_second(2.0).unwrap();
         let k = RedisKey::try_from(format!("k_{unique}")).unwrap();
         let cap = 5_u64 * 2; // window=5s, rate=2/s => cap=10
 
@@ -370,7 +370,7 @@ fn test_hybrid_absolute_cleanup_loop_removes_stale_redis_keys() {
             "expected Rejected after overflow: {d:?}"
         );
 
-        runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+        runtime::async_sleep(Duration::from_millis(sync_interval * 2 + 50)).await;
 
         let kg = key_gen(&prefix, RateType::HybridAbsolute);
         let total_key = kg.get_total_count_key(&k);
@@ -429,29 +429,29 @@ fn test_hybrid_absolute_cleanup_loop_keeps_active_entity() {
             .unwrap()
             .as_millis();
         let prefix = RedisKey::try_from(format!("test_hybrid_abs_active_{unique}")).unwrap();
-        let sync_interval_ms = 25_u64;
+        let sync_interval = 25_u64;
 
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
-                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(5).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
             },
             redis: crate::RedisRateLimiterOptions {
                 connection_manager,
                 prefix: Some(prefix.clone()),
-                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(5).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-                sync_interval_ms: SyncIntervalMs::try_from(sync_interval_ms).unwrap(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+                sync_interval: SyncInterval::milliseconds(sync_interval).unwrap(),
             },
         };
 
         let rl = Arc::new(RateLimiter::new(options));
 
-        let rate_limit = RateLimit::try_from(2.0).unwrap();
+        let rate_limit = RateLimit::per_second(2.0).unwrap();
         let k = RedisKey::try_from(format!("k_{unique}")).unwrap();
         let cap = 5_u64 * 2;
 
@@ -473,7 +473,7 @@ fn test_hybrid_absolute_cleanup_loop_keeps_active_entity() {
             matches!(d, RateLimitDecision::Rejected { .. }),
             "expected Rejected: {d:?}"
         );
-        runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+        runtime::async_sleep(Duration::from_millis(sync_interval * 2 + 50)).await;
 
         let total_key = key_gen(&prefix, RateType::HybridAbsolute).get_total_count_key(&k);
 
@@ -520,29 +520,29 @@ fn test_hybrid_suppressed_cleanup_loop_removes_stale_redis_keys() {
             .unwrap()
             .as_millis();
         let prefix = RedisKey::try_from(format!("test_hybrid_sup_cleanup_{unique}")).unwrap();
-        let sync_interval_ms = 25_u64;
+        let sync_interval = 25_u64;
 
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
-                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(5).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::try_from(2.0).unwrap(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
             },
             redis: crate::RedisRateLimiterOptions {
                 connection_manager,
                 prefix: Some(prefix.clone()),
-                window_size_seconds: WindowSizeSeconds::try_from(5).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(5).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::try_from(2.0).unwrap(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-                sync_interval_ms: SyncIntervalMs::try_from(sync_interval_ms).unwrap(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+                sync_interval: SyncInterval::milliseconds(sync_interval).unwrap(),
             },
         };
 
         let rl = Arc::new(RateLimiter::new(options));
 
-        let rate_limit = RateLimit::try_from(2.0).unwrap();
+        let rate_limit = RateLimit::per_second(2.0).unwrap();
         let k = RedisKey::try_from(format!("k_{unique}")).unwrap();
         let soft_cap = 5_u64 * 2; // window=5s, rate=2/s => soft_cap=10
 
@@ -555,7 +555,7 @@ fn test_hybrid_suppressed_cleanup_loop_removes_stale_redis_keys() {
                 .await
                 .unwrap();
         }
-        runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+        runtime::async_sleep(Duration::from_millis(sync_interval * 2 + 50)).await;
 
         let kg = key_gen(&prefix, RateType::HybridSuppressed);
         let total_key = kg.get_total_count_key(&k);
@@ -615,32 +615,32 @@ fn test_hybrid_cleanup_loop_fresh_requests_allowed_after_cleanup() {
             .unwrap()
             .as_millis();
         let prefix = RedisKey::try_from(format!("test_hybrid_loop_fresh_{unique}")).unwrap();
-        let window_size_seconds = 1_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let sync_interval = 25_u64;
 
         let options = RateLimiterOptions {
             local: LocalRateLimiterOptions {
-                window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(window_size).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
             },
             redis: crate::RedisRateLimiterOptions {
                 connection_manager,
                 prefix: Some(prefix.clone()),
-                window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-                rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+                window_size: WindowSize::seconds(window_size).unwrap(),
+                bucket_size: BucketSize::milliseconds(100).unwrap(),
                 hard_limit_factor: HardLimitFactor::default(),
-                suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-                sync_interval_ms: SyncIntervalMs::try_from(sync_interval_ms).unwrap(),
+                suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+                sync_interval: SyncInterval::milliseconds(sync_interval).unwrap(),
             },
         };
 
         let rl = Arc::new(RateLimiter::new(options));
 
-        let rate_limit = RateLimit::try_from(2.0).unwrap();
+        let rate_limit = RateLimit::per_second(2.0).unwrap();
         let k = RedisKey::try_from(format!("k_{unique}")).unwrap();
-        let cap = window_size_seconds * 2;
+        let cap = window_size * 2;
 
         // Overflow — entity ends up in Rejecting state.
         for _ in 0..cap {
@@ -665,7 +665,7 @@ fn test_hybrid_cleanup_loop_fresh_requests_allowed_after_cleanup() {
             matches!(rejected, RateLimitDecision::Rejected { .. }),
             "expected Rejected after overflow: {rejected:?}"
         );
-        runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+        runtime::async_sleep(Duration::from_millis(sync_interval * 2 + 50)).await;
 
         // Start cleanup loop with stale_after_ms=150, interval=75. Rejecting local state is
         // retained through its retry TTL and the following stale horizon.

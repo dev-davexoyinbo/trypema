@@ -1,6 +1,6 @@
 use crate::{
     AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
-    common::{HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds},
+    common::{BucketSize, HardLimitFactor, SuppressionFactorCachePeriod, WindowSize},
 };
 
 /// Configuration for local (in-process) rate limiters.
@@ -11,32 +11,32 @@ use crate::{
 /// # Examples
 ///
 /// ```
-/// use trypema::{HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds};
+/// use trypema::{HardLimitFactor, BucketSize, SuppressionFactorCachePeriod, WindowSize};
 /// use trypema::local::LocalRateLimiterOptions;
 ///
 /// let defaults = LocalRateLimiterOptions::default();
 ///
 /// let options = LocalRateLimiterOptions {
-///     window_size_seconds: WindowSizeSeconds::try_from(60).unwrap(),   // 60s sliding window
-///     rate_group_size_ms: RateGroupSizeMs::try_from(10).unwrap(),      // 10ms coalescing
+///     window_size: WindowSize::seconds(60).unwrap(),   // 60s sliding window
+///     bucket_size: BucketSize::milliseconds(10).unwrap(),      // 10ms coalescing
 ///     hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),      // 50% burst headroom
-///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+///     suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
 /// };
 ///
 /// // High-precision, low-coalescing
 /// let precise = LocalRateLimiterOptions {
-///     window_size_seconds: WindowSizeSeconds::try_from(10).unwrap(),
-///     rate_group_size_ms: RateGroupSizeMs::try_from(1).unwrap(),
+///     window_size: WindowSize::seconds(10).unwrap(),
+///     bucket_size: BucketSize::milliseconds(1).unwrap(),
 ///     hard_limit_factor: HardLimitFactor::default(),
-///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+///     suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
 /// };
 ///
 /// // High-performance, aggressive coalescing
 /// let fast = LocalRateLimiterOptions {
-///     window_size_seconds: WindowSizeSeconds::try_from(120).unwrap(),
-///     rate_group_size_ms: RateGroupSizeMs::try_from(100).unwrap(),
+///     window_size: WindowSize::seconds(120).unwrap(),
+///     bucket_size: BucketSize::milliseconds(100).unwrap(),
 ///     hard_limit_factor: HardLimitFactor::try_from(2.0).unwrap(),
-///     suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+///     suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
 /// };
 /// ```
 #[derive(Clone, Debug, Default)]
@@ -48,7 +48,7 @@ pub struct LocalRateLimiterOptions {
     ///
     /// **Typical values:** 10-300 seconds  
     /// **Recommended:** 60 seconds
-    pub window_size_seconds: WindowSizeSeconds,
+    pub window_size: WindowSize,
 
     /// Bucket coalescing interval in milliseconds.
     ///
@@ -57,7 +57,7 @@ pub struct LocalRateLimiterOptions {
     ///
     /// **Typical values:** 10-100 milliseconds  
     /// **Recommended:** 10 milliseconds
-    pub rate_group_size_ms: RateGroupSizeMs,
+    pub bucket_size: BucketSize,
 
     /// Hard cutoff multiplier for the suppressed strategy.
     ///
@@ -78,7 +78,7 @@ pub struct LocalRateLimiterOptions {
     ///
     /// **Typical values:** 10-1000 ms
     /// **Recommended:** 10-200 ms
-    pub suppression_factor_cache_ms: SuppressionFactorCacheMs,
+    pub suppression_factor_cache_period: SuppressionFactorCachePeriod,
 }
 
 /// Provider for in-process rate limiting strategies.
@@ -101,7 +101,7 @@ pub struct LocalRateLimiterOptions {
 /// # let rl = trypema::__doctest_helpers::rate_limiter();
 /// use trypema::RateLimit;
 ///
-/// let rate = RateLimit::try_from(10.0).unwrap();
+/// let rate = RateLimit::per_second(10.0).unwrap();
 /// let abs_decision = rl.local().absolute().inc("user_123", &rate, 1);
 /// let sup_decision = rl.local().suppressed().inc("user_456", &rate, 1);
 /// ```
@@ -132,7 +132,7 @@ impl LocalRateLimiterProvider {
     /// # let rl = trypema::__doctest_helpers::rate_limiter();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// let decision = rl.local().absolute().inc("user_123", &rate, 1);
     /// assert!(matches!(decision, RateLimitDecision::Allowed));
     /// ```
@@ -156,7 +156,7 @@ impl LocalRateLimiterProvider {
     /// # let rl = trypema::__doctest_helpers::rate_limiter();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// match rl.local().suppressed().inc("user_123", &rate, 1) {
     ///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
     ///         println!("suppression: {suppression_factor}, allowed: {is_allowed}");

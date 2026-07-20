@@ -4,30 +4,34 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    HardLimitFactor, LocalRateLimiterOptions, RateGroupSizeMs, SuppressionFactorCacheMs,
-    WindowSizeSeconds,
+    BucketSize, HardLimitFactor, LocalRateLimiterOptions, SuppressionFactorCachePeriod, WindowSize,
 };
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 use crate::{RateLimit, RateLimiter, RateLimiterOptions};
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use crate::{RateLimit, RateLimiter, hybrid::SyncInterval};
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use super::{common, runtime};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Defaults
 // ────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn window_size_seconds_default_is_10() {
-    assert_eq!(*WindowSizeSeconds::default(), 10);
+fn window_size_default_is_10_seconds() {
+    assert_eq!(*WindowSize::default(), 10);
 }
 
 #[test]
 fn local_rate_limiter_options_default_has_expected_field_defaults() {
     let opts = LocalRateLimiterOptions::default();
-    assert_eq!(*opts.window_size_seconds, *WindowSizeSeconds::default());
-    assert_eq!(*opts.rate_group_size_ms, *RateGroupSizeMs::default());
+    assert_eq!(*opts.window_size, *WindowSize::default());
+    assert_eq!(*opts.bucket_size, *BucketSize::default());
     assert_eq!(*opts.hard_limit_factor, *HardLimitFactor::default());
     assert_eq!(
-        *opts.suppression_factor_cache_ms,
-        *SuppressionFactorCacheMs::default()
+        *opts.suppression_factor_cache_period,
+        *SuppressionFactorCachePeriod::default()
     );
 }
 
@@ -35,10 +39,7 @@ fn local_rate_limiter_options_default_has_expected_field_defaults() {
 #[test]
 fn rate_limiter_options_default_composes_local_defaults() {
     let opts = RateLimiterOptions::default();
-    assert_eq!(
-        *opts.local.window_size_seconds,
-        *WindowSizeSeconds::default()
-    );
+    assert_eq!(*opts.local.window_size, *WindowSize::default());
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -65,11 +66,11 @@ fn builder_returns_arc() {
 #[test]
 fn builder_produced_limiter_is_functional() {
     let rl = RateLimiter::builder()
-        .window_size_seconds(60)
+        .window_size(WindowSize::seconds_or_panic(60))
         .build()
         .unwrap();
 
-    let rate = RateLimit::new_or_panic(5.0);
+    let rate = RateLimit::per_second_or_panic(5.0);
     // First inc on an unknown key is always allowed.
     let decision = rl.local().absolute().inc("user_1", &rate, 1);
     assert!(
@@ -87,11 +88,11 @@ fn builder_produced_limiter_is_functional() {
 fn builder_window_size_setter_is_applied() {
     // Window of 1 second: capacity = 1 req/s × 1 s = 1 request.
     let rl = RateLimiter::builder()
-        .window_size_seconds(1)
+        .window_size(WindowSize::seconds_or_panic(1))
         .build()
         .unwrap();
 
-    let rate = RateLimit::new_or_panic(1.0);
+    let rate = RateLimit::per_second_or_panic(1.0);
     assert!(matches!(
         rl.local().absolute().inc("k", &rate, 1),
         crate::RateLimitDecision::Allowed
@@ -104,13 +105,13 @@ fn builder_window_size_setter_is_applied() {
 
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 #[test]
-fn builder_rate_group_size_ms_setter_is_applied() {
+fn builder_bucket_size_setter_is_applied() {
     // Just verify the builder accepts and applies the value without error.
     let rl = RateLimiter::builder()
-        .rate_group_size_ms(50)
+        .bucket_size(BucketSize::milliseconds_or_panic(50))
         .build()
         .unwrap();
-    let rate = RateLimit::new_or_panic(10.0);
+    let rate = RateLimit::per_second_or_panic(10.0);
     assert!(matches!(
         rl.local().absolute().inc("k", &rate, 1),
         crate::RateLimitDecision::Allowed
@@ -127,7 +128,7 @@ fn builder_hard_limit_factor_setter_is_applied() {
         .hard_limit_factor(1.5)
         .build()
         .unwrap();
-    let rate = RateLimit::new_or_panic(10.0);
+    let rate = RateLimit::per_second_or_panic(10.0);
     // First inc on a fresh key is always allowed regardless of strategy.
     let decision = rl.local().absolute().inc("k", &rate, 1);
     assert!(
@@ -138,12 +139,12 @@ fn builder_hard_limit_factor_setter_is_applied() {
 
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 #[test]
-fn builder_suppression_factor_cache_ms_setter_is_applied() {
+fn builder_suppression_factor_cache_period_setter_is_applied() {
     let rl = RateLimiter::builder()
-        .suppression_factor_cache_ms(50)
+        .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(50))
         .build()
         .unwrap();
-    let rate = RateLimit::new_or_panic(10.0);
+    let rate = RateLimit::per_second_or_panic(10.0);
     assert!(matches!(
         rl.local().absolute().inc("k", &rate, 1),
         crate::RateLimitDecision::Allowed
@@ -151,40 +152,14 @@ fn builder_suppression_factor_cache_ms_setter_is_applied() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Builder: validation errors propagate through build()
+// Builder: remaining raw value validation propagates through build()
 // ────────────────────────────────────────────────────────────────────────────
-
-#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-#[test]
-fn builder_invalid_window_size_returns_err() {
-    let result = RateLimiter::builder().window_size_seconds(0).build();
-    assert!(result.is_err(), "window_size_seconds(0) should fail");
-}
-
-#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-#[test]
-fn builder_invalid_rate_group_size_returns_err() {
-    let result = RateLimiter::builder().rate_group_size_ms(0).build();
-    assert!(result.is_err(), "rate_group_size_ms(0) should fail");
-}
 
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 #[test]
 fn builder_invalid_hard_limit_factor_returns_err() {
     let result = RateLimiter::builder().hard_limit_factor(0.5).build();
     assert!(result.is_err(), "hard_limit_factor(0.5) should fail");
-}
-
-#[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-#[test]
-fn builder_invalid_suppression_factor_cache_ms_returns_err() {
-    let result = RateLimiter::builder()
-        .suppression_factor_cache_ms(0)
-        .build();
-    assert!(
-        result.is_err(),
-        "suppression_factor_cache_ms(0) should fail"
-    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -195,13 +170,13 @@ fn builder_invalid_suppression_factor_cache_ms_returns_err() {
 #[test]
 fn builder_cleanup_loop_runs_with_custom_timing() {
     let rl = RateLimiter::builder()
-        .window_size_seconds(60)
+        .window_size(WindowSize::seconds_or_panic(60))
         .stale_after_ms(100)
         .cleanup_interval_ms(50)
         .build()
         .unwrap();
 
-    let rate = RateLimit::new_or_panic(100.0);
+    let rate = RateLimit::per_second_or_panic(100.0);
     rl.local().absolute().inc("k1", &rate, 1);
     rl.local().absolute().inc("k2", &rate, 1);
     assert_eq!(rl.local().absolute().series().len(), 2);
@@ -226,7 +201,7 @@ fn builder_cleanup_loop_is_idempotent_after_build() {
         .build()
         .unwrap();
 
-    let rate = RateLimit::new_or_panic(100.0);
+    let rate = RateLimit::per_second_or_panic(100.0);
     rl.local().absolute().inc("k1", &rate, 1);
     assert_eq!(rl.local().absolute().series().len(), 1);
 
@@ -248,7 +223,7 @@ fn builder_cleanup_loop_is_idempotent_after_build() {
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 #[test]
 fn drop_stops_cleanup_loop() {
-    let rate = RateLimit::new_or_panic(100.0);
+    let rate = RateLimit::per_second_or_panic(100.0);
 
     let rl = RateLimiter::builder()
         .stale_after_ms(100)
@@ -272,7 +247,7 @@ fn drop_stops_cleanup_loop() {
     // the cleanup doesn't continue (we can't inspect the old one after drop).
     let rl2 = Arc::new(RateLimiter::new(RateLimiterOptions {
         local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::new_or_panic(60),
+            window_size: WindowSize::seconds_or_panic(60),
             ..LocalRateLimiterOptions::default()
         },
     }));
@@ -303,7 +278,7 @@ fn stop_cleanup_loop_callable_on_deref_of_arc() {
         .build()
         .unwrap();
 
-    let rate = RateLimit::new_or_panic(100.0);
+    let rate = RateLimit::per_second_or_panic(100.0);
     rl.local().absolute().inc("k", &rate, 1);
 
     // This call must compile: Arc<RateLimiter> auto-derefs to RateLimiter,
@@ -326,18 +301,67 @@ fn stop_cleanup_loop_callable_on_deref_of_arc() {
 #[test]
 fn builder_full_chain_compiles_and_works() {
     let rl = RateLimiter::builder()
-        .window_size_seconds(30)
-        .rate_group_size_ms(10)
+        .window_size(WindowSize::seconds_or_panic(30))
+        .bucket_size(BucketSize::milliseconds_or_panic(10))
         .hard_limit_factor(1.5)
-        .suppression_factor_cache_ms(50)
+        .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(50))
         .stale_after_ms(300_000)
         .cleanup_interval_ms(60_000)
         .build()
         .unwrap();
 
-    let rate = RateLimit::new_or_panic(10.0);
+    let rate = RateLimit::per_second_or_panic(10.0);
     assert!(matches!(
         rl.local().absolute().inc("k", &rate, 1),
         crate::RateLimitDecision::Allowed
     ));
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn redis_builder_accepts_typed_time_configuration_for_all_providers() {
+    runtime::block_on(async {
+        let connection_manager = redis::Client::open(common::redis_url())
+            .unwrap()
+            .get_connection_manager()
+            .await
+            .unwrap();
+        let rl = RateLimiter::builder(connection_manager)
+            .redis_prefix(common::unique_prefix())
+            .window_size(WindowSize::seconds_or_panic(1))
+            .bucket_size(BucketSize::milliseconds_or_panic(10))
+            .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(
+                50,
+            ))
+            .sync_interval(SyncInterval::milliseconds_or_panic(10))
+            .build()
+            .unwrap();
+        let key = common::key("typed_builder");
+        let rate_limit = RateLimit::per_second_or_panic(1.0);
+
+        assert!(matches!(
+            rl.redis()
+                .absolute()
+                .inc(&key, &rate_limit, 1)
+                .await
+                .unwrap(),
+            crate::RateLimitDecision::Allowed
+        ));
+        assert!(matches!(
+            rl.redis()
+                .absolute()
+                .inc(&key, &rate_limit, 1)
+                .await
+                .unwrap(),
+            crate::RateLimitDecision::Rejected { .. }
+        ));
+        assert!(matches!(
+            rl.hybrid()
+                .absolute()
+                .inc(&key, &rate_limit, 1)
+                .await
+                .unwrap(),
+            crate::RateLimitDecision::Allowed
+        ));
+    });
 }

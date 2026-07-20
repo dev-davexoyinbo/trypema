@@ -35,7 +35,7 @@ Each provider offers:
 | ---------- | ---------------------------------------------------- | ---------------------------------------------------- |
 | **Local**  | single-process services, jobs, CLIs                  | state is not shared across processes                 |
 | **Redis**  | strictest distributed coordination this crate offers | every check performs Redis I/O                       |
-| **Hybrid** | high-throughput distributed paths                    | decisions may lag behind Redis by `sync_interval_ms` |
+| **Hybrid** | high-throughput distributed paths                    | decisions may lag behind Redis by `sync_interval` |
 
 ## Installation
 
@@ -43,21 +43,21 @@ Local-only usage:
 
 ```toml
 [dependencies]
-trypema = "1"
+trypema = "2"
 ```
 
 Redis-backed usage with Tokio:
 
 ```toml
 [dependencies]
-trypema = { version = "1", features = ["redis-tokio"] }
+trypema = { version = "2", features = ["redis-tokio"] }
 ```
 
 Redis-backed usage with Smol:
 
 ```toml
 [dependencies]
-trypema = { version = "1", features = ["redis-smol"] }
+trypema = { version = "2", features = ["redis-smol"] }
 ```
 
 Redis and hybrid providers require:
@@ -79,14 +79,22 @@ features are enabled.
 suppressed provider.
 [`RateLimiter`](crate::RateLimiter) is the top-level entry point used throughout the examples.
 
+Time configuration uses unit-explicit constructors. [`WindowSize`](crate::WindowSize) accepts
+seconds through 30-day months; [`BucketSize`](crate::BucketSize) accepts milliseconds through
+30-day months; [`SuppressionFactorCachePeriod`](crate::SuppressionFactorCachePeriod) accepts
+milliseconds through days; and hybrid `SyncInterval` accepts milliseconds through hours.
+[`RateLimit`](crate::RateLimit) accepts per-second, per-minute, per-hour, per-day, per-week, and
+per-30-day-month values. Every fallible constructor has an `_or_panic` counterpart, and integer
+unit conversion returns an error instead of overflowing.
+
 ```rust
 use trypema::RateLimit;
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use trypema::redis::RedisKey;
 
-let _rate_a = RateLimit::new(5.0).unwrap();
-let _rate_b = RateLimit::try_from(5.0).unwrap();
-let _rate_c = RateLimit::new_or_panic(5.0);
+let _rate_a = RateLimit::per_second(5.0).unwrap();
+let _rate_b = RateLimit::per_second(5.0).unwrap();
+let _rate_c = RateLimit::per_second_or_panic(5.0);
 
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 # {
@@ -110,13 +118,13 @@ just a few optional settings.
 ```rust
 # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
 # {
-use trypema::{RateLimit, RateLimitDecision, RateLimiterBuilder};
+use trypema::{BucketSize, RateLimit, RateLimitDecision, RateLimiterBuilder, WindowSize};
 
 let rl = RateLimiterBuilder::default()
     // Optional: override the sliding window size.
-    .window_size_seconds(60)
+    .window_size(WindowSize::seconds_or_panic(60))
     // Optional: override bucket coalescing.
-    .rate_group_size_ms(10)
+    .bucket_size(BucketSize::milliseconds_or_panic(10))
     // Optional: tune suppressed-mode headroom.
     .hard_limit_factor(1.5)
     // Optional: tune cleanup cadence.
@@ -124,7 +132,7 @@ let rl = RateLimiterBuilder::default()
     .build()
     .unwrap();
 
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(
     rl.local().absolute().inc("user_123", &rate, 1),
@@ -142,7 +150,7 @@ simplest setup with defaults and automatic cleanup-loop startup.
 use trypema::{RateLimit, RateLimitDecision, RateLimiter};
 
 let rl = RateLimiter::builder().build().unwrap();
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(
     rl.local().absolute().inc("user_123", &rate, 1),
@@ -157,7 +165,8 @@ With `redis-tokio` or `redis-smol`, create the builder with a Redis `connection_
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 # {
 # trypema::__doctest_helpers::with_redis_rate_limiter(|_rl| async move {
-use trypema::{RateLimit, RateLimitDecision, RateLimiter};
+use trypema::{BucketSize, RateLimit, RateLimitDecision, RateLimiter, WindowSize};
+use trypema::hybrid::SyncInterval;
 use trypema::redis::RedisKey;
 
 let url = std::env::var("REDIS_URL")
@@ -170,20 +179,20 @@ let connection_manager = redis::Client::open(url)
 
 let rl = RateLimiter::builder(connection_manager)
     // Optional: override the sliding window size.
-    .window_size_seconds(60)
+    .window_size(WindowSize::seconds_or_panic(60))
     // Optional: override bucket coalescing.
-    .rate_group_size_ms(10)
+    .bucket_size(BucketSize::milliseconds_or_panic(10))
     // Optional: tune suppressed-mode headroom.
     .hard_limit_factor(1.5)
     // Optional: only available with `redis-tokio` or `redis-smol`.
     .redis_prefix(RedisKey::new_or_panic("docs".to_string()))
     // Optional: only available with `redis-tokio` or `redis-smol`.
-    .sync_interval_ms(10)
+    .sync_interval(SyncInterval::milliseconds_or_panic(10))
     .build()
     .unwrap();
 
 let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(
     rl.redis().absolute().inc(&key, &rate, 1).await.unwrap(),
@@ -204,24 +213,24 @@ over configuration.
 use std::sync::Arc;
 
 use trypema::{
-    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter,
-    RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
+    HardLimitFactor, BucketSize, RateLimit, RateLimitDecision, RateLimiter,
+    RateLimiterOptions, SuppressionFactorCachePeriod, WindowSize,
 };
 use trypema::local::LocalRateLimiterOptions;
 
 let options = RateLimiterOptions {
     local: LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::new_or_panic(60),
-        rate_group_size_ms: RateGroupSizeMs::new_or_panic(10),
+        window_size: WindowSize::seconds_or_panic(60),
+        bucket_size: BucketSize::milliseconds_or_panic(10),
         hard_limit_factor: HardLimitFactor::new_or_panic(1.5),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::new_or_panic(100),
+        suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds_or_panic(100),
     },
 };
 
 let rl = Arc::new(RateLimiter::new(options));
 rl.run_cleanup_loop();
 
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(
     rl.local().absolute().inc("user_123", &rate, 1),
@@ -245,7 +254,7 @@ want to inspect whether a request would be allowed without recording an incremen
 use trypema::{RateLimit, RateLimitDecision};
 
 let limiter = rl.local().absolute();
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(limiter.is_allowed("user_123"), RateLimitDecision::Allowed));
 assert!(matches!(
@@ -289,7 +298,7 @@ equivalents are available on Redis and hybrid strategies when a Redis feature is
 use trypema::{HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision};
 
 let limiter = rl.local().absolute();
-let rate = RateLimit::try_from(10.0).unwrap();
+let rate = RateLimit::per_second(10.0).unwrap();
 assert!(matches!(limiter.inc("user_123", &rate, 2), RateLimitDecision::Allowed));
 assert_eq!(limiter.get("user_123"), 2);
 
@@ -341,7 +350,7 @@ use trypema::{RateLimit, RateLimitDecision};
 use trypema::redis::RedisKey;
 
 let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(
     rl.redis().absolute().inc(&key, &rate, 1).await.unwrap(),
@@ -385,7 +394,7 @@ use trypema::{RateLimit, RateLimitDecision};
 use trypema::redis::RedisKey;
 
 let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-let rate = RateLimit::try_from(10.0).unwrap();
+let rate = RateLimit::per_second(10.0).unwrap();
 
 assert!(matches!(
     rl.hybrid().absolute().inc(&key, &rate, 1).await.unwrap(),
@@ -437,7 +446,7 @@ as old buckets expire, which avoids large boundary effects.
 
 ### Bucket Coalescing
 
-Increments close together in time are merged into one bucket using `rate_group_size_ms`. Larger
+Increments close together in time are merged into one bucket using `bucket_size`. Larger
 values reduce overhead but make timing less precise.
 
 ### Sticky Per-Key Limits

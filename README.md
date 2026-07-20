@@ -39,7 +39,7 @@ Each provider offers:
 | ---------- | ------------------------------------------ | ------------------------------------------------ |
 | **Local**  | single-process services, jobs, CLIs        | not shared across processes                      |
 | **Redis**  | shared limits across processes or machines | every check performs Redis I/O                   |
-| **Hybrid** | high-throughput distributed request paths  | state can lag behind Redis by `sync_interval_ms` |
+| **Hybrid** | high-throughput distributed request paths  | state can lag behind Redis by `sync_interval` |
 
 Redis and hybrid providers require Redis 7.2+ and exactly one runtime feature: `redis-tokio` or
 `redis-smol`.
@@ -50,21 +50,21 @@ Local-only:
 
 ```toml
 [dependencies]
-trypema = "1"
+trypema = "2"
 ```
 
 Redis with Tokio:
 
 ```toml
 [dependencies]
-trypema = { version = "1", features = ["redis-tokio"] }
+trypema = { version = "2", features = ["redis-tokio"] }
 ```
 
 Redis with Smol:
 
 ```toml
 [dependencies]
-trypema = { version = "1", features = ["redis-smol"] }
+trypema = { version = "2", features = ["redis-smol"] }
 ```
 
 ## Quick Start
@@ -76,13 +76,20 @@ type required by the Redis and hybrid providers. `RateLimitDecision` is the resu
 `inc()` and `is_allowed()`, and `RateLimiter` is the top-level entry point used throughout the
 examples. `SuppressedRateLimitSnapshot` is returned by `get()` on each suppressed provider.
 
+Time configuration uses unit-explicit constructors. `WindowSize` accepts seconds through
+30-day months; `BucketSize` accepts milliseconds through 30-day months;
+`SuppressionFactorCachePeriod` accepts milliseconds through days; and hybrid `SyncInterval`
+accepts milliseconds through hours. `RateLimit` accepts per-second, per-minute, per-hour,
+per-day, per-week, and per-30-day-month values. Every fallible constructor has an `_or_panic`
+counterpart, and integer unit conversion returns an error instead of overflowing.
+
 ```rust,no_run
 use trypema::RateLimit;
 use trypema::redis::RedisKey;
 
-let _rate_a = RateLimit::new(5.0).unwrap();
-let _rate_b = RateLimit::try_from(5.0).unwrap();
-let _rate_c = RateLimit::new_or_panic(5.0);
+let _rate_a = RateLimit::per_second(5.0).unwrap();
+let _rate_b = RateLimit::per_second(5.0).unwrap();
+let _rate_c = RateLimit::per_second_or_panic(5.0);
 
 let _key_a = RedisKey::new("user_123".to_string()).unwrap();
 let _key_b = RedisKey::try_from("user_123".to_string()).unwrap();
@@ -94,13 +101,13 @@ let _key_c = RedisKey::new_or_panic("user_123".to_string());
 These examples show the local-only and Redis-enabled builder paths.
 
 ```rust
-use trypema::{RateLimit, RateLimitDecision, RateLimiterBuilder};
+use trypema::{BucketSize, RateLimit, RateLimitDecision, RateLimiterBuilder, WindowSize};
 
 let rl = RateLimiterBuilder::default()
     // Optional: override the sliding window size.
-    .window_size_seconds(60)
+    .window_size(WindowSize::seconds_or_panic(60))
     // Optional: override bucket coalescing.
-    .rate_group_size_ms(10)
+    .bucket_size(BucketSize::milliseconds_or_panic(10))
     // Optional: tune suppressed-mode headroom.
     .hard_limit_factor(1.5)
     // Optional: tune cleanup cadence.
@@ -108,7 +115,7 @@ let rl = RateLimiterBuilder::default()
     .build()
     .unwrap();
 
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(
     rl.local().absolute().inc("user_123", &rate, 1),
@@ -120,7 +127,7 @@ assert!(matches!(
 use trypema::{RateLimit, RateLimitDecision, RateLimiter};
 
 let rl = RateLimiter::builder().build().unwrap();
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(
     rl.local().absolute().inc("user_123", &rate, 1),
@@ -129,7 +136,8 @@ assert!(matches!(
 ```
 
 ```rust,no_run
-use trypema::{RateLimit, RateLimitDecision, RateLimiter};
+use trypema::{BucketSize, RateLimit, RateLimitDecision, RateLimiter, WindowSize};
+use trypema::hybrid::SyncInterval;
 use trypema::redis::RedisKey;
 
 async fn example() -> Result<(), trypema::TrypemaError> {
@@ -141,19 +149,19 @@ async fn example() -> Result<(), trypema::TrypemaError> {
 
     let rl = RateLimiter::builder(connection_manager)
         // Optional: override the sliding window size.
-        .window_size_seconds(60)
+        .window_size(WindowSize::seconds_or_panic(60))
         // Optional: override bucket coalescing.
-        .rate_group_size_ms(10)
+        .bucket_size(BucketSize::milliseconds_or_panic(10))
         // Optional: tune suppressed-mode headroom.
         .hard_limit_factor(1.5)
         // Optional: only available with `redis-tokio` or `redis-smol`.
         .redis_prefix(RedisKey::new_or_panic("docs".to_string()))
         // Optional: only available with `redis-tokio` or `redis-smol`.
-        .sync_interval_ms(10)
+        .sync_interval(SyncInterval::milliseconds_or_panic(10))
         .build()?;
 
     let key = RedisKey::try_from("user_123".to_string())?;
-    let rate = RateLimit::try_from(5.0).unwrap();
+    let rate = RateLimit::per_second(5.0).unwrap();
 
     assert!(matches!(
         rl.redis().absolute().inc(&key, &rate, 1).await?,
@@ -168,24 +176,24 @@ async fn example() -> Result<(), trypema::TrypemaError> {
 use std::sync::Arc;
 
 use trypema::{
-    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter,
-    RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
+    HardLimitFactor, BucketSize, RateLimit, RateLimitDecision, RateLimiter,
+    RateLimiterOptions, SuppressionFactorCachePeriod, WindowSize,
 };
 use trypema::local::LocalRateLimiterOptions;
 
 let options = RateLimiterOptions {
     local: LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::new_or_panic(60),
-        rate_group_size_ms: RateGroupSizeMs::new_or_panic(10),
+        window_size: WindowSize::seconds_or_panic(60),
+        bucket_size: BucketSize::milliseconds_or_panic(10),
         hard_limit_factor: HardLimitFactor::new_or_panic(1.5),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::new_or_panic(100),
+        suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds_or_panic(100),
     },
 };
 
 let rl = Arc::new(RateLimiter::new(options));
 rl.run_cleanup_loop();
 
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(
     rl.local().absolute().inc("user_123", &rate, 1),
@@ -203,7 +211,7 @@ use trypema::{RateLimit, RateLimitDecision, RateLimiter};
 
 let rl = RateLimiter::builder().build().unwrap();
 let limiter = rl.local().absolute();
-let rate = RateLimit::try_from(5.0).unwrap();
+let rate = RateLimit::per_second(5.0).unwrap();
 
 assert!(matches!(limiter.is_allowed("user_123"), RateLimitDecision::Allowed));
 assert!(matches!(
@@ -242,7 +250,7 @@ use trypema::{
 
 let rl = RateLimiter::builder().build().unwrap();
 let limiter = rl.local().absolute();
-let rate = RateLimit::try_from(10.0).unwrap();
+let rate = RateLimit::per_second(10.0).unwrap();
 assert!(matches!(limiter.inc("user_123", &rate, 2), RateLimitDecision::Allowed));
 assert_eq!(limiter.get("user_123"), 2);
 
@@ -294,7 +302,7 @@ async fn example() -> Result<(), trypema::TrypemaError> {
 
     let rl = RateLimiter::builder(connection_manager).build()?;
     let key = RedisKey::try_from("user_123".to_string())?;
-    let rate = RateLimit::try_from(5.0).unwrap();
+    let rate = RateLimit::per_second(5.0).unwrap();
 
     assert!(matches!(
         rl.redis().absolute().inc(&key, &rate, 1).await?,
@@ -345,7 +353,7 @@ async fn example() -> Result<(), trypema::TrypemaError> {
 
     let rl = RateLimiter::builder(connection_manager).build()?;
     let key = RedisKey::try_from("user_123".to_string())?;
-    let rate = RateLimit::try_from(10.0).unwrap();
+    let rate = RateLimit::per_second(10.0).unwrap();
 
     assert!(matches!(
         rl.hybrid().absolute().inc(&key, &rate, 1).await?,
@@ -373,7 +381,7 @@ async fn example() -> Result<(), trypema::TrypemaError> {
 
     let rl = RateLimiter::builder(connection_manager).build()?;
     let key = RedisKey::try_from("user_123".to_string())?;
-    let rate = RateLimit::try_from(10.0).unwrap();
+    let rate = RateLimit::per_second(10.0).unwrap();
 
     assert!(matches!(
         rl.hybrid().suppressed().inc(&key, &rate, 1).await?,

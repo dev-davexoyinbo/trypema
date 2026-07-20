@@ -1,9 +1,8 @@
 use redis::aio::ConnectionManager;
 
 use crate::{
-    AbsoluteRedisRateLimiter, HardLimitFactor, RateGroupSizeMs, RedisKey,
-    SuppressedRedisRateLimiter, TrypemaError, WindowSizeSeconds, common::SuppressionFactorCacheMs,
-    hybrid::SyncIntervalMs,
+    AbsoluteRedisRateLimiter, BucketSize, HardLimitFactor, RedisKey, SuppressedRedisRateLimiter,
+    TrypemaError, WindowSize, common::SuppressionFactorCachePeriod, hybrid::SyncInterval,
 };
 
 /// Configuration for Redis-backed rate limiters.
@@ -72,15 +71,15 @@ pub struct RedisRateLimiterOptions {
 
     /// Sliding window duration for admission decisions.
     ///
-    /// Same semantics as [`crate::local::LocalRateLimiterOptions::window_size_seconds`]. See
-    /// [`WindowSizeSeconds`] for details.
-    pub window_size_seconds: WindowSizeSeconds,
+    /// Same semantics as [`crate::local::LocalRateLimiterOptions::window_size`]. See
+    /// [`WindowSize`] for details.
+    pub window_size: WindowSize,
 
     /// Bucket coalescing interval in milliseconds.
     ///
-    /// Same semantics as [`crate::local::LocalRateLimiterOptions::rate_group_size_ms`]. See
-    /// [`RateGroupSizeMs`] for details.
-    pub rate_group_size_ms: RateGroupSizeMs,
+    /// Same semantics as [`crate::local::LocalRateLimiterOptions::bucket_size`]. See
+    /// [`BucketSize`] for details.
+    pub bucket_size: BucketSize,
 
     /// Hard cutoff multiplier for the suppressed strategy.
     ///
@@ -91,8 +90,8 @@ pub struct RedisRateLimiterOptions {
     /// Cache duration (milliseconds) for suppression factor recomputation.
     ///
     /// Same semantics as
-    /// [`crate::local::LocalRateLimiterOptions::suppression_factor_cache_ms`].
-    pub suppression_factor_cache_ms: SuppressionFactorCacheMs,
+    /// [`crate::local::LocalRateLimiterOptions::suppression_factor_cache_period`].
+    pub suppression_factor_cache_period: SuppressionFactorCachePeriod,
 
     /// Sync interval (milliseconds) for the hybrid provider's background flush.
     ///
@@ -101,7 +100,7 @@ pub struct RedisRateLimiterOptions {
     ///
     /// The pure Redis provider (`rl.redis()`) does not maintain a local fast-path and therefore
     /// does not use this value.
-    pub sync_interval_ms: SyncIntervalMs,
+    pub sync_interval: SyncInterval,
 }
 
 impl RedisRateLimiterOptions {
@@ -109,17 +108,17 @@ impl RedisRateLimiterOptions {
     ///
     /// All other fields default to their type's [`Default`] value:
     /// - `prefix`: `None` (uses `"trypema"`)
-    /// - `window_size_seconds`: [`WindowSizeSeconds::default()`]
-    /// - `rate_group_size_ms`: [`RateGroupSizeMs::default()`]
+    /// - `window_size`: [`WindowSize::default()`]
+    /// - `bucket_size`: [`BucketSize::default()`]
     /// - `hard_limit_factor`: [`HardLimitFactor::default()`]
-    /// - `suppression_factor_cache_ms`: [`SuppressionFactorCacheMs::default()`]
-    /// - `sync_interval_ms`: [`SyncIntervalMs::default()`]
+    /// - `suppression_factor_cache_period`: [`SuppressionFactorCachePeriod::default()`]
+    /// - `sync_interval`: [`SyncInterval::default()`]
     ///
     /// Override specific fields with struct update syntax:
     ///
     /// ```
     /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
-    /// use trypema::WindowSizeSeconds;
+    /// use trypema::WindowSize;
     /// use trypema::redis::RedisRateLimiterOptions;
     ///
     /// let url = std::env::var("REDIS_URL")
@@ -131,7 +130,7 @@ impl RedisRateLimiterOptions {
     ///     .unwrap();
     ///
     /// let _options = RedisRateLimiterOptions {
-    ///     window_size_seconds: WindowSizeSeconds::new_or_panic(60),
+    ///     window_size: WindowSize::seconds_or_panic(60),
     ///     ..RedisRateLimiterOptions::new(conn)
     /// };
     /// let _ = rl;
@@ -141,11 +140,11 @@ impl RedisRateLimiterOptions {
         Self {
             connection_manager,
             prefix: None,
-            window_size_seconds: WindowSizeSeconds::default(),
-            rate_group_size_ms: RateGroupSizeMs::default(),
+            window_size: WindowSize::default(),
+            bucket_size: BucketSize::default(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-            sync_interval_ms: SyncIntervalMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+            sync_interval: SyncInterval::default(),
         }
     }
 }
@@ -182,7 +181,7 @@ impl RedisRateLimiterOptions {
 /// use trypema::redis::RedisKey;
 ///
 /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-/// let rate = RateLimit::try_from(10.0).unwrap();
+/// let rate = RateLimit::per_second(10.0).unwrap();
 ///
 /// assert!(matches!(
 ///     rl.redis().absolute().inc(&key, &rate, 1).await.unwrap(),
@@ -221,7 +220,7 @@ impl RedisRateLimiterProvider {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// assert!(matches!(
     ///     rl.redis().absolute().inc(&key, &rate, 1).await.unwrap(),
     ///     RateLimitDecision::Allowed
@@ -249,7 +248,7 @@ impl RedisRateLimiterProvider {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// match rl.redis().suppressed().inc(&key, &rate, 1).await.unwrap() {
     ///     RateLimitDecision::Allowed => {}

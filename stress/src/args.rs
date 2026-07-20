@@ -6,7 +6,7 @@ use std::{
 use clap::{Parser, ValueEnum};
 
 use trypema::local::LocalRateLimiterOptions;
-use trypema::{HardLimitFactor, RateGroupSizeMs, SuppressionFactorCacheMs, WindowSizeSeconds};
+use trypema::{BucketSize, HardLimitFactor, SuppressionFactorCachePeriod, WindowSize};
 
 #[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 pub(crate) enum Provider {
@@ -305,11 +305,13 @@ pub(crate) fn build_keys(args: &Args) -> Arc<[String]> {
 
 pub(crate) fn build_local_options(args: &Args) -> LocalRateLimiterOptions {
     LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::try_from(args.window_s).unwrap(),
-        rate_group_size_ms: RateGroupSizeMs::try_from(args.group_ms).unwrap(),
+        window_size: WindowSize::seconds(args.window_s).unwrap(),
+        bucket_size: BucketSize::milliseconds(args.group_ms).unwrap(),
         hard_limit_factor: HardLimitFactor::try_from(args.hard_limit_factor).unwrap(),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(args.suppression_cache_ms)
-            .unwrap(),
+        suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
+            args.suppression_cache_ms,
+        )
+        .unwrap(),
     }
 } // end fn build_local_options
 
@@ -324,12 +326,14 @@ pub(crate) fn build_redis_options(
     RedisRateLimiterOptions {
         connection_manager,
         prefix: Some(RedisKey::try_from(args.redis_prefix.clone()).unwrap()),
-        window_size_seconds: WindowSizeSeconds::try_from(args.window_s).unwrap(),
-        rate_group_size_ms: RateGroupSizeMs::try_from(args.group_ms).unwrap(),
+        window_size: WindowSize::seconds(args.window_s).unwrap(),
+        bucket_size: BucketSize::milliseconds(args.group_ms).unwrap(),
         hard_limit_factor: HardLimitFactor::try_from(args.hard_limit_factor).unwrap(),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(args.suppression_cache_ms)
-            .unwrap(),
-        sync_interval_ms: trypema::hybrid::SyncIntervalMs::default(),
+        suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
+            args.suppression_cache_ms,
+        )
+        .unwrap(),
+        sync_interval: trypema::hybrid::SyncInterval::default(),
     }
 } // end fn build_redis_options
 

@@ -9,8 +9,8 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use crate::{
     HistoryPreservation, LocalRateLimiterOptions, RateLimitComparator,
     common::{
-        Bucket, HistoryUpdateMode, RandomState, RateGroupSizeMs, RateLimit, RateLimitDecision,
-        WindowSizeSeconds,
+        Bucket, BucketSize, HistoryUpdateMode, RandomState, RateLimit, RateLimitDecision,
+        WindowSize,
     },
 };
 
@@ -38,7 +38,7 @@ impl RateLimitSeries {
 ///
 /// # Algorithm
 ///
-/// 1. **Window capacity:** `window_size_seconds × rate_limit`
+/// 1. **Window capacity:** `window_size × rate_limit`
 /// 2. **Admission check:** Sum all bucket counts within the window
 /// 3. **Decision:** Allow if `total < capacity`, reject otherwise
 /// 4. **Increment:** If allowed, add count to current (or coalesced) bucket
@@ -64,7 +64,7 @@ impl RateLimitSeries {
 ///
 /// **Eviction granularity:**
 /// - Uses `Instant::elapsed().as_millis()` (whole-millisecond truncation)
-/// - Buckets expire close to `window_size_seconds` (lazy eviction may delay removal until next call)
+/// - Buckets expire close to `window_size` (lazy eviction may delay removal until next call)
 ///
 /// **Memory growth:**
 /// - Keys are not automatically removed
@@ -88,27 +88,27 @@ impl RateLimitSeries {
 /// use trypema::{RateLimit, RateLimitDecision};
 ///
 /// let limiter = rl.local().absolute();
-/// let rate = RateLimit::try_from(10.0).unwrap();
+/// let rate = RateLimit::per_second(10.0).unwrap();
 ///
 /// assert!(matches!(limiter.inc("user_123", &rate, 1), RateLimitDecision::Allowed));
 /// assert!(matches!(limiter.is_allowed("user_123"), RateLimitDecision::Allowed));
 /// ```
 #[derive(Debug)]
 pub struct AbsoluteLocalRateLimiter {
-    window_size_seconds: WindowSizeSeconds,
+    window_size: WindowSize,
     window_size_ms: u128,
     window_duration: Duration,
-    rate_group_size_ms: RateGroupSizeMs,
+    bucket_size: BucketSize,
     series: DashMap<String, RateLimitSeries, RandomState>,
 }
 
 impl AbsoluteLocalRateLimiter {
     pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
         Self {
-            window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
-            window_duration: Duration::from_secs(*options.window_size_seconds),
-            window_size_seconds: options.window_size_seconds,
-            rate_group_size_ms: options.rate_group_size_ms,
+            window_size_ms: (*options.window_size as u128).saturating_mul(1000),
+            window_duration: Duration::from_secs(*options.window_size),
+            window_size: options.window_size,
+            bucket_size: options.bucket_size,
             series: DashMap::default(),
         }
     } // end constructor
@@ -139,7 +139,7 @@ impl AbsoluteLocalRateLimiter {
     /// 1. Check current window usage via `is_allowed(key)`
     /// 2. If over limit, return `Rejected` (no state change)
     /// 3. If allowed:
-    ///    - Check if recent bucket exists within `rate_group_size_ms`
+    ///    - Check if recent bucket exists within `bucket_size`
     ///    - If yes: add count to existing bucket (coalescing)
     ///    - If no: create new bucket with count
     ///    - Return `Allowed`
@@ -155,7 +155,7 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// # Bucket Coalescing
     ///
-    /// Increments within `rate_group_size_ms` of the most recent bucket are merged
+    /// Increments within `bucket_size` of the most recent bucket are merged
     /// into that bucket. This reduces memory usage and improves performance.
     ///
     /// # Examples
@@ -165,7 +165,7 @@ impl AbsoluteLocalRateLimiter {
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let limiter = rl.local().absolute();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Single request
     /// assert!(matches!(limiter.inc("user_123", &rate, 1), RateLimitDecision::Allowed));
@@ -185,23 +185,22 @@ impl AbsoluteLocalRateLimiter {
             None => self
                 .series
                 .entry(key.to_string())
-                .or_insert_with(|| {
-                    RateLimitSeries::new(**rate_limit * *self.window_size_seconds as f64)
-                })
+                .or_insert_with(|| RateLimitSeries::new(**rate_limit * *self.window_size as f64))
                 .downgrade(),
         };
 
         if let Some(latest_bucket) = series.buckets.back()
-            && latest_bucket.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
+            && latest_bucket.timestamp.elapsed().as_millis() <= *self.bucket_size as u128
         {
             latest_bucket.count.fetch_add(count, Ordering::AcqRel);
             series.total_count.fetch_add(count, Ordering::AcqRel);
         } else {
             drop(series);
 
-            let mut series = self.series.entry(key.to_string()).or_insert_with(|| {
-                RateLimitSeries::new(**rate_limit * *self.window_size_seconds as f64)
-            });
+            let mut series = self
+                .series
+                .entry(key.to_string())
+                .or_insert_with(|| RateLimitSeries::new(**rate_limit * *self.window_size as f64));
 
             series.buckets.push_back(Bucket {
                 count: count.into(),
@@ -234,7 +233,7 @@ impl AbsoluteLocalRateLimiter {
     /// 1. If key doesn't exist, return `Allowed` (no state yet)
     /// 2. Perform lazy eviction of expired buckets
     /// 3. Sum remaining bucket counts
-    /// 4. Compare against `window_capacity = window_size_seconds × rate_limit`
+    /// 4. Compare against `window_capacity = window_size × rate_limit`
     /// 5. Return decision with metadata if rejected
     ///
     /// # Side Effects
@@ -255,7 +254,7 @@ impl AbsoluteLocalRateLimiter {
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let limiter = rl.local().absolute();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Unknown key → always allowed
     /// assert!(matches!(limiter.is_allowed("new_key"), RateLimitDecision::Allowed));
@@ -317,7 +316,7 @@ impl AbsoluteLocalRateLimiter {
         };
 
         RateLimitDecision::Rejected {
-            window_size_seconds: *self.window_size_seconds,
+            window_size_seconds: *self.window_size,
             retry_after_ms,
             remaining_after_waiting,
         }
@@ -402,7 +401,7 @@ impl AbsoluteLocalRateLimiter {
                     return (old_total, old_total);
                 }
 
-                let window_limit = **rate_limit * *self.window_size_seconds as f64;
+                let window_limit = **rate_limit * *self.window_size as f64;
 
                 let unchanged = count > 0
                     && matches!(mode, HistoryUpdateMode::Preserve(_))
@@ -443,7 +442,7 @@ impl AbsoluteLocalRateLimiter {
                     Self::evict_expired(series, self.window_duration);
                 }
 
-                series.window_limit = **rate_limit * *self.window_size_seconds as f64;
+                series.window_limit = **rate_limit * *self.window_size as f64;
 
                 if old_total == count && matches!(mode, HistoryUpdateMode::Preserve(_)) {
                     return (old_total, old_total);
@@ -458,8 +457,7 @@ impl AbsoluteLocalRateLimiter {
                     return (0, 0);
                 }
 
-                let mut series =
-                    RateLimitSeries::new(**rate_limit * *self.window_size_seconds as f64);
+                let mut series = RateLimitSeries::new(**rate_limit * *self.window_size as f64);
 
                 Self::apply_history_update(&mut series, count, 0, mode);
                 entry.insert(series);
@@ -555,7 +553,7 @@ impl AbsoluteLocalRateLimiter {
     /// let limiter = rl.local().absolute();
     /// assert_eq!(limiter.get("user_123"), 0);
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// limiter.inc("user_123", &rate, 3);
     /// assert_eq!(limiter.get("user_123"), 3);
     /// ```
@@ -600,7 +598,7 @@ impl AbsoluteLocalRateLimiter {
     /// use trypema::{RateLimit, RateLimitComparator};
     ///
     /// let limiter = rl.local().absolute();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Prime the window to 40.
     /// let (new_total, old_total) =

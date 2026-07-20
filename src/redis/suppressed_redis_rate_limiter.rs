@@ -1,10 +1,10 @@
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    HardLimitFactor, HistoryPreservation, RateGroupSizeMs, RateLimit, RateLimitComparator,
+    BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, RedisKey, RedisRateLimiterOptions, SuppressedRateLimitSnapshot,
-    TrypemaError, WindowSizeSeconds,
-    common::{HistoryUpdateMode, RateType, SuppressionFactorCacheMs},
+    TrypemaError, WindowSize,
+    common::{HistoryUpdateMode, RateType, SuppressionFactorCachePeriod},
     redis::{
         RedisKeyGenerator,
         scripts::{
@@ -48,9 +48,9 @@ pub struct SuppressedRedisRateLimiter {
     connection_manager: ConnectionManager,
     key_generator: RedisKeyGenerator,
     hard_limit_factor: HardLimitFactor,
-    rate_group_size_ms: RateGroupSizeMs,
-    window_size_seconds: WindowSizeSeconds,
-    suppression_factor_cache_ms: SuppressionFactorCacheMs,
+    bucket_size: BucketSize,
+    window_size: WindowSize,
+    suppression_factor_cache_period: SuppressionFactorCachePeriod,
     inc_script: Script,
     cleanup_script: Script,
     suppression_factor_script: Script,
@@ -65,10 +65,10 @@ impl SuppressedRedisRateLimiter {
 
         Self {
             connection_manager: options.connection_manager,
-            window_size_seconds: options.window_size_seconds,
-            rate_group_size_ms: options.rate_group_size_ms,
+            window_size: options.window_size,
+            bucket_size: options.bucket_size,
             hard_limit_factor: options.hard_limit_factor,
-            suppression_factor_cache_ms: options.suppression_factor_cache_ms,
+            suppression_factor_cache_period: options.suppression_factor_cache_period,
             key_generator,
             inc_script: suppressed_lua_script(SUPPRESSED_INC_LUA),
             cleanup_script: lua_script(SUPPRESSED_CLEANUP_LUA),
@@ -112,7 +112,7 @@ impl SuppressedRedisRateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// // Under limit → Allowed
     /// assert!(matches!(
     ///     rl.redis().suppressed().inc(&key, &rate, 1).await.unwrap(),
@@ -127,8 +127,7 @@ impl SuppressedRedisRateLimiter {
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
-        let hard_window_limit =
-            *self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor;
+        let hard_window_limit = *self.window_size as f64 * **rate_limit * *self.hard_limit_factor;
 
         let (result, suppression_factor, should_allow): (String, f64, u8) = self
             .inc_script
@@ -141,10 +140,10 @@ impl SuppressedRedisRateLimiter {
             .key(self.key_generator.get_total_declined_key(key))
             .key(self.key_generator.get_hash_declined_key(key))
             .arg(key.to_string())
-            .arg(*self.window_size_seconds)
+            .arg(*self.window_size)
             .arg(hard_window_limit)
-            .arg(*self.rate_group_size_ms)
-            .arg(*self.suppression_factor_cache_ms)
+            .arg(*self.bucket_size)
+            .arg(*self.suppression_factor_cache_period)
             .arg(*self.hard_limit_factor)
             .arg(count)
             .invoke_async(&mut connection_manager)
@@ -186,8 +185,8 @@ impl SuppressedRedisRateLimiter {
             .key(self.key_generator.get_total_declined_key(key))
             .key(self.key_generator.get_hash_declined_key(key))
             .arg(key.to_string())
-            .arg(*self.window_size_seconds)
-            .arg(*self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor)
+            .arg(*self.window_size)
+            .arg(*self.window_size as f64 * **rate_limit * *self.hard_limit_factor)
             .arg(comparator_op)
             .arg(comparator_operand)
             .arg(count)
@@ -213,7 +212,7 @@ impl SuppressedRedisRateLimiter {
     ///
     /// **Caching:** If a cached value exists in Redis (set via `SET ... PX`), it is returned
     /// directly. Otherwise, this recomputes the factor via the same algorithm used in `inc()`
-    /// and writes it back to Redis with a `suppression_factor_cache_ms` TTL. If the cached
+    /// and writes it back to Redis with a `suppression_factor_cache_period` TTL. If the cached
     /// value is outside `[0.0, 1.0]`, it is treated as stale and recomputed.
     /// Unknown keys return `0.0` without creating cache or active-entity state. Evicting
     /// expired history invalidates any factor cached from that history.
@@ -243,9 +242,9 @@ impl SuppressedRedisRateLimiter {
             .key(self.key_generator.get_total_declined_key(key))
             .key(self.key_generator.get_hash_declined_key(key))
             .arg(key.to_string())
-            .arg(*self.window_size_seconds)
-            .arg(*self.rate_group_size_ms)
-            .arg(*self.suppression_factor_cache_ms)
+            .arg(*self.window_size)
+            .arg(*self.bucket_size)
+            .arg(*self.suppression_factor_cache_period)
             .arg(*self.hard_limit_factor)
             .invoke_async(&mut connection_manager)
             .await?;
@@ -273,7 +272,7 @@ impl SuppressedRedisRateLimiter {
     /// assert_eq!(snapshot.total_declined, 0);
     /// assert_eq!(snapshot.suppression_factor, 0.0);
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// rl.redis().suppressed().inc(&key, &rate, 3).await.unwrap();
     /// assert_eq!(rl.redis().suppressed().get(&key).await.unwrap().total, 3);
     /// # });
@@ -292,8 +291,8 @@ impl SuppressedRedisRateLimiter {
             .key(self.key_generator.get_window_limit_key(key))
             .key(self.key_generator.get_suppression_factor_key(key))
             .arg(key.to_string())
-            .arg(*self.window_size_seconds)
-            .arg(*self.suppression_factor_cache_ms)
+            .arg(*self.window_size)
+            .arg(*self.suppression_factor_cache_period)
             .arg(*self.hard_limit_factor)
             .invoke_async(&mut connection_manager)
             .await?;
@@ -311,7 +310,7 @@ impl SuppressedRedisRateLimiter {
     /// evaluates `comparator`, and — on a match — prunes expired buckets and replaces
     /// the window contents with a single current-timestamp bucket holding `count`,
     /// with **no declines** recorded against it. On a match the key's hard window
-    /// limit is (re)defined as `window_size_seconds × rate_limit × hard_limit_factor`
+    /// limit is (re)defined as `window_size × rate_limit × hard_limit_factor`
     /// and the cached suppression factor is deleted so it is recomputed from the new
     /// state on the next call. A comparator miss leaves history, limit, TTL, and
     /// cached suppression metadata untouched. A matched `count` of zero removes all
@@ -343,7 +342,7 @@ impl SuppressedRedisRateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Prime the window to 40.
     /// let (new_total, old_total) = rl

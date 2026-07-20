@@ -1,8 +1,8 @@
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    HistoryPreservation, RateGroupSizeMs, RateLimit, RateLimitComparator, RateLimitDecision,
-    RedisKey, RedisKeyGenerator, RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
+    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, RedisKey,
+    RedisKeyGenerator, RedisRateLimiterOptions, TrypemaError, WindowSize,
     common::{HistoryUpdateMode, RateType},
     redis::scripts::{
         ABSOLUTE_CLEANUP_LUA, ABSOLUTE_GET_TOTAL_LUA, ABSOLUTE_INC_LUA, ABSOLUTE_IS_ALLOWED_LUA,
@@ -43,8 +43,8 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct AbsoluteRedisRateLimiter {
     connection_manager: ConnectionManager,
-    window_size_seconds: WindowSizeSeconds,
-    rate_group_size_ms: RateGroupSizeMs,
+    window_size: WindowSize,
+    bucket_size: BucketSize,
     key_generator: RedisKeyGenerator,
     inc_script: Script,
     is_allowed_script: Script,
@@ -59,8 +59,8 @@ impl AbsoluteRedisRateLimiter {
 
         Self {
             connection_manager: options.connection_manager,
-            window_size_seconds: options.window_size_seconds,
-            rate_group_size_ms: options.rate_group_size_ms,
+            window_size: options.window_size,
+            bucket_size: options.bucket_size,
             key_generator: RedisKeyGenerator::new(prefix, RateType::Absolute),
             inc_script: absolute_lua_script(ABSOLUTE_INC_LUA),
             is_allowed_script: absolute_lua_script(ABSOLUTE_IS_ALLOWED_LUA),
@@ -98,7 +98,7 @@ impl AbsoluteRedisRateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// assert!(matches!(
     ///     rl.redis().absolute().inc(&key, &rate, 1).await.unwrap(),
     ///     RateLimitDecision::Allowed
@@ -113,7 +113,7 @@ impl AbsoluteRedisRateLimiter {
     ) -> Result<RateLimitDecision, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let window_limit = *self.window_size_seconds as f64 * **rate_limit;
+        let window_limit = *self.window_size as f64 * **rate_limit;
 
         let (result, retry_after_ms, remaining_after_waiting): (String, u128, u64) = self
             .inc_script
@@ -123,9 +123,9 @@ impl AbsoluteRedisRateLimiter {
             .key(self.key_generator.get_total_count_key(key))
             .key(self.key_generator.get_active_entities_key())
             .arg(key.to_string())
-            .arg(*self.window_size_seconds)
+            .arg(*self.window_size)
             .arg(window_limit)
-            .arg(*self.rate_group_size_ms)
+            .arg(*self.bucket_size)
             .arg(count)
             .invoke_async(&mut connection_manager)
             .await?;
@@ -133,7 +133,7 @@ impl AbsoluteRedisRateLimiter {
         match result.as_str() {
             "allowed" => Ok(RateLimitDecision::Allowed),
             "rejected" => Ok(RateLimitDecision::Rejected {
-                window_size_seconds: *self.window_size_seconds,
+                window_size_seconds: *self.window_size,
                 retry_after_ms,
                 remaining_after_waiting,
             }),
@@ -175,14 +175,14 @@ impl AbsoluteRedisRateLimiter {
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))
             .key(self.key_generator.get_total_count_key(key))
-            .arg(*self.window_size_seconds)
+            .arg(*self.window_size)
             .invoke_async(&mut connection_manager)
             .await?;
 
         match result.as_str() {
             "allowed" => Ok(RateLimitDecision::Allowed),
             "rejected" => Ok(RateLimitDecision::Rejected {
-                window_size_seconds: *self.window_size_seconds,
+                window_size_seconds: *self.window_size,
                 retry_after_ms,
                 remaining_after_waiting,
             }),
@@ -210,7 +210,7 @@ impl AbsoluteRedisRateLimiter {
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
     /// assert_eq!(rl.redis().absolute().get(&key).await.unwrap(), 0);
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// rl.redis().absolute().inc(&key, &rate, 3).await.unwrap();
     /// assert_eq!(rl.redis().absolute().get(&key).await.unwrap(), 3);
     /// # });
@@ -226,7 +226,7 @@ impl AbsoluteRedisRateLimiter {
             .key(self.key_generator.get_active_entities_key())
             .key(self.key_generator.get_window_limit_key(key))
             .arg(key.to_string())
-            .arg(*self.window_size_seconds)
+            .arg(*self.window_size)
             .invoke_async(&mut connection_manager)
             .await?;
 
@@ -252,8 +252,8 @@ impl AbsoluteRedisRateLimiter {
             .key(self.key_generator.get_total_count_key(key))
             .key(self.key_generator.get_active_entities_key())
             .arg(key.to_string())
-            .arg(*self.window_size_seconds)
-            .arg(*self.window_size_seconds as f64 * **rate_limit)
+            .arg(*self.window_size)
+            .arg(*self.window_size as f64 * **rate_limit)
             .arg(comparator_op)
             .arg(comparator_operand)
             .arg(count)
@@ -271,7 +271,7 @@ impl AbsoluteRedisRateLimiter {
     /// evaluates `comparator`, and — on a match — prunes expired buckets and replaces
     /// the window contents with a single current-timestamp bucket holding `count`.
     /// On a match the key's window limit is (re)defined as
-    /// `window_size_seconds × rate_limit` and its TTL refreshed. A comparator miss
+    /// `window_size × rate_limit` and its TTL refreshed. A comparator miss
     /// performs no Redis writes. A matched `count` of zero removes every per-entity
     /// Redis key and its active-entity membership.
     ///
@@ -306,7 +306,7 @@ impl AbsoluteRedisRateLimiter {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Prime the window to 40.
     /// let (new_total, old_total) = rl

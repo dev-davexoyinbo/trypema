@@ -13,8 +13,8 @@ mod benchmarks {
 
     fn config(window_s: u64, group_ms: u64) -> LimiterConfig {
         LimiterConfig {
-            window_size_seconds: window_s,
-            rate_group_size_ms: group_ms,
+            window_size: window_s,
+            bucket_size: group_ms,
             ..LimiterConfig::default()
         }
     }
@@ -72,7 +72,7 @@ mod benchmarks {
         group.bench_function("inc/rejected", |b| {
             let rl = build_local_limiter(config(60, 10));
             let limiter = rl.local().absolute();
-            let rate = RateLimit::try_from(10.0).unwrap();
+            let rate = RateLimit::per_second(10.0).unwrap();
             let k = "k";
 
             // Fill to (or past) capacity so we take the reject fast-path.
@@ -89,7 +89,7 @@ mod benchmarks {
         group.bench_function("is_allowed/rejected", |b| {
             let rl = build_local_limiter(config(60, 10));
             let limiter = rl.local().absolute();
-            let rate = RateLimit::try_from(10.0).unwrap();
+            let rate = RateLimit::per_second(10.0).unwrap();
             let k = "k";
 
             let capacity = (60_f64 * *rate) as u64;
@@ -111,7 +111,7 @@ mod benchmarks {
 
         let rl = build_local_limiter(config(3_600, 100));
         let limiter = rl.local().absolute();
-        let rate = RateLimit::try_from(100.0).unwrap();
+        let rate = RateLimit::per_second(100.0).unwrap();
         let key = "k";
         let _ = limiter.inc(key, &rate, 1);
 
@@ -143,7 +143,7 @@ mod benchmarks {
         group.sample_size(50);
         let rl = build_local_limiter(config(3_600, 100));
         let limiter = rl.local().absolute();
-        let rate = RateLimit::try_from(100.0).unwrap();
+        let rate = RateLimit::per_second(100.0).unwrap();
         limiter.set_if("guard", &rate, RateLimitComparator::Nil, 100);
 
         group.bench_function("set_if/guard_miss", |b| {

@@ -1,7 +1,7 @@
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    RateGroupSizeMs, RateLimitComparator, TrypemaError, WindowSizeSeconds,
+    BucketSize, RateLimitComparator, TrypemaError, WindowSize,
     common::{HistoryUpdateMode, RateType},
     hybrid::RedisProxyCommitter,
     redis::{
@@ -32,8 +32,8 @@ pub(crate) struct AbsoluteHybridRedisProxyReadStateResult {
 pub(crate) struct AbsoluteHybridRedisProxyOptions {
     pub prefix: RedisKey,
     pub connection_manager: ConnectionManager,
-    pub window_size_seconds: WindowSizeSeconds,
-    pub rate_group_size_ms: RateGroupSizeMs,
+    pub window_size: WindowSize,
+    pub bucket_size: BucketSize,
 }
 
 #[derive(Clone, Debug)]
@@ -45,8 +45,8 @@ pub(crate) struct AbsoluteHybridRedisProxy {
     cleanup_script: Script,
     connection_manager: ConnectionManager,
     read_chunk_size: usize,
-    window_size_seconds: WindowSizeSeconds,
-    rate_group_size_ms: RateGroupSizeMs,
+    window_size: WindowSize,
+    bucket_size: BucketSize,
     window_size_ms: u128,
 }
 
@@ -55,11 +55,11 @@ impl AbsoluteHybridRedisProxy {
         let AbsoluteHybridRedisProxyOptions {
             prefix,
             connection_manager,
-            window_size_seconds,
-            rate_group_size_ms,
+            window_size,
+            bucket_size,
         } = options;
 
-        let window_size_ms = *window_size_seconds as u128 * 1000;
+        let window_size_ms = *window_size as u128 * 1000;
 
         Self {
             key_generator: RedisKeyGenerator::new(prefix, RateType::HybridAbsolute),
@@ -69,9 +69,9 @@ impl AbsoluteHybridRedisProxy {
             cleanup_script: absolute_lua_script(ABSOLUTE_CLEANUP_LUA),
             connection_manager,
             read_chunk_size: 100,
-            window_size_seconds,
+            window_size,
             window_size_ms,
-            rate_group_size_ms,
+            bucket_size,
         }
     }
 
@@ -116,9 +116,9 @@ impl AbsoluteHybridRedisProxy {
                     .key(self.key_generator.get_total_count_key(&commit.key))
                     .key(self.key_generator.get_active_entities_key())
                     .arg(commit.key.as_str())
-                    .arg(*self.window_size_seconds)
+                    .arg(*self.window_size)
                     .arg(commit.window_limit)
-                    .arg(*self.rate_group_size_ms)
+                    .arg(*self.bucket_size)
                     .arg(commit.count),
             );
         }
@@ -232,7 +232,7 @@ impl AbsoluteHybridRedisProxy {
             .key(self.key_generator.get_total_count_key(key))
             .key(self.key_generator.get_active_entities_key())
             .arg(key.as_str())
-            .arg(*self.window_size_seconds)
+            .arg(*self.window_size)
             .arg(window_limit)
             .arg(comparator_op)
             .arg(comparator_operand)

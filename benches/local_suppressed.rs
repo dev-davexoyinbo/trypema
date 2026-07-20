@@ -13,10 +13,10 @@ mod benchmarks {
 
     fn config(window_s: u64, group_ms: u64, cache_ms: u64, hard: f64) -> LimiterConfig {
         LimiterConfig {
-            window_size_seconds: window_s,
-            rate_group_size_ms: group_ms,
+            window_size: window_s,
+            bucket_size: group_ms,
             hard_limit_factor: hard,
-            suppression_factor_cache_ms: cache_ms,
+            suppression_factor_cache_period: cache_ms,
             ..LimiterConfig::default()
         }
     }
@@ -50,7 +50,7 @@ mod benchmarks {
             let limiter = rl.local().suppressed();
 
             // Choose values that avoid too much f64->u64 truncation noise.
-            let rate = RateLimit::try_from(50.0).unwrap();
+            let rate = RateLimit::per_second(50.0).unwrap();
             let k = "k";
 
             // Prefill enough to push suppression_factor to 1.0.
@@ -77,7 +77,7 @@ mod benchmarks {
         group.bench_function("cache_hit", |b| {
             let rl = build_local_limiter(config(60, 10, 1_000, 1.5));
             let limiter = rl.local().suppressed();
-            let rate = RateLimit::try_from(5.0).unwrap();
+            let rate = RateLimit::per_second(5.0).unwrap();
             let k = "k";
             for _ in 0..500 {
                 let _ = limiter.inc(k, &rate, 1);
@@ -92,7 +92,7 @@ mod benchmarks {
         group.bench_function("cache_miss_many_keys", |b| {
             let rl = build_local_limiter(config(60, 10, 1, 1.5));
             let limiter = rl.local().suppressed();
-            let rate = RateLimit::try_from(5.0).unwrap();
+            let rate = RateLimit::per_second(5.0).unwrap();
             let keys: Vec<String> = (0..50_000).map(|i| format!("user_{i}")).collect();
 
             // Ensure series exists for each key so we measure calculation, not insertion.
@@ -117,7 +117,7 @@ mod benchmarks {
 
         let rl = build_local_limiter(config(3_600, 100, 1_000, 1.5));
         let limiter = rl.local().suppressed();
-        let rate = RateLimit::try_from(100.0).unwrap();
+        let rate = RateLimit::per_second(100.0).unwrap();
         let key = "k";
         let _ = limiter.inc(key, &rate, 1);
 
@@ -149,7 +149,7 @@ mod benchmarks {
         group.sample_size(50);
         let rl = build_local_limiter(config(3_600, 100, 1_000, 1.5));
         let limiter = rl.local().suppressed();
-        let rate = RateLimit::try_from(100.0).unwrap();
+        let rate = RateLimit::per_second(100.0).unwrap();
         limiter.set_if("guard", &rate, RateLimitComparator::Nil, 100);
 
         group.bench_function("set_if/guard_miss", |b| {

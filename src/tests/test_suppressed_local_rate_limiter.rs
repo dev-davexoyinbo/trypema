@@ -7,9 +7,9 @@ use std::{
 use dashmap::DashMap;
 
 use crate::{
-    HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
+    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
     RateLimitComparator, RateLimitDecision, SuppressedLocalRateLimiter,
-    SuppressedRateLimitSnapshot, SuppressionFactorCacheMs, WindowSizeSeconds, common::RandomState,
+    SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, WindowSize, common::RandomState,
     local::suppressed_local_rate_limiter::RateLimitSeries,
 };
 
@@ -29,30 +29,30 @@ impl SuppressedLocalRateLimiter {
 }
 
 fn limiter(
-    window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    window_size: u64,
+    bucket_size: u64,
     hard_limit_factor: f64,
 ) -> SuppressedLocalRateLimiter {
     SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-        rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+        window_size: WindowSize::seconds(window_size).unwrap(),
+        bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
         hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+        suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
     })
 }
 
 fn limiter_with_cache_ms(
-    window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    window_size: u64,
+    bucket_size: u64,
     hard_limit_factor: f64,
-    suppression_factor_cache_ms: u64,
+    suppression_factor_cache_period: u64,
 ) -> SuppressedLocalRateLimiter {
     SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-        rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+        window_size: WindowSize::seconds(window_size).unwrap(),
+        bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
         hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::try_from(
-            suppression_factor_cache_ms,
+        suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
+            suppression_factor_cache_period,
         )
         .unwrap(),
     })
@@ -61,7 +61,7 @@ fn limiter_with_cache_ms(
 /// Push `key` to the soft window capacity so that subsequent `inc_with_rng` calls
 /// enter the suppression-decision branch (rather than short-circuiting to `Allowed`).
 ///
-/// The soft window limit is `window_size_seconds * rate_limit`. We need
+/// The soft window limit is `window_size * rate_limit`. We need
 /// `total - total_declined >= soft_window_limit`. We achieve this by recording a
 /// single increment of `soft_window_limit` (all accepted, so `total_declined = 0`),
 /// then overwriting the cached suppression factor with the desired test value so the
@@ -70,10 +70,10 @@ fn fill_to_soft_window_limit(
     limiter: &SuppressedLocalRateLimiter,
     key: &str,
     rate_limit: &RateLimit,
-    window_size_seconds: u64,
+    window_size: u64,
     desired_suppression_factor: f64,
 ) {
-    let soft_window_limit = (window_size_seconds as f64 * **rate_limit) as u64;
+    let soft_window_limit = (window_size as f64 * **rate_limit) as u64;
     // A single batch increment of exactly `soft_window_limit` puts accepted = soft_window_limit.
     let decision = limiter.inc(key, rate_limit, soft_window_limit);
     assert!(
@@ -97,7 +97,7 @@ fn fill_to_soft_window_limit(
 fn does_not_suppress_when_soft_window_limit_not_exceeded() {
     let limiter = limiter(10, 1000, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
     let soft_window_limit = 50;
 
     let first = limiter.inc(key, &rate_limit, soft_window_limit - 1);
@@ -121,7 +121,7 @@ fn does_not_suppress_when_soft_window_limit_not_exceeded() {
 fn verify_suppression_factor_calculation_spread() {
     let limiter = limiter(10, 1000, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     let decision = limiter.inc(key, &rate_limit, 20);
     assert!(
@@ -157,7 +157,7 @@ fn verify_suppression_factor_calculation_spread() {
 fn verify_suppression_factor_calculation_last_second() {
     let limiter = limiter(10, 100, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     let first = limiter.inc(key, &rate_limit, 10);
     assert!(
@@ -196,7 +196,7 @@ fn verify_suppression_factor_calculation_last_second() {
 fn reaching_shared_soft_and_hard_limit_is_allowed_then_suppresses() {
     let limiter = limiter(10, 100, 1f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     let below = limiter.inc(key, &rate_limit, 9);
     assert!(
@@ -237,7 +237,7 @@ fn reaching_shared_soft_and_hard_limit_is_allowed_then_suppresses() {
 fn public_suppressed_decisions_never_return_absolute_rejection_metadata() {
     let limiter = limiter(1, 1_000, 1.0);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     for observed_after in 1..=10_u64 {
         let decision = limiter.inc(key, &rate_limit, 1);
@@ -269,7 +269,7 @@ fn public_suppressed_decisions_never_return_absolute_rejection_metadata() {
 fn fractional_limits_use_truncated_soft_and_hard_window_boundaries() {
     // soft = floor(1s * 1.3) = 1; hard = floor(1s * 1.3 * 2) = 2.
     let limiter = limiter(1, 1000, 2.0);
-    let rate = RateLimit::try_from(1.3).unwrap();
+    let rate = RateLimit::per_second(1.3).unwrap();
 
     let reaches_soft = limiter.inc("k", &rate, 1);
     assert!(
@@ -307,7 +307,7 @@ fn fractional_limits_use_truncated_soft_and_hard_window_boundaries() {
 #[test]
 fn batch_crossing_hard_limit_is_fully_declined_without_consuming_accepted_capacity() {
     let limiter = limiter(10, 1000, 2.0);
-    let rate = RateLimit::try_from(1.0).unwrap();
+    let rate = RateLimit::per_second(1.0).unwrap();
 
     let below_hard = limiter.inc("k", &rate, 19);
     assert!(
@@ -348,7 +348,7 @@ fn batch_crossing_hard_limit_is_fully_declined_without_consuming_accepted_capaci
 fn suppressed_inc_denied_returns_suppressed_and_does_not_increment_accepted() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     fill_to_soft_window_limit(&limiter, key, &rate_limit, 1, 0.25);
 
@@ -396,7 +396,7 @@ fn suppressed_inc_denied_returns_suppressed_and_does_not_increment_accepted() {
 fn suppressed_inc_allowed_returns_suppressed_is_allowed_true_and_increments_accepted() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     fill_to_soft_window_limit(&limiter, key, &rate_limit, 1, 0.25);
 
@@ -434,12 +434,12 @@ fn suppressed_inc_allowed_returns_suppressed_is_allowed_true_and_increments_acce
 
 #[test]
 fn hard_limit_is_enforced_after_suppression_factor_cache_expires() {
-    // The hard window limit = window_size_seconds * rate_limit * hard_limit_factor.
+    // The hard window limit = window_size * rate_limit * hard_limit_factor.
     // Setup: window=10s, rate=1 req/s, hard_limit_factor=2 => soft=10, hard=20.
     // Use a tiny cache (1ms) so the suppression factor is always recomputed.
     let limiter = limiter_with_cache_ms(10, 1000, 2f64, 1);
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     // d1 reaches an accepted total of 1, below soft(10).
     let d1 = limiter.inc(key, &rate_limit, 1);
@@ -494,7 +494,7 @@ fn hard_limit_is_enforced_after_suppression_factor_cache_expires() {
 fn suppression_factor_gt_one_panics() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     fill_to_soft_window_limit(&limiter, key, &rate_limit, 1, 2f64);
 
@@ -509,7 +509,7 @@ fn suppression_factor_gt_one_panics() {
 fn suppression_factor_negative_panics() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     fill_to_soft_window_limit(&limiter, key, &rate_limit, 1, -0.01);
 
@@ -521,9 +521,9 @@ fn suppression_factor_negative_panics() {
 fn suppression_factor_cache_is_recomputed_after_cache_window() {
     let limiter = limiter(1, 50, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
-    // Default suppression_factor_cache_ms is 100ms; make the cached value stale.
+    // Default suppression_factor_cache_period is 100ms; make the cached value stale.
     let old_ts = Instant::now() - Duration::from_millis(101);
     limiter.test_set_suppression_factor(key, old_ts, 0.9);
 
@@ -584,7 +584,7 @@ fn cleanup_does_not_break_factor_recomputation_when_cache_entry_removed() {
 #[test]
 fn cleanup_removes_stale_series_and_keeps_fresh_series() {
     let limiter = limiter(6, 1, 2.0);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
 
     let stale = limiter.inc("stale", &rate, 3);
     assert!(matches!(stale, RateLimitDecision::Allowed));
@@ -615,7 +615,7 @@ fn cleanup_is_millisecond_granularity_for_suppression_factor() {
 fn suppression_factor_zero_returns_suppressed_allowed_and_rng_not_called() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     fill_to_soft_window_limit(&limiter, key, &rate_limit, 1, 0.0);
 
@@ -637,7 +637,7 @@ fn suppression_factor_zero_returns_suppressed_allowed_and_rng_not_called() {
 fn suppression_factor_one_must_not_return_allowed() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     fill_to_soft_window_limit(&limiter, key, &rate_limit, 1, 1.0);
 
@@ -660,7 +660,7 @@ fn suppression_factor_one_must_not_return_allowed() {
 fn suppression_rng_probability_is_one_minus_suppression_factor() {
     let limiter = limiter(1, 1000, 10f64);
     let key = "k";
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     fill_to_soft_window_limit(&limiter, key, &rate_limit, 1, 0.25);
 
@@ -685,7 +685,7 @@ fn suppression_rng_probability_is_one_minus_suppression_factor() {
 #[test]
 fn suppression_property_values_do_not_panic_and_follow_basic_contract() {
     let limiter = limiter(1, 1000, 10f64);
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     // Sample values across the full inclusive range.
     let sfs = [0.0, 0.1, 0.25, 0.5, 0.9, 1.0];
@@ -774,12 +774,12 @@ fn suppressed_is_deterministically_allowed_until_base_capacity_boundary() {
     // With window=10s, rate=1 req/s, hard_factor=2:
     //   soft_window_limit = 10 * 1 = 10
     //   hard_window_limit = 10 * 1 * 2 = 20
-    let window_size_seconds = 10_u64;
+    let window_size = 10_u64;
     let hard_limit_factor = 2f64;
-    let limiter = limiter(window_size_seconds, 1000, hard_limit_factor);
+    let limiter = limiter(window_size, 1000, hard_limit_factor);
 
     let key = "k";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     // The forecasted accepted total includes the current increment exactly once. All ten
     // calls through the soft-window boundary must return Allowed.
@@ -814,13 +814,13 @@ fn suppressed_is_deterministically_allowed_until_base_capacity_boundary() {
 fn suppressed_is_fully_denied_after_hard_limit_observed() {
     // With window=10s, rate=1 req/s, hard_factor=2:
     //   soft_window_limit = 10,  hard_window_limit = 20
-    let window_size_seconds = 10_u64;
+    let window_size = 10_u64;
     let hard_limit_factor = 2f64;
 
-    let limiter = limiter(window_size_seconds, 1000, hard_limit_factor);
+    let limiter = limiter(window_size, 1000, hard_limit_factor);
 
     let key = "k_hard";
-    let rate_limit = RateLimit::try_from(1f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     let initial = limiter.inc(key, &rate_limit, 20);
     assert!(
@@ -872,7 +872,7 @@ fn get_unknown_key_returns_empty_snapshot() {
 #[test]
 fn get_returns_observed_snapshot() {
     let limiter = limiter(6, 1000, 1.0);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     for _ in 0..3 {
         let decision = limiter.inc("k", &rate_limit, 1);
@@ -892,7 +892,7 @@ fn get_returns_observed_snapshot() {
 #[test]
 fn get_evicts_expired_buckets_and_updates_declined_total() {
     let limiter = limiter(1, 50, 1.0);
-    let rate = RateLimit::try_from(10f64).unwrap();
+    let rate = RateLimit::per_second(10f64).unwrap();
 
     // Seed both keys through the public API. After the sleeps, `k` has one
     // expired bucket and one fresh declined bucket, while `k2` is expired-only.
@@ -967,7 +967,7 @@ fn get_evicts_expired_buckets_and_updates_declined_total() {
 #[test]
 fn get_fresh_key_uses_shared_dashmap_lock() {
     let limiter = Arc::new(limiter(6, 1000, 1.0));
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
     let decision = limiter.inc("k", &rate_limit, 3);
     assert!(
         matches!(decision, RateLimitDecision::Allowed),
@@ -1003,7 +1003,7 @@ fn get_fresh_key_uses_shared_dashmap_lock() {
 #[test]
 fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
     let limiter = limiter(6, 1000, 1.0);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     let (new_total, old_total) =
         limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
@@ -1019,7 +1019,7 @@ fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
 #[test]
 fn set_if_lt_with_lower_target_is_noop() {
     let limiter = limiter(6, 1000, 1.0);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100),
@@ -1034,7 +1034,7 @@ fn set_if_lt_with_lower_target_is_noop() {
 #[test]
 fn set_if_nil_overwrites_unconditionally_including_lowering() {
     let limiter = limiter(6, 1000, 1.0);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 100),
@@ -1049,7 +1049,7 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
 #[test]
 fn set_if_eq_zero_sets_only_when_window_is_empty() {
     let limiter = limiter(6, 1000, 1.0);
-    let rate_limit = RateLimit::try_from(100f64).unwrap();
+    let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 25);
     assert_eq!((new_total, old_total), (25, 0));
@@ -1062,7 +1062,7 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
 fn set_if_prime_below_soft_limit_allows_next_inc() {
     // window 6 * rate 5 * factor 1.0 → hard = soft = 30.
     let limiter = limiter(6, 1000, 1.0);
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     let result = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(27), 27);
     assert_eq!(result, (27, 0));
@@ -1077,7 +1077,7 @@ fn set_if_prime_below_soft_limit_allows_next_inc() {
 #[test]
 fn set_if_prime_at_hard_limit_declines_next_inc() {
     let limiter = limiter(6, 1000, 1.0);
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     let result = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(30), 30);
     assert_eq!(result, (30, 0));
@@ -1098,7 +1098,7 @@ fn set_if_prime_at_hard_limit_declines_next_inc() {
 #[test]
 fn set_if_zero_count_resets_declines_and_suppression_state() {
     let limiter = limiter(6, 1000, 1.0);
-    let rate_limit = RateLimit::try_from(5f64).unwrap();
+    let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     // Saturate the window and record some declines.
     assert_eq!(
@@ -1143,7 +1143,7 @@ fn set_if_zero_count_resets_declines_and_suppression_state() {
 #[test]
 fn set_if_replacement_resets_declined_history_and_cached_factor() {
     let limiter = limiter(6, 1000, 1.0);
-    let rate = RateLimit::try_from(5f64).unwrap();
+    let rate = RateLimit::per_second(5f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate, RateLimitComparator::Nil, 30),
@@ -1176,7 +1176,7 @@ fn set_if_replacement_resets_declined_history_and_cached_factor() {
 #[test]
 fn set_if_replacement_with_unchanged_total_still_replaces_history() {
     let limiter = limiter(10, 50, 1.0);
-    let rate = RateLimit::try_from(2.0).unwrap();
+    let rate = RateLimit::per_second(2.0).unwrap();
 
     let oldest = limiter.inc("k", &rate, 4);
     assert!(
@@ -1232,7 +1232,7 @@ fn set_if_replacement_with_unchanged_total_still_replaces_history() {
 fn set_if_redefines_sticky_hard_window_limit() {
     // Original hard window limit: 6 * 1 * 1.0 = 6.
     let limiter = limiter(6, 1000, 1.0);
-    let rate_one = RateLimit::try_from(1f64).unwrap();
+    let rate_one = RateLimit::per_second(1f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate_one, RateLimitComparator::Nil, 6),
@@ -1256,7 +1256,7 @@ fn set_if_redefines_sticky_hard_window_limit() {
 
     // set_if with a higher rate redefines the stored limit (6 * 10 * 1.0 = 60),
     // unlike inc where the limit is sticky.
-    let rate_ten = RateLimit::try_from(10f64).unwrap();
+    let rate_ten = RateLimit::per_second(10f64).unwrap();
     assert_eq!(
         limiter.set_if("k", &rate_ten, RateLimitComparator::Nil, 1),
         (1, 7)
@@ -1278,7 +1278,7 @@ fn set_if_redefines_sticky_hard_window_limit() {
 #[test]
 fn set_if_preserve_history_scales_partial_declines_proportionally() {
     let limiter = limiter(10, 50, 1.0);
-    let rate = RateLimit::try_from(2f64).unwrap();
+    let rate = RateLimit::per_second(2f64).unwrap();
 
     assert!(matches!(
         limiter.inc("k", &rate, 4),
@@ -1374,7 +1374,7 @@ fn set_if_preserve_history_keeps_exact_decline_ratio_for_large_counters() {
     const TARGET: u64 = OLD_TOTAL - AMOUNT_REMOVED;
 
     let limiter = limiter(1, 1000, 1.0);
-    let rate = RateLimit::try_from(HARD_LIMIT as f64).unwrap();
+    let rate = RateLimit::per_second(HARD_LIMIT as f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate, RateLimitComparator::Nil, HARD_LIMIT),
@@ -1430,7 +1430,7 @@ fn set_if_preserve_history_keeps_exact_decline_ratio_for_large_counters() {
 #[test]
 fn set_if_preserve_oldest_keeps_oldest_suppressed_history() {
     let limiter = limiter(10, 50, 1.0);
-    let rate = RateLimit::try_from(2f64).unwrap();
+    let rate = RateLimit::per_second(2f64).unwrap();
 
     assert!(matches!(
         limiter.inc("k", &rate, 20),
@@ -1495,7 +1495,7 @@ fn set_if_preserve_oldest_keeps_oldest_suppressed_history() {
 #[test]
 fn set_if_preserve_history_increases_the_selected_edge_bucket() {
     let limiter = limiter(10, 50, 1.5);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
 
     for key in ["newest", "oldest"] {
         let decision = limiter.inc(key, &rate, 4);
@@ -1562,7 +1562,7 @@ fn set_if_preserve_history_increases_the_selected_edge_bucket() {
 #[test]
 fn set_if_preserve_history_creates_missing_positive_targets() {
     let limiter = limiter(6, 1000, 1.5);
-    let rate = RateLimit::try_from(10f64).unwrap();
+    let rate = RateLimit::per_second(10f64).unwrap();
 
     for (key, preservation) in [
         ("newest", HistoryPreservation::PreserveNewest),
@@ -1592,7 +1592,7 @@ fn set_if_preserve_history_creates_missing_positive_targets() {
 #[test]
 fn set_if_preserve_history_prunes_expired_buckets_before_matching_update() {
     let limiter = limiter(1, 50, 2.0);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
 
     for key in ["newest", "oldest"] {
         let decision = limiter.inc(key, &rate, 4);
@@ -1629,7 +1629,7 @@ fn set_if_preserve_history_prunes_expired_buckets_before_matching_update() {
 #[test]
 fn unchanged_preserve_history_uses_shared_lock_and_keeps_cached_factor() {
     let limiter = Arc::new(limiter(6, 1000, 1.5));
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
     let setup = limiter.inc("k", &rate, 3);
     assert!(matches!(setup, RateLimitDecision::Allowed));
 
@@ -1674,8 +1674,8 @@ fn unchanged_preserve_history_uses_shared_lock_and_keeps_cached_factor() {
 #[test]
 fn unchanged_total_with_a_new_limit_updates_limit_and_invalidates_cache() {
     let limiter = limiter(6, 1000, 1.5);
-    let original_rate = RateLimit::try_from(1f64).unwrap();
-    let new_rate = RateLimit::try_from(10f64).unwrap();
+    let original_rate = RateLimit::per_second(1f64).unwrap();
+    let new_rate = RateLimit::per_second(10f64).unwrap();
 
     let setup = limiter.inc("k", &original_rate, 3);
     assert!(matches!(setup, RateLimitDecision::Allowed));
@@ -1704,8 +1704,8 @@ fn unchanged_total_with_a_new_limit_updates_limit_and_invalidates_cache() {
 #[test]
 fn inc_keeps_the_first_hard_window_limit_for_the_key() {
     let limiter = limiter(6, 1000, 1.5);
-    let strict_rate = RateLimit::try_from(1f64).unwrap();
-    let loose_rate = RateLimit::try_from(100f64).unwrap();
+    let strict_rate = RateLimit::per_second(1f64).unwrap();
+    let loose_rate = RateLimit::per_second(100f64).unwrap();
 
     let first = limiter.inc("k", &strict_rate, 1);
     assert!(matches!(first, RateLimitDecision::Allowed));
@@ -1743,7 +1743,7 @@ fn concurrent_increments_record_every_observation() {
     const INCREMENTS_PER_WORKER: u64 = 500;
 
     let limiter = Arc::new(limiter(6, 1000, 2.0));
-    let rate = RateLimit::try_from(1_000_000.0).unwrap();
+    let rate = RateLimit::per_second(1_000_000.0).unwrap();
     let barrier = Arc::new(Barrier::new(WORKERS + 1));
     let mut workers = Vec::with_capacity(WORKERS);
 
@@ -1797,7 +1797,7 @@ fn concurrent_increments_record_every_observation() {
 #[test]
 fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
     let limiter = Arc::new(limiter(6, 1000, 1.5));
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
     let setup = limiter.inc("k", &rate, 3);
     assert!(
         matches!(setup, RateLimitDecision::Allowed),
@@ -1834,7 +1834,7 @@ fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
 #[test]
 fn conditional_set_guard_miss_leaves_expired_history_untouched() {
     let limiter = limiter(1, 1, 2.0);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
     assert!(matches!(
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
@@ -1882,7 +1882,7 @@ fn conditional_set_guard_miss_leaves_expired_history_untouched() {
 #[test]
 fn conditional_set_missing_zero_leaves_suppressed_key_absent() {
     let limiter = limiter(6, 1000, 1.5);
-    let rate = RateLimit::try_from(100f64).unwrap();
+    let rate = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
         limiter.set_if("k", &rate, RateLimitComparator::Eq(0), 0),
@@ -1904,7 +1904,7 @@ fn conditional_set_missing_zero_leaves_suppressed_key_absent() {
 #[test]
 fn conditional_set_present_zero_removes_suppressed_key_completely() {
     let limiter = limiter(6, 1000, 1.5);
-    let rate = RateLimit::try_from(1f64).unwrap();
+    let rate = RateLimit::per_second(1f64).unwrap();
 
     for (key, preserve) in [("replace", false), ("preserve", true)] {
         assert_eq!(

@@ -5,16 +5,16 @@ use super::{
     runtime,
 };
 
-use crate::common::SuppressionFactorCacheMs;
-use crate::hybrid::SyncIntervalMs;
+use crate::common::SuppressionFactorCachePeriod;
+use crate::hybrid::SyncInterval;
 use crate::{
-    HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
+    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
     RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions,
-    RedisRateLimiterOptions, WindowSizeSeconds,
+    RedisRateLimiterOptions, WindowSize,
 };
 
-fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
-    ((window_size_seconds as f64) * **rate_limit) as u64
+fn window_capacity(window_size: u64, rate_limit: &RateLimit) -> u64 {
+    ((window_size as f64) * **rate_limit) as u64
 }
 
 fn record_decision(
@@ -49,8 +49,8 @@ fn assert_allowed(decision: RateLimitDecision, context: &str) {
 
 async fn build_limiter(
     url: &str,
-    window_size_seconds: u64,
-    rate_group_size_ms: u64,
+    window_size: u64,
+    bucket_size: u64,
 ) -> std::sync::Arc<RateLimiter> {
     let client = redis::Client::open(url).unwrap();
     let cm = client.get_connection_manager().await.unwrap();
@@ -58,19 +58,19 @@ async fn build_limiter(
 
     let options = RateLimiterOptions {
         local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+            window_size: WindowSize::seconds(window_size).unwrap(),
+            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
         },
         redis: RedisRateLimiterOptions {
             connection_manager: cm,
             prefix: Some(prefix.clone()),
-            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+            window_size: WindowSize::seconds(window_size).unwrap(),
+            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-            sync_interval_ms: SyncIntervalMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+            sync_interval: SyncInterval::default(),
         },
     };
 
@@ -85,7 +85,7 @@ fn rejects_at_exact_window_limit() {
         let rl = build_limiter(&url, 1, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let rate_limit = RateLimit::per_second(2f64).unwrap();
 
         assert!(matches!(
             rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
@@ -110,8 +110,8 @@ fn inc_uses_the_first_rate_limit_for_existing_keys() {
     runtime::block_on(async {
         let rl = build_limiter(&url, 1, 1000).await;
         let low_then_high = key("low-then-high");
-        let low_rate = RateLimit::try_from(2f64).unwrap();
-        let high_rate = RateLimit::try_from(10f64).unwrap();
+        let low_rate = RateLimit::per_second(2f64).unwrap();
+        let high_rate = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
             rl.redis()
@@ -163,7 +163,7 @@ fn per_key_state_is_independent() {
 
         let a = key("a");
         let b = key("b");
-        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let rate_limit = RateLimit::per_second(2f64).unwrap();
 
         // Saturate key a.
         assert_allowed(
@@ -195,7 +195,7 @@ fn rate_grouping_merges_within_group_affects_remaining_after_waiting() {
         let rl = build_limiter(&url, 6, 300).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         // Create a single bucket by staying within the rate-group coalescing window.
         assert_allowed(
@@ -236,7 +236,7 @@ fn unblocks_after_window_expires() {
         let rl = build_limiter(&url, 1, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(3f64).unwrap();
+        let rate_limit = RateLimit::per_second(3f64).unwrap();
 
         assert!(
             matches!(
@@ -274,7 +274,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
         let rl = build_limiter(&url, 10, 200).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         // Create two buckets.
         assert_allowed(
@@ -290,7 +290,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
         // At capacity (10 * 1 = 10). Next increment should be rejected.
         let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
         let RateLimitDecision::Rejected {
-            window_size_seconds,
+            window_size_seconds: window_size,
             retry_after_ms,
             remaining_after_waiting,
         } = decision
@@ -298,7 +298,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
             panic!("expected rejected decision");
         };
 
-        assert_eq!(window_size_seconds, 10, "window size should be 10");
+        assert_eq!(window_size, 10, "window size should be 10");
         assert!(
             retry_after_ms >= 8_500 && retry_after_ms <= 10_000,
             "retry after should be the remaining lifetime of the oldest bucket, got {retry_after_ms}"
@@ -332,7 +332,7 @@ fn rejected_inc_does_not_consume_capacity() {
         let rl = build_limiter(&url, 1, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let rate_limit = RateLimit::per_second(2f64).unwrap();
 
         assert!(matches!(
             rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
@@ -360,11 +360,11 @@ fn oversized_request_on_empty_key_has_no_backoff_wait() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
-        let rl = build_limiter(&url, window_size_seconds, 1_000).await;
+        let window_size = 1_u64;
+        let rl = build_limiter(&url, window_size, 1_000).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
 
         let decision = rl
             .redis()
@@ -396,7 +396,7 @@ fn is_allowed_evicts_old_buckets_and_updates_total_count() {
         let k = key("k");
         // Use a rate limit that makes behavior differ depending on whether eviction happens.
         // window=2s, rate=1/s -> capacity=2.
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         // Two buckets (sleep > group size).
         assert_allowed(
@@ -441,7 +441,7 @@ fn inc_evicts_expired_buckets_before_admission() {
         let k = key("k");
         // window=1s, rate=2/s -> capacity=2.
         // If eviction does not happen, the post-sleep increment would push total over capacity.
-        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let rate_limit = RateLimit::per_second(2f64).unwrap();
 
         // Two buckets.
         assert_allowed(
@@ -473,7 +473,7 @@ fn is_allowed_reflects_rejected_after_hitting_limit_then_allows_after_expiry() {
         let rl = build_limiter(&url, 1, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let rate_limit = RateLimit::per_second(2f64).unwrap();
 
         assert_allowed(
             rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap(),
@@ -496,7 +496,7 @@ fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
         let rl = build_limiter(&url, 10, 200).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         assert_allowed(
             rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
@@ -510,7 +510,7 @@ fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
 
         let decision = rl.redis().absolute().is_allowed(&k).await.unwrap();
         let RateLimitDecision::Rejected {
-            window_size_seconds,
+            window_size_seconds: window_size,
             retry_after_ms,
             remaining_after_waiting,
         } = decision
@@ -519,8 +519,8 @@ fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
         };
 
         assert_eq!(
-            window_size_seconds, 10,
-            "window size should be 10 instead got {window_size_seconds}"
+            window_size, 10,
+            "window size should be 10 instead got {window_size}"
         );
         assert!(
             retry_after_ms >= 8_500 && retry_after_ms <= 10_000,
@@ -541,7 +541,7 @@ fn is_allowed_returns_allowed_when_below_limit() {
         let rl = build_limiter(&url, 6, 200).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         assert_allowed(
             rl.redis().absolute().inc(&k, &rate_limit, 5).await.unwrap(),
@@ -560,12 +560,12 @@ fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
-        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+        let window_size = 1_u64;
+        let rl = build_limiter(&url, window_size, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(50f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(50f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 50);
 
         let mut accepted_volume = 0_u64;
@@ -597,12 +597,12 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
-        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+        let window_size = 1_u64;
+        let rl = build_limiter(&url, window_size, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(10f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(10f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 10);
 
         let mut accepted_volume = 0_u64;
@@ -659,12 +659,12 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
-        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+        let window_size = 1_u64;
+        let rl = build_limiter(&url, window_size, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(2f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(2f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 2);
 
         // Fill capacity.
@@ -708,12 +708,12 @@ fn volume_non_integer_rate_uses_truncating_capacity() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
-        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+        let window_size = 1_u64;
+        let rl = build_limiter(&url, window_size, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(2.9f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(2.9f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 2);
 
         for _ in 0..capacity {
@@ -758,7 +758,7 @@ fn get_returns_exact_window_total() {
         let rl = build_limiter(&url, 6, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         for _ in 0..3 {
             let d = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
@@ -776,11 +776,11 @@ fn get_evicts_expired_buckets() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
-        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+        let window_size = 1_u64;
+        let rl = build_limiter(&url, window_size, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_allowed(
             rl.redis().absolute().inc(&k, &rate_limit, 5).await.unwrap(),
@@ -802,7 +802,7 @@ fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
         let rl = build_limiter(&url, 6, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         let (new_total, old_total) = rl
             .redis()
@@ -832,7 +832,7 @@ fn set_if_lt_with_lower_target_is_noop() {
         let rl = build_limiter(&url, 6, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
             rl.redis()
@@ -861,7 +861,7 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
         let rl = build_limiter(&url, 6, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
             rl.redis()
@@ -904,7 +904,7 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
         let rl = build_limiter(&url, 6, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         let (new_total, old_total) = rl
             .redis()
@@ -932,7 +932,7 @@ fn set_if_gt_and_ne_guards_follow_current_total() {
         let rl = build_limiter(&url, 6, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
             rl.redis()
@@ -977,12 +977,12 @@ fn set_if_prime_then_inc_enforces_remaining_budget() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 6_u64;
-        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+        let window_size = 6_u64;
+        let rl = build_limiter(&url, window_size, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 30);
 
         // Prime 27 of 30: exactly 3 units of budget remain.
@@ -1009,12 +1009,12 @@ fn set_if_prime_at_capacity_rejects_inc_and_is_allowed() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 6_u64;
-        let rl = build_limiter(&url, window_size_seconds, 1000).await;
+        let window_size = 6_u64;
+        let rl = build_limiter(&url, window_size, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
 
         let (new_total, _) = rl
             .redis()
@@ -1039,7 +1039,7 @@ fn set_if_preserve_history_creates_missing_positive_keys_in_both_directions() {
 
     runtime::block_on(async {
         let rl = build_limiter(&url, 6, 1000).await;
-        let rate_limit = RateLimit::try_from(10f64).unwrap();
+        let rate_limit = RateLimit::per_second(10f64).unwrap();
 
         for (name, preservation) in [
             ("newest", HistoryPreservation::PreserveNewest),
@@ -1071,8 +1071,8 @@ fn set_if_preserve_history_redefines_limit_when_total_is_unchanged() {
     runtime::block_on(async {
         let rl = build_limiter(&url, 1, 1000).await;
         let k = key("k");
-        let initial_rate = RateLimit::try_from(10f64).unwrap();
-        let replacement_rate = RateLimit::try_from(6f64).unwrap();
+        let initial_rate = RateLimit::per_second(10f64).unwrap();
+        let replacement_rate = RateLimit::per_second(6f64).unwrap();
 
         assert_allowed(
             rl.redis()
@@ -1126,7 +1126,7 @@ fn set_if_and_get_do_not_cross_provider_keyspaces() {
         let rl = build_limiter(&url, 6, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         // Write through the pure Redis provider only.
         assert_eq!(

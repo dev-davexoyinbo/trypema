@@ -7,11 +7,11 @@ use std::{
 use dashmap::{DashMap, mapref::entry::Entry};
 
 use crate::{
-    HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimitComparator,
+    BucketSize, HistoryPreservation, LocalRateLimiterOptions, RateLimitComparator,
     RateLimitDecision, SuppressedRateLimitSnapshot,
     common::{
         Bucket, HardLimitFactor, HistoryUpdateMode, RandomState, RateLimit,
-        SuppressionFactorCacheMs, WindowSizeSeconds,
+        SuppressionFactorCachePeriod, WindowSize,
     },
 };
 
@@ -95,7 +95,7 @@ impl RateLimitSeries {
 ///
 /// # Hard Limit
 ///
-/// `hard_window_limit = rate_limit × window_size_seconds × hard_limit_factor`
+/// `hard_window_limit = rate_limit × window_size × hard_limit_factor`
 ///
 /// - Acts as an absolute ceiling beyond which no requests are admitted
 /// - Prevents runaway acceptance if suppression calculation fails
@@ -118,7 +118,7 @@ impl RateLimitSeries {
 /// use trypema::{RateLimit, RateLimitDecision};
 ///
 /// let limiter = rl.local().suppressed();
-/// let rate = RateLimit::try_from(10.0).unwrap();
+/// let rate = RateLimit::per_second(10.0).unwrap();
 ///
 /// match limiter.inc("user_123", &rate, 1) {
 ///     RateLimitDecision::Allowed => {}
@@ -130,13 +130,13 @@ impl RateLimitSeries {
 /// ```
 #[derive(Debug)]
 pub struct SuppressedLocalRateLimiter {
-    window_size_seconds: WindowSizeSeconds,
+    window_size: WindowSize,
     window_size_ms: u128,
     window_duration: Duration,
-    rate_group_size_ms: RateGroupSizeMs,
+    bucket_size: BucketSize,
     pub(crate) series: DashMap<String, RateLimitSeries, RandomState>,
     hard_limit_factor: HardLimitFactor,
-    suppression_factor_cache_ms: SuppressionFactorCacheMs,
+    suppression_factor_cache_period: SuppressionFactorCachePeriod,
     pub(crate) suppression_factors: DashMap<String, (Instant, f64), RandomState>,
 }
 
@@ -144,11 +144,11 @@ impl SuppressedLocalRateLimiter {
     pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
         Self {
             hard_limit_factor: options.hard_limit_factor,
-            window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
-            window_size_seconds: options.window_size_seconds,
-            window_duration: Duration::from_secs(*options.window_size_seconds),
-            suppression_factor_cache_ms: options.suppression_factor_cache_ms,
-            rate_group_size_ms: options.rate_group_size_ms,
+            window_size_ms: (*options.window_size as u128).saturating_mul(1000),
+            window_size: options.window_size,
+            window_duration: Duration::from_secs(*options.window_size),
+            suppression_factor_cache_period: options.suppression_factor_cache_period,
+            bucket_size: options.bucket_size,
             series: DashMap::default(),
             suppression_factors: DashMap::default(),
         }
@@ -182,7 +182,7 @@ impl SuppressedLocalRateLimiter {
     /// 2. If the forecasted accepted usage is at or below the soft window capacity, return `Allowed`
     /// 3. If the increment reaches the hard limit exactly, admit it and cache full suppression for
     ///    subsequent calls
-    /// 4. If above the hard limit (`window_size_seconds × rate_limit × hard_limit_factor`), return
+    /// 4. If above the hard limit (`window_size × rate_limit × hard_limit_factor`), return
     ///    `Suppressed { is_allowed: false, suppression_factor: 1.0 }`
     /// 5. Otherwise, compute (or retrieve cached) suppression factor and probabilistically decide
     ///
@@ -198,7 +198,7 @@ impl SuppressedLocalRateLimiter {
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let limiter = rl.local().suppressed();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Under limit → Allowed
     /// assert!(matches!(limiter.inc("user_123", &rate, 1), RateLimitDecision::Allowed));
@@ -223,7 +223,7 @@ impl SuppressedLocalRateLimiter {
                 .entry(key.to_string())
                 .or_insert_with(|| {
                     RateLimitSeries::new(
-                        **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64,
+                        **rate_limit * *self.hard_limit_factor * *self.window_size as f64,
                     )
                 })
                 .downgrade(),
@@ -238,7 +238,7 @@ impl SuppressedLocalRateLimiter {
 
                 let mut series = self.series.entry(key.to_string()).or_insert_with(|| {
                     RateLimitSeries::new(
-                        **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64,
+                        **rate_limit * *self.hard_limit_factor * *self.window_size as f64,
                     )
                 });
 
@@ -303,7 +303,7 @@ impl SuppressedLocalRateLimiter {
         series.total_count.fetch_add(count, Ordering::AcqRel);
 
         if let Some(latest_bucket) = series.buckets.back()
-            && latest_bucket.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
+            && latest_bucket.timestamp.elapsed().as_millis() <= *self.bucket_size as u128
         {
             latest_bucket.count.fetch_add(count, Ordering::AcqRel);
 
@@ -386,7 +386,7 @@ impl SuppressedLocalRateLimiter {
     /// This method is read-only and does not record any increment. It is useful for
     /// exporting metrics, building dashboards, or debugging why calls are being suppressed.
     ///
-    /// **Caching:** Returns the cached value if it was computed within `suppression_factor_cache_ms`.
+    /// **Caching:** Returns the cached value if it was computed within `suppression_factor_cache_period`.
     /// Otherwise, evicts expired buckets and recomputes the factor from the current sliding window.
     ///
     /// # Examples
@@ -407,7 +407,7 @@ impl SuppressedLocalRateLimiter {
         let suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
             Some(val)
-                if val.0.elapsed().as_millis() < *self.suppression_factor_cache_ms as u128 =>
+                if val.0.elapsed().as_millis() < *self.suppression_factor_cache_period as u128 =>
             {
                 val.1
             }
@@ -478,12 +478,12 @@ impl SuppressedLocalRateLimiter {
                 total_in_last_second.saturating_add(bucket.count.load(Ordering::Acquire));
         }
 
-        let average_rate_in_window: f64 = total_count as f64 / *self.window_size_seconds as f64;
+        let average_rate_in_window: f64 = total_count as f64 / *self.window_size as f64;
 
         let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
 
-        let suppression_factor = 1f64
-            - (soft_window_limit as f64 / *self.window_size_seconds as f64 / perceived_rate_limit);
+        let suppression_factor =
+            1f64 - (soft_window_limit as f64 / *self.window_size as f64 / perceived_rate_limit);
 
         self.persist_suppression_factor(key, suppression_factor)
     } // end method calculate_suppression_factor
@@ -507,7 +507,7 @@ impl SuppressedLocalRateLimiter {
     /// assert_eq!(snapshot.total_declined, 0);
     /// assert_eq!(snapshot.suppression_factor, 0.0);
     ///
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// limiter.inc("user_123", &rate, 3);
     /// assert_eq!(limiter.get("user_123").total, 3);
     /// ```
@@ -716,7 +716,7 @@ impl SuppressedLocalRateLimiter {
                 }
 
                 let hard_window_limit =
-                    **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64;
+                    **rate_limit * *self.hard_limit_factor * *self.window_size as f64;
 
                 let unchanged = count > 0
                     && matches!(mode, HistoryUpdateMode::Preserve(_))
@@ -757,7 +757,7 @@ impl SuppressedLocalRateLimiter {
                     }
 
                     series.hard_window_limit =
-                        **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64;
+                        **rate_limit * *self.hard_limit_factor * *self.window_size as f64;
 
                     Self::apply_history_update(series, count, old_total, mode);
 
@@ -770,7 +770,7 @@ impl SuppressedLocalRateLimiter {
                 }
 
                 let mut series = RateLimitSeries::new(
-                    **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64,
+                    **rate_limit * *self.hard_limit_factor * *self.window_size as f64,
                 );
 
                 Self::apply_history_update(&mut series, count, 0, mode);
@@ -791,7 +791,7 @@ impl SuppressedLocalRateLimiter {
     /// window contents are replaced by a single current-timestamp bucket holding
     /// `count` with **no declines** recorded against it; otherwise nothing is
     /// written. On a match, the key's stored hard window limit is redefined from
-    /// `rate_limit` (`window_size_seconds × rate_limit × hard_limit_factor`) — unlike
+    /// `rate_limit` (`window_size × rate_limit × hard_limit_factor`) — unlike
     /// `inc`, where the limit is sticky after the first call — and the cached
     /// suppression factor is dropped so it is recomputed from the new state on the
     /// next call. A comparator miss leaves both the limit and cache untouched. A
@@ -822,7 +822,7 @@ impl SuppressedLocalRateLimiter {
     /// use trypema::{RateLimit, RateLimitComparator};
     ///
     /// let limiter = rl.local().suppressed();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Prime the window to 40.
     /// let (new_total, old_total) =

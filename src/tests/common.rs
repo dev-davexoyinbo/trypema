@@ -33,6 +33,6 @@ pub fn key_gen(prefix: &RedisKey, rate_type: RateType) -> RedisKeyGenerator {
 }
 
 /// Wait long enough for the background hybrid committer to flush two ticks.
-pub async fn wait_for_hybrid_sync(sync_interval_ms: u64) {
-    runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+pub async fn wait_for_hybrid_sync(sync_interval: u64) {
+    runtime::async_sleep(Duration::from_millis(sync_interval * 2 + 50)).await;
 }

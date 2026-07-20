@@ -2,16 +2,16 @@ use std::{env, thread, time::Duration};
 
 use super::runtime;
 
-use crate::common::SuppressionFactorCacheMs;
-use crate::hybrid::SyncIntervalMs;
+use crate::common::SuppressionFactorCachePeriod;
+use crate::hybrid::SyncInterval;
 use crate::{
-    HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateGroupSizeMs, RateLimit,
+    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
     RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions, RedisKey,
-    RedisRateLimiterOptions, WindowSizeSeconds,
+    RedisRateLimiterOptions, WindowSize,
 };
 
-fn window_capacity(window_size_seconds: u64, rate_limit: &RateLimit) -> u64 {
-    ((window_size_seconds as f64) * **rate_limit) as u64
+fn window_capacity(window_size: u64, rate_limit: &RateLimit) -> u64 {
+    ((window_size as f64) * **rate_limit) as u64
 }
 
 fn record_decision(
@@ -70,9 +70,9 @@ fn key(s: &str) -> RedisKey {
 
 async fn build_limiter_with_prefix(
     url: &str,
-    window_size_seconds: u64,
-    rate_group_size_ms: u64,
-    sync_interval_ms: u64,
+    window_size: u64,
+    bucket_size: u64,
+    sync_interval: u64,
     prefix: RedisKey,
 ) -> std::sync::Arc<RateLimiter> {
     let client = redis::Client::open(url).unwrap();
@@ -80,29 +80,29 @@ async fn build_limiter_with_prefix(
 
     let options = RateLimiterOptions {
         local: LocalRateLimiterOptions {
-            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+            window_size: WindowSize::seconds(window_size).unwrap(),
+            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
         },
         redis: RedisRateLimiterOptions {
             connection_manager: cm,
             prefix: Some(prefix),
-            window_size_seconds: WindowSizeSeconds::try_from(window_size_seconds).unwrap(),
-            rate_group_size_ms: RateGroupSizeMs::try_from(rate_group_size_ms).unwrap(),
+            window_size: WindowSize::seconds(window_size).unwrap(),
+            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
             hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_ms: SuppressionFactorCacheMs::default(),
-            sync_interval_ms: SyncIntervalMs::try_from(sync_interval_ms).unwrap(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+            sync_interval: SyncInterval::milliseconds(sync_interval).unwrap(),
         },
     };
 
     std::sync::Arc::new(RateLimiter::new(options))
 }
 
-async fn wait_for_hybrid_sync(sync_interval_ms: u64) {
+async fn wait_for_hybrid_sync(sync_interval: u64) {
     // Wait past two interval boundaries so the assertion does not depend on where
     // construction landed within the committer's current interval.
-    runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+    runtime::async_sleep(Duration::from_millis(sync_interval * 2 + 50)).await;
 }
 
 #[test]
@@ -111,22 +111,16 @@ fn hybrid_allows_until_capacity_then_rejects() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1_000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1_000_u64;
+        let sync_interval = 25_u64;
 
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
+        let rl =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let cap = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let cap = window_capacity(window_size, &rate_limit);
 
         for _ in 0..cap {
             let d = rl
@@ -156,7 +150,7 @@ fn hybrid_absolute_never_returns_suppressed() {
         let rl = build_limiter_with_prefix(&url, 1, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(50f64).unwrap();
+        let rate_limit = RateLimit::per_second(50f64).unwrap();
 
         for _ in 0..200_u64 {
             let d = rl
@@ -178,22 +172,16 @@ fn hybrid_absolute_pending_only_rejection_reports_window_ttl_and_full_released_c
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1_000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1_000_u64;
+        let sync_interval = 25_u64;
 
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
+        let rl =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let cap = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let cap = window_capacity(window_size, &rate_limit);
 
         for _ in 0..cap {
             assert_allowed(
@@ -237,12 +225,11 @@ fn hybrid_absolute_oversized_request_on_empty_key_has_no_backoff_wait() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
-        let rl =
-            build_limiter_with_prefix(&url, window_size_seconds, 1_000, 25, unique_prefix()).await;
+        let window_size = 1_u64;
+        let rl = build_limiter_with_prefix(&url, window_size, 1_000, 25, unique_prefix()).await;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
 
         let decision = rl
             .hybrid()
@@ -271,20 +258,15 @@ fn hybrid_absolute_known_oldest_ttl_is_not_inflated_to_sync_interval() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 60_u64;
-        let sync_interval_ms = 120_000_u64;
+        let window_size = 60_u64;
+        let sync_interval = 120_000_u64;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
 
-        let seed = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            1_000,
-            sync_interval_ms,
-            prefix.clone(),
-        )
-        .await;
+        let seed =
+            build_limiter_with_prefix(&url, window_size, 1_000, sync_interval, prefix.clone())
+                .await;
         assert_eq!(
             seed.hybrid()
                 .absolute()
@@ -297,8 +279,7 @@ fn hybrid_absolute_known_oldest_ttl_is_not_inflated_to_sync_interval() {
         runtime::async_sleep(Duration::from_millis(50)).await;
 
         let observer =
-            build_limiter_with_prefix(&url, window_size_seconds, 1_000, sync_interval_ms, prefix)
-                .await;
+            build_limiter_with_prefix(&url, window_size, 1_000, sync_interval, prefix).await;
         let decision = observer.hybrid().absolute().is_allowed(&k).await.unwrap();
         let RateLimitDecision::Rejected {
             retry_after_ms,
@@ -325,29 +306,29 @@ fn hybrid_usage_is_committed_to_redis_on_flush_and_then_visible_to_others() {
         // Use a shared prefix so both instances address the same Redis keys.
         let prefix = unique_prefix();
 
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1_000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1_000_u64;
+        let sync_interval = 25_u64;
 
         let rl_a = build_limiter_with_prefix(
             &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
+            window_size,
+            bucket_size,
+            sync_interval,
             prefix.clone(),
         )
         .await;
         let rl_b = build_limiter_with_prefix(
             &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
+            window_size,
+            bucket_size,
+            sync_interval,
             prefix.clone(),
         )
         .await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
 
         // Fill the hybrid local accept budget (does not write to Redis yet).
         for _ in 0..5_u64 {
@@ -389,30 +370,30 @@ fn hybrid_absolute_does_not_touch_redis_until_commit() {
     runtime::block_on(async {
         let prefix = unique_prefix();
 
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1_000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1_000_u64;
+        let sync_interval = 25_u64;
 
         let rl_a = build_limiter_with_prefix(
             &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
+            window_size,
+            bucket_size,
+            sync_interval,
             prefix.clone(),
         )
         .await;
         let rl_b = build_limiter_with_prefix(
             &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
+            window_size,
+            bucket_size,
+            sync_interval,
             prefix.clone(),
         )
         .await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let cap = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let cap = window_capacity(window_size, &rate_limit);
 
         // Fill local accept budget; no commit should have happened yet.
         for _ in 0..cap {
@@ -438,22 +419,16 @@ fn hybrid_absolute_unblocks_after_window_expires() {
     runtime::block_on(async {
         let prefix = unique_prefix();
 
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1_000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1_000_u64;
+        let sync_interval = 25_u64;
 
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
+        let rl =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let cap = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let cap = window_capacity(window_size, &rate_limit);
 
         for _ in 0..cap {
             assert_allowed(
@@ -504,7 +479,7 @@ fn hybrid_absolute_per_key_state_is_independent() {
 
         let a = key("a");
         let b = key("b");
-        let rate_limit = RateLimit::try_from(2f64).unwrap();
+        let rate_limit = RateLimit::per_second(2f64).unwrap();
         let cap = window_capacity(1, &rate_limit);
 
         for _ in 0..cap {
@@ -544,30 +519,30 @@ fn hybrid_absolute_prefix_isolation() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1_000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1_000_u64;
+        let sync_interval = 25_u64;
 
         let rl_a = build_limiter_with_prefix(
             &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
+            window_size,
+            bucket_size,
+            sync_interval,
             unique_prefix(),
         )
         .await;
         let rl_b = build_limiter_with_prefix(
             &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
+            window_size,
+            bucket_size,
+            sync_interval,
             unique_prefix(),
         )
         .await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let cap = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let cap = window_capacity(window_size, &rate_limit);
 
         for _ in 0..cap {
             assert_allowed(
@@ -607,22 +582,22 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
     runtime::block_on(async {
         let prefix = unique_prefix();
 
-        let window_size_seconds = 6_u64;
-        // Make grouping easy to satisfy: commits separated by ~2*sync_interval_ms must be < group.
-        let rate_group_size_ms = 1_000_u64;
-        let sync_interval_ms = 200_u64;
+        let window_size = 6_u64;
+        // Make grouping easy to satisfy: commits separated by ~2*sync_interval must be < group.
+        let bucket_size = 1_000_u64;
+        let sync_interval = 200_u64;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         // Seed Redis state through the hybrid public API (no direct Redis commands).
         // We write 2, wait for it to be committed, then write 4; the commit times are close enough
         // that Redis groups them into one bucket.
         let rl_seed = build_limiter_with_prefix(
             &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
+            window_size,
+            bucket_size,
+            sync_interval,
             prefix.clone(),
         )
         .await;
@@ -635,7 +610,7 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
                 .unwrap(),
             "oldest bucket setup increment",
         );
-        wait_for_hybrid_sync(sync_interval_ms).await;
+        wait_for_hybrid_sync(sync_interval).await;
         assert_allowed(
             rl_seed
                 .hybrid()
@@ -645,17 +620,11 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
                 .unwrap(),
             "newest bucket setup increment",
         );
-        wait_for_hybrid_sync(sync_interval_ms).await;
+        wait_for_hybrid_sync(sync_interval).await;
 
         // Create a hybrid limiter that will read the current Redis state.
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
+        let rl =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
 
         let d_prime = rl
             .hybrid()
@@ -693,17 +662,17 @@ fn hybrid_absolute_remaining_after_waiting_is_capacity_released_by_oldest_bucket
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 10_u64;
-        let rate_group_size_ms = 100_u64;
-        let sync_interval_ms = 200_u64;
+        let window_size = 10_u64;
+        let bucket_size = 100_u64;
+        let sync_interval = 200_u64;
         let k = key("k");
-        let rate_limit = RateLimit::try_from(1f64).unwrap();
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         let seed = build_limiter_with_prefix(
             &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
+            window_size,
+            bucket_size,
+            sync_interval,
             prefix.clone(),
         )
         .await;
@@ -715,7 +684,7 @@ fn hybrid_absolute_remaining_after_waiting_is_capacity_released_by_oldest_bucket
                 .unwrap(),
             "oldest bucket setup increment",
         );
-        wait_for_hybrid_sync(sync_interval_ms).await;
+        wait_for_hybrid_sync(sync_interval).await;
         assert_allowed(
             seed.hybrid()
                 .absolute()
@@ -724,16 +693,10 @@ fn hybrid_absolute_remaining_after_waiting_is_capacity_released_by_oldest_bucket
                 .unwrap(),
             "newest bucket setup increment",
         );
-        wait_for_hybrid_sync(sync_interval_ms).await;
+        wait_for_hybrid_sync(sync_interval).await;
 
-        let observer = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
+        let observer =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
         let decision = observer.hybrid().absolute().is_allowed(&k).await.unwrap();
         let RateLimitDecision::Rejected {
             remaining_after_waiting,
@@ -774,7 +737,7 @@ fn hybrid_absolute_concurrent_smoke_does_not_panic() {
         let rl = build_limiter_with_prefix(&url, 1, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(10f64).unwrap();
+        let rate_limit = RateLimit::per_second(10f64).unwrap();
 
         let mut tasks = Vec::new();
         for _ in 0..16 {
@@ -808,22 +771,16 @@ fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1000_u64;
+        let sync_interval = 25_u64;
 
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
+        let rl =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(50f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(50f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 50);
 
         let mut accepted_volume = 0_u64;
@@ -861,22 +818,16 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1000_u64;
+        let sync_interval = 25_u64;
 
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
+        let rl =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(10f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(10f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 10);
 
         let mut accepted_volume = 0_u64;
@@ -949,22 +900,16 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1000_u64;
+        let sync_interval = 25_u64;
 
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
+        let rl =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(2f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(2f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 2);
 
         // Fill capacity.
@@ -1040,7 +985,7 @@ fn cleanup_keeps_rejecting_state_while_retry_ttl_is_live() {
         let window_size_ms = 1_000_u64;
         let rl = build_limiter_with_prefix(&url, 1, 1_000, 2_000, unique_prefix()).await;
         let k = key("k");
-        let rate = RateLimit::try_from(10f64).unwrap();
+        let rate = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
             rl.hybrid()
@@ -1087,7 +1032,7 @@ fn cleanup_keeps_rejecting_state_until_stale_horizon_after_retry_ttl_expiry() {
         let window_size_ms = 1_000_u64;
         let rl = build_limiter_with_prefix(&url, 1, 1_000, 2_000, unique_prefix()).await;
         let k = key("k");
-        let rate = RateLimit::try_from(10f64).unwrap();
+        let rate = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
             rl.hybrid()
@@ -1134,7 +1079,7 @@ fn get_inferred_refreshes_undefined_state_then_uses_local_snapshot() {
         let writer = build_limiter_with_prefix(&url, 6, 1_000, 2_000, prefix.clone()).await;
         let reader = build_limiter_with_prefix(&url, 6, 1_000, 2_000, prefix).await;
         let k = key("k");
-        let rate = RateLimit::try_from(100f64).unwrap();
+        let rate = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
             writer
@@ -1179,7 +1124,7 @@ fn get_includes_local_pending_increments() {
         let rl = build_limiter_with_prefix(&url, 6, 1000, 2_000, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         for _ in 0..3 {
             let d = rl
@@ -1205,11 +1150,10 @@ fn get_methods_keep_the_exact_total_during_background_sync() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let sync_interval_ms = 500_u64;
-        let rl =
-            build_limiter_with_prefix(&url, 60, 1_000, sync_interval_ms, unique_prefix()).await;
+        let sync_interval = 500_u64;
+        let rl = build_limiter_with_prefix(&url, 60, 1_000, sync_interval, unique_prefix()).await;
         let k = key("k");
-        let rate = RateLimit::try_from(100f64).unwrap();
+        let rate = RateLimit::per_second(100f64).unwrap();
 
         assert_allowed(
             rl.hybrid().absolute().inc(&k, &rate, 3).await.unwrap(),
@@ -1218,7 +1162,7 @@ fn get_methods_keep_the_exact_total_during_background_sync() {
 
         // The first tick refreshes local state. Historically it only queued the
         // captured count, leaving a gap until the second tick wrote it to Redis.
-        runtime::async_sleep(Duration::from_millis(sync_interval_ms + 100)).await;
+        runtime::async_sleep(Duration::from_millis(sync_interval + 100)).await;
         assert_eq!(rl.hybrid().absolute().get_inferred(&k).await.unwrap(), 3);
         assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 3);
     });
@@ -1233,7 +1177,7 @@ fn get_inferred_refreshes_an_expired_rejection_cache() {
         let limiter = build_limiter_with_prefix(&url, 1, 1_000, 25, prefix.clone()).await;
         let writer = build_limiter_with_prefix(&url, 1, 1_000, 25, prefix).await;
         let k = key("k");
-        let rate = RateLimit::try_from(10f64).unwrap();
+        let rate = RateLimit::per_second(10f64).unwrap();
         let capacity = window_capacity(1, &rate);
 
         assert_allowed(
@@ -1274,8 +1218,8 @@ fn inc_keeps_the_first_rate_limit_for_an_existing_key() {
 
     runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 6, 1_000, 2_000, unique_prefix()).await;
-        let low_rate = RateLimit::try_from(1f64).unwrap();
-        let high_rate = RateLimit::try_from(10f64).unwrap();
+        let low_rate = RateLimit::per_second(1f64).unwrap();
+        let high_rate = RateLimit::per_second(10f64).unwrap();
 
         let low_first = key("low_first");
         assert_allowed(
@@ -1325,7 +1269,7 @@ fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
         let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         let (new_total, old_total) = rl
             .hybrid()
@@ -1357,7 +1301,7 @@ fn set_if_lt_with_lower_target_is_noop() {
         let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
             rl.hybrid()
@@ -1387,7 +1331,7 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
         let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
             rl.hybrid()
@@ -1419,7 +1363,7 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
         let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         let (new_total, old_total) = rl
             .hybrid()
@@ -1446,7 +1390,7 @@ fn set_if_gt_and_ne_compare_against_the_current_total() {
     runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 6, 1_000, 25, unique_prefix()).await;
         let k = key("k");
-        let rate = RateLimit::try_from(100f64).unwrap();
+        let rate = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
             rl.hybrid()
@@ -1490,7 +1434,7 @@ fn preserve_history_creates_missing_positive_keys_in_both_directions() {
 
     runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 6, 1_000, 25, unique_prefix()).await;
-        let rate = RateLimit::try_from(100f64).unwrap();
+        let rate = RateLimit::per_second(100f64).unwrap();
 
         for (name, preservation) in [
             ("newest", HistoryPreservation::PreserveNewest),
@@ -1523,8 +1467,8 @@ fn unchanged_preserve_history_target_redefines_the_window_limit() {
     runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 6, 1_000, 25, unique_prefix()).await;
         let k = key("k");
-        let high_rate = RateLimit::try_from(100f64).unwrap();
-        let low_rate = RateLimit::try_from(1f64).unwrap();
+        let high_rate = RateLimit::per_second(100f64).unwrap();
+        let low_rate = RateLimit::per_second(1f64).unwrap();
 
         assert_eq!(
             rl.hybrid()
@@ -1567,7 +1511,7 @@ fn conditional_set_zero_handles_missing_and_present_keys() {
 
     runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
-        let rate = RateLimit::try_from(100f64).unwrap();
+        let rate = RateLimit::per_second(100f64).unwrap();
 
         for (key_name, preservation) in [
             ("replace", None),
@@ -1625,13 +1569,12 @@ fn set_if_prime_then_inc_enforces_remaining_budget() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 6_u64;
-        let rl =
-            build_limiter_with_prefix(&url, window_size_seconds, 1000, 25, unique_prefix()).await;
+        let window_size = 6_u64;
+        let rl = build_limiter_with_prefix(&url, window_size, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 30);
 
         // Prime 27 of 30: exactly 3 units of budget remain.
@@ -1681,13 +1624,12 @@ fn set_if_prime_at_capacity_rejects_next_inc() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 6_u64;
-        let rl =
-            build_limiter_with_prefix(&url, window_size_seconds, 1000, 25, unique_prefix()).await;
+        let window_size = 6_u64;
+        let rl = build_limiter_with_prefix(&url, window_size, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(5f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
 
         let (new_total, _) = rl
             .hybrid()
@@ -1729,7 +1671,7 @@ fn set_if_folds_pending_local_increments_before_comparing() {
         let rl = build_limiter_with_prefix(&url, 6, 1000, 2_000, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(100f64).unwrap();
+        let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         for _ in 0..5 {
             let d = rl
@@ -1761,19 +1703,14 @@ fn set_if_after_rejection_transition_has_no_stale_commit_to_land_later() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 6_u64;
-        let sync_interval_ms = 2_000_u64;
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            1_000,
-            sync_interval_ms,
-            unique_prefix(),
-        )
-        .await;
+        let window_size = 6_u64;
+        let sync_interval = 2_000_u64;
+        let rl =
+            build_limiter_with_prefix(&url, window_size, 1_000, sync_interval, unique_prefix())
+                .await;
         let k = key("k");
-        let rate = RateLimit::try_from(1f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate);
+        let rate = RateLimit::per_second(1f64).unwrap();
+        let capacity = window_capacity(window_size, &rate);
 
         assert!(matches!(
             rl.hybrid()
@@ -1800,7 +1737,7 @@ fn set_if_after_rejection_transition_has_no_stale_commit_to_land_later() {
 
         // A previously queued capacity commit must not arrive after the reset and
         // raise the total again.
-        runtime::async_sleep(Duration::from_millis(sync_interval_ms + 100)).await;
+        runtime::async_sleep(Duration::from_millis(sync_interval + 100)).await;
         assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 2);
     });
 }
@@ -1810,13 +1747,12 @@ fn set_if_invalidates_local_state_so_next_inc_observes_written_total() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size_seconds = 6_u64;
-        let rl = build_limiter_with_prefix(&url, window_size_seconds, 1000, 2_000, unique_prefix())
-            .await;
+        let window_size = 6_u64;
+        let rl = build_limiter_with_prefix(&url, window_size, 1000, 2_000, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(4f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(4f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 24);
 
         for _ in 0..2 {
@@ -1865,17 +1801,15 @@ fn set_if_window_limit_is_sticky_for_other_instances() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 6_u64;
+        let window_size = 6_u64;
 
-        let rl_a =
-            build_limiter_with_prefix(&url, window_size_seconds, 1000, 25, prefix.clone()).await;
-        let rl_b =
-            build_limiter_with_prefix(&url, window_size_seconds, 1000, 25, prefix.clone()).await;
+        let rl_a = build_limiter_with_prefix(&url, window_size, 1000, 25, prefix.clone()).await;
+        let rl_b = build_limiter_with_prefix(&url, window_size, 1000, 25, prefix.clone()).await;
 
         let k = key("k");
 
         // Instance A defines the window limit via a positive set: 6s * 2/s = 12.
-        let rate_a = RateLimit::try_from(2f64).unwrap();
+        let rate_a = RateLimit::per_second(2f64).unwrap();
         assert_eq!(
             rl_a.hybrid()
                 .absolute()
@@ -1886,7 +1820,7 @@ fn set_if_window_limit_is_sticky_for_other_instances() {
         );
 
         // Instance B incs with a much higher rate, but the stored window limit wins.
-        let rate_b = RateLimit::try_from(100f64).unwrap();
+        let rate_b = RateLimit::per_second(100f64).unwrap();
 
         for i in 0..11_u64 {
             let d = rl_b.hybrid().absolute().inc(&k, &rate_b, 1).await.unwrap();
@@ -1904,7 +1838,7 @@ fn set_if_preserve_history_includes_pending_and_guard_miss_keeps_local_state() {
     runtime::block_on(async {
         let rl = build_limiter_with_prefix(&url, 60, 1000, 2_000, unique_prefix()).await;
         let k = key("k");
-        let rate = RateLimit::try_from(100f64).unwrap();
+        let rate = RateLimit::per_second(100f64).unwrap();
 
         for _ in 0..4 {
             assert!(matches!(
@@ -1953,10 +1887,10 @@ fn concurrent_increments_remain_exact_across_background_refreshes() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let sync_interval_ms = 25_u64;
-        let rl = build_limiter_with_prefix(&url, 60, 1_000, sync_interval_ms, prefix.clone()).await;
+        let sync_interval = 25_u64;
+        let rl = build_limiter_with_prefix(&url, 60, 1_000, sync_interval, prefix.clone()).await;
         let k = key("k");
-        let rate = RateLimit::try_from(1_000f64).unwrap();
+        let rate = RateLimit::per_second(1_000f64).unwrap();
         let worker_count = 8_u64;
         let increments_per_worker = 1_000_u64;
 
@@ -1980,8 +1914,8 @@ fn concurrent_increments_remain_exact_across_background_refreshes() {
             runtime::join(task).await;
         }
 
-        wait_for_hybrid_sync(sync_interval_ms).await;
-        let observer = build_limiter_with_prefix(&url, 60, 1_000, sync_interval_ms, prefix).await;
+        wait_for_hybrid_sync(sync_interval).await;
+        let observer = build_limiter_with_prefix(&url, 60, 1_000, sync_interval, prefix).await;
         assert_eq!(
             observer.hybrid().absolute().get(&k).await.unwrap(),
             worker_count * increments_per_worker
@@ -1995,22 +1929,16 @@ fn volume_non_integer_rate_uses_truncating_capacity() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size_seconds = 1_u64;
-        let rate_group_size_ms = 1000_u64;
-        let sync_interval_ms = 25_u64;
+        let window_size = 1_u64;
+        let bucket_size = 1000_u64;
+        let sync_interval = 25_u64;
 
-        let rl = build_limiter_with_prefix(
-            &url,
-            window_size_seconds,
-            rate_group_size_ms,
-            sync_interval_ms,
-            prefix,
-        )
-        .await;
+        let rl =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::try_from(2.9f64).unwrap();
-        let capacity = window_capacity(window_size_seconds, &rate_limit);
+        let rate_limit = RateLimit::per_second(2.9f64).unwrap();
+        let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 2);
 
         for _ in 0..capacity {

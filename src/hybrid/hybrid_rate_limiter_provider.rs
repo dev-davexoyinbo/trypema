@@ -20,7 +20,7 @@ use crate::{
 /// Compared to the pure Redis provider (`rl.redis()`):
 /// - ✅ Lower steady-state latency for admission checks (no per-request Redis I/O)
 /// - ✅ Reduced Redis load via batched commits
-/// - ❌ More approximation: admission decisions reflect Redis state with up to `sync_interval_ms`
+/// - ❌ More approximation: admission decisions reflect Redis state with up to `sync_interval`
 ///   of lag
 ///
 /// # Strategies
@@ -58,7 +58,7 @@ impl HybridRateLimiterProvider {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// assert!(matches!(
     ///     rl.hybrid().absolute().inc(&key, &rate, 1).await.unwrap(),
     ///     RateLimitDecision::Allowed
@@ -81,7 +81,7 @@ impl HybridRateLimiterProvider {
     /// use trypema::redis::RedisKey;
     ///
     /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// assert!(matches!(
     ///     rl.hybrid().suppressed().inc(&key, &rate, 1).await.unwrap(),
     ///     RateLimitDecision::Allowed

@@ -29,8 +29,8 @@ enum BursterStore {
 }
 
 impl BursterStore {
-    fn for_window_seconds(window_size_seconds: u64) -> Option<Self> {
-        match window_size_seconds {
+    fn for_window_seconds(window_size: u64) -> Option<Self> {
+        match window_size {
             10 => Some(Self::Window10(Arc::new(DashMap::new()))),
             60 => Some(Self::Window60(Arc::new(DashMap::new()))),
             300 => Some(Self::Window300(Arc::new(DashMap::new()))),
@@ -93,7 +93,7 @@ fn run_trypema(args: &Args) {
     );
 
     let rate_limiter = Arc::new(build_trypema_rate_limiter(args));
-    let rate_limit = RateLimit::try_from(args.rate_limit_per_s).unwrap();
+    let rate_limit = RateLimit::per_second(args.rate_limit_per_s).unwrap();
     let strategy = args.strategy;
 
     println!("local_limiter=Trypema");
