@@ -26,7 +26,7 @@ mod benchmarks {
         for group_ms in [1_u64, 10, 100] {
             group.bench_function(format!("inc/group_ms={group_ms}"), |b| {
                 let rl = build_local_limiter(config(60, group_ms));
-                let limiter = rl.local().absolute();
+                let limiter = rl.absolute();
                 let rate = RateLimit::max();
                 limiter.inc("k", &rate, 1);
 
@@ -47,7 +47,7 @@ mod benchmarks {
             for group_ms in [1_u64, 10, 100] {
                 group.bench_function(format!("inc/keys={key_space}/group_ms={group_ms}"), |b| {
                     let rl = build_local_limiter(config(60, group_ms));
-                    let limiter = rl.local().absolute();
+                    let limiter = rl.absolute();
                     let rate = RateLimit::max();
 
                     let keys: Vec<String> = (0..key_space).map(|i| format!("user_{i}")).collect();
@@ -71,12 +71,12 @@ mod benchmarks {
 
         group.bench_function("inc/rejected", |b| {
             let rl = build_local_limiter(config(60, 10));
-            let limiter = rl.local().absolute();
+            let limiter = rl.absolute();
             let rate = RateLimit::per_second(10.0).unwrap();
             let k = "k";
 
             // Fill to (or past) capacity so we take the reject fast-path.
-            let capacity = (60_f64 * *rate) as u64;
+            let capacity = (60_f64 * rate.as_per_second()) as u64;
             for _ in 0..(capacity + 10) {
                 let _ = limiter.inc(k, &rate, 1);
             }
@@ -88,11 +88,11 @@ mod benchmarks {
 
         group.bench_function("is_allowed/rejected", |b| {
             let rl = build_local_limiter(config(60, 10));
-            let limiter = rl.local().absolute();
+            let limiter = rl.absolute();
             let rate = RateLimit::per_second(10.0).unwrap();
             let k = "k";
 
-            let capacity = (60_f64 * *rate) as u64;
+            let capacity = (60_f64 * rate.as_per_second()) as u64;
             for _ in 0..(capacity + 10) {
                 let _ = limiter.inc(k, &rate, 1);
             }
@@ -110,7 +110,7 @@ mod benchmarks {
         group.sample_size(50);
 
         let rl = build_local_limiter(config(3_600, 100));
-        let limiter = rl.local().absolute();
+        let limiter = rl.absolute();
         let rate = RateLimit::per_second(100.0).unwrap();
         let key = "k";
         let _ = limiter.inc(key, &rate, 1);
@@ -142,9 +142,9 @@ mod benchmarks {
         let mut group = c.benchmark_group("local_absolute/conditional_set");
         group.sample_size(50);
         let rl = build_local_limiter(config(3_600, 100));
-        let limiter = rl.local().absolute();
+        let limiter = rl.absolute();
         let rate = RateLimit::per_second(100.0).unwrap();
-        limiter.set_if("guard", &rate, RateLimitComparator::Nil, 100);
+        limiter.set_if("guard", &rate, RateLimitComparator::Always, 100);
 
         group.bench_function("set_if/guard_miss", |b| {
             b.iter(|| {
@@ -157,7 +157,7 @@ mod benchmarks {
             });
         });
 
-        limiter.set_if("replace", &rate, RateLimitComparator::Nil, 100);
+        limiter.set_if("replace", &rate, RateLimitComparator::Always, 100);
         let mut replace_high = false;
         group.bench_function("set_if/replace", |b| {
             b.iter(|| {
@@ -166,7 +166,7 @@ mod benchmarks {
                 black_box(limiter.set_if(
                     black_box("replace"),
                     black_box(&rate),
-                    RateLimitComparator::Nil,
+                    RateLimitComparator::Always,
                     black_box(target),
                 ));
             });
@@ -199,7 +199,7 @@ mod benchmarks {
                 HistoryPreservation::PreserveNewest => "newest",
                 HistoryPreservation::PreserveOldest => "oldest",
             };
-            limiter.set_if(key, &rate, RateLimitComparator::Nil, 100);
+            limiter.set_if(key, &rate, RateLimitComparator::Always, 100);
             let mut high = false;
             group.bench_function(format!("preserve/{preservation:?}"), |b| {
                 b.iter(|| {
@@ -208,7 +208,7 @@ mod benchmarks {
                     black_box(limiter.set_if_preserve_history(
                         black_box(key),
                         black_box(&rate),
-                        RateLimitComparator::Nil,
+                        RateLimitComparator::Always,
                         black_box(target),
                         preservation,
                     ));

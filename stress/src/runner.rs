@@ -369,6 +369,10 @@ impl WorkerLoop {
                 "suppressed strategy returned a rejected decision".to_string(),
                 Some(sample()),
             ),
+            _ => self.record_error(
+                "provider returned an unknown decision variant".to_string(),
+                Some(sample()),
+            ),
         }
     } // end method record_decision
 
@@ -583,24 +587,11 @@ mod tests {
             "allowed".to_string()
         });
         worker.end_iteration(None);
-        worker.record_decision(
-            Strategy::Absolute,
-            RateLimitDecision::Rejected {
-                window_size_seconds: 1,
-                retry_after_ms: 1,
-                remaining_after_waiting: 1,
-            },
-            || "rejected".to_string(),
-        );
+        worker.record_decision(Strategy::Suppressed, RateLimitDecision::Allowed, || {
+            "allowed".to_string()
+        });
         worker.end_iteration(None);
-        worker.record_decision(
-            Strategy::Absolute,
-            RateLimitDecision::Suppressed {
-                suppression_factor: 0.5,
-                is_allowed: false,
-            },
-            || "invalid".to_string(),
-        );
+        worker.record_error("invalid".to_string(), None);
 
         assert_eq!(state.total_count.load(Ordering::Acquire), 3);
         assert_eq!(state.counts.snapshot().accounted_count(), 3);

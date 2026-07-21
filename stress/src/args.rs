@@ -5,8 +5,10 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 
-use trypema::local::LocalRateLimiterOptions;
-use trypema::{BucketSize, HardLimitFactor, SuppressionFactorCachePeriod, WindowSize};
+use trypema::{
+    BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, WindowSize,
+    local::LocalRateLimiterProvider,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
 pub(crate) enum Provider {
@@ -303,39 +305,18 @@ pub(crate) fn build_keys(args: &Args) -> Arc<[String]> {
         .into()
 } // end fn build_keys
 
-pub(crate) fn build_local_options(args: &Args) -> LocalRateLimiterOptions {
-    LocalRateLimiterOptions {
-        window_size: WindowSize::seconds(args.window_s).unwrap(),
-        bucket_size: BucketSize::milliseconds(args.group_ms).unwrap(),
-        hard_limit_factor: HardLimitFactor::try_from(args.hard_limit_factor).unwrap(),
-        suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
+pub(crate) fn build_local_provider(args: &Args) -> Arc<LocalRateLimiterProvider> {
+    LocalRateLimiterProvider::builder()
+        .window_size(WindowSize::seconds_or_panic(args.window_s))
+        .bucket_size(BucketSize::milliseconds_or_panic(args.group_ms))
+        .hard_limit_factor(HardLimitFactor::new_or_panic(args.hard_limit_factor))
+        .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(
             args.suppression_cache_ms,
-        )
-        .unwrap(),
-    }
-} // end fn build_local_options
-
-/// Build a `RedisRateLimiterOptions` from `Args`. Requires a connection manager.
-#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-pub(crate) fn build_redis_options(
-    args: &Args,
-    connection_manager: redis::aio::ConnectionManager,
-) -> trypema::redis::RedisRateLimiterOptions {
-    use trypema::redis::{RedisKey, RedisRateLimiterOptions};
-
-    RedisRateLimiterOptions {
-        connection_manager,
-        prefix: Some(RedisKey::try_from(args.redis_prefix.clone()).unwrap()),
-        window_size: WindowSize::seconds(args.window_s).unwrap(),
-        bucket_size: BucketSize::milliseconds(args.group_ms).unwrap(),
-        hard_limit_factor: HardLimitFactor::try_from(args.hard_limit_factor).unwrap(),
-        suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
-            args.suppression_cache_ms,
-        )
-        .unwrap(),
-        sync_interval: trypema::hybrid::SyncInterval::default(),
-    }
-} // end fn build_redis_options
+        ))
+        .cleanup_enabled(false)
+        .build()
+        .unwrap()
+} // end fn build_local_provider
 
 #[cfg(test)]
 mod tests {

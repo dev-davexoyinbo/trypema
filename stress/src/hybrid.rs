@@ -4,7 +4,12 @@
 
 use std::sync::Arc;
 
-use trypema::{RateLimit, RateLimiter, RateLimiterOptions, redis::RedisKey};
+use trypema::{
+    BucketSize, HardLimitFactor, RateLimit, RateLimiterBuilder, SuppressionFactorCachePeriod,
+    WindowSize,
+    hybrid::{HybridRateLimiterProvider, SyncInterval},
+    redis::RedisKey,
+};
 
 use crate::{
     args::{Args, Strategy, build_keys},
@@ -35,10 +40,18 @@ async fn run_async(args: Args) {
             eprintln!("failed to connect to Redis: {error}");
             std::process::exit(2);
         });
-    let rate_limiter = Arc::new(RateLimiter::new(RateLimiterOptions {
-        local: crate::args::build_local_options(&args),
-        redis: crate::args::build_redis_options(&args, connection_manager),
-    }));
+    let rate_limiter = HybridRateLimiterProvider::builder(connection_manager)
+        .prefix(RedisKey::try_from(args.redis_prefix.as_str()).unwrap())
+        .window_size(WindowSize::seconds_or_panic(args.window_s))
+        .bucket_size(BucketSize::milliseconds_or_panic(args.group_ms))
+        .hard_limit_factor(HardLimitFactor::new_or_panic(args.hard_limit_factor))
+        .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(
+            args.suppression_cache_ms,
+        ))
+        .sync_interval(SyncInterval::default())
+        .cleanup_enabled(false)
+        .build()
+        .unwrap();
     let rate_limit = RateLimit::per_second(args.rate_limit_per_s).unwrap();
 
     warmup(&args, &rate_limiter, &rate_limit).await;
@@ -85,19 +98,9 @@ async fn run_async(args: Args) {
                 let key = &redis_keys[key_index];
                 let sample_started = worker.begin_iteration();
                 let result = match args.strategy {
-                    Strategy::Absolute => {
-                        rate_limiter
-                            .hybrid()
-                            .absolute()
-                            .inc(key, &rate_limit, 1)
-                            .await
-                    }
+                    Strategy::Absolute => rate_limiter.absolute().inc(key, &rate_limit, 1).await,
                     Strategy::Suppressed => {
-                        rate_limiter
-                            .hybrid()
-                            .suppressed()
-                            .inc(key, &rate_limit, 1)
-                            .await
+                        rate_limiter.suppressed().inc(key, &rate_limit, 1).await
                     }
                 };
                 worker.end_iteration(sample_started);
@@ -125,23 +128,11 @@ async fn run_async(args: Args) {
     finish_run(&args, started, histograms, &state);
 } // end fn run_async
 
-async fn warmup(args: &Args, rate_limiter: &RateLimiter, rate_limit: &RateLimit) {
+async fn warmup(args: &Args, rate_limiter: &HybridRateLimiterProvider, rate_limit: &RateLimit) {
     let key = RedisKey::new_or_panic("stress_warmup".to_string());
     let result = match args.strategy {
-        Strategy::Absolute => {
-            rate_limiter
-                .hybrid()
-                .absolute()
-                .inc(&key, rate_limit, 1)
-                .await
-        }
-        Strategy::Suppressed => {
-            rate_limiter
-                .hybrid()
-                .suppressed()
-                .inc(&key, rate_limit, 1)
-                .await
-        }
+        Strategy::Absolute => rate_limiter.absolute().inc(&key, rate_limit, 1).await,
+        Strategy::Suppressed => rate_limiter.suppressed().inc(&key, rate_limit, 1).await,
     };
 
     if let Err(error) = result {

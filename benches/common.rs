@@ -11,10 +11,12 @@
 
 #![allow(dead_code)]
 
-use std::{ops::Deref, sync::Arc};
+use std::sync::Arc;
 
-use trypema::local::LocalRateLimiterOptions;
-use trypema::{BucketSize, HardLimitFactor, RateLimiter, SuppressionFactorCachePeriod, WindowSize};
+use trypema::{
+    BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, WindowSize,
+    local::LocalRateLimiterProvider,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers available under any feature flag
@@ -44,71 +46,18 @@ impl Default for LimiterConfig {
     }
 }
 
-fn local_options(config: &LimiterConfig) -> LocalRateLimiterOptions {
-    LocalRateLimiterOptions {
-        window_size: WindowSize::seconds(config.window_size).unwrap(),
-        bucket_size: BucketSize::milliseconds(config.bucket_size).unwrap(),
-        hard_limit_factor: HardLimitFactor::try_from(config.hard_limit_factor).unwrap(),
-        suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
-            config.suppression_factor_cache_period,
-        )
-        .unwrap(),
-    }
-}
-
-/// Owns the facade used by local benchmarks and any runtime required to construct it.
-///
-/// Local APIs themselves are feature-independent. With `redis-tokio`, the retained
-/// runtime keeps the connection manager and hybrid background tasks created by the
-/// feature-enabled facade alive for the benchmark's lifetime.
-pub struct LocalBenchLimiter {
-    limiter: Arc<RateLimiter>,
-    #[cfg(feature = "redis-tokio")]
-    _runtime: tokio::runtime::Runtime,
-}
-
-impl Deref for LocalBenchLimiter {
-    type Target = RateLimiter;
-
-    fn deref(&self) -> &Self::Target {
-        self.limiter.as_ref()
-    }
-}
-
 /// Build a limiter for a local benchmark under any feature configuration.
-pub fn build_local_limiter(config: LimiterConfig) -> LocalBenchLimiter {
-    #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-    {
-        use trypema::RateLimiterOptions;
-
-        LocalBenchLimiter {
-            limiter: Arc::new(RateLimiter::new(RateLimiterOptions {
-                local: local_options(&config),
-            })),
-        }
-    }
-
-    #[cfg(feature = "redis-tokio")]
-    {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(2)
-            .build()
-            .unwrap();
-        let limiter = runtime.block_on(redis::build_limiter(config));
-
-        LocalBenchLimiter {
-            limiter,
-            _runtime: runtime,
-        }
-    }
-
-    #[cfg(feature = "redis-smol")]
-    {
-        LocalBenchLimiter {
-            limiter: smol::block_on(redis::build_limiter(config)),
-        }
-    }
+pub fn build_local_limiter(config: LimiterConfig) -> Arc<LocalRateLimiterProvider> {
+    LocalRateLimiterProvider::builder()
+        .window_size(WindowSize::seconds_or_panic(config.window_size))
+        .bucket_size(BucketSize::milliseconds_or_panic(config.bucket_size))
+        .hard_limit_factor(HardLimitFactor::new_or_panic(config.hard_limit_factor))
+        .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(
+            config.suppression_factor_cache_period,
+        ))
+        .cleanup_enabled(false)
+        .build()
+        .unwrap()
 }
 
 /// Measure exactly `iterations` operations distributed across `thread_count` workers.
@@ -181,37 +130,58 @@ where
 pub mod redis {
     use std::{env, sync::Arc};
 
-    use trypema::redis::{RedisKey, RedisRateLimiterOptions};
-    use trypema::{RateLimiter, RateLimiterOptions, hybrid::SyncInterval};
+    use trypema::{
+        RateLimiterBuilder,
+        hybrid::{HybridRateLimiterProvider, SyncInterval},
+        redis::{RedisKey, RedisRateLimiterProvider},
+    };
 
-    use super::{LimiterConfig, local_options};
+    use super::LimiterConfig;
 
     /// Read `REDIS_URL` from the environment, defaulting to the local dev address.
     pub fn redis_url() -> String {
         env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379/".to_string())
     }
 
-    /// Build a `RateLimiter` backed by Redis using the given `LimiterConfig`.
-    ///
-    /// Must be called from inside an async context (or via `runtime::block_on`).
-    pub async fn build_limiter(cfg: LimiterConfig) -> Arc<RateLimiter> {
+    async fn connection_manager() -> ::redis::aio::ConnectionManager {
         let client = ::redis::Client::open(redis_url()).unwrap();
-        let connection_manager = client.get_connection_manager().await.unwrap();
+        client.get_connection_manager().await.unwrap()
+    }
 
-        let local = local_options(&cfg);
+    /// Build a Redis provider using the given benchmark configuration.
+    pub async fn build_redis_limiter(cfg: LimiterConfig) -> Arc<RedisRateLimiterProvider> {
         let prefix = RedisKey::try_from(cfg.prefix.to_string()).unwrap();
+        RedisRateLimiterProvider::builder(connection_manager().await)
+            .prefix(prefix)
+            .window_size(super::WindowSize::seconds_or_panic(cfg.window_size))
+            .bucket_size(super::BucketSize::milliseconds_or_panic(cfg.bucket_size))
+            .hard_limit_factor(super::HardLimitFactor::new_or_panic(cfg.hard_limit_factor))
+            .suppression_factor_cache_period(
+                super::SuppressionFactorCachePeriod::milliseconds_or_panic(
+                    cfg.suppression_factor_cache_period,
+                ),
+            )
+            .cleanup_enabled(false)
+            .build()
+            .unwrap()
+    }
 
-        Arc::new(RateLimiter::new(RateLimiterOptions {
-            local: local.clone(),
-            redis: RedisRateLimiterOptions {
-                connection_manager,
-                prefix: Some(prefix),
-                window_size: local.window_size,
-                bucket_size: local.bucket_size,
-                hard_limit_factor: local.hard_limit_factor,
-                suppression_factor_cache_period: local.suppression_factor_cache_period,
-                sync_interval: SyncInterval::default(),
-            },
-        }))
+    /// Build a hybrid provider using the given benchmark configuration.
+    pub async fn build_hybrid_limiter(cfg: LimiterConfig) -> Arc<HybridRateLimiterProvider> {
+        let prefix = RedisKey::try_from(cfg.prefix.to_string()).unwrap();
+        HybridRateLimiterProvider::builder(connection_manager().await)
+            .prefix(prefix)
+            .window_size(super::WindowSize::seconds_or_panic(cfg.window_size))
+            .bucket_size(super::BucketSize::milliseconds_or_panic(cfg.bucket_size))
+            .hard_limit_factor(super::HardLimitFactor::new_or_panic(cfg.hard_limit_factor))
+            .suppression_factor_cache_period(
+                super::SuppressionFactorCachePeriod::milliseconds_or_panic(
+                    cfg.suppression_factor_cache_period,
+                ),
+            )
+            .sync_interval(SyncInterval::default())
+            .cleanup_enabled(false)
+            .build()
+            .unwrap()
     }
 }

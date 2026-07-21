@@ -28,7 +28,7 @@ mod benchmarks {
         for group_ms in [1_u64, 10, 100] {
             group.bench_function(format!("inc/group_ms={group_ms}"), |b| {
                 let rl = build_local_limiter(config(60, group_ms, 100, 1.5));
-                let limiter = rl.local().suppressed();
+                let limiter = rl.suppressed();
                 let rate = RateLimit::max();
                 limiter.inc("k", &rate, 1);
 
@@ -47,14 +47,14 @@ mod benchmarks {
 
         group.bench_function("inc/suppressed_full", |b| {
             let rl = build_local_limiter(config(60, 10, 10_000, 1.5));
-            let limiter = rl.local().suppressed();
+            let limiter = rl.suppressed();
 
             // Choose values that avoid too much f64->u64 truncation noise.
             let rate = RateLimit::per_second(50.0).unwrap();
             let k = "k";
 
             // Prefill enough to push suppression_factor to 1.0.
-            let hard_window_limit = (60_f64 * *rate * 1.5) as u64;
+            let hard_window_limit = (60_f64 * rate.as_per_second() * 1.5) as u64;
             for _ in 0..(hard_window_limit + 100) {
                 let _ = limiter.inc(k, &rate, 1);
             }
@@ -76,7 +76,7 @@ mod benchmarks {
 
         group.bench_function("cache_hit", |b| {
             let rl = build_local_limiter(config(60, 10, 1_000, 1.5));
-            let limiter = rl.local().suppressed();
+            let limiter = rl.suppressed();
             let rate = RateLimit::per_second(5.0).unwrap();
             let k = "k";
             for _ in 0..500 {
@@ -91,7 +91,7 @@ mod benchmarks {
 
         group.bench_function("cache_miss_many_keys", |b| {
             let rl = build_local_limiter(config(60, 10, 1, 1.5));
-            let limiter = rl.local().suppressed();
+            let limiter = rl.suppressed();
             let rate = RateLimit::per_second(5.0).unwrap();
             let keys: Vec<String> = (0..50_000).map(|i| format!("user_{i}")).collect();
 
@@ -116,7 +116,7 @@ mod benchmarks {
         group.sample_size(50);
 
         let rl = build_local_limiter(config(3_600, 100, 1_000, 1.5));
-        let limiter = rl.local().suppressed();
+        let limiter = rl.suppressed();
         let rate = RateLimit::per_second(100.0).unwrap();
         let key = "k";
         let _ = limiter.inc(key, &rate, 1);
@@ -148,9 +148,9 @@ mod benchmarks {
         let mut group = c.benchmark_group("local_suppressed/conditional_set");
         group.sample_size(50);
         let rl = build_local_limiter(config(3_600, 100, 1_000, 1.5));
-        let limiter = rl.local().suppressed();
+        let limiter = rl.suppressed();
         let rate = RateLimit::per_second(100.0).unwrap();
-        limiter.set_if("guard", &rate, RateLimitComparator::Nil, 100);
+        limiter.set_if("guard", &rate, RateLimitComparator::Always, 100);
 
         group.bench_function("set_if/guard_miss", |b| {
             b.iter(|| {
@@ -163,7 +163,7 @@ mod benchmarks {
             });
         });
 
-        limiter.set_if("replace", &rate, RateLimitComparator::Nil, 100);
+        limiter.set_if("replace", &rate, RateLimitComparator::Always, 100);
         let mut replace_high = false;
         group.bench_function("set_if/replace", |b| {
             b.iter(|| {
@@ -172,7 +172,7 @@ mod benchmarks {
                 black_box(limiter.set_if(
                     black_box("replace"),
                     black_box(&rate),
-                    RateLimitComparator::Nil,
+                    RateLimitComparator::Always,
                     black_box(target),
                 ));
             });
@@ -205,7 +205,7 @@ mod benchmarks {
                 HistoryPreservation::PreserveNewest => "newest",
                 HistoryPreservation::PreserveOldest => "oldest",
             };
-            limiter.set_if(key, &rate, RateLimitComparator::Nil, 100);
+            limiter.set_if(key, &rate, RateLimitComparator::Always, 100);
             let mut high = false;
             group.bench_function(format!("preserve/{preservation:?}"), |b| {
                 b.iter(|| {
@@ -214,7 +214,7 @@ mod benchmarks {
                     black_box(limiter.set_if_preserve_history(
                         black_box(key),
                         black_box(&rate),
-                        RateLimitComparator::Nil,
+                        RateLimitComparator::Always,
                         black_box(target),
                         preservation,
                     ));

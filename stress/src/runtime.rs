@@ -74,20 +74,3 @@ where
 pub(crate) async fn join_task(join_handle: smol::Task<WorkerHistogram>) -> WorkerHistogram {
     join_handle.await
 } // end fn join_task
-
-/// Run a future to completion on a single-threaded executor.
-/// Used outside of an existing async context, such as constructing a connection manager from a
-/// synchronous runner.
-#[cfg(feature = "redis-tokio")]
-pub(crate) fn block_on<Future: std::future::Future>(future: Future) -> Future::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(future)
-} // end fn block_on
-
-#[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-pub(crate) fn block_on<Future: std::future::Future>(future: Future) -> Future::Output {
-    smol::block_on(future)
-} // end fn block_on

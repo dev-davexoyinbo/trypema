@@ -87,20 +87,15 @@ pub(crate) fn run(args: &Args) {
 } // end fn run
 
 fn run_trypema(args: &Args) {
-    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    eprintln!(
-        "note: a Redis-enabled stress build must initialize Redis even for --provider local; use the no-feature build for isolated local measurements"
-    );
-
-    let rate_limiter = Arc::new(build_trypema_rate_limiter(args));
+    let rate_limiter = crate::args::build_local_provider(args);
     let rate_limit = RateLimit::per_second(args.rate_limit_per_s).unwrap();
     let strategy = args.strategy;
 
     println!("local_limiter=Trypema");
     run_sync(args, None, move |key| {
         let decision = match strategy {
-            Strategy::Absolute => rate_limiter.local().absolute().inc(key, &rate_limit, 1),
-            Strategy::Suppressed => rate_limiter.local().suppressed().inc(key, &rate_limit, 1),
+            Strategy::Absolute => rate_limiter.absolute().inc(key, &rate_limit, 1),
+            Strategy::Suppressed => rate_limiter.suppressed().inc(key, &rate_limit, 1),
         };
         LocalIterationOutcome::Decision(decision)
     });
@@ -224,27 +219,3 @@ fn run_sync(
         .collect::<Vec<_>>();
     finish_run(&args, started, histograms, &state);
 } // end fn run_sync
-
-fn build_trypema_rate_limiter(args: &Args) -> trypema::RateLimiter {
-    #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-    {
-        trypema::RateLimiter::new(trypema::RateLimiterOptions {
-            local: crate::args::build_local_options(args),
-        })
-    }
-
-    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    {
-        let connection_manager = crate::runtime::block_on(
-            crate::runtime::create_redis_connection_manager(&args.redis_url),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("failed to connect to Redis: {error}");
-            std::process::exit(2);
-        });
-        trypema::RateLimiter::new(trypema::RateLimiterOptions {
-            local: crate::args::build_local_options(args),
-            redis: crate::args::build_redis_options(args, connection_manager),
-        })
-    }
-} // end fn build_trypema_rate_limiter

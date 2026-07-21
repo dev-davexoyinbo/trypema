@@ -14,7 +14,7 @@ mod enabled {
     use trypema::redis::RedisKey;
     use trypema::{HistoryPreservation, RateLimit, RateLimitComparator};
 
-    use super::common::{LimiterConfig, redis::build_limiter};
+    use super::common::{LimiterConfig, redis::build_hybrid_limiter};
     use super::runtime;
 
     pub fn bench_public_api(c: &mut Criterion) {
@@ -23,7 +23,7 @@ mod enabled {
         let rt = runtime::build();
         let rl = runtime::block_on(
             &rt,
-            build_limiter(LimiterConfig {
+            build_hybrid_limiter(LimiterConfig {
                 hard_limit_factor: 1.5,
                 prefix: "bench_hybrid_suppressed",
                 ..LimiterConfig::default()
@@ -32,18 +32,13 @@ mod enabled {
         let rate = RateLimit::max();
         let hot_key = RedisKey::try_from("hot_key".to_string()).unwrap();
         runtime::block_on(&rt, async {
-            rl.hybrid()
-                .suppressed()
-                .inc(&hot_key, &rate, 1)
-                .await
-                .unwrap();
+            rl.suppressed().inc(&hot_key, &rate, 1).await.unwrap();
         });
 
         group.bench_function("inc/hot_key", |b| {
             b.iter(|| {
                 black_box(runtime::block_on(&rt, async {
-                    rl.hybrid()
-                        .suppressed()
+                    rl.suppressed()
                         .inc(black_box(&hot_key), black_box(&rate), black_box(1))
                         .await
                 }))
@@ -53,40 +48,33 @@ mod enabled {
         group.bench_function("get/redis_synchronized", |b| {
             b.iter(|| {
                 black_box(runtime::block_on(&rt, async {
-                    rl.hybrid().suppressed().get(black_box(&hot_key)).await
+                    rl.suppressed().get(black_box(&hot_key)).await
                 }))
             });
         });
 
-        group.bench_function("get_inferred/local_fast_path", |b| {
+        group.bench_function("get_estimate/local_fast_path", |b| {
             b.iter(|| {
                 black_box(runtime::block_on(&rt, async {
-                    rl.hybrid()
-                        .suppressed()
-                        .get_inferred(black_box(&hot_key))
-                        .await
+                    rl.suppressed().get_estimate(black_box(&hot_key)).await
                 }))
             });
         });
 
         let refresh_key = RedisKey::try_from("refresh_key".to_string()).unwrap();
-        group.bench_function("get_inferred/redis_refresh", |b| {
+        group.bench_function("get_estimate/redis_refresh", |b| {
             b.iter_batched(
                 || {
                     runtime::block_on(&rt, async {
-                        rl.hybrid()
-                            .suppressed()
-                            .set_if(&refresh_key, &rate, RateLimitComparator::Nil, 1)
+                        rl.suppressed()
+                            .set_if(&refresh_key, &rate, RateLimitComparator::Always, 1)
                             .await
                             .unwrap();
                     });
                 },
                 |_| {
                     black_box(runtime::block_on(&rt, async {
-                        rl.hybrid()
-                            .suppressed()
-                            .get_inferred(black_box(&refresh_key))
-                            .await
+                        rl.suppressed().get_estimate(black_box(&refresh_key)).await
                     }))
                 },
                 BatchSize::SmallInput,
@@ -96,8 +84,7 @@ mod enabled {
         group.bench_function("get_suppression_factor/hot_key", |b| {
             b.iter(|| {
                 black_box(runtime::block_on(&rt, async {
-                    rl.hybrid()
-                        .suppressed()
+                    rl.suppressed()
                         .get_suppression_factor(black_box(&hot_key))
                         .await
                 }))
@@ -106,9 +93,8 @@ mod enabled {
 
         let guard_key = RedisKey::try_from("guard".to_string()).unwrap();
         runtime::block_on(&rt, async {
-            rl.hybrid()
-                .suppressed()
-                .set_if(&guard_key, &rate, RateLimitComparator::Nil, 100)
+            rl.suppressed()
+                .set_if(&guard_key, &rate, RateLimitComparator::Always, 100)
                 .await
                 .unwrap();
         });
@@ -116,8 +102,7 @@ mod enabled {
         group.bench_function("set_if/guard_miss", |b| {
             b.iter(|| {
                 black_box(runtime::block_on(&rt, async {
-                    rl.hybrid()
-                        .suppressed()
+                    rl.suppressed()
                         .set_if(&guard_key, &rate, RateLimitComparator::Eq(0), 50)
                         .await
                 }))
@@ -126,9 +111,8 @@ mod enabled {
 
         let replace_key = RedisKey::try_from("replace".to_string()).unwrap();
         runtime::block_on(&rt, async {
-            rl.hybrid()
-                .suppressed()
-                .set_if(&replace_key, &rate, RateLimitComparator::Nil, 100)
+            rl.suppressed()
+                .set_if(&replace_key, &rate, RateLimitComparator::Always, 100)
                 .await
                 .unwrap();
         });
@@ -138,9 +122,8 @@ mod enabled {
                 replace_high = !replace_high;
                 let target = if replace_high { 150 } else { 50 };
                 black_box(runtime::block_on(&rt, async {
-                    rl.hybrid()
-                        .suppressed()
-                        .set_if(&replace_key, &rate, RateLimitComparator::Nil, target)
+                    rl.suppressed()
+                        .set_if(&replace_key, &rate, RateLimitComparator::Always, target)
                         .await
                 }))
             });
@@ -152,9 +135,8 @@ mod enabled {
         ] {
             let key = RedisKey::try_from(format!("preserve_{preservation:?}")).unwrap();
             runtime::block_on(&rt, async {
-                rl.hybrid()
-                    .suppressed()
-                    .set_if(&key, &rate, RateLimitComparator::Nil, 100)
+                rl.suppressed()
+                    .set_if(&key, &rate, RateLimitComparator::Always, 100)
                     .await
                     .unwrap();
             });
@@ -164,12 +146,11 @@ mod enabled {
                     high = !high;
                     let target = if high { 150 } else { 50 };
                     black_box(runtime::block_on(&rt, async {
-                        rl.hybrid()
-                            .suppressed()
+                        rl.suppressed()
                             .set_if_preserve_history(
                                 &key,
                                 &rate,
-                                RateLimitComparator::Nil,
+                                RateLimitComparator::Always,
                                 target,
                                 preservation,
                             )

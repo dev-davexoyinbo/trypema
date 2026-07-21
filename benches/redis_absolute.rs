@@ -16,7 +16,7 @@ mod enabled {
     use trypema::redis::RedisKey;
     use trypema::{HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator};
 
-    use super::common::{LimiterConfig, redis::build_limiter};
+    use super::common::{LimiterConfig, redis::build_redis_limiter};
     use super::runtime;
 
     pub fn bench_inc(c: &mut Criterion) {
@@ -27,8 +27,8 @@ mod enabled {
 
         let rl = runtime::block_on(
             &rt,
-            build_limiter(LimiterConfig {
-                hard_limit_factor: *HardLimitFactor::default(),
+            build_redis_limiter(LimiterConfig {
+                hard_limit_factor: HardLimitFactor::default().as_multiplier(),
                 prefix: "bench_redis_absolute",
                 ..LimiterConfig::default()
             }),
@@ -39,14 +39,13 @@ mod enabled {
 
         // Ensure connection is warm.
         runtime::block_on(&rt, async {
-            let _ = rl.redis().absolute().inc(&key, &rate, 1).await.unwrap();
+            let _ = rl.absolute().inc(&key, &rate, 1).await.unwrap();
         });
 
         group.bench_function("inc/hot_key", |b| {
             b.iter(|| {
                 let _ = runtime::block_on(&rt, async {
                     let res = rl
-                        .redis()
                         .absolute()
                         .inc(black_box(&key), black_box(&rate), black_box(1))
                         .await;
@@ -58,7 +57,7 @@ mod enabled {
         group.bench_function("is_allowed/hot_key", |b| {
             b.iter(|| {
                 let _ = runtime::block_on(&rt, async {
-                    let res = rl.redis().absolute().is_allowed(black_box(&key)).await;
+                    let res = rl.absolute().is_allowed(black_box(&key)).await;
                     black_box(res)
                 });
             });
@@ -66,17 +65,15 @@ mod enabled {
 
         let set_key = RedisKey::try_from("set_user".to_string()).unwrap();
         runtime::block_on(&rt, async {
-            rl.redis()
-                .absolute()
-                .set_if(&set_key, &rate, RateLimitComparator::Nil, 100)
+            rl.absolute()
+                .set_if(&set_key, &rate, RateLimitComparator::Always, 100)
                 .await
                 .unwrap();
         });
         group.bench_function("set_if/guard_miss", |b| {
             b.iter(|| {
                 black_box(runtime::block_on(&rt, async {
-                    rl.redis()
-                        .absolute()
+                    rl.absolute()
                         .set_if(&set_key, &rate, RateLimitComparator::Eq(0), 50)
                         .await
                 }))
@@ -85,9 +82,8 @@ mod enabled {
 
         let replace_key = RedisKey::try_from("replace_user".to_string()).unwrap();
         runtime::block_on(&rt, async {
-            rl.redis()
-                .absolute()
-                .set_if(&replace_key, &rate, RateLimitComparator::Nil, 100)
+            rl.absolute()
+                .set_if(&replace_key, &rate, RateLimitComparator::Always, 100)
                 .await
                 .unwrap();
         });
@@ -97,9 +93,8 @@ mod enabled {
                 replace_high = !replace_high;
                 let target = if replace_high { 150 } else { 50 };
                 black_box(runtime::block_on(&rt, async {
-                    rl.redis()
-                        .absolute()
-                        .set_if(&replace_key, &rate, RateLimitComparator::Nil, target)
+                    rl.absolute()
+                        .set_if(&replace_key, &rate, RateLimitComparator::Always, target)
                         .await
                 }))
             });
@@ -111,9 +106,8 @@ mod enabled {
         ] {
             let key = RedisKey::try_from(format!("preserve_{preservation:?}")).unwrap();
             runtime::block_on(&rt, async {
-                rl.redis()
-                    .absolute()
-                    .set_if(&key, &rate, RateLimitComparator::Nil, 100)
+                rl.absolute()
+                    .set_if(&key, &rate, RateLimitComparator::Always, 100)
                     .await
                     .unwrap();
             });
@@ -123,12 +117,11 @@ mod enabled {
                     high = !high;
                     let target = if high { 150 } else { 50 };
                     black_box(runtime::block_on(&rt, async {
-                        rl.redis()
-                            .absolute()
+                        rl.absolute()
                             .set_if_preserve_history(
                                 &key,
                                 &rate,
-                                RateLimitComparator::Nil,
+                                RateLimitComparator::Always,
                                 target,
                                 preservation,
                             )
