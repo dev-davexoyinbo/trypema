@@ -14,7 +14,7 @@ use crate::{
     },
 };
 
-/// Strict sliding-window rate limiter backed by Redis.
+/// Sliding-window allow/reject limiter backed by Redis.
 ///
 /// Provides the same deterministic admission semantics as
 /// [`AbsoluteLocalRateLimiter`](crate::local::AbsoluteLocalRateLimiter), but stores

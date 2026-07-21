@@ -81,7 +81,7 @@ impl RateLimiterBuilder for LocalRateLimiterBuilder {
 ///
 /// # Strategies
 ///
-/// - **Absolute:** Strict sliding-window enforcement
+/// - **Absolute:** Best-effort sliding-window allow/reject admission
 /// - **Suppressed:** Probabilistic suppression for graceful degradation
 ///
 /// # Thread Safety
@@ -92,7 +92,7 @@ impl RateLimiterBuilder for LocalRateLimiterBuilder {
 ///
 /// ```
 /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-/// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+/// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
 /// use trypema::RateLimit;
 ///
 /// let rate = RateLimit::per_second(10.0).unwrap();
@@ -167,8 +167,8 @@ impl LocalRateLimiterProvider {
 
     /// Access the absolute strategy.
     ///
-    /// Returns a reference to the absolute local rate limiter, which provides strict
-    /// sliding-window enforcement with deterministic behavior.
+    /// Returns the absolute local limiter. Admission is allow/reject and best-effort under
+    /// concurrency; concurrent callers may temporarily overshoot.
     ///
     /// See [`AbsoluteLocalRateLimiter`] for full documentation.
     ///
@@ -176,7 +176,7 @@ impl LocalRateLimiterProvider {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let rate = RateLimit::per_second(10.0).unwrap();
@@ -201,7 +201,7 @@ impl LocalRateLimiterProvider {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let rate = RateLimit::per_second(10.0).unwrap();

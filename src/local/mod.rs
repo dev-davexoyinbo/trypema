@@ -3,30 +3,9 @@
 //! The local provider maintains rate limiting state within the current process using
 //! thread-safe data structures ([`DashMap`](dashmap::DashMap) and atomics).
 //!
-//! # Key Characteristics
-//!
-//! - **Thread-safe:** Safe for concurrent use across multiple threads
-//! - **Zero external dependencies:** No network or database required
-//! - **Low latency:** Sub-microsecond admission checks (no I/O)
-//! - **Process-scoped:** State is not shared across processes
-//!
-//! # Strategies
-//!
-//! - [`AbsoluteLocalRateLimiter`]: Strict sliding-window enforcement
-//! - [`SuppressedLocalRateLimiter`]: Probabilistic suppression for graceful degradation
-//!
-//! # When to Use
-//!
-//! ✅ **Use local provider when:**
-//! - Single-process application
-//! - Low-latency requirements
-//! - No need for distributed coordination
-//! - Simple deployment (no Redis/external dependencies)
-//!
-//! ❌ **Don't use local provider when:**
-//! - Multiple application instances need shared limits
-//! - Horizontal scaling requires coordinated rate limiting
-//! - Rate limits must survive process restarts
+//! It is synchronous, requires no external service, and keeps state within one process. Use
+//! [`AbsoluteLocalRateLimiter`] for allow/reject admission or [`SuppressedLocalRateLimiter`] for
+//! probabilistic load shedding. Absolute admission is best-effort under concurrency.
 //!
 //! # Examples
 //!
@@ -34,12 +13,12 @@
 //! use trypema::{RateLimit, RateLimiterBuilder, local::LocalRateLimiterProvider};
 //!
 //! let rl = LocalRateLimiterProvider::builder()
-//!     .cleanup_enabled(false)
+//!     .disable_cleanup()
 //!     .build()
 //!     .unwrap();
 //! let rate = RateLimit::per_second(10.0).unwrap();
 //!
-//! // Absolute strategy: strict enforcement
+//! // Absolute strategy: allow/reject admission
 //! let decision = rl.absolute().inc("user_123", &rate, 1);
 //!
 //! // Suppressed strategy: probabilistic suppression

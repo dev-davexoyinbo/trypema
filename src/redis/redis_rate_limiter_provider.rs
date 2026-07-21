@@ -128,11 +128,6 @@ impl RateLimiterBuilder for RedisRateLimiterBuilder {
 /// - **Redis:** >= 7.2.0
 /// - **Runtime:** Tokio or Smol
 ///
-/// # Strategies
-///
-/// - **Absolute:** ✅ Implemented (Lua scripts)
-/// - **Suppressed:** ✅ Implemented (Lua scripts)
-///
 /// # Consistency Semantics
 ///
 /// - **Atomic operations:** Each Lua script execution is atomic within Redis
@@ -230,12 +225,10 @@ impl RedisRateLimiterProvider {
         self.is_cleanup_loop_running.store(false, Ordering::Release);
     }
 
-    /// Access the absolute strategy for strict enforcement.
+    /// Access the absolute allow/reject strategy.
     ///
     /// Returns a reference to the Redis absolute rate limiter, which provides
     /// distributed sliding-window enforcement via atomic Lua scripts.
-    ///
-    /// **Status:** ✅ Implemented
     ///
     /// See [`AbsoluteRedisRateLimiter`] for full documentation.
     ///
@@ -261,8 +254,6 @@ impl RedisRateLimiterProvider {
     }
 
     /// Access the suppressed strategy for probabilistic suppression.
-    ///
-    /// **Status:** ✅ Implemented
     ///
     /// Returns a reference to the Redis suppressed rate limiter, which provides
     /// distributed probabilistic suppression via atomic Lua scripts.

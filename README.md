@@ -18,13 +18,13 @@ And three independently constructed providers:
 
 ```toml
 [dependencies]
-trypema = "1.1"
+trypema = "2"
 ```
 
 For Redis or hybrid providers, enable exactly one runtime feature:
 
 ```toml
-trypema = { version = "1.1", features = ["redis-tokio"] }
+trypema = { version = "2", features = ["redis-tokio"] }
 # or: features = ["redis-smol"]
 ```
 
@@ -118,12 +118,21 @@ These getters expose values without leaking or permitting mutation of their repr
 
 Use `RateLimitComparator::Always` for an unconditional update through the conditional path.
 Matched zero targets delete state. Matched updates also replace the sticky window capacity.
+`set_if_preserve_history` additionally retains one side of live history:
+
+- `PreserveNewest` consumes oldest buckets first; increases extend newest history.
+- `PreserveOldest` consumes newest buckets first; increases extend oldest history.
 
 ## Decisions and behavior
 
 `RateLimitDecision::Rejected` exposes `window_size: WindowSize`, `retry_after: Duration`, and
 `remaining_after_waiting`. Metadata is best-effort under bucket coalescing and concurrency.
 Suppressed decisions expose `is_allowed` and `suppression_factor`.
+
+Absolute `get` returns the live total as `u64`. Suppressed `get` returns
+`SuppressedRateLimitSnapshot` with observed usage, declined usage, and suppression factor.
+Unknown keys return zero-valued results without creating state. Hybrid reads include this
+instance's pending local counts; `get_estimate` may answer from local state without Redis I/O.
 
 `RateLimitDecision` is exhaustive, while the fields of its `Rejected` and `Suppressed` variants
 are non-exhaustive; match those variants with `{ .. }`. Other public result structs and the error

@@ -32,7 +32,7 @@ impl RateLimitSeries {
     }
 }
 
-/// Strict sliding-window rate limiter for in-process use.
+/// Sliding-window allow/reject rate limiter for in-process use.
 ///
 /// Provides deterministic rate limiting with per-key state maintained in memory.
 /// Uses a sliding time window to track request counts and enforce limits.
@@ -67,26 +67,15 @@ impl RateLimitSeries {
 /// - Uses `Instant::elapsed().as_millis()` (whole-millisecond truncation)
 /// - Buckets expire close to `window_size` (lazy eviction may delay removal until next call)
 ///
-/// **Memory growth:**
-/// - Keys are not automatically removed
-/// - Unbounded key cardinality will grow memory
-/// - Use `run_cleanup_loop()` to periodically remove stale keys
-///
 /// **Lazy eviction:**
-/// - Expired buckets are only removed when `is_allowed()` or `inc()` is called
-/// - Stale buckets remain in memory until accessed or cleanup runs
-///
-/// # Performance
-///
-/// - **Admission check:** O(buckets_in_window) — typically < 10 buckets
-/// - **Increment:** O(1) amortised (coalesced into existing bucket or appended via `push_back`)
-/// - **Memory:** ~50–200 bytes per key (depends on bucket count)
+/// - Reads and admission operations may remove expired buckets
+/// - Provider builders start stale-key cleanup by default
 ///
 /// # Examples
 ///
 /// ```
 /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-/// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+/// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
 /// use trypema::{RateLimit, RateLimitDecision};
 ///
 /// let limiter = rl.absolute();
@@ -164,7 +153,7 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let limiter = rl.absolute();
@@ -260,7 +249,7 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let limiter = rl.absolute();
@@ -562,7 +551,7 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::RateLimit;
     ///
     /// let limiter = rl.absolute();
@@ -609,7 +598,7 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitComparator};
     ///
     /// let limiter = rl.absolute();

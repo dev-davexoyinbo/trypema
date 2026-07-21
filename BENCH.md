@@ -100,8 +100,8 @@ Harness guarantees:
   support only `--strategy absolute`; Redis and hybrid providers require exactly one runtime
   feature.
 
-Use the no-feature build for isolated local measurements. A Redis-enabled build can still access
-the local API, but constructing the facade also constructs its feature-enabled Redis providers.
+Use the no-feature build for isolated local measurements. A Redis-enabled build can still
+construct and benchmark the local provider independently.
 
 Examples:
 

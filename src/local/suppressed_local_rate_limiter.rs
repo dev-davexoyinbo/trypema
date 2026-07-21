@@ -116,7 +116,7 @@ impl RateLimitSeries {
 ///
 /// ```
 /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-/// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+/// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
 /// use trypema::{RateLimit, RateLimitDecision};
 ///
 /// let limiter = rl.suppressed();
@@ -197,7 +197,7 @@ impl SuppressedLocalRateLimiter {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let limiter = rl.suppressed();
@@ -402,7 +402,7 @@ impl SuppressedLocalRateLimiter {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// let limiter = rl.suppressed();
     ///
     /// // No state yet → 0.0 (no suppression)
@@ -513,7 +513,7 @@ impl SuppressedLocalRateLimiter {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::RateLimit;
     ///
     /// let limiter = rl.suppressed();
@@ -837,7 +837,7 @@ impl SuppressedLocalRateLimiter {
     ///
     /// ```
     /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitComparator};
     ///
     /// let limiter = rl.suppressed();

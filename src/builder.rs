@@ -33,17 +33,20 @@ pub trait RateLimiterBuilder: Sized {
     /// Set interval between stale-state cleanup passes.
     fn cleanup_interval(self, value: Duration) -> Self;
 
-    /// Disable automatic cleanup startup when the provider is built.
+    /// Disable automatic cleanup startup when provider is built.
     fn disable_cleanup(self) -> Self {
         self.cleanup_enabled(false)
     }
 
-    /// Enable automatic cleanup startup when the provider is built.
+    /// Enable automatic cleanup startup when provider is built.
     fn enable_cleanup(self) -> Self {
         self.cleanup_enabled(true)
     }
 
-    /// Enable or disable automatic cleanup startup when provider is built.
+    /// Set automatic cleanup startup from a runtime boolean.
+    ///
+    /// Prefer [`enable_cleanup`](Self::enable_cleanup) or
+    /// [`disable_cleanup`](Self::disable_cleanup) when value is known statically.
     fn cleanup_enabled(self, enabled: bool) -> Self;
 
     /// Build provider and start cleanup when enabled.

@@ -51,7 +51,7 @@ enum AbsoluteRedisLimitingState {
     },
 }
 
-/// Strict sliding-window rate limiter with a local fast-path and periodic Redis sync.
+/// Sliding-window allow/reject limiter with a local fast path and periodic Redis sync.
 ///
 /// This is the hybrid counterpart to [`AbsoluteRedisRateLimiter`](crate::redis::AbsoluteRedisRateLimiter).
 /// Instead of executing a Redis round-trip on every `inc()` call, it maintains local

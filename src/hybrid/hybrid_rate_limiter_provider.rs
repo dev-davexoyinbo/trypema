@@ -126,11 +126,8 @@ impl RateLimiterBuilder for HybridRateLimiterBuilder {
 /// It is constructed from a public Redis connection manager and exposes
 /// [`AbsoluteHybridRateLimiter`] and [`SuppressedHybridRateLimiter`] as strategies.
 ///
-/// Compared to the pure Redis provider:
-/// - ✅ Lower steady-state latency for admission checks (no per-request Redis I/O)
-/// - ✅ Reduced Redis load via batched commits
-/// - ❌ More approximation: admission decisions reflect Redis state with up to `sync_interval`
-///   of lag
+/// Compared with the Redis provider, hybrid admission avoids steady-state per-request Redis I/O
+/// and batches commits. Decisions can lag shared Redis state by the synchronization interval.
 ///
 /// # Strategies
 ///
@@ -211,7 +208,7 @@ impl HybridRateLimiterProvider {
         self.is_cleanup_loop_running.store(false, Ordering::Release);
     }
 
-    /// Access the absolute strategy for strict sliding-window enforcement.
+    /// Access the absolute allow/reject strategy.
     ///
     /// See [`AbsoluteHybridRateLimiter`] for full documentation.
     ///

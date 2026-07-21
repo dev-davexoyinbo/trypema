@@ -95,7 +95,7 @@ pub(crate) struct Bucket {
 ///
 /// ```
 /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
-/// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+/// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
 /// use trypema::{RateLimit, RateLimitDecision};
 ///
 /// let rate = RateLimit::per_second(10.0).unwrap();
@@ -611,14 +611,12 @@ impl WindowSize {
 /// # Trade-offs
 ///
 /// **Larger values (50-100ms):**
-/// - ✅ Lower memory usage (fewer buckets)
-/// - ✅ Better performance
-/// - ❌ Coarser rejection metadata
+/// - Lower memory usage and overhead
+/// - Coarser rejection metadata
 ///
 /// **Smaller values (1-20ms):**
-/// - ✅ More accurate timing
-/// - ✅ Better rejection metadata
-/// - ❌ Higher memory usage
+/// - More accurate timing and rejection metadata
+/// - Higher memory usage
 ///
 /// # Examples
 ///

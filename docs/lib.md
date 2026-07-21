@@ -106,6 +106,10 @@ comparator miss from a successful no-op; `previous_total` and `current_total` ex
 before and after the operation. [`RateLimitComparator::Always`] requests an unconditional
 update through this path.
 
+[`HistoryPreservation::PreserveNewest`] consumes oldest buckets first and extends newest
+history. [`HistoryPreservation::PreserveOldest`] does the reverse. Matched zero targets remove
+the key; every matched update replaces its sticky window capacity.
+
 [`RateLimitDecision`] is exhaustive, so callers can match all three variants without a wildcard.
 The fields of its `Rejected` and `Suppressed` variants remain non-exhaustive, so match those
 variants with `{ .. }`:
@@ -127,6 +131,14 @@ Other public result structs and [`TrypemaError`] remain non-exhaustive.
 `inc` limits are sticky per key: the first increment stores the computed window capacity.
 Matched conditional updates replace that stored capacity. A matched target of zero removes the
 key. Absolute admission is best-effort under concurrency and may temporarily overshoot.
+
+## Reading live state
+
+Absolute `get` methods return the live total as `u64`. Suppressed `get` methods return
+[`SuppressedRateLimitSnapshot`], containing observed usage, declined usage, and the current
+suppression factor. Unknown keys return zero-valued results without creating state. Reads may
+perform lazy expiration maintenance. Hybrid reads include this instance's pending local counts;
+`get_estimate` may use initialized local state instead of consulting Redis.
 
 ## Name and Biblical Inspiration
 
