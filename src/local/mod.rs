@@ -30,74 +30,27 @@
 //!
 //! # Examples
 //!
-//! ```no_run
-//! use trypema::{HardLimitFactor, BucketSize, RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, SuppressionFactorCachePeriod, WindowSize};
-//! use trypema::local::LocalRateLimiterOptions;
-//! # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-//! # use trypema::redis::RedisRateLimiterOptions;
-//! # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-//! # use trypema::hybrid::SyncInterval;
-//! #
-//! # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-//! # fn options() -> RateLimiterOptions {
-//! #     let window_size = WindowSize::seconds(60).unwrap();
-//! #     let bucket_size = BucketSize::milliseconds(10).unwrap();
-//! #     let hard_limit_factor = HardLimitFactor::default();
-//! #     let suppression_factor_cache_period = SuppressionFactorCachePeriod::default();
-//! #     let sync_interval = SyncInterval::default();
-//! #
-//! #     RateLimiterOptions {
-//! #         local: LocalRateLimiterOptions {
-//! #             window_size,
-//! #             bucket_size,
-//! #             hard_limit_factor,
-//! #             suppression_factor_cache_period,
-//! #         },
-//! #         redis: RedisRateLimiterOptions {
-//! #             connection_manager: todo!(),
-//! #             prefix: None,
-//! #             window_size,
-//! #             bucket_size,
-//! #             hard_limit_factor,
-//! #             suppression_factor_cache_period,
-//! #             sync_interval,
-//! #         },
-//! #     }
-//! # }
-//! #
-//! # #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-//! # fn options() -> RateLimiterOptions {
-//! #     let window_size = WindowSize::seconds(60).unwrap();
-//! #     let bucket_size = BucketSize::milliseconds(10).unwrap();
-//! #     let hard_limit_factor = HardLimitFactor::default();
-//! #     let suppression_factor_cache_period = SuppressionFactorCachePeriod::default();
-//! #
-//! #     RateLimiterOptions {
-//! #         local: LocalRateLimiterOptions {
-//! #             window_size,
-//! #             bucket_size,
-//! #             hard_limit_factor,
-//! #             suppression_factor_cache_period,
-//! #         },
-//! #     }
-//! # }
+//! ```
+//! use trypema::{RateLimit, RateLimiterBuilder, local::LocalRateLimiterProvider};
 //!
-//! let rl = RateLimiter::new(options());
-//!
+//! let rl = LocalRateLimiterProvider::builder()
+//!     .cleanup_enabled(false)
+//!     .build()
+//!     .unwrap();
 //! let rate = RateLimit::per_second(10.0).unwrap();
 //!
 //! // Absolute strategy: strict enforcement
-//! let decision = rl.local().absolute().inc("user_123", &rate, 1);
+//! let decision = rl.absolute().inc("user_123", &rate, 1);
 //!
 //! // Suppressed strategy: probabilistic suppression
-//! let decision = rl.local().suppressed().inc("api_endpoint", &rate, 1);
+//! let decision = rl.suppressed().inc("api_endpoint", &rate, 1);
 //! ```
 
 mod absolute_local_rate_limiter;
-pub use absolute_local_rate_limiter::*;
+pub use absolute_local_rate_limiter::AbsoluteLocalRateLimiter;
 
 mod local_rate_limiter_provider;
-pub use local_rate_limiter_provider::*;
+pub use local_rate_limiter_provider::{LocalRateLimiterBuilder, LocalRateLimiterProvider};
 
 pub(crate) mod suppressed_local_rate_limiter;
-pub use suppressed_local_rate_limiter::*;
+pub use suppressed_local_rate_limiter::SuppressedLocalRateLimiter;

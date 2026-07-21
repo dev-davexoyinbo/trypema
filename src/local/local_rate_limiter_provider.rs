@@ -1,84 +1,77 @@
-use crate::{
-    AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter,
-    common::{BucketSize, HardLimitFactor, SuppressionFactorCachePeriod, WindowSize},
+use std::{
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
-/// Configuration for local (in-process) rate limiters.
-///
-/// Controls the shared settings used by [`AbsoluteLocalRateLimiter`] and
-/// [`SuppressedLocalRateLimiter`].
-///
-/// # Examples
-///
-/// ```
-/// use trypema::{HardLimitFactor, BucketSize, SuppressionFactorCachePeriod, WindowSize};
-/// use trypema::local::LocalRateLimiterOptions;
-///
-/// let defaults = LocalRateLimiterOptions::default();
-///
-/// let options = LocalRateLimiterOptions {
-///     window_size: WindowSize::seconds(60).unwrap(),   // 60s sliding window
-///     bucket_size: BucketSize::milliseconds(10).unwrap(),      // 10ms coalescing
-///     hard_limit_factor: HardLimitFactor::try_from(1.5).unwrap(),      // 50% burst headroom
-///     suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-/// };
-///
-/// // High-precision, low-coalescing
-/// let precise = LocalRateLimiterOptions {
-///     window_size: WindowSize::seconds(10).unwrap(),
-///     bucket_size: BucketSize::milliseconds(1).unwrap(),
-///     hard_limit_factor: HardLimitFactor::default(),
-///     suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-/// };
-///
-/// // High-performance, aggressive coalescing
-/// let fast = LocalRateLimiterOptions {
-///     window_size: WindowSize::seconds(120).unwrap(),
-///     bucket_size: BucketSize::milliseconds(100).unwrap(),
-///     hard_limit_factor: HardLimitFactor::try_from(2.0).unwrap(),
-///     suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-/// };
-/// ```
-#[derive(Clone, Debug, Default)]
-pub struct LocalRateLimiterOptions {
-    /// Sliding window duration for admission decisions.
-    ///
-    /// Determines how far back in time the limiter looks. Larger windows smooth bursts
-    /// but delay recovery after hitting limits.
-    ///
-    /// **Typical values:** 10-300 seconds  
-    /// **Recommended:** 60 seconds
-    pub window_size: WindowSize,
+use crate::{
+    BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, TrypemaError,
+    WindowSize,
+    builder::{CleanupConfig, ProviderConfig},
+};
 
-    /// Bucket coalescing interval in milliseconds.
-    ///
-    /// Increments within this interval are merged into the same bucket to reduce overhead.
-    /// Larger values improve performance but reduce timing accuracy.
-    ///
-    /// **Typical values:** 10-100 milliseconds  
-    /// **Recommended:** 10 milliseconds
-    pub bucket_size: BucketSize,
+use super::{AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter};
 
-    /// Hard cutoff multiplier for the suppressed strategy.
-    ///
-    /// Defines the absolute maximum rate: `rate_limit × hard_limit_factor`
-    ///
-    /// Beyond this limit, the suppressed strategy transitions to full suppression
-    /// (`suppression_factor = 1.0`). Only relevant for [`SuppressedLocalRateLimiter`].
-    ///
-    /// **Typical values:** 1.0-2.0  
-    /// **Recommended:** 1.5 (50% burst headroom)  
-    /// **Note:** Ignored by [`AbsoluteLocalRateLimiter`]
-    pub hard_limit_factor: HardLimitFactor,
+/// Builder for [`LocalRateLimiterProvider`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalRateLimiterBuilder {
+    provider: ProviderConfig,
+    cleanup: CleanupConfig,
+}
 
-    /// Cache duration (milliseconds) for suppression factor recomputation.
-    ///
-    /// The suppressed strategy caches the computed suppression factor per key to avoid
-    /// recomputing it on every request.
-    ///
-    /// **Typical values:** 10-1000 ms
-    /// **Recommended:** 10-200 ms
-    pub suppression_factor_cache_period: SuppressionFactorCachePeriod,
+impl RateLimiterBuilder for LocalRateLimiterBuilder {
+    type Provider = LocalRateLimiterProvider;
+
+    fn window_size(mut self, value: WindowSize) -> Self {
+        self.provider.window_size = value;
+        self
+    }
+
+    fn bucket_size(mut self, value: BucketSize) -> Self {
+        self.provider.bucket_size = value;
+        self
+    }
+
+    fn hard_limit_factor(mut self, value: HardLimitFactor) -> Self {
+        self.provider.hard_limit_factor = value;
+        self
+    }
+
+    fn suppression_factor_cache_period(mut self, value: SuppressionFactorCachePeriod) -> Self {
+        self.provider.suppression_factor_cache_period = value;
+        self
+    }
+
+    fn stale_after(mut self, value: Duration) -> Self {
+        self.cleanup.stale_after = value;
+        self
+    }
+
+    fn cleanup_interval(mut self, value: Duration) -> Self {
+        self.cleanup.interval = value;
+        self
+    }
+
+    fn cleanup_enabled(mut self, enabled: bool) -> Self {
+        self.cleanup.enabled = enabled;
+        self
+    }
+
+    fn build(self) -> Result<Arc<Self::Provider>, TrypemaError> {
+        let config = self.provider.validate()?;
+        let cleanup = self.cleanup.validate()?;
+
+        let provider = Arc::new(LocalRateLimiterProvider::new(config, cleanup));
+
+        if cleanup.enabled {
+            provider.start_cleanup_loop();
+        }
+
+        Ok(provider)
+    }
 }
 
 /// Provider for in-process rate limiting strategies.
@@ -98,25 +91,78 @@ pub struct LocalRateLimiterOptions {
 /// # Examples
 ///
 /// ```
-/// # let rl = trypema::__doctest_helpers::rate_limiter();
+/// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+/// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
 /// use trypema::RateLimit;
 ///
 /// let rate = RateLimit::per_second(10.0).unwrap();
-/// let abs_decision = rl.local().absolute().inc("user_123", &rate, 1);
-/// let sup_decision = rl.local().suppressed().inc("user_456", &rate, 1);
+/// let abs_decision = rl.absolute().inc("user_123", &rate, 1);
+/// let sup_decision = rl.suppressed().inc("user_456", &rate, 1);
 /// ```
 #[derive(Debug)]
 pub struct LocalRateLimiterProvider {
     absolute: AbsoluteLocalRateLimiter,
     suppressed: SuppressedLocalRateLimiter,
+    cleanup: CleanupConfig,
+    is_cleanup_loop_running: AtomicBool,
+    cleanup_generation: AtomicU64,
 }
 
 impl LocalRateLimiterProvider {
-    pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
+    /// Create builder using default validated configuration.
+    pub fn builder() -> LocalRateLimiterBuilder {
+        LocalRateLimiterBuilder::default()
+    }
+
+    pub(crate) fn new(config: ProviderConfig, cleanup: CleanupConfig) -> Self {
         Self {
-            absolute: AbsoluteLocalRateLimiter::new(options.clone()),
-            suppressed: SuppressedLocalRateLimiter::new(options.clone()),
+            absolute: AbsoluteLocalRateLimiter::new(config),
+            suppressed: SuppressedLocalRateLimiter::new(config),
+            cleanup,
+            is_cleanup_loop_running: AtomicBool::new(false),
+            cleanup_generation: AtomicU64::new(0),
         }
+    }
+
+    /// Start stale-state cleanup. Calling while already running is no-op.
+    pub fn start_cleanup_loop(self: &Arc<Self>) {
+        if self.is_cleanup_loop_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let generation = self
+            .cleanup_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let provider = Arc::downgrade(self);
+        thread::spawn(move || Self::run_cleanup_loop(provider, generation));
+    }
+
+    fn run_cleanup_loop(weak_provider: Weak<Self>, generation: u64) {
+        loop {
+            let Some(provider) = weak_provider.upgrade() else {
+                break;
+            };
+            let interval = provider.cleanup.interval;
+            drop(provider);
+            thread::sleep(interval);
+
+            let Some(provider) = weak_provider.upgrade() else {
+                break;
+            };
+            if !provider.is_cleanup_loop_running.load(Ordering::Acquire)
+                || provider.cleanup_generation.load(Ordering::Acquire) != generation
+            {
+                break;
+            }
+            provider.cleanup(provider.cleanup.stale_after_ms());
+        }
+    }
+
+    /// Stop stale-state cleanup. Calling while stopped is no-op.
+    pub fn stop_cleanup_loop(&self) {
+        self.cleanup_generation.fetch_add(1, Ordering::AcqRel);
+        self.is_cleanup_loop_running.store(false, Ordering::Release);
     }
 
     /// Access the absolute strategy.
@@ -129,11 +175,12 @@ impl LocalRateLimiterProvider {
     /// # Examples
     ///
     /// ```
-    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let rate = RateLimit::per_second(10.0).unwrap();
-    /// let decision = rl.local().absolute().inc("user_123", &rate, 1);
+    /// let decision = rl.absolute().inc("user_123", &rate, 1);
     /// assert!(matches!(decision, RateLimitDecision::Allowed));
     /// ```
     pub fn absolute(&self) -> &AbsoluteLocalRateLimiter {
@@ -153,16 +200,17 @@ impl LocalRateLimiterProvider {
     /// # Examples
     ///
     /// ```
-    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
     /// let rate = RateLimit::per_second(10.0).unwrap();
-    /// match rl.local().suppressed().inc("user_123", &rate, 1) {
-    ///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
+    /// match rl.suppressed().inc("user_123", &rate, 1) {
+    ///     RateLimitDecision::Suppressed { is_allowed, suppression_factor, .. } => {
     ///         println!("suppression: {suppression_factor}, allowed: {is_allowed}");
     ///     }
     ///     RateLimitDecision::Allowed => {}
-    ///     _ => unreachable!(),
+    ///     RateLimitDecision::Rejected { .. } => unreachable!(),
     /// }
     /// ```
     pub fn suppressed(&self) -> &SuppressedLocalRateLimiter {

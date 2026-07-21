@@ -7,8 +7,9 @@ use std::{
 use dashmap::{DashMap, mapref::entry::Entry};
 
 use crate::{
-    BucketSize, HistoryPreservation, LocalRateLimiterOptions, RateLimitComparator,
-    RateLimitDecision, SuppressedRateLimitSnapshot,
+    BucketSize, ConditionalSetOutcome, HistoryPreservation, RateLimitComparator, RateLimitDecision,
+    SuppressedRateLimitSnapshot,
+    builder::ProviderConfig,
     common::{
         Bucket, HardLimitFactor, HistoryUpdateMode, RandomState, RateLimit,
         SuppressionFactorCachePeriod, WindowSize,
@@ -114,15 +115,16 @@ impl RateLimitSeries {
 /// # Examples
 ///
 /// ```
-/// # let rl = trypema::__doctest_helpers::rate_limiter();
+/// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+/// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
 /// use trypema::{RateLimit, RateLimitDecision};
 ///
-/// let limiter = rl.local().suppressed();
+/// let limiter = rl.suppressed();
 /// let rate = RateLimit::per_second(10.0).unwrap();
 ///
 /// match limiter.inc("user_123", &rate, 1) {
 ///     RateLimitDecision::Allowed => {}
-///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
+///     RateLimitDecision::Suppressed { is_allowed, suppression_factor, .. } => {
 ///         println!("suppression: {suppression_factor:.2}, allowed: {is_allowed}");
 ///     }
 ///     RateLimitDecision::Rejected { .. } => unreachable!(),
@@ -141,12 +143,12 @@ pub struct SuppressedLocalRateLimiter {
 }
 
 impl SuppressedLocalRateLimiter {
-    pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
+    pub(crate) fn new(options: ProviderConfig) -> Self {
         Self {
             hard_limit_factor: options.hard_limit_factor,
-            window_size_ms: (*options.window_size as u128).saturating_mul(1000),
+            window_size_ms: options.window_size.as_milliseconds(),
             window_size: options.window_size,
-            window_duration: Duration::from_secs(*options.window_size),
+            window_duration: Duration::from_secs(options.window_size.as_seconds()),
             suppression_factor_cache_period: options.suppression_factor_cache_period,
             bucket_size: options.bucket_size,
             series: DashMap::default(),
@@ -194,10 +196,11 @@ impl SuppressedLocalRateLimiter {
     /// # Examples
     ///
     /// ```
-    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
-    /// let limiter = rl.local().suppressed();
+    /// let limiter = rl.suppressed();
     /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Under limit → Allowed
@@ -223,7 +226,9 @@ impl SuppressedLocalRateLimiter {
                 .entry(key.to_string())
                 .or_insert_with(|| {
                     RateLimitSeries::new(
-                        **rate_limit * *self.hard_limit_factor * *self.window_size as f64,
+                        rate_limit.as_per_second()
+                            * self.hard_limit_factor.as_multiplier()
+                            * self.window_size.as_seconds() as f64,
                     )
                 })
                 .downgrade(),
@@ -238,7 +243,9 @@ impl SuppressedLocalRateLimiter {
 
                 let mut series = self.series.entry(key.to_string()).or_insert_with(|| {
                     RateLimitSeries::new(
-                        **rate_limit * *self.hard_limit_factor * *self.window_size as f64,
+                        rate_limit.as_per_second()
+                            * self.hard_limit_factor.as_multiplier()
+                            * self.window_size.as_seconds() as f64,
                     )
                 });
 
@@ -253,7 +260,8 @@ impl SuppressedLocalRateLimiter {
             _ => series,
         };
 
-        let soft_window_limit = (series.hard_window_limit / *self.hard_limit_factor) as u64;
+        let soft_window_limit =
+            (series.hard_window_limit / self.hard_limit_factor.as_multiplier()) as u64;
         let hard_window_limit = series.hard_window_limit as u64;
         let total_count = series.total_count.load(Ordering::Acquire);
         let total_declined_count = series.total_declined_count.load(Ordering::Acquire);
@@ -303,7 +311,8 @@ impl SuppressedLocalRateLimiter {
         series.total_count.fetch_add(count, Ordering::AcqRel);
 
         if let Some(latest_bucket) = series.buckets.back()
-            && latest_bucket.timestamp.elapsed().as_millis() <= *self.bucket_size as u128
+            && latest_bucket.timestamp.elapsed().as_millis()
+                <= self.bucket_size.as_milliseconds() as u128
         {
             latest_bucket.count.fetch_add(count, Ordering::AcqRel);
 
@@ -392,8 +401,9 @@ impl SuppressedLocalRateLimiter {
     /// # Examples
     ///
     /// ```
-    /// # let rl = trypema::__doctest_helpers::rate_limiter();
-    /// let limiter = rl.local().suppressed();
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+    /// let limiter = rl.suppressed();
     ///
     /// // No state yet → 0.0 (no suppression)
     /// assert_eq!(limiter.get_suppression_factor("unknown_key"), 0.0);
@@ -407,7 +417,8 @@ impl SuppressedLocalRateLimiter {
         let suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
             Some(val)
-                if val.0.elapsed().as_millis() < *self.suppression_factor_cache_period as u128 =>
+                if val.0.elapsed().as_millis()
+                    < self.suppression_factor_cache_period.as_milliseconds() as u128 =>
             {
                 val.1
             }
@@ -446,7 +457,8 @@ impl SuppressedLocalRateLimiter {
             return self.persist_suppression_factor(key, 0f64);
         }
 
-        let soft_window_limit = (series.hard_window_limit / *self.hard_limit_factor) as u64;
+        let soft_window_limit =
+            (series.hard_window_limit / self.hard_limit_factor.as_multiplier()) as u64;
 
         let total_count = series.total_count.load(Ordering::Acquire);
         let total_declined_count = series.total_declined_count.load(Ordering::Acquire);
@@ -478,12 +490,14 @@ impl SuppressedLocalRateLimiter {
                 total_in_last_second.saturating_add(bucket.count.load(Ordering::Acquire));
         }
 
-        let average_rate_in_window: f64 = total_count as f64 / *self.window_size as f64;
+        let average_rate_in_window: f64 = total_count as f64 / self.window_size.as_seconds() as f64;
 
         let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
 
-        let suppression_factor =
-            1f64 - (soft_window_limit as f64 / *self.window_size as f64 / perceived_rate_limit);
+        let suppression_factor = 1f64
+            - (soft_window_limit as f64
+                / self.window_size.as_seconds() as f64
+                / perceived_rate_limit);
 
         self.persist_suppression_factor(key, suppression_factor)
     } // end method calculate_suppression_factor
@@ -498,10 +512,11 @@ impl SuppressedLocalRateLimiter {
     /// # Examples
     ///
     /// ```
-    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
     /// use trypema::RateLimit;
     ///
-    /// let limiter = rl.local().suppressed();
+    /// let limiter = rl.suppressed();
     /// let snapshot = limiter.get("user_123");
     /// assert_eq!(snapshot.total, 0);
     /// assert_eq!(snapshot.total_declined, 0);
@@ -715,8 +730,9 @@ impl SuppressedLocalRateLimiter {
                     return (old_total, old_total);
                 }
 
-                let hard_window_limit =
-                    **rate_limit * *self.hard_limit_factor * *self.window_size as f64;
+                let hard_window_limit = rate_limit.as_per_second()
+                    * self.hard_limit_factor.as_multiplier()
+                    * self.window_size.as_seconds() as f64;
 
                 let unchanged = count > 0
                     && matches!(mode, HistoryUpdateMode::Preserve(_))
@@ -756,8 +772,9 @@ impl SuppressedLocalRateLimiter {
                         Self::evict_expired(series, self.window_duration);
                     }
 
-                    series.hard_window_limit =
-                        **rate_limit * *self.hard_limit_factor * *self.window_size as f64;
+                    series.hard_window_limit = rate_limit.as_per_second()
+                        * self.hard_limit_factor.as_multiplier()
+                        * self.window_size.as_seconds() as f64;
 
                     Self::apply_history_update(series, count, old_total, mode);
 
@@ -770,7 +787,9 @@ impl SuppressedLocalRateLimiter {
                 }
 
                 let mut series = RateLimitSeries::new(
-                    **rate_limit * *self.hard_limit_factor * *self.window_size as f64,
+                    rate_limit.as_per_second()
+                        * self.hard_limit_factor.as_multiplier()
+                        * self.window_size.as_seconds() as f64,
                 );
 
                 Self::apply_history_update(&mut series, count, 0, mode);
@@ -806,9 +825,8 @@ impl SuppressedLocalRateLimiter {
     ///
     /// # Returns
     ///
-    /// `(new_total, old_total)` — `old_total` is the post-eviction total the
-    /// comparator was evaluated against; `new_total` is `count` when the guard
-    /// matched, `old_total` otherwise.
+    /// A [`ConditionalSetOutcome`] describing whether the comparator matched and the totals
+    /// before and after the operation.
     ///
     /// # Priming Idiom
     ///
@@ -818,21 +836,22 @@ impl SuppressedLocalRateLimiter {
     /// # Examples
     ///
     /// ```
-    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
     /// use trypema::{RateLimit, RateLimitComparator};
     ///
-    /// let limiter = rl.local().suppressed();
+    /// let limiter = rl.suppressed();
     /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Prime the window to 40.
-    /// let (new_total, old_total) =
-    ///     limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
-    /// assert_eq!((new_total, old_total), (40, 0));
+    /// let outcome = limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
+    /// assert!(outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 0));
     ///
     /// // Re-priming is a no-op: the guard no longer matches.
-    /// let (new_total, old_total) =
-    ///     limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
-    /// assert_eq!((new_total, old_total), (40, 40));
+    /// let outcome = limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
+    /// assert!(!outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 40));
     /// ```
     pub fn set_if(
         &self,
@@ -840,14 +859,20 @@ impl SuppressedLocalRateLimiter {
         rate_limit: &RateLimit,
         comparator: RateLimitComparator,
         count: u64,
-    ) -> (u64, u64) {
-        self.set_if_with_history_mode(
+    ) -> ConditionalSetOutcome {
+        let (current_total, previous_total) = self.set_if_with_history_mode(
             key,
             rate_limit,
             comparator,
             count,
             HistoryUpdateMode::Replace,
-        )
+        );
+
+        ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        }
     } // end method set_if
 
     /// Conditionally set the observed total while retaining the selected side of
@@ -859,14 +884,20 @@ impl SuppressedLocalRateLimiter {
         comparator: RateLimitComparator,
         count: u64,
         preservation: HistoryPreservation,
-    ) -> (u64, u64) {
-        self.set_if_with_history_mode(
+    ) -> ConditionalSetOutcome {
+        let (current_total, previous_total) = self.set_if_with_history_mode(
             key,
             rate_limit,
             comparator,
             count,
             HistoryUpdateMode::Preserve(preservation),
-        )
+        );
+
+        ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        }
     } // end method set_if_preserve_history
 
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {

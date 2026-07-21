@@ -115,11 +115,9 @@ pub(crate) struct Bucket {
 ///             println!("Suppressed");
 ///         }
 ///     }
-///     _ => {}
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, strum_macros::Display)]
-#[non_exhaustive]
 pub enum RateLimitDecision {
     /// Request is allowed to proceed.
     ///
