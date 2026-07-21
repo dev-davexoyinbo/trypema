@@ -23,7 +23,7 @@ fn local_builder_implements_shared_trait_and_returns_arc() {
             .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(
                 25,
             ))
-            .cleanup_enabled(false),
+            .disable_cleanup(),
     )
     .unwrap();
 
@@ -173,6 +173,25 @@ fn cleanup_can_be_disabled_started_stopped_and_restarted() {
     assert_eq!(provider.absolute().series().len(), 0);
 }
 
+#[test]
+fn cleanup_convenience_methods_follow_builder_order() {
+    let provider = LocalRateLimiterProvider::builder()
+        .stale_after(Duration::from_millis(40))
+        .cleanup_interval(Duration::from_millis(20))
+        .disable_cleanup()
+        .enable_cleanup()
+        .build()
+        .unwrap();
+    let rate = RateLimit::per_second_or_panic(100.0);
+
+    assert!(matches!(
+        provider.absolute().inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(provider.absolute().series().len(), 0);
+}
+
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 #[test]
 fn redis_and_hybrid_builders_support_shared_and_specific_methods() {
@@ -218,7 +237,7 @@ fn redis_and_hybrid_builders_support_shared_and_specific_methods() {
             RedisRateLimiterProvider::builder(connection_manager.clone())
                 .window_size(WindowSize::seconds_or_panic(1))
                 .prefix(prefix)
-                .cleanup_enabled(false),
+                .disable_cleanup(),
         )
         .unwrap();
         assert_eq!(Arc::strong_count(&redis), 1);
@@ -238,7 +257,7 @@ fn redis_and_hybrid_builders_support_shared_and_specific_methods() {
                 .bucket_size(BucketSize::milliseconds_or_panic(10))
                 .prefix(prefix)
                 .sync_interval(SyncInterval::milliseconds_or_panic(5))
-                .cleanup_enabled(false),
+                .disable_cleanup(),
         )
         .unwrap();
         assert_eq!(Arc::strong_count(&hybrid), 1);
