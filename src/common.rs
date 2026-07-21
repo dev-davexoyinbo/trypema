@@ -216,24 +216,6 @@ pub struct ConditionalSetOutcome {
     pub current_total: u64,
 }
 
-impl ConditionalSetOutcome {
-    pub(crate) fn matched(current_total: u64, previous_total: u64) -> Self {
-        Self {
-            matched: true,
-            previous_total,
-            current_total,
-        }
-    }
-
-    pub(crate) fn not_matched(current_total: u64) -> Self {
-        Self {
-            matched: false,
-            previous_total: current_total,
-            current_total,
-        }
-    }
-}
-
 #[cfg(test)]
 impl PartialEq<(u64, u64)> for ConditionalSetOutcome {
     fn eq(&self, other: &(u64, u64)) -> bool {

@@ -88,7 +88,8 @@ pub enum TrypemaError {
 
     /// Bucket size is invalid.
     ///
-    /// Bucket size must be >= 1 millisecond.
+    /// Bucket size must be >= 1 millisecond. When building a provider, it must also be less than
+    /// or equal to the configured window size.
     ///
     /// # Examples
     ///

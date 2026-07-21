@@ -55,8 +55,8 @@ impl AbsoluteHybridRateLimiter {
                     *mutex_lock(count_after_release, "rejecting.count_after_release")?;
 
                 Ok(LocalAdmission::Rejected(RateLimitDecision::Rejected {
-                    window_size_seconds: *self.window_size,
-                    retry_after_ms: ttl_ms.saturating_sub(elapsed_ms),
+                    window_size: self.window_size,
+                    retry_after: duration_from_milliseconds(ttl_ms.saturating_sub(elapsed_ms)),
                     remaining_after_waiting,
                 }))
             }
@@ -90,7 +90,7 @@ impl AbsoluteHybridRateLimiter {
                         Some(oldest_bucket_ttl) => {
                             (oldest_bucket_ttl as u128).saturating_sub(elapsed_ms)
                         }
-                        None => (*self.window_size as u128).saturating_mul(1_000),
+                        None => self.window_size.as_milliseconds(),
                     };
                 let remaining_after_waiting =
                     (*mutex_lock(oldest_bucket_count, "accepting.oldest_bucket_count")?)
@@ -98,8 +98,8 @@ impl AbsoluteHybridRateLimiter {
 
                 if local_count < accept_limit {
                     return Ok(LocalAdmission::Rejected(RateLimitDecision::Rejected {
-                        window_size_seconds: *self.window_size,
-                        retry_after_ms,
+                        window_size: self.window_size,
+                        retry_after: duration_from_milliseconds(retry_after_ms),
                         remaining_after_waiting,
                     }));
                 }
@@ -164,7 +164,7 @@ impl AbsoluteHybridRateLimiter {
                 committed_at,
                 ..
             } => {
-                let window_size_ms = (*self.window_size as u128).saturating_mul(1_000);
+                let window_size_ms = self.window_size.as_milliseconds();
 
                 if committed_at.elapsed().as_millis() < window_size_ms {
                     current_total = current_total.max(*committed_count);
@@ -401,7 +401,7 @@ impl AbsoluteHybridRateLimiter {
                     return Ok(RateLimitDecision::Allowed);
                 };
 
-                ((*self.window_size as f64) * **rate_limit) as u64
+                ((self.window_size.as_seconds() as f64) * rate_limit.as_per_second()) as u64
             }
         };
 
@@ -412,8 +412,8 @@ impl AbsoluteHybridRateLimiter {
             self.store_rejecting_state(&state, retry_after_ms, remaining_after_waiting)?;
 
             return Ok(RateLimitDecision::Rejected {
-                window_size_seconds: *self.window_size,
-                retry_after_ms: retry_after_ms as u128,
+                window_size: self.window_size,
+                retry_after: duration_from_milliseconds(u128::from(retry_after_ms)),
                 remaining_after_waiting,
             });
         }
@@ -540,8 +540,8 @@ impl AbsoluteHybridRateLimiter {
         )?;
 
         Ok(RateLimitDecision::Rejected {
-            window_size_seconds: *self.window_size,
-            retry_after_ms: transition.retry_after_ms,
+            window_size: self.window_size,
+            retry_after: duration_from_milliseconds(transition.retry_after_ms),
             remaining_after_waiting: transition.remaining_after_waiting,
         })
     }

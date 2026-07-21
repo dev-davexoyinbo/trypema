@@ -1,4 +1,3 @@
-use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
 use crate::{
@@ -58,7 +57,8 @@ pub(crate) enum RedisRateLimiterSignal {
 /// use trypema::hybrid::SyncInterval;
 ///
 /// let interval = SyncInterval::milliseconds(10).unwrap();
-/// assert_eq!(*interval, 10);
+/// assert_eq!(interval.as_milliseconds(), 10);
+/// assert_eq!(interval.as_seconds(), 0.01);
 ///
 /// let interval = SyncInterval::milliseconds(50).unwrap();
 /// let interval = SyncInterval::milliseconds_or_panic(75);
@@ -77,6 +77,26 @@ impl Default for SyncInterval {
 }
 
 impl SyncInterval {
+    /// Return synchronization interval in milliseconds.
+    pub fn as_milliseconds(self) -> u64 {
+        self.0
+    }
+
+    /// Return the synchronization interval in seconds.
+    pub fn as_seconds(self) -> f64 {
+        self.as_period(MILLISECONDS_PER_SECOND)
+    }
+
+    /// Return the synchronization interval in minutes.
+    pub fn as_minutes(self) -> f64 {
+        self.as_period(MILLISECONDS_PER_SECOND * SECONDS_PER_MINUTE)
+    }
+
+    /// Return the synchronization interval in hours.
+    pub fn as_hours(self) -> f64 {
+        self.as_period(MILLISECONDS_PER_SECOND * SECONDS_PER_HOUR)
+    }
+
     /// Create a sync interval expressed in milliseconds.
     pub fn milliseconds(value: u64) -> Result<Self, TrypemaError> {
         Self::from_milliseconds(value, 1)
@@ -142,18 +162,8 @@ impl SyncInterval {
         )
         .map(Self)
     }
-}
 
-impl Deref for SyncInterval {
-    type Target = u64;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for SyncInterval {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+    fn as_period(self, period_milliseconds: u64) -> f64 {
+        (self.0 as f64) / (period_milliseconds as f64)
     }
 }

@@ -106,7 +106,7 @@ impl SuppressedHybridRateLimiter {
         let starting_count = *mutex_lock(state.starting_count, "accepting.starting_count")?;
         let declined_count = *mutex_lock(state.declined_count, "accepting.declined_count")?;
         let hard_window_capacity = hard_window_limit as u64;
-        let soft_window_limit = (hard_window_limit / *self.hard_limit_factor) as u64;
+        let soft_window_limit = (hard_window_limit / self.hard_limit_factor.as_multiplier()) as u64;
         let forecasted_allowed_count = starting_count
             .saturating_add(state.count.load(Ordering::Acquire))
             .saturating_sub(declined_count)
@@ -146,7 +146,7 @@ impl SuppressedHybridRateLimiter {
         )?;
 
         let hard_window_capacity = hard_window_limit as u64;
-        let soft_window_limit = (hard_window_limit / *self.hard_limit_factor) as u64;
+        let soft_window_limit = (hard_window_limit / self.hard_limit_factor.as_multiplier()) as u64;
         let forecasted_allowed_count = starting_count
             .saturating_add(state.count.load(Ordering::Acquire))
             .saturating_sub(
@@ -205,7 +205,7 @@ impl SuppressedHybridRateLimiter {
         *mutex_lock(
             state.suppression_factor_ttl_ms,
             "suppressing.suppression_factor_ttl_ms",
-        )? = *self.suppression_factor_cache_period;
+        )? = self.suppression_factor_cache_period.as_milliseconds();
         *mutex_lock(state.time_instant, "suppressing.time_instant")? = Instant::now();
         *mutex_lock(state.suppression_factor, "suppressing.suppression_factor")? = 1f64;
 
@@ -248,7 +248,9 @@ impl SuppressedHybridRateLimiter {
 
                 if observed_count >= hard_window_limit as u64 {
                     suppression_factor = 1f64;
-                } else if accepted_count < (hard_window_limit / *self.hard_limit_factor) as u64 {
+                } else if accepted_count
+                    < (hard_window_limit / self.hard_limit_factor.as_multiplier()) as u64
+                {
                     suppression_factor = 0f64;
                 }
 
@@ -492,12 +494,14 @@ impl SuppressedHybridRateLimiter {
                     return Ok(RateLimitDecision::Allowed);
                 };
 
-                *self.window_size as f64 * **rate_limit * *self.hard_limit_factor
+                self.window_size.as_seconds() as f64
+                    * rate_limit.as_per_second()
+                    * self.hard_limit_factor.as_multiplier()
             }
         };
 
         let hard_window_capacity = hard_window_limit as u64;
-        let soft_window_limit = (hard_window_limit / *self.hard_limit_factor) as u64;
+        let soft_window_limit = (hard_window_limit / self.hard_limit_factor.as_multiplier()) as u64;
         let forecasted_allowed_count = state
             .current_total_count
             .saturating_sub(state.current_declined_count)
@@ -522,11 +526,11 @@ impl SuppressedHybridRateLimiter {
             let declined_count = if should_allow { 0 } else { increment };
 
             let suppression_factor_ttl_ms = if suppression_factor == 1f64 {
-                *self.suppression_factor_cache_period
+                self.suppression_factor_cache_period.as_milliseconds()
             } else {
                 state
                     .suppression_factor_ttl_ms
-                    .unwrap_or(*self.suppression_factor_cache_period)
+                    .unwrap_or(self.suppression_factor_cache_period.as_milliseconds())
             };
 
             self.store_local_state(
@@ -792,7 +796,7 @@ impl SuppressedHybridRateLimiter {
             }
         };
 
-        Ok(elapsed_ms > (*self.window_size * 1_000) as u128)
+        Ok(elapsed_ms > self.window_size.as_milliseconds())
     } // end fn is_stale_for_flush
 
     pub(super) fn has_pending_counts(state: &SuppressedRedisLimitingState) -> bool {

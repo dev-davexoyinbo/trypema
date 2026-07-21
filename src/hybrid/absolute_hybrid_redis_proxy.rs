@@ -59,8 +59,6 @@ impl AbsoluteHybridRedisProxy {
             bucket_size,
         } = options;
 
-        let window_size_ms = *window_size as u128 * 1000;
-
         Self {
             key_generator: RedisKeyGenerator::new(prefix, RateType::HybridAbsolute),
             read_state_script: absolute_lua_script(ABSOLUTE_HYBRID_READ_STATE_LUA),
@@ -69,8 +67,8 @@ impl AbsoluteHybridRedisProxy {
             cleanup_script: absolute_lua_script(ABSOLUTE_CLEANUP_LUA),
             connection_manager,
             read_chunk_size: 100,
+            window_size_ms: window_size.as_milliseconds(),
             window_size,
-            window_size_ms,
             bucket_size,
         }
     }
@@ -116,9 +114,9 @@ impl AbsoluteHybridRedisProxy {
                     .key(self.key_generator.get_total_count_key(&commit.key))
                     .key(self.key_generator.get_active_entities_key())
                     .arg(commit.key.as_str())
-                    .arg(*self.window_size)
+                    .arg(self.window_size.as_seconds())
                     .arg(commit.window_limit)
-                    .arg(*self.bucket_size)
+                    .arg(self.bucket_size.as_milliseconds())
                     .arg(commit.count),
             );
         }
@@ -232,7 +230,7 @@ impl AbsoluteHybridRedisProxy {
             .key(self.key_generator.get_total_count_key(key))
             .key(self.key_generator.get_active_entities_key())
             .arg(key.as_str())
-            .arg(*self.window_size)
+            .arg(self.window_size.as_seconds())
             .arg(window_limit)
             .arg(comparator_op)
             .arg(comparator_operand)

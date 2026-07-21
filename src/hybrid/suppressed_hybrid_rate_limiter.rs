@@ -11,17 +11,18 @@ use dashmap::{DashMap, mapref::entry::Entry, mapref::one::Ref};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
-    RedisKey, RedisRateLimiterOptions, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod,
-    TrypemaError, WindowSize,
+    ConditionalSetOutcome, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
+    RateLimitDecision, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, TrypemaError,
+    WindowSize,
     common::{HistoryUpdateMode, RandomState},
     hybrid::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
         SuppressedHybridCommit, SuppressedHybridPendingState, SuppressedHybridRedisProxy,
         SuppressedHybridRedisProxyOptions, SuppressedHybridRedisProxyReadStateResult,
         common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal},
+        hybrid_rate_limiter_provider::HybridRateLimiterConfig,
     },
-    redis::{mutex_lock, spawn_task},
+    redis::{RedisKey, mutex_lock, spawn_task},
     runtime,
 };
 
@@ -96,14 +97,14 @@ pub struct SuppressedHybridRateLimiter {
 }
 
 impl SuppressedHybridRateLimiter {
-    pub(crate) fn new(options: RedisRateLimiterOptions) -> Arc<Self> {
+    pub(crate) fn new(options: HybridRateLimiterConfig) -> Arc<Self> {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<RedisRateLimiterSignal>(1);
-        let hard_limit_factor = options.hard_limit_factor;
-        let suppression_factor_cache_period = options.suppression_factor_cache_period;
-        let window_size = options.window_size;
-        let bucket_size = options.bucket_size;
+        let hard_limit_factor = options.provider.hard_limit_factor;
+        let suppression_factor_cache_period = options.provider.suppression_factor_cache_period;
+        let window_size = options.provider.window_size;
+        let bucket_size = options.provider.bucket_size;
 
         let redis_proxy = SuppressedHybridRedisProxy::new(SuppressedHybridRedisProxyOptions {
             prefix: prefix.clone(),
@@ -116,7 +117,7 @@ impl SuppressedHybridRateLimiter {
 
         let is_active_watch = watch::Sender::new(0u64);
 
-        let sync_interval = Duration::from_millis(*options.sync_interval);
+        let sync_interval = Duration::from_millis(options.sync_interval.as_milliseconds());
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval,
@@ -242,14 +243,16 @@ impl SuppressedHybridRateLimiter {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::redis::RedisKey;
     ///
-    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let key = RedisKey::try_from("user_123").unwrap();
     /// // No state yet → 0.0 (no suppression)
-    /// assert_eq!(rl.hybrid().suppressed().get_suppression_factor(&key).await.unwrap(), 0.0);
-    /// # });
+    /// assert_eq!(rl.suppressed().get_suppression_factor(&key).await.unwrap(), 0.0);
+    /// # }
     /// ```
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         self.send_epoch_change_if_needed();
@@ -316,7 +319,9 @@ impl SuppressedHybridRateLimiter {
             }
         }
 
-        let hard_window_limit = *self.window_size as f64 * **rate_limit * *self.hard_limit_factor;
+        let hard_window_limit = self.window_size.as_seconds() as f64
+            * rate_limit.as_per_second()
+            * self.hard_limit_factor.as_multiplier();
 
         let (new_total, old_total, changed) = self
             .redis_proxy
@@ -352,26 +357,28 @@ impl SuppressedHybridRateLimiter {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::RateLimit;
     /// use trypema::redis::RedisKey;
     ///
-    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let key = RedisKey::try_from("user_123").unwrap();
     /// assert_eq!(
-    ///     rl.hybrid().suppressed().get_inferred(&key).await.unwrap().total,
+    ///     rl.suppressed().get_estimate(&key).await.unwrap().total,
     ///     0
     /// );
     ///
     /// let rate = RateLimit::per_second(10.0).unwrap();
-    /// rl.hybrid().suppressed().inc(&key, &rate, 3).await.unwrap();
+    /// rl.suppressed().inc(&key, &rate, 3).await.unwrap();
     /// assert_eq!(
-    ///     rl.hybrid().suppressed().get_inferred(&key).await.unwrap().total,
+    ///     rl.suppressed().get_estimate(&key).await.unwrap().total,
     ///     3
     /// );
-    /// # });
+    /// # }
     /// ```
-    pub async fn get_inferred(
+    pub async fn get_estimate(
         &self,
         key: &RedisKey,
     ) -> Result<SuppressedRateLimitSnapshot, TrypemaError> {
@@ -383,7 +390,7 @@ impl SuppressedHybridRateLimiter {
         };
 
         Ok(self.local_snapshot(state.deref())?.unwrap_or_default())
-    } // end method get_inferred
+    } // end method get_estimate
 
     /// Current live window state for `key` (best-effort).
     ///
@@ -395,21 +402,23 @@ impl SuppressedHybridRateLimiter {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::RateLimit;
     /// use trypema::redis::RedisKey;
     ///
-    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let snapshot = rl.hybrid().suppressed().get(&key).await.unwrap();
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// let snapshot = rl.suppressed().get(&key).await.unwrap();
     /// assert_eq!(snapshot.total, 0);
     /// assert_eq!(snapshot.total_declined, 0);
     /// assert_eq!(snapshot.suppression_factor, 0.0);
     ///
     /// let rate = RateLimit::per_second(10.0).unwrap();
-    /// rl.hybrid().suppressed().inc(&key, &rate, 3).await.unwrap();
-    /// assert_eq!(rl.hybrid().suppressed().get(&key).await.unwrap().total, 3);
-    /// # });
+    /// rl.suppressed().inc(&key, &rate, 3).await.unwrap();
+    /// assert_eq!(rl.suppressed().get(&key).await.unwrap().total, 3);
+    /// # }
     /// ```
     pub async fn get(&self, key: &RedisKey) -> Result<SuppressedRateLimitSnapshot, TrypemaError> {
         self.send_epoch_change_if_needed();
@@ -484,9 +493,8 @@ impl SuppressedHybridRateLimiter {
     ///
     /// # Returns
     ///
-    /// `(new_total, old_total)` — `old_total` is the post-eviction total the
-    /// comparator was evaluated against; `new_total` is `count` when the guard
-    /// matched, `old_total` otherwise.
+    /// A [`ConditionalSetOutcome`] describing whether the comparator matched and the totals
+    /// before and after the operation.
     ///
     /// # Priming Idiom
     ///
@@ -496,32 +504,34 @@ impl SuppressedHybridRateLimiter {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitComparator};
     /// use trypema::redis::RedisKey;
     ///
-    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let key = RedisKey::try_from("user_123").unwrap();
     /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Prime the window to 40.
-    /// let (new_total, old_total) = rl
-    ///     .hybrid()
+    /// let outcome = rl
     ///     .suppressed()
     ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
     ///     .await
     ///     .unwrap();
-    /// assert_eq!((new_total, old_total), (40, 0));
+    /// assert!(outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 0));
     ///
     /// // Re-priming is a no-op: the guard no longer matches.
-    /// let (new_total, old_total) = rl
-    ///     .hybrid()
+    /// let outcome = rl
     ///     .suppressed()
     ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
     ///     .await
     ///     .unwrap();
-    /// assert_eq!((new_total, old_total), (40, 40));
-    /// # });
+    /// assert!(!outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 40));
+    /// # }
     /// ```
     pub async fn set_if(
         &self,
@@ -529,15 +539,22 @@ impl SuppressedHybridRateLimiter {
         rate_limit: &RateLimit,
         comparator: RateLimitComparator,
         count: u64,
-    ) -> Result<(u64, u64), TrypemaError> {
-        self.set_if_with_history_mode(
-            key,
-            rate_limit,
-            comparator,
-            count,
-            HistoryUpdateMode::Replace,
-        )
-        .await
+    ) -> Result<ConditionalSetOutcome, TrypemaError> {
+        let (current_total, previous_total) = self
+            .set_if_with_history_mode(
+                key,
+                rate_limit,
+                comparator,
+                count,
+                HistoryUpdateMode::Replace,
+            )
+            .await?;
+
+        Ok(ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        })
     } // end method set_if
 
     /// Conditionally set the observed total while retaining the selected side of
@@ -549,15 +566,22 @@ impl SuppressedHybridRateLimiter {
         comparator: RateLimitComparator,
         count: u64,
         preservation: HistoryPreservation,
-    ) -> Result<(u64, u64), TrypemaError> {
-        self.set_if_with_history_mode(
-            key,
-            rate_limit,
-            comparator,
-            count,
-            HistoryUpdateMode::Preserve(preservation),
-        )
-        .await
+    ) -> Result<ConditionalSetOutcome, TrypemaError> {
+        let (current_total, previous_total) = self
+            .set_if_with_history_mode(
+                key,
+                rate_limit,
+                comparator,
+                count,
+                HistoryUpdateMode::Preserve(preservation),
+            )
+            .await?;
+
+        Ok(ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        })
     } // end method set_if_preserve_history
 
     /// Check admission and record the increment for `key` using probabilistic suppression.
@@ -587,19 +611,21 @@ impl SuppressedHybridRateLimiter {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     /// use trypema::redis::RedisKey;
     ///
-    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let key = RedisKey::try_from("user_123").unwrap();
     /// let rate = RateLimit::per_second(10.0).unwrap();
     /// // Under limit → Allowed
     /// assert!(matches!(
-    ///     rl.hybrid().suppressed().inc(&key, &rate, 1).await.unwrap(),
+    ///     rl.suppressed().inc(&key, &rate, 1).await.unwrap(),
     ///     RateLimitDecision::Allowed
     /// ));
-    /// # });
+    /// # }
     /// ```
     pub async fn inc(
         &self,

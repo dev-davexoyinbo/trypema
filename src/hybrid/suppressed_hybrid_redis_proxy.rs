@@ -106,9 +106,9 @@ impl SuppressedHybridRedisProxy {
             .key(self.key_generator.get_total_declined_key(key))
             .key(self.key_generator.get_hash_declined_key(key))
             .arg(key.as_str())
-            .arg(*self.window_size)
-            .arg(*self.suppression_factor_cache_period)
-            .arg(*self.hard_limit_factor)
+            .arg(self.window_size.as_seconds())
+            .arg(self.suppression_factor_cache_period.as_milliseconds())
+            .arg(self.hard_limit_factor.as_multiplier())
             .invoke_async(&mut connection_manager)
             .await?;
 
@@ -138,11 +138,11 @@ impl SuppressedHybridRedisProxy {
                     .key(self.key_generator.get_total_declined_key(&commit.key))
                     .key(self.key_generator.get_hash_declined_key(&commit.key))
                     .arg(commit.key.as_str())
-                    .arg(*self.window_size)
+                    .arg(self.window_size.as_seconds())
                     .arg(commit.hard_window_limit)
-                    .arg(*self.bucket_size)
-                    .arg(*self.suppression_factor_cache_period)
-                    .arg(*self.hard_limit_factor)
+                    .arg(self.bucket_size.as_milliseconds())
+                    .arg(self.suppression_factor_cache_period.as_milliseconds())
+                    .arg(self.hard_limit_factor.as_multiplier())
                     .arg(commit.count)
                     .arg(commit.declined_count),
             );
@@ -226,9 +226,9 @@ impl SuppressedHybridRedisProxy {
                     .key(self.key_generator.get_total_declined_key(key))
                     .key(self.key_generator.get_hash_declined_key(key))
                     .arg(key.as_str())
-                    .arg(*self.window_size)
-                    .arg(*self.suppression_factor_cache_period)
-                    .arg(*self.hard_limit_factor),
+                    .arg(self.window_size.as_seconds())
+                    .arg(self.suppression_factor_cache_period.as_milliseconds())
+                    .arg(self.hard_limit_factor.as_multiplier()),
             );
         }
 
@@ -267,7 +267,7 @@ impl SuppressedHybridRedisProxy {
             .key(self.key_generator.get_total_declined_key(key))
             .key(self.key_generator.get_hash_declined_key(key))
             .arg(key.as_str())
-            .arg(*self.window_size)
+            .arg(self.window_size.as_seconds())
             .arg(hard_window_limit)
             .arg(comparator_op)
             .arg(comparator_operand)
