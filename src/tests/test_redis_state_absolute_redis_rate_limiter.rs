@@ -22,12 +22,11 @@ use redis::AsyncCommands;
 use super::common::{key, key_gen, redis_url, unique_prefix};
 use super::runtime;
 
-use crate::common::{RateType, SuppressionFactorCachePeriod};
-use crate::hybrid::SyncInterval;
+use crate::common::RateType;
 use crate::{
-    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
-    RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions, RedisKey,
-    RedisRateLimiterOptions, WindowSize,
+    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
+    RateLimiterBuilder, WindowSize,
+    redis::{RedisKey, RedisRateLimiterProvider},
 };
 
 /// Build a rate limiter and also return its unique prefix so tests can construct Redis keys.
@@ -35,30 +34,20 @@ async fn build_limiter(
     url: &str,
     window_size: u64,
     bucket_size: u64,
-) -> (std::sync::Arc<RateLimiter>, RedisKey) {
+) -> (std::sync::Arc<RedisRateLimiterProvider>, RedisKey) {
     let client = redis::Client::open(url).unwrap();
     let cm = client.get_connection_manager().await.unwrap();
     let prefix = unique_prefix();
 
-    let options = RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager: cm,
-            prefix: Some(prefix.clone()),
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-            sync_interval: SyncInterval::default(),
-        },
-    };
+    let provider = RedisRateLimiterProvider::builder(cm)
+        .prefix(prefix.clone())
+        .window_size(WindowSize::seconds(window_size).unwrap())
+        .bucket_size(BucketSize::milliseconds(bucket_size).unwrap())
+        .cleanup_enabled(false)
+        .build()
+        .unwrap();
 
-    (std::sync::Arc::new(RateLimiter::new(options)), prefix)
+    (provider, prefix)
 }
 
 /// Construct the canonical Redis key for a given suffix using the key generator.
@@ -100,7 +89,7 @@ fn redis_state_after_single_allowed_inc() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(5f64).unwrap();
 
-        let d = rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 3).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
 
         let mut conn = redis::Client::open(url.as_str())
@@ -129,7 +118,7 @@ fn redis_state_after_single_allowed_inc() {
 
         // The global active_entities sorted set must include the user key.
         let entity_score: Option<f64> = conn
-            .zscore(active_entities_key(&prefix), &**k)
+            .zscore(active_entities_key(&prefix), k.as_str())
             .await
             .unwrap();
         assert!(entity_score.is_some(), "key should be in active_entities");
@@ -149,14 +138,10 @@ fn redis_state_inc_retains_the_first_window_limit() {
         let later_rate = RateLimit::per_second(100f64).unwrap();
 
         assert_allowed(
-            rl.redis()
-                .absolute()
-                .inc(&k, &initial_rate, 2)
-                .await
-                .unwrap(),
+            rl.absolute().inc(&k, &initial_rate, 2).await.unwrap(),
             "filling the truncated initial capacity",
         );
-        let decision = rl.redis().absolute().inc(&k, &later_rate, 1).await.unwrap();
+        let decision = rl.absolute().inc(&k, &later_rate, 1).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Rejected { .. }),
             "the later rate must not replace the sticky limit: {decision:?}"
@@ -190,13 +175,13 @@ fn redis_state_coalesces_increments_within_rate_group() {
         let rate_limit = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 2).await.unwrap(),
             "creating the grouped bucket",
         );
         // Sleep well within the 2-second group window.
         thread::sleep(Duration::from_millis(50));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "coalescing into the grouped bucket",
         );
 
@@ -235,12 +220,12 @@ fn redis_state_creates_distinct_buckets_across_rate_groups() {
         let rate_limit = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the oldest bucket",
         );
         thread::sleep(Duration::from_millis(150));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 2).await.unwrap(),
             "creating the newest bucket",
         );
 
@@ -277,7 +262,7 @@ fn redis_state_rejected_inc_does_not_mutate_usage_or_limit_state() {
 
         // Fill capacity.
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 2).await.unwrap(),
             "filling the window",
         );
 
@@ -297,7 +282,7 @@ fn redis_state_rejected_inc_does_not_mutate_usage_or_limit_state() {
         let limit_before: f64 = conn.get(redis_key(&prefix, &k, "w")).await.unwrap();
 
         // Attempt a rejected increment.
-        let d = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
 
         let total_after: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
@@ -339,7 +324,7 @@ fn redis_state_evicts_expired_buckets_after_window() {
         let rate_limit = RateLimit::per_second(3f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "filling the initial window",
         );
 
@@ -357,7 +342,7 @@ fn redis_state_evicts_expired_buckets_after_window() {
         thread::sleep(Duration::from_millis(1100));
 
         // A new increment triggers eviction inside the Lua script.
-        let d = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
 
         // The evicted buckets must have been removed from both hash and sorted set,
@@ -393,12 +378,12 @@ fn redis_state_is_allowed_evicts_expired_buckets() {
         let rate_limit = RateLimit::per_second(2f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the oldest bucket",
         );
         runtime::async_sleep(Duration::from_millis(500)).await;
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the fresh bucket and refreshing the limit TTL",
         );
 
@@ -417,7 +402,7 @@ fn redis_state_is_allowed_evicts_expired_buckets() {
         // Only the first bucket expires. The second increment keeps the sticky-limit key alive,
         // so this call must execute the eviction path rather than return early for an unknown key.
         runtime::async_sleep(Duration::from_millis(550)).await;
-        let decision = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let decision = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Allowed),
             "evicting the oldest bucket should move the key below capacity: {decision:?}"
@@ -451,11 +436,11 @@ fn redis_state_per_key_state_is_independent() {
         let rate_limit = RateLimit::per_second(5f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&a, &rate_limit, 3).await.unwrap(),
+            rl.absolute().inc(&a, &rate_limit, 3).await.unwrap(),
             "seeding key a",
         );
         assert_allowed(
-            rl.redis().absolute().inc(&b, &rate_limit, 7).await.unwrap(),
+            rl.absolute().inc(&b, &rate_limit, 7).await.unwrap(),
             "seeding key b",
         );
 
@@ -496,17 +481,17 @@ fn redis_state_hash_sum_matches_total_count() {
 
         // Multiple increments across multiple buckets.
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 5).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 5).await.unwrap(),
             "creating the oldest bucket",
         );
         thread::sleep(Duration::from_millis(150));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "creating the middle bucket",
         );
         thread::sleep(Duration::from_millis(150));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 7).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 7).await.unwrap(),
             "creating the newest bucket",
         );
 
@@ -540,17 +525,17 @@ fn redis_state_active_sorted_set_scores_are_ordered() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the oldest bucket",
         );
         thread::sleep(Duration::from_millis(150));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the middle bucket",
         );
         thread::sleep(Duration::from_millis(150));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the newest bucket",
         );
 
@@ -596,18 +581,18 @@ fn redis_state_active_entities_registers_allowed_inc() {
             .get_multiplexed_async_connection()
             .await
             .unwrap();
-        let score_before: Option<f64> = conn.zscore(&ae_key, &**k).await.unwrap();
+        let score_before: Option<f64> = conn.zscore(&ae_key, k.as_str()).await.unwrap();
         assert!(
             score_before.is_none(),
             "key should not be in active_entities before inc"
         );
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "registering the active entity",
         );
 
-        let score_after: Option<f64> = conn.zscore(&ae_key, &**k).await.unwrap();
+        let score_after: Option<f64> = conn.zscore(&ae_key, k.as_str()).await.unwrap();
         assert!(
             score_after.is_some(),
             "key should be in active_entities after inc"
@@ -628,7 +613,7 @@ fn redis_state_window_limit_key_has_ttl() {
         let rate_limit = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating state with a window-limit TTL",
         );
 
@@ -665,12 +650,12 @@ fn redis_state_absolute_set_if_writes_single_bucket_total_and_window_limit() {
         let rate_limit = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "creating the oldest bucket",
         );
         runtime::async_sleep(Duration::from_millis(150)).await;
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 4).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 4).await.unwrap(),
             "creating the newest bucket",
         );
 
@@ -683,12 +668,12 @@ fn redis_state_absolute_set_if_writes_single_bucket_total_and_window_limit() {
             conn.hgetall(redis_key(&prefix, &k, "h")).await.unwrap();
         assert_eq!(buckets_before.len(), 2, "setup must create two buckets");
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(40), 40)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (40, 7));
 
         let total: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
@@ -733,9 +718,8 @@ fn redis_state_absolute_set_if_no_match_leaves_buckets_and_total_untouched() {
         // Seed exact state through set_if itself (single bucket of 17, window limit 6*10=60).
         let rate_seed = RateLimit::per_second(10f64).unwrap();
         assert_eq!(
-            rl.redis()
-                .absolute()
-                .set_if(&k, &rate_seed, RateLimitComparator::Nil, 17)
+            rl.absolute()
+                .set_if(&k, &rate_seed, RateLimitComparator::Always, 17)
                 .await
                 .unwrap(),
             (17, 0)
@@ -765,12 +749,12 @@ fn redis_state_absolute_set_if_no_match_leaves_buckets_and_total_untouched() {
 
         // Guard cannot match (17 is not > 1000); the different rate must be ignored.
         let rate_new = RateLimit::per_second(20f64).unwrap();
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_new, RateLimitComparator::Gt(1000), 5)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (17, 17));
 
         let history_after: HashMap<String, u64> = conn.hgetall(&history_key).await.unwrap();
@@ -816,14 +800,14 @@ fn redis_state_absolute_set_if_handles_expired_history_only_after_a_match() {
 
         for k in [&miss_key, &match_key] {
             assert_allowed(
-                rl.redis().absolute().inc(k, &rate, 4).await.unwrap(),
+                rl.absolute().inc(k, &rate, 4).await.unwrap(),
                 "creating an oldest bucket",
             );
         }
         runtime::async_sleep(Duration::from_millis(900)).await;
         for k in [&miss_key, &match_key] {
             assert_allowed(
-                rl.redis().absolute().inc(k, &rate, 6).await.unwrap(),
+                rl.absolute().inc(k, &rate, 6).await.unwrap(),
                 "creating a fresh bucket",
             );
         }
@@ -859,7 +843,6 @@ fn redis_state_absolute_set_if_handles_expired_history_only_after_a_match() {
         );
 
         let miss_result = rl
-            .redis()
             .absolute()
             .set_if(&miss_key, &rate, RateLimitComparator::Gt(100), 1)
             .await
@@ -893,7 +876,6 @@ fn redis_state_absolute_set_if_handles_expired_history_only_after_a_match() {
         );
 
         let match_result = rl
-            .redis()
             .absolute()
             .set_if_preserve_history(
                 &match_key,
@@ -946,24 +928,29 @@ fn redis_state_absolute_preserves_requested_history_edge() {
         ] {
             let k = key(name);
             assert!(matches!(
-                rl.redis().absolute().inc(&k, &rate, 4).await.unwrap(),
+                rl.absolute().inc(&k, &rate, 4).await.unwrap(),
                 RateLimitDecision::Allowed
             ));
             runtime::async_sleep(Duration::from_millis(3)).await;
             assert!(matches!(
-                rl.redis().absolute().inc(&k, &rate, 5).await.unwrap(),
+                rl.absolute().inc(&k, &rate, 5).await.unwrap(),
                 RateLimitDecision::Allowed
             ));
             runtime::async_sleep(Duration::from_millis(3)).await;
             assert!(matches!(
-                rl.redis().absolute().inc(&k, &rate, 6).await.unwrap(),
+                rl.absolute().inc(&k, &rate, 6).await.unwrap(),
                 RateLimitDecision::Allowed
             ));
 
             assert_eq!(
-                rl.redis()
-                    .absolute()
-                    .set_if_preserve_history(&k, &rate, RateLimitComparator::Nil, 8, preservation,)
+                rl.absolute()
+                    .set_if_preserve_history(
+                        &k,
+                        &rate,
+                        RateLimitComparator::Always,
+                        8,
+                        preservation,
+                    )
                     .await
                     .unwrap(),
                 (8, 15)
@@ -987,9 +974,14 @@ fn redis_state_absolute_preserves_requested_history_edge() {
             assert_eq!(counts, expected_reduced);
 
             assert_eq!(
-                rl.redis()
-                    .absolute()
-                    .set_if_preserve_history(&k, &rate, RateLimitComparator::Nil, 11, preservation,)
+                rl.absolute()
+                    .set_if_preserve_history(
+                        &k,
+                        &rate,
+                        RateLimitComparator::Always,
+                        11,
+                        preservation,
+                    )
                     .await
                     .unwrap(),
                 (11, 8)
@@ -1021,8 +1013,7 @@ fn redis_state_absolute_missing_zero_and_guard_miss_write_nothing() {
         for (name, preserve) in [("replace", false), ("preserve", true)] {
             let k = key(name);
             let result = if preserve {
-                rl.redis()
-                    .absolute()
+                rl.absolute()
                     .set_if_preserve_history(
                         &k,
                         &rate,
@@ -1033,8 +1024,7 @@ fn redis_state_absolute_missing_zero_and_guard_miss_write_nothing() {
                     .await
                     .unwrap()
             } else {
-                rl.redis()
-                    .absolute()
+                rl.absolute()
                     .set_if(&k, &rate, RateLimitComparator::Eq(0), 0)
                     .await
                     .unwrap()
@@ -1042,8 +1032,7 @@ fn redis_state_absolute_missing_zero_and_guard_miss_write_nothing() {
             assert_eq!(result, (0, 0));
 
             let guard_miss = if preserve {
-                rl.redis()
-                    .absolute()
+                rl.absolute()
                     .set_if_preserve_history(
                         &k,
                         &rate,
@@ -1054,8 +1043,7 @@ fn redis_state_absolute_missing_zero_and_guard_miss_write_nothing() {
                     .await
                     .unwrap()
             } else {
-                rl.redis()
-                    .absolute()
+                rl.absolute()
                     .set_if(&k, &rate, RateLimitComparator::Eq(1), 5)
                     .await
                     .unwrap()
@@ -1096,30 +1084,27 @@ fn redis_state_absolute_conditional_set_zero_removes_entity_state() {
         for (name, preserve) in [("replace", false), ("preserve", true)] {
             let k = key(name);
             assert_eq!(
-                rl.redis()
-                    .absolute()
-                    .set_if(&k, &rate_limit, RateLimitComparator::Nil, 17)
+                rl.absolute()
+                    .set_if(&k, &rate_limit, RateLimitComparator::Always, 17)
                     .await
                     .unwrap(),
                 (17, 0)
             );
 
             let result = if preserve {
-                rl.redis()
-                    .absolute()
+                rl.absolute()
                     .set_if_preserve_history(
                         &k,
                         &rate_limit,
-                        RateLimitComparator::Nil,
+                        RateLimitComparator::Always,
                         0,
                         HistoryPreservation::PreserveOldest,
                     )
                     .await
                     .unwrap()
             } else {
-                rl.redis()
-                    .absolute()
-                    .set_if(&k, &rate_limit, RateLimitComparator::Nil, 0)
+                rl.absolute()
+                    .set_if(&k, &rate_limit, RateLimitComparator::Always, 0)
                     .await
                     .unwrap()
             };
@@ -1153,9 +1138,9 @@ fn redis_state_absolute_unknown_reads_stay_absent_and_known_get_refreshes_member
         let k = key("k");
         let rate = RateLimit::per_second(10f64).unwrap();
 
-        let total = rl.redis().absolute().get(&k).await.unwrap();
+        let total = rl.absolute().get(&k).await.unwrap();
         assert_eq!(total, 0);
-        let decision = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let decision = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
 
         let mut conn = redis::Client::open(url.as_str())
@@ -1176,9 +1161,8 @@ fn redis_state_absolute_unknown_reads_stay_absent_and_known_get_refreshes_member
         assert!(score.is_none(), "unknown reads must not create state");
 
         assert_eq!(
-            rl.redis()
-                .absolute()
-                .set_if(&k, &rate, RateLimitComparator::Nil, 3)
+            rl.absolute()
+                .set_if(&k, &rate, RateLimitComparator::Always, 3)
                 .await
                 .unwrap(),
             (3, 0)
@@ -1188,7 +1172,7 @@ fn redis_state_absolute_unknown_reads_stay_absent_and_known_get_refreshes_member
             .await
             .unwrap();
 
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 3);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 3);
         let score: Option<f64> = conn
             .zscore(active_entities_key(&prefix), k.to_string())
             .await
@@ -1209,25 +1193,17 @@ fn redis_state_absolute_cleanup_removes_only_stale_entities() {
         let active_key = key("active");
 
         assert_allowed(
-            rl.redis()
-                .absolute()
-                .inc(&stale_key, &rate, 3)
-                .await
-                .unwrap(),
+            rl.absolute().inc(&stale_key, &rate, 3).await.unwrap(),
             "seeding the stale entity",
         );
         assert_allowed(
-            rl.redis()
-                .absolute()
-                .inc(&active_key, &rate, 4)
-                .await
-                .unwrap(),
+            rl.absolute().inc(&active_key, &rate, 4).await.unwrap(),
             "seeding the active entity",
         );
         runtime::async_sleep(Duration::from_millis(250)).await;
-        assert_eq!(rl.redis().absolute().get(&active_key).await.unwrap(), 4);
+        assert_eq!(rl.absolute().get(&active_key).await.unwrap(), 4);
 
-        rl.redis().absolute().cleanup(100).await.unwrap();
+        rl.absolute().cleanup(100).await.unwrap();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -1258,6 +1234,6 @@ fn redis_state_absolute_cleanup_removes_only_stale_entities() {
             .await
             .unwrap();
         assert!(active_score.is_some());
-        assert_eq!(rl.redis().absolute().get(&active_key).await.unwrap(), 4);
+        assert_eq!(rl.absolute().get(&active_key).await.unwrap(), 4);
     });
 }

@@ -24,11 +24,10 @@ use super::common::{key, key_gen, redis_url, unique_prefix};
 use super::runtime;
 
 use crate::common::{RateType, SuppressionFactorCachePeriod};
-use crate::hybrid::SyncInterval;
 use crate::{
-    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
-    RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions, RedisKey,
-    RedisRateLimiterOptions, WindowSize,
+    BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
+    RateLimitDecision, RateLimiterBuilder, WindowSize,
+    redis::{RedisKey, RedisRateLimiterProvider},
 };
 
 /// Build a rate limiter and return its unique prefix.
@@ -38,36 +37,24 @@ async fn build_limiter(
     bucket_size: u64,
     hard_limit_factor: f64,
     suppression_factor_cache_period: u64,
-) -> (std::sync::Arc<RateLimiter>, RedisKey) {
+) -> (std::sync::Arc<RedisRateLimiterProvider>, RedisKey) {
     let client = redis::Client::open(url).unwrap();
     let cm = client.get_connection_manager().await.unwrap();
     let prefix = unique_prefix();
 
-    let options = RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
-                suppression_factor_cache_period,
-            )
-            .unwrap(),
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager: cm,
-            prefix: Some(prefix.clone()),
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
-                suppression_factor_cache_period,
-            )
-            .unwrap(),
-            sync_interval: SyncInterval::default(),
-        },
-    };
+    let provider = RedisRateLimiterProvider::builder(cm)
+        .prefix(prefix.clone())
+        .window_size(WindowSize::seconds(window_size).unwrap())
+        .bucket_size(BucketSize::milliseconds(bucket_size).unwrap())
+        .hard_limit_factor(HardLimitFactor::try_from(hard_limit_factor).unwrap())
+        .suppression_factor_cache_period(
+            SuppressionFactorCachePeriod::milliseconds(suppression_factor_cache_period).unwrap(),
+        )
+        .cleanup_enabled(false)
+        .build()
+        .unwrap();
 
-    (std::sync::Arc::new(RateLimiter::new(options)), prefix)
+    (provider, prefix)
 }
 
 /// Construct the canonical Redis key for a given suffix using the key generator.
@@ -105,12 +92,7 @@ fn redis_state_suppressed_allowed_inc_sets_total_count_and_zero_declined() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
-        let d = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 3)
-            .await
-            .unwrap();
+        let d = rl.suppressed().inc(&k, &rate_limit, 3).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
 
         let mut conn = redis::Client::open(url.as_str())
@@ -153,7 +135,6 @@ fn redis_state_suppressed_exact_hard_caches_one_and_next_call_records_decline() 
         let hard_window_limit = 20_u64;
 
         let reaches_hard = rl
-            .redis()
             .suppressed()
             .inc(&k, &rate_limit, hard_window_limit)
             .await
@@ -163,12 +144,7 @@ fn redis_state_suppressed_exact_hard_caches_one_and_next_call_records_decline() 
             "reaches_hard: {reaches_hard:?}"
         );
 
-        let next = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let next = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(
                 next,
@@ -245,24 +221,14 @@ fn redis_state_suppressed_sf_cache_key_is_set_in_suppression_zone() {
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         for accepted_after in 1..=10_u64 {
-            let decision = rl
-                .redis()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "accepted_after={accepted_after}, decision={decision:?}"
             );
         }
 
-        let above_soft = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let above_soft = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(
                 above_soft,
@@ -280,12 +246,7 @@ fn redis_state_suppressed_sf_cache_key_is_set_in_suppression_zone() {
         runtime::async_sleep(Duration::from_millis(cache_ms + 10)).await;
 
         // Trigger a fresh computation. This writes `sf` with `cache_ms` TTL.
-        let sf = rl
-            .redis()
-            .suppressed()
-            .get_suppression_factor(&k)
-            .await
-            .unwrap();
+        let sf = rl.suppressed().get_suppression_factor(&k).await.unwrap();
 
         // Verify the return value directly — no separate Redis read needed here.
         assert!(
@@ -331,24 +292,14 @@ fn redis_state_suppressed_sf_cache_key_has_ttl() {
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         for accepted_after in 1..=10_u64 {
-            let decision = rl
-                .redis()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "accepted_after={accepted_after}, decision={decision:?}"
             );
         }
 
-        let above_soft = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let above_soft = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(
                 above_soft,
@@ -392,9 +343,8 @@ fn redis_state_suppressed_invalid_cached_factors_are_recomputed() {
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 11)
+            rl.suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 11)
                 .await
                 .unwrap(),
             (11, 0)
@@ -411,12 +361,7 @@ fn redis_state_suppressed_invalid_cached_factors_are_recomputed() {
         for invalid in [-0.25_f64, 1.25_f64] {
             let _: () = conn.set(&factor_key, invalid).await.unwrap();
 
-            let factor = rl
-                .redis()
-                .suppressed()
-                .get_suppression_factor(&k)
-                .await
-                .unwrap();
+            let factor = rl.suppressed().get_suppression_factor(&k).await.unwrap();
             assert!(
                 (factor - expected).abs() < 1e-12,
                 "invalid={invalid}, factor={factor}, expected={expected}"
@@ -447,12 +392,7 @@ fn redis_state_suppressed_window_limit_key_equals_hard_limit() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(rate_limit_value).unwrap();
 
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
 
         let mut conn = redis::Client::open(url.as_str())
@@ -479,19 +419,9 @@ fn redis_state_suppressed_inc_retains_first_hard_window_limit() {
         let initial_rate = RateLimit::per_second(2f64).unwrap();
         let later_rate = RateLimit::per_second(10f64).unwrap();
 
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &initial_rate, 2)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &initial_rate, 2).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &later_rate, 1)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &later_rate, 1).await.unwrap();
         assert!(
             matches!(
                 decision,
@@ -526,24 +456,14 @@ fn redis_state_suppressed_hash_sums_match_counter_keys() {
         // We'll drive past the hard limit so some calls are denied.
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
-        let reaches_hard = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 100)
-            .await
-            .unwrap();
+        let reaches_hard = rl.suppressed().inc(&k, &rate_limit, 100).await.unwrap();
         assert!(
             matches!(reaches_hard, RateLimitDecision::Allowed),
             "reaches_hard: {reaches_hard:?}"
         );
 
         for denied_after in 1..=5_u64 {
-            let decision = rl
-                .redis()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(
                     decision,
@@ -598,20 +518,10 @@ fn redis_state_suppressed_evicts_expired_buckets_from_both_hashes() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
-        let reaches_hard = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 10)
-            .await
-            .unwrap();
+        let reaches_hard = rl.suppressed().inc(&k, &rate_limit, 10).await.unwrap();
         assert!(matches!(reaches_hard, RateLimitDecision::Allowed));
 
-        let declined = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let declined = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(
                 declined,
@@ -628,12 +538,7 @@ fn redis_state_suppressed_evicts_expired_buckets_from_both_hashes() {
         runtime::async_sleep(Duration::from_millis(10)).await;
 
         // A fresh inc triggers eviction inside the Lua script.
-        let d = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
 
         let mut conn = redis::Client::open(url.as_str())
@@ -672,12 +577,7 @@ fn redis_state_suppressed_get_factor_on_unknown_key_writes_no_state() {
         let (rl, prefix) = build_limiter(&url, 10, 1000, 2.0, 100).await;
         let k = key("brand_new");
 
-        let sf = rl
-            .redis()
-            .suppressed()
-            .get_suppression_factor(&k)
-            .await
-            .unwrap();
+        let sf = rl.suppressed().get_suppression_factor(&k).await.unwrap();
         assert!((sf - 0.0).abs() < 1e-12, "sf: {sf}");
 
         let mut conn = redis::Client::open(url.as_str())
@@ -716,19 +616,9 @@ fn redis_state_suppressed_per_key_state_is_independent() {
         let b = key("b");
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&a, &rate_limit, 4)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&a, &rate_limit, 4).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&b, &rate_limit, 9)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&b, &rate_limit, 9).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
 
         let mut conn = redis::Client::open(url.as_str())
@@ -764,21 +654,16 @@ fn redis_state_suppressed_active_entities_updated_on_inc() {
             .unwrap();
 
         // Not present before any call.
-        let score_before: Option<f64> = conn.zscore(&ae_key, &**k).await.unwrap();
+        let score_before: Option<f64> = conn.zscore(&ae_key, k.as_str()).await.unwrap();
         assert!(
             score_before.is_none(),
             "key should not be in active_entities before inc"
         );
 
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
 
-        let score_after: Option<f64> = conn.zscore(&ae_key, &**k).await.unwrap();
+        let score_after: Option<f64> = conn.zscore(&ae_key, k.as_str()).await.unwrap();
         assert!(
             score_after.is_some(),
             "key should be in active_entities after inc"
@@ -798,12 +683,12 @@ fn redis_state_suppressed_set_if_writes_single_bucket_and_resets_declines() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(10f64).unwrap();
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(40), 40)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (40, 0));
 
         let mut conn = redis::Client::open(url.as_str())
@@ -872,9 +757,8 @@ fn redis_state_suppressed_set_if_no_match_is_true_noop() {
 
         let rate_seed = RateLimit::per_second(10f64).unwrap();
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .set_if(&k, &rate_seed, RateLimitComparator::Nil, 17)
+            rl.suppressed()
+                .set_if(&k, &rate_seed, RateLimitComparator::Always, 17)
                 .await
                 .unwrap(),
             (17, 0)
@@ -882,22 +766,14 @@ fn redis_state_suppressed_set_if_no_match_is_true_noop() {
 
         // A below-soft increment does not create a cache entry, matching suppressed-local.
         assert!(matches!(
-            rl.redis()
-                .suppressed()
-                .inc(&k, &rate_seed, 1)
-                .await
-                .unwrap(),
+            rl.suppressed().inc(&k, &rate_seed, 1).await.unwrap(),
             RateLimitDecision::Allowed
         ));
 
         // A public factor read computes and caches the current factor so the guard-miss
         // assertion below can prove that set_if leaves valid cache metadata untouched.
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .get_suppression_factor(&k)
-                .await
-                .unwrap(),
+            rl.suppressed().get_suppression_factor(&k).await.unwrap(),
             0.0
         );
 
@@ -938,12 +814,12 @@ fn redis_state_suppressed_set_if_no_match_is_true_noop() {
         runtime::async_sleep(Duration::from_millis(50)).await;
 
         let rate_new = RateLimit::per_second(20f64).unwrap();
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
             .set_if(&k, &rate_new, RateLimitComparator::Gt(1000), 5)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (18, 18));
 
         let history_after: HashMap<String, u64> = conn.hgetall(&history_key).await.unwrap();
@@ -1006,7 +882,7 @@ fn redis_state_suppressed_set_if_handles_expired_history_only_after_a_match() {
         let match_key = key("match");
 
         for k in [&miss_key, &match_key] {
-            let decision = rl.redis().suppressed().inc(k, &rate, 4).await.unwrap();
+            let decision = rl.suppressed().inc(k, &rate, 4).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "creating an oldest bucket: {decision:?}"
@@ -1014,17 +890,13 @@ fn redis_state_suppressed_set_if_handles_expired_history_only_after_a_match() {
         }
         runtime::async_sleep(Duration::from_millis(900)).await;
         for k in [&miss_key, &match_key] {
-            let decision = rl.redis().suppressed().inc(k, &rate, 6).await.unwrap();
+            let decision = rl.suppressed().inc(k, &rate, 6).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "creating a fresh bucket: {decision:?}"
             );
             assert_eq!(
-                rl.redis()
-                    .suppressed()
-                    .get_suppression_factor(k)
-                    .await
-                    .unwrap(),
+                rl.suppressed().get_suppression_factor(k).await.unwrap(),
                 0.0
             );
         }
@@ -1067,7 +939,6 @@ fn redis_state_suppressed_set_if_handles_expired_history_only_after_a_match() {
         assert!(factor_ttl_before > 0);
 
         let result = rl
-            .redis()
             .suppressed()
             .set_if(&miss_key, &rate, RateLimitComparator::Gt(100), 1)
             .await
@@ -1105,7 +976,6 @@ fn redis_state_suppressed_set_if_handles_expired_history_only_after_a_match() {
         assert!(factor_ttl_after > 0 && factor_ttl_after <= factor_ttl_before);
 
         let result = rl
-            .redis()
             .suppressed()
             .set_if_preserve_history(
                 &match_key,
@@ -1205,22 +1075,17 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
             match preservation {
                 HistoryPreservation::PreserveNewest => {
                     assert_eq!(
-                        rl.redis()
-                            .suppressed()
-                            .set_if(&k, &low_rate, RateLimitComparator::Nil, 4)
+                        rl.suppressed()
+                            .set_if(&k, &low_rate, RateLimitComparator::Always, 4)
                             .await
                             .unwrap(),
                         (4, 0)
                     );
                     assert_eq!(
-                        rl.redis()
-                            .suppressed()
-                            .get_suppression_factor(&k)
-                            .await
-                            .unwrap(),
+                        rl.suppressed().get_suppression_factor(&k).await.unwrap(),
                         1.0
                     );
-                    let declined = rl.redis().suppressed().inc(&k, &low_rate, 2).await.unwrap();
+                    let declined = rl.suppressed().inc(&k, &low_rate, 2).await.unwrap();
                     assert!(matches!(
                         declined,
                         RateLimitDecision::Suppressed {
@@ -1229,8 +1094,7 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
                         }
                     ));
                     assert_eq!(
-                        rl.redis()
-                            .suppressed()
+                        rl.suppressed()
                             .set_if_preserve_history(
                                 &k,
                                 &high_rate,
@@ -1244,44 +1108,30 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
                     );
                     runtime::async_sleep(Duration::from_millis(120)).await;
                     assert!(matches!(
-                        rl.redis()
-                            .suppressed()
-                            .inc(&k, &high_rate, 5)
-                            .await
-                            .unwrap(),
+                        rl.suppressed().inc(&k, &high_rate, 5).await.unwrap(),
                         RateLimitDecision::Allowed
                     ));
                     runtime::async_sleep(Duration::from_millis(120)).await;
                     assert!(matches!(
-                        rl.redis()
-                            .suppressed()
-                            .inc(&k, &high_rate, 6)
-                            .await
-                            .unwrap(),
+                        rl.suppressed().inc(&k, &high_rate, 6).await.unwrap(),
                         RateLimitDecision::Allowed
                     ));
                 }
                 HistoryPreservation::PreserveOldest => {
                     assert_eq!(
-                        rl.redis()
-                            .suppressed()
-                            .set_if(&k, &high_rate, RateLimitComparator::Nil, 4)
+                        rl.suppressed()
+                            .set_if(&k, &high_rate, RateLimitComparator::Always, 4)
                             .await
                             .unwrap(),
                         (4, 0)
                     );
                     runtime::async_sleep(Duration::from_millis(120)).await;
                     assert!(matches!(
-                        rl.redis()
-                            .suppressed()
-                            .inc(&k, &high_rate, 5)
-                            .await
-                            .unwrap(),
+                        rl.suppressed().inc(&k, &high_rate, 5).await.unwrap(),
                         RateLimitDecision::Allowed
                     ));
                     assert_eq!(
-                        rl.redis()
-                            .suppressed()
+                        rl.suppressed()
                             .set_if_preserve_history(
                                 &k,
                                 &medium_rate,
@@ -1295,28 +1145,15 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
                     );
                     runtime::async_sleep(Duration::from_millis(120)).await;
                     assert!(matches!(
-                        rl.redis()
-                            .suppressed()
-                            .inc(&k, &medium_rate, 3)
-                            .await
-                            .unwrap(),
+                        rl.suppressed().inc(&k, &medium_rate, 3).await.unwrap(),
                         RateLimitDecision::Allowed
                     ));
                     runtime::async_sleep(Duration::from_millis(5)).await;
                     assert_eq!(
-                        rl.redis()
-                            .suppressed()
-                            .get_suppression_factor(&k)
-                            .await
-                            .unwrap(),
+                        rl.suppressed().get_suppression_factor(&k).await.unwrap(),
                         1.0
                     );
-                    let declined = rl
-                        .redis()
-                        .suppressed()
-                        .inc(&k, &medium_rate, 3)
-                        .await
-                        .unwrap();
+                    let declined = rl.suppressed().inc(&k, &medium_rate, 3).await.unwrap();
                     assert!(matches!(
                         declined,
                         RateLimitDecision::Suppressed {
@@ -1327,14 +1164,10 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
                 }
             }
 
-            assert_eq!(
-                rl.redis().suppressed().get(&k).await.unwrap().total,
-                old_total
-            );
+            assert_eq!(rl.suppressed().get(&k).await.unwrap().total, old_total);
 
             assert_eq!(
-                rl.redis()
-                    .suppressed()
+                rl.suppressed()
                     .set_if_preserve_history(
                         &k,
                         &high_rate,
@@ -1380,8 +1213,7 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
             assert!(factor.is_none());
 
             assert_eq!(
-                rl.redis()
-                    .suppressed()
+                rl.suppressed()
                     .set_if_preserve_history(
                         &k,
                         &high_rate,
@@ -1434,8 +1266,7 @@ fn redis_state_suppressed_missing_zero_and_guard_miss_write_nothing() {
         for (name, preserve) in [("replace", false), ("preserve", true)] {
             let k = key(name);
             let result = if preserve {
-                rl.redis()
-                    .suppressed()
+                rl.suppressed()
                     .set_if_preserve_history(
                         &k,
                         &rate,
@@ -1446,8 +1277,7 @@ fn redis_state_suppressed_missing_zero_and_guard_miss_write_nothing() {
                     .await
                     .unwrap()
             } else {
-                rl.redis()
-                    .suppressed()
+                rl.suppressed()
                     .set_if(&k, &rate, RateLimitComparator::Eq(0), 0)
                     .await
                     .unwrap()
@@ -1455,8 +1285,7 @@ fn redis_state_suppressed_missing_zero_and_guard_miss_write_nothing() {
             assert_eq!(result, (0, 0));
 
             let guard_miss = if preserve {
-                rl.redis()
-                    .suppressed()
+                rl.suppressed()
                     .set_if_preserve_history(
                         &k,
                         &rate,
@@ -1467,8 +1296,7 @@ fn redis_state_suppressed_missing_zero_and_guard_miss_write_nothing() {
                     .await
                     .unwrap()
             } else {
-                rl.redis()
-                    .suppressed()
+                rl.suppressed()
                     .set_if(&k, &rate, RateLimitComparator::Eq(1), 5)
                     .await
                     .unwrap()
@@ -1508,30 +1336,27 @@ fn redis_state_suppressed_conditional_set_zero_removes_entity_state() {
         for (name, preserve) in [("replace", false), ("preserve", true)] {
             let k = key(name);
             assert_eq!(
-                rl.redis()
-                    .suppressed()
-                    .set_if(&k, &rate_limit, RateLimitComparator::Nil, 17)
+                rl.suppressed()
+                    .set_if(&k, &rate_limit, RateLimitComparator::Always, 17)
                     .await
                     .unwrap(),
                 (17, 0)
             );
 
             let result = if preserve {
-                rl.redis()
-                    .suppressed()
+                rl.suppressed()
                     .set_if_preserve_history(
                         &k,
                         &rate_limit,
-                        RateLimitComparator::Nil,
+                        RateLimitComparator::Always,
                         0,
                         HistoryPreservation::PreserveOldest,
                     )
                     .await
                     .unwrap()
             } else {
-                rl.redis()
-                    .suppressed()
-                    .set_if(&k, &rate_limit, RateLimitComparator::Nil, 0)
+                rl.suppressed()
+                    .set_if(&k, &rate_limit, RateLimitComparator::Always, 0)
                     .await
                     .unwrap()
             };
@@ -1565,7 +1390,7 @@ fn redis_state_suppressed_get_only_registers_existing_entity_as_active() {
         let k = key("k");
         let rate = RateLimit::per_second(10f64).unwrap();
 
-        assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 0);
+        assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 0);
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -1583,9 +1408,8 @@ fn redis_state_suppressed_get_only_registers_existing_entity_as_active() {
             .unwrap();
         assert!(score.is_none(), "unknown get must not create state");
 
-        rl.redis()
-            .suppressed()
-            .set_if(&k, &rate, RateLimitComparator::Nil, 3)
+        rl.suppressed()
+            .set_if(&k, &rate, RateLimitComparator::Always, 3)
             .await
             .unwrap();
         let _: u64 = conn
@@ -1593,7 +1417,7 @@ fn redis_state_suppressed_get_only_registers_existing_entity_as_active() {
             .await
             .unwrap();
 
-        assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 3);
+        assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 3);
         let score: Option<f64> = conn
             .zscore(active_entities_key(&prefix), k.to_string())
             .await
@@ -1612,19 +1436,14 @@ fn redis_state_suppressed_get_eviction_invalidates_cached_factor() {
         let rate = RateLimit::per_second(1f64).unwrap();
 
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .set_if(&k, &rate, RateLimitComparator::Nil, 1)
+            rl.suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, 1)
                 .await
                 .unwrap(),
             (1, 0)
         );
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .get_suppression_factor(&k)
-                .await
-                .unwrap(),
+            rl.suppressed().get_suppression_factor(&k).await.unwrap(),
             1.0
         );
 
@@ -1638,14 +1457,14 @@ fn redis_state_suppressed_get_eviction_invalidates_cached_factor() {
 
         runtime::async_sleep(Duration::from_millis(1_050)).await;
 
-        assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 0);
+        assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 0);
         let cached: bool = conn.exists(redis_key(&prefix, &k, "sf")).await.unwrap();
         assert!(
             !cached,
             "history eviction must invalidate the cached factor"
         );
 
-        let decision = rl.redis().suppressed().inc(&k, &rate, 1).await.unwrap();
+        let decision = rl.suppressed().inc(&k, &rate, 1).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Allowed),
             "fresh usage after eviction must not use the stale full-suppression cache: {decision:?}"
@@ -1665,12 +1484,12 @@ fn redis_state_suppressed_cleanup_removes_only_stale_entities() {
         let active_key = key("active");
 
         for k in [&stale_key, &active_key] {
-            let decision = rl.redis().suppressed().inc(k, &rate, 10).await.unwrap();
+            let decision = rl.suppressed().inc(k, &rate, 10).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "seeding exact-hard usage: {decision:?}"
             );
-            let decision = rl.redis().suppressed().inc(k, &rate, 1).await.unwrap();
+            let decision = rl.suppressed().inc(k, &rate, 1).await.unwrap();
             assert!(
                 matches!(
                     decision,
@@ -1684,10 +1503,10 @@ fn redis_state_suppressed_cleanup_removes_only_stale_entities() {
         }
 
         runtime::async_sleep(Duration::from_millis(250)).await;
-        let snapshot = rl.redis().suppressed().get(&active_key).await.unwrap();
+        let snapshot = rl.suppressed().get(&active_key).await.unwrap();
         assert_eq!((snapshot.total, snapshot.total_declined), (11, 1));
 
-        rl.redis().suppressed().cleanup(100).await.unwrap();
+        rl.suppressed().cleanup(100).await.unwrap();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -1718,7 +1537,7 @@ fn redis_state_suppressed_cleanup_removes_only_stale_entities() {
             .await
             .unwrap();
         assert!(active_score.is_some());
-        let snapshot = rl.redis().suppressed().get(&active_key).await.unwrap();
+        let snapshot = rl.suppressed().get(&active_key).await.unwrap();
         assert_eq!((snapshot.total, snapshot.total_declined), (11, 1));
     });
 }

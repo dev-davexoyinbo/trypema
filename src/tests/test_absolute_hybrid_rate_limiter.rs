@@ -2,16 +2,15 @@ use std::{env, thread, time::Duration};
 
 use super::runtime;
 
-use crate::common::SuppressionFactorCachePeriod;
-use crate::hybrid::SyncInterval;
 use crate::{
-    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
-    RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions, RedisKey,
-    RedisRateLimiterOptions, WindowSize,
+    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
+    RateLimiterBuilder, WindowSize,
+    hybrid::{HybridRateLimiterProvider, SyncInterval},
+    redis::RedisKey,
 };
 
 fn window_capacity(window_size: u64, rate_limit: &RateLimit) -> u64 {
-    ((window_size as f64) * **rate_limit) as u64
+    ((window_size as f64) * rate_limit.as_per_second()) as u64
 }
 
 fn record_decision(
@@ -74,29 +73,18 @@ async fn build_limiter_with_prefix(
     bucket_size: u64,
     sync_interval: u64,
     prefix: RedisKey,
-) -> std::sync::Arc<RateLimiter> {
+) -> std::sync::Arc<HybridRateLimiterProvider> {
     let client = redis::Client::open(url).unwrap();
     let cm = client.get_connection_manager().await.unwrap();
 
-    let options = RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager: cm,
-            prefix: Some(prefix),
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-            sync_interval: SyncInterval::milliseconds(sync_interval).unwrap(),
-        },
-    };
-
-    std::sync::Arc::new(RateLimiter::new(options))
+    HybridRateLimiterProvider::builder(cm)
+        .prefix(prefix)
+        .window_size(WindowSize::seconds(window_size).unwrap())
+        .bucket_size(BucketSize::milliseconds(bucket_size).unwrap())
+        .sync_interval(SyncInterval::milliseconds(sync_interval).unwrap())
+        .cleanup_enabled(false)
+        .build()
+        .unwrap()
 }
 
 async fn wait_for_hybrid_sync(sync_interval: u64) {
@@ -123,21 +111,11 @@ fn hybrid_allows_until_capacity_then_rejects() {
         let cap = window_capacity(window_size, &rate_limit);
 
         for _ in 0..cap {
-            let d = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
-        let d = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
     });
 }
@@ -153,12 +131,7 @@ fn hybrid_absolute_never_returns_suppressed() {
         let rate_limit = RateLimit::per_second(50f64).unwrap();
 
         for _ in 0..200_u64 {
-            let d = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             if matches!(d, RateLimitDecision::Suppressed { .. }) {
                 panic!("suppressed decision is not expected in hybrid absolute: {d:?}");
             }
@@ -185,23 +158,14 @@ fn hybrid_absolute_pending_only_rejection_reports_window_ttl_and_full_released_c
 
         for _ in 0..cap {
             assert_allowed(
-                rl.hybrid()
-                    .absolute()
-                    .inc(&k, &rate_limit, 1)
-                    .await
-                    .unwrap(),
+                rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
                 "capacity setup increment",
             );
         }
 
-        let d = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         let RateLimitDecision::Rejected {
-            retry_after_ms,
+            retry_after,
             remaining_after_waiting,
             ..
         } = d
@@ -210,7 +174,8 @@ fn hybrid_absolute_pending_only_rejection_reports_window_ttl_and_full_released_c
         };
 
         assert!(
-            retry_after_ms >= 900 && retry_after_ms <= 1_000,
+            retry_after >= Duration::from_millis(900)
+                && retry_after <= Duration::from_millis(1_000),
             "pending usage should retain approximately one window of TTL: {d:?}"
         );
         assert_eq!(
@@ -232,13 +197,12 @@ fn hybrid_absolute_oversized_request_on_empty_key_has_no_backoff_wait() {
         let capacity = window_capacity(window_size, &rate_limit);
 
         let decision = rl
-            .hybrid()
             .absolute()
             .inc(&k, &rate_limit, capacity + 1)
             .await
             .unwrap();
         let RateLimitDecision::Rejected {
-            retry_after_ms,
+            retry_after,
             remaining_after_waiting,
             ..
         } = decision
@@ -246,9 +210,13 @@ fn hybrid_absolute_oversized_request_on_empty_key_has_no_backoff_wait() {
             panic!("expected oversized request to be rejected, got {decision:?}");
         };
 
-        assert_eq!(retry_after_ms, 0, "no existing bucket needs to expire");
+        assert_eq!(
+            retry_after,
+            Duration::ZERO,
+            "no existing bucket needs to expire"
+        );
         assert_eq!(remaining_after_waiting, 0, "no bucket releases capacity");
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 0);
     });
 }
 
@@ -268,9 +236,8 @@ fn hybrid_absolute_known_oldest_ttl_is_not_inflated_to_sync_interval() {
             build_limiter_with_prefix(&url, window_size, 1_000, sync_interval, prefix.clone())
                 .await;
         assert_eq!(
-            seed.hybrid()
-                .absolute()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, capacity)
+            seed.absolute()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, capacity)
                 .await
                 .unwrap(),
             (capacity, 0)
@@ -280,9 +247,9 @@ fn hybrid_absolute_known_oldest_ttl_is_not_inflated_to_sync_interval() {
 
         let observer =
             build_limiter_with_prefix(&url, window_size, 1_000, sync_interval, prefix).await;
-        let decision = observer.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let decision = observer.absolute().is_allowed(&k).await.unwrap();
         let RateLimitDecision::Rejected {
-            retry_after_ms,
+            retry_after,
             remaining_after_waiting,
             ..
         } = decision
@@ -291,7 +258,8 @@ fn hybrid_absolute_known_oldest_ttl_is_not_inflated_to_sync_interval() {
         };
 
         assert!(
-            retry_after_ms >= 50_000 && retry_after_ms <= 60_000,
+            retry_after >= Duration::from_millis(50_000)
+                && retry_after <= Duration::from_millis(60_000),
             "Redis bucket TTL must not be inflated to the 120s sync interval: {decision:?}"
         );
         assert_eq!(remaining_after_waiting, capacity);
@@ -332,33 +300,23 @@ fn hybrid_usage_is_committed_to_redis_on_flush_and_then_visible_to_others() {
 
         // Fill the hybrid local accept budget (does not write to Redis yet).
         for _ in 0..5_u64 {
-            let d = rl_a
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl_a.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
         // Other instances should still see no limit state in the hybrid keyspace.
-        let d0 = rl_b.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let d0 = rl_b.absolute().is_allowed(&k).await.unwrap();
         assert!(matches!(d0, RateLimitDecision::Allowed), "d0: {d0:?}");
 
         // Crossing the accept limit queues a commit (and rejects).
-        let d1 = rl_a
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d1 = rl_a.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(d1, RateLimitDecision::Rejected { .. }),
             "d1: {d1:?}"
         );
 
         // Exhaustion commits synchronously before the rejecting decision returns.
-        let d2 = rl_b.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let d2 = rl_b.absolute().is_allowed(&k).await.unwrap();
         assert_rejected(d2, "overflow commit must be visible to another instance");
     });
 }
@@ -397,17 +355,12 @@ fn hybrid_absolute_does_not_touch_redis_until_commit() {
 
         // Fill local accept budget; no commit should have happened yet.
         for _ in 0..cap {
-            let d = rl_a
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl_a.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
         // Other instances should not observe a limit until a commit is flushed.
-        let d0 = rl_b.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let d0 = rl_b.absolute().is_allowed(&k).await.unwrap();
         assert!(matches!(d0, RateLimitDecision::Allowed), "d0: {d0:?}");
     });
 }
@@ -432,21 +385,12 @@ fn hybrid_absolute_unblocks_after_window_expires() {
 
         for _ in 0..cap {
             assert_allowed(
-                rl.hybrid()
-                    .absolute()
-                    .inc(&k, &rate_limit, 1)
-                    .await
-                    .unwrap(),
+                rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
                 "capacity setup increment",
             );
         }
 
-        let d = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
 
         // Wait for the full window to expire. We poll to avoid flakiness.
@@ -457,12 +401,7 @@ fn hybrid_absolute_unblocks_after_window_expires() {
             }
 
             thread::sleep(Duration::from_millis(25));
-            let d2 = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d2 = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             if matches!(d2, RateLimitDecision::Allowed) {
                 break;
             }
@@ -484,32 +423,18 @@ fn hybrid_absolute_per_key_state_is_independent() {
 
         for _ in 0..cap {
             assert_allowed(
-                rl.hybrid()
-                    .absolute()
-                    .inc(&a, &rate_limit, 1)
-                    .await
-                    .unwrap(),
+                rl.absolute().inc(&a, &rate_limit, 1).await.unwrap(),
                 "key A capacity setup increment",
             );
         }
 
-        let da = rl
-            .hybrid()
-            .absolute()
-            .inc(&a, &rate_limit, 1)
-            .await
-            .unwrap();
+        let da = rl.absolute().inc(&a, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(da, RateLimitDecision::Rejected { .. }),
             "da: {da:?}"
         );
 
-        let db = rl
-            .hybrid()
-            .absolute()
-            .inc(&b, &rate_limit, 1)
-            .await
-            .unwrap();
+        let db = rl.absolute().inc(&b, &rate_limit, 1).await.unwrap();
         assert!(matches!(db, RateLimitDecision::Allowed), "db: {db:?}");
     });
 }
@@ -546,28 +471,14 @@ fn hybrid_absolute_prefix_isolation() {
 
         for _ in 0..cap {
             assert_allowed(
-                rl_a.hybrid()
-                    .absolute()
-                    .inc(&k, &rate_limit, 1)
-                    .await
-                    .unwrap(),
+                rl_a.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
                 "prefix A capacity setup increment",
             );
         }
-        let d = rl_a
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl_a.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
 
-        let d_other = rl_b
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d_other = rl_b.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(d_other, RateLimitDecision::Allowed),
             "d_other: {d_other:?}"
@@ -602,22 +513,12 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
         )
         .await;
         assert_allowed(
-            rl_seed
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 2)
-                .await
-                .unwrap(),
+            rl_seed.absolute().inc(&k, &rate_limit, 2).await.unwrap(),
             "oldest bucket setup increment",
         );
         wait_for_hybrid_sync(sync_interval).await;
         assert_allowed(
-            rl_seed
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 4)
-                .await
-                .unwrap(),
+            rl_seed.absolute().inc(&k, &rate_limit, 4).await.unwrap(),
             "newest bucket setup increment",
         );
         wait_for_hybrid_sync(sync_interval).await;
@@ -626,12 +527,7 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
         let rl =
             build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
 
-        let d_prime = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d_prime = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(d_prime, RateLimitDecision::Rejected { .. }),
             "d_prime: {d_prime:?}"
@@ -639,12 +535,7 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
 
         // At capacity (2 + 4). Next increment should be rejected and remaining_after_waiting
         // should reflect the oldest bucket count (6 when grouped).
-        let d = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         let RateLimitDecision::Rejected {
             remaining_after_waiting,
             ..
@@ -677,27 +568,19 @@ fn hybrid_absolute_remaining_after_waiting_is_capacity_released_by_oldest_bucket
         )
         .await;
         assert_allowed(
-            seed.hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 3)
-                .await
-                .unwrap(),
+            seed.absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "oldest bucket setup increment",
         );
         wait_for_hybrid_sync(sync_interval).await;
         assert_allowed(
-            seed.hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 7)
-                .await
-                .unwrap(),
+            seed.absolute().inc(&k, &rate_limit, 7).await.unwrap(),
             "newest bucket setup increment",
         );
         wait_for_hybrid_sync(sync_interval).await;
 
         let observer =
             build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
-        let decision = observer.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let decision = observer.absolute().is_allowed(&k).await.unwrap();
         let RateLimitDecision::Rejected {
             remaining_after_waiting,
             ..
@@ -711,12 +594,7 @@ fn hybrid_absolute_remaining_after_waiting_is_capacity_released_by_oldest_bucket
             "the oldest bucket releases three count units: {decision:?}"
         );
 
-        let cached_decision = observer
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let cached_decision = observer.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         let RateLimitDecision::Rejected {
             remaining_after_waiting,
             ..
@@ -725,7 +603,7 @@ fn hybrid_absolute_remaining_after_waiting_is_capacity_released_by_oldest_bucket
             panic!("expected cached rejected decision, got {cached_decision:?}");
         };
         assert_eq!(remaining_after_waiting, 3);
-        assert_eq!(observer.hybrid().absolute().get(&k).await.unwrap(), 10);
+        assert_eq!(observer.absolute().get(&k).await.unwrap(), 10);
     });
 }
 
@@ -746,12 +624,7 @@ fn hybrid_absolute_concurrent_smoke_does_not_panic() {
             let rate_limit = rate_limit.clone();
             tasks.push(runtime::spawn(async move {
                 for _ in 0..50 {
-                    let d = rl
-                        .hybrid()
-                        .absolute()
-                        .inc(&k, &rate_limit, 1)
-                        .await
-                        .unwrap();
+                    let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
                     if matches!(d, RateLimitDecision::Suppressed { .. }) {
                         panic!("unexpected suppressed decision in hybrid absolute");
                     }
@@ -789,12 +662,7 @@ fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
         let mut rejected_ops = 0_u64;
 
         for _ in 0..80_u64 {
-            let decision = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             record_decision(
                 decision,
                 1,
@@ -836,12 +704,7 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
         let mut rejected_ops = 0_u64;
 
         // Allowed: consumes 9 of 10.
-        let d1 = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 9)
-            .await
-            .unwrap();
+        let d1 = rl.absolute().inc(&k, &rate_limit, 9).await.unwrap();
         record_decision(
             d1,
             9,
@@ -852,12 +715,7 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
         );
 
         // Rejected: would push total to 11.
-        let d2 = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 2)
-            .await
-            .unwrap();
+        let d2 = rl.absolute().inc(&k, &rate_limit, 2).await.unwrap();
         assert!(
             matches!(d2, RateLimitDecision::Rejected { .. }),
             "d2: {d2:?}"
@@ -872,12 +730,7 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
         );
 
         // Allowed: proves the rejected batch did not consume capacity.
-        let d3 = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d3 = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         record_decision(
             d3,
             1,
@@ -914,12 +767,7 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
 
         // Fill capacity.
         for _ in 0..capacity {
-            let decision = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "decision: {decision:?}"
@@ -929,12 +777,7 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
         // Many rejected attempts should not change what we can do after the window expires.
         let mut rejected_ops = 0_u64;
         for _ in 0..20_u64 {
-            let decision = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Rejected { .. }),
                 "decision: {decision:?}"
@@ -947,12 +790,7 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
 
         let mut accepted_after_expiry = 0_u64;
         for _ in 0..capacity {
-            let decision = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "decision: {decision:?}"
@@ -971,8 +809,8 @@ fn get_returns_zero_for_untouched_key() {
         let rl = build_limiter_with_prefix(&url, 6, 1000, 25, unique_prefix()).await;
 
         let k = key("k");
-        assert_eq!(rl.hybrid().absolute().get_inferred(&k).await.unwrap(), 0);
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
+        assert_eq!(rl.absolute().get_estimate(&k).await.unwrap(), 0);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 0);
     });
 }
 
@@ -988,38 +826,29 @@ fn cleanup_keeps_rejecting_state_while_retry_ttl_is_live() {
         let rate = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .inc(&k, &rate, window_capacity(1, &rate))
                 .await
                 .unwrap(),
             "fill rejection setup capacity",
         );
         assert_rejected(
-            rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate, 1).await.unwrap(),
             "create rejection cache",
         );
-        assert_eq!(rl.hybrid().absolute().local_state_count(), 1);
+        assert_eq!(rl.absolute().local_state_count(), 1);
 
         runtime::async_sleep(Duration::from_millis(100)).await;
-        rl.hybrid()
-            .absolute()
-            .cleanup(stale_after_ms)
-            .await
-            .unwrap();
+        rl.absolute().cleanup(stale_after_ms).await.unwrap();
         assert_eq!(
-            rl.hybrid().absolute().local_state_count(),
+            rl.absolute().local_state_count(),
             1,
             "live rejection TTL must outlive the shorter stale horizon"
         );
 
         runtime::async_sleep(Duration::from_millis(window_size_ms)).await;
-        rl.hybrid()
-            .absolute()
-            .cleanup(stale_after_ms)
-            .await
-            .unwrap();
-        assert_eq!(rl.hybrid().absolute().local_state_count(), 0);
+        rl.absolute().cleanup(stale_after_ms).await.unwrap();
+        assert_eq!(rl.absolute().local_state_count(), 0);
     });
 }
 
@@ -1035,43 +864,34 @@ fn cleanup_keeps_rejecting_state_until_stale_horizon_after_retry_ttl_expiry() {
         let rate = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .inc(&k, &rate, window_capacity(1, &rate))
                 .await
                 .unwrap(),
             "fill rejection setup capacity",
         );
         assert_rejected(
-            rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate, 1).await.unwrap(),
             "create rejection cache",
         );
-        assert_eq!(rl.hybrid().absolute().local_state_count(), 1);
+        assert_eq!(rl.absolute().local_state_count(), 1);
 
         runtime::async_sleep(Duration::from_millis(window_size_ms + 100)).await;
-        rl.hybrid()
-            .absolute()
-            .cleanup(stale_after_ms)
-            .await
-            .unwrap();
+        rl.absolute().cleanup(stale_after_ms).await.unwrap();
         assert_eq!(
-            rl.hybrid().absolute().local_state_count(),
+            rl.absolute().local_state_count(),
             1,
             "the stale horizon must begin after the retry TTL expires"
         );
 
         runtime::async_sleep(Duration::from_millis(stale_after_ms)).await;
-        rl.hybrid()
-            .absolute()
-            .cleanup(stale_after_ms)
-            .await
-            .unwrap();
-        assert_eq!(rl.hybrid().absolute().local_state_count(), 0);
+        rl.absolute().cleanup(stale_after_ms).await.unwrap();
+        assert_eq!(rl.absolute().local_state_count(), 0);
     });
 }
 
 #[test]
-fn get_inferred_refreshes_undefined_state_then_uses_local_snapshot() {
+fn get_estimate_refreshes_undefined_state_then_uses_local_snapshot() {
     let url = redis_url();
 
     runtime::block_on(async {
@@ -1083,35 +903,30 @@ fn get_inferred_refreshes_undefined_state_then_uses_local_snapshot() {
 
         assert_eq!(
             writer
-                .hybrid()
                 .absolute()
-                .set_if(&k, &rate, RateLimitComparator::Nil, 5)
+                .set_if(&k, &rate, RateLimitComparator::Always, 5)
                 .await
                 .unwrap(),
             (5, 0)
         );
 
-        assert_eq!(
-            reader.hybrid().absolute().get_inferred(&k).await.unwrap(),
-            5
-        );
+        assert_eq!(reader.absolute().get_estimate(&k).await.unwrap(), 5);
 
         assert_eq!(
             writer
-                .hybrid()
                 .absolute()
-                .set_if(&k, &rate, RateLimitComparator::Nil, 9)
+                .set_if(&k, &rate, RateLimitComparator::Always, 9)
                 .await
                 .unwrap(),
             (9, 5)
         );
 
         assert_eq!(
-            reader.hybrid().absolute().get_inferred(&k).await.unwrap(),
+            reader.absolute().get_estimate(&k).await.unwrap(),
             5,
             "usable local state must stay on the inference fast path"
         );
-        assert_eq!(reader.hybrid().absolute().get(&k).await.unwrap(), 9);
+        assert_eq!(reader.absolute().get(&k).await.unwrap(), 9);
     });
 }
 
@@ -1127,20 +942,15 @@ fn get_includes_local_pending_increments() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         for _ in 0..3 {
-            let d = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
         // Redis holds nothing yet; the 3 increments are local pending.
-        let inferred_total = rl.hybrid().absolute().get_inferred(&k).await.unwrap();
+        let inferred_total = rl.absolute().get_estimate(&k).await.unwrap();
         assert_eq!(inferred_total, 3);
 
-        let total = rl.hybrid().absolute().get(&k).await.unwrap();
+        let total = rl.absolute().get(&k).await.unwrap();
         assert_eq!(total, 3);
     });
 }
@@ -1156,20 +966,20 @@ fn get_methods_keep_the_exact_total_during_background_sync() {
         let rate = RateLimit::per_second(100f64).unwrap();
 
         assert_allowed(
-            rl.hybrid().absolute().inc(&k, &rate, 3).await.unwrap(),
+            rl.absolute().inc(&k, &rate, 3).await.unwrap(),
             "pending usage setup increment",
         );
 
         // The first tick refreshes local state. Historically it only queued the
         // captured count, leaving a gap until the second tick wrote it to Redis.
         runtime::async_sleep(Duration::from_millis(sync_interval + 100)).await;
-        assert_eq!(rl.hybrid().absolute().get_inferred(&k).await.unwrap(), 3);
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 3);
+        assert_eq!(rl.absolute().get_estimate(&k).await.unwrap(), 3);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 3);
     });
 }
 
 #[test]
-fn get_inferred_refreshes_an_expired_rejection_cache() {
+fn get_estimate_refreshes_an_expired_rejection_cache() {
     let url = redis_url();
 
     runtime::block_on(async {
@@ -1181,34 +991,25 @@ fn get_inferred_refreshes_an_expired_rejection_cache() {
         let capacity = window_capacity(1, &rate);
 
         assert_allowed(
-            limiter
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate, capacity)
-                .await
-                .unwrap(),
+            limiter.absolute().inc(&k, &rate, capacity).await.unwrap(),
             "rejection setup increment",
         );
         assert_rejected(
-            limiter.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+            limiter.absolute().inc(&k, &rate, 1).await.unwrap(),
             "rejection cache setup",
         );
 
         runtime::async_sleep(Duration::from_millis(1_100)).await;
         assert_eq!(
             writer
-                .hybrid()
                 .absolute()
-                .set_if(&k, &rate, RateLimitComparator::Nil, 4)
+                .set_if(&k, &rate, RateLimitComparator::Always, 4)
                 .await
                 .unwrap(),
             (4, 0)
         );
 
-        assert_eq!(
-            limiter.hybrid().absolute().get_inferred(&k).await.unwrap(),
-            4
-        );
+        assert_eq!(limiter.absolute().get_estimate(&k).await.unwrap(), 4);
     });
 }
 
@@ -1223,41 +1024,28 @@ fn inc_keeps_the_first_rate_limit_for_an_existing_key() {
 
         let low_first = key("low_first");
         assert_allowed(
-            rl.hybrid()
-                .absolute()
-                .inc(&low_first, &low_rate, 4)
-                .await
-                .unwrap(),
+            rl.absolute().inc(&low_first, &low_rate, 4).await.unwrap(),
             "initial low-rate increment",
         );
         assert_rejected(
-            rl.hybrid()
-                .absolute()
-                .inc(&low_first, &high_rate, 3)
-                .await
-                .unwrap(),
+            rl.absolute().inc(&low_first, &high_rate, 3).await.unwrap(),
             "later high rate must not expand the stored window limit",
         );
-        assert_eq!(rl.hybrid().absolute().get(&low_first).await.unwrap(), 4);
+        assert_eq!(rl.absolute().get(&low_first).await.unwrap(), 4);
 
         let high_first = key("high_first");
         assert_allowed(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .inc(&high_first, &high_rate, 40)
                 .await
                 .unwrap(),
             "initial high-rate increment",
         );
         assert_allowed(
-            rl.hybrid()
-                .absolute()
-                .inc(&high_first, &low_rate, 10)
-                .await
-                .unwrap(),
+            rl.absolute().inc(&high_first, &low_rate, 10).await.unwrap(),
             "later low rate must not shrink the stored window limit",
         );
-        assert_eq!(rl.hybrid().absolute().get(&high_first).await.unwrap(), 50);
+        assert_eq!(rl.absolute().get(&high_first).await.unwrap(), 50);
     });
 }
 
@@ -1271,24 +1059,24 @@ fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-        let (new_total, old_total) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (100, 0));
 
         // The guard no longer matches: idempotent re-prime.
-        let (new_total, old_total) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (100, 100));
 
-        let total = rl.hybrid().absolute().get(&k).await.unwrap();
+        let total = rl.absolute().get(&k).await.unwrap();
         assert_eq!(total, 100);
     });
 }
@@ -1304,8 +1092,7 @@ fn set_if_lt_with_lower_target_is_noop() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
                 .await
                 .unwrap(),
@@ -1313,18 +1100,18 @@ fn set_if_lt_with_lower_target_is_noop() {
         );
 
         // Raise-only: a lower target must never lower the total.
-        let (new_total, old_total) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(50), 50)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (100, 100));
     });
 }
 
 #[test]
-fn set_if_nil_overwrites_unconditionally_including_lowering() {
+fn set_if_always_overwrites_unconditionally_including_lowering() {
     let url = redis_url();
 
     runtime::block_on(async {
@@ -1334,23 +1121,22 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
-            rl.hybrid()
-                .absolute()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 100)
+            rl.absolute()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 100)
                 .await
                 .unwrap(),
             (100, 0)
         );
 
-        let (new_total, old_total) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
-            .set_if(&k, &rate_limit, RateLimitComparator::Nil, 30)
+            .set_if(&k, &rate_limit, RateLimitComparator::Always, 30)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (30, 100));
 
-        let total = rl.hybrid().absolute().get(&k).await.unwrap();
+        let total = rl.absolute().get(&k).await.unwrap();
         assert_eq!(total, 30);
     });
 }
@@ -1365,20 +1151,20 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-        let (new_total, old_total) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Eq(0), 25)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (25, 0));
 
-        let (new_total, old_total) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Eq(0), 99)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (25, 25));
     });
 }
@@ -1393,38 +1179,34 @@ fn set_if_gt_and_ne_compare_against_the_current_total() {
         let rate = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
-            rl.hybrid()
-                .absolute()
-                .set_if(&k, &rate, RateLimitComparator::Nil, 7)
+            rl.absolute()
+                .set_if(&k, &rate, RateLimitComparator::Always, 7)
                 .await
                 .unwrap(),
             (7, 0)
         );
         assert_eq!(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .set_if(&k, &rate, RateLimitComparator::Gt(6), 9)
                 .await
                 .unwrap(),
             (9, 7)
         );
         assert_eq!(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .set_if(&k, &rate, RateLimitComparator::Ne(9), 12)
                 .await
                 .unwrap(),
             (9, 9)
         );
         assert_eq!(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .set_if(&k, &rate, RateLimitComparator::Ne(8), 11)
                 .await
                 .unwrap(),
             (11, 9)
         );
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 11);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 11);
     });
 }
 
@@ -1442,7 +1224,7 @@ fn preserve_history_creates_missing_positive_keys_in_both_directions() {
         ] {
             let k = key(name);
             assert_eq!(
-                rl.hybrid()
+                rl
                     .absolute()
                     .set_if_preserve_history(
                         &k,
@@ -1455,7 +1237,7 @@ fn preserve_history_creates_missing_positive_keys_in_both_directions() {
                     .unwrap(),
                 (4, 0)
             );
-            assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 4);
+            assert_eq!(rl.absolute().get(&k).await.unwrap(), 4);
         }
     });
 }
@@ -1471,16 +1253,14 @@ fn unchanged_preserve_history_target_redefines_the_window_limit() {
         let low_rate = RateLimit::per_second(1f64).unwrap();
 
         assert_eq!(
-            rl.hybrid()
-                .absolute()
-                .set_if(&k, &high_rate, RateLimitComparator::Nil, 5)
+            rl.absolute()
+                .set_if(&k, &high_rate, RateLimitComparator::Always, 5)
                 .await
                 .unwrap(),
             (5, 0)
         );
         assert_eq!(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .set_if_preserve_history(
                     &k,
                     &low_rate,
@@ -1494,14 +1274,14 @@ fn unchanged_preserve_history_target_redefines_the_window_limit() {
         );
 
         assert_allowed(
-            rl.hybrid().absolute().inc(&k, &high_rate, 1).await.unwrap(),
+            rl.absolute().inc(&k, &high_rate, 1).await.unwrap(),
             "one unit remains under the redefined limit",
         );
         assert_rejected(
-            rl.hybrid().absolute().inc(&k, &high_rate, 1).await.unwrap(),
+            rl.absolute().inc(&k, &high_rate, 1).await.unwrap(),
             "the redefined six-unit window limit must be enforced",
         );
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 6);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 6);
     });
 }
 
@@ -1520,25 +1300,22 @@ fn conditional_set_zero_handles_missing_and_present_keys() {
             let k = key(key_name);
             let missing_result = match preservation {
                 Some(preservation) => rl
-                    .hybrid()
                     .absolute()
                     .set_if_preserve_history(&k, &rate, RateLimitComparator::Eq(0), 0, preservation)
                     .await
                     .unwrap(),
                 None => rl
-                    .hybrid()
                     .absolute()
                     .set_if(&k, &rate, RateLimitComparator::Eq(0), 0)
                     .await
                     .unwrap(),
             };
             assert_eq!(missing_result, (0, 0));
-            assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
+            assert_eq!(rl.absolute().get(&k).await.unwrap(), 0);
 
             assert_eq!(
-                rl.hybrid()
-                    .absolute()
-                    .set_if(&k, &rate, RateLimitComparator::Nil, 9)
+                rl.absolute()
+                    .set_if(&k, &rate, RateLimitComparator::Always, 9)
                     .await
                     .unwrap(),
                 (9, 0)
@@ -1546,20 +1323,24 @@ fn conditional_set_zero_handles_missing_and_present_keys() {
 
             let present_result = match preservation {
                 Some(preservation) => rl
-                    .hybrid()
                     .absolute()
-                    .set_if_preserve_history(&k, &rate, RateLimitComparator::Nil, 0, preservation)
+                    .set_if_preserve_history(
+                        &k,
+                        &rate,
+                        RateLimitComparator::Always,
+                        0,
+                        preservation,
+                    )
                     .await
                     .unwrap(),
                 None => rl
-                    .hybrid()
                     .absolute()
-                    .set_if(&k, &rate, RateLimitComparator::Nil, 0)
+                    .set_if(&k, &rate, RateLimitComparator::Always, 0)
                     .await
                     .unwrap(),
             };
             assert_eq!(present_result, (0, 9));
-            assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
+            assert_eq!(rl.absolute().get(&k).await.unwrap(), 0);
         }
     });
 }
@@ -1578,33 +1359,23 @@ fn set_if_prime_then_inc_enforces_remaining_budget() {
         assert_eq!(capacity, 30);
 
         // Prime 27 of 30: exactly 3 units of budget remain.
-        let (new_total, _) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(27), 27)
             .await
             .unwrap();
+        let new_total = outcome.current_total;
         assert_eq!(new_total, 27);
 
         for i in 0..3_u64 {
-            let d = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "i: {i}, d: {d:?}");
         }
 
-        let d = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
 
-        let d = rl.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let d = rl.absolute().is_allowed(&k).await.unwrap();
         let RateLimitDecision::Rejected {
             remaining_after_waiting,
             ..
@@ -1631,23 +1402,18 @@ fn set_if_prime_at_capacity_rejects_next_inc() {
         let rate_limit = RateLimit::per_second(5f64).unwrap();
         let capacity = window_capacity(window_size, &rate_limit);
 
-        let (new_total, _) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(capacity), capacity)
             .await
             .unwrap();
+        let new_total = outcome.current_total;
         assert_eq!(new_total, capacity);
 
-        let d = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
 
-        let d = rl.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let d = rl.absolute().is_allowed(&k).await.unwrap();
         let RateLimitDecision::Rejected {
             remaining_after_waiting,
             ..
@@ -1674,26 +1440,21 @@ fn set_if_folds_pending_local_increments_before_comparing() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         for _ in 0..5 {
-            let d = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
         // The pending 5 are included in the Redis comparison overlay, so Lt(3)
         // sees 5 and the write is skipped — increments are never lost.
-        let (new_total, old_total) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(3), 3)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (5, 5));
 
-        let total = rl.hybrid().absolute().get(&k).await.unwrap();
+        let total = rl.absolute().get(&k).await.unwrap();
         assert_eq!(total, 5);
     });
 }
@@ -1713,32 +1474,27 @@ fn set_if_after_rejection_transition_has_no_stale_commit_to_land_later() {
         let capacity = window_capacity(window_size, &rate);
 
         assert!(matches!(
-            rl.hybrid()
-                .absolute()
-                .inc(&k, &rate, capacity)
-                .await
-                .unwrap(),
+            rl.absolute().inc(&k, &rate, capacity).await.unwrap(),
             RateLimitDecision::Allowed
         ));
         assert!(matches!(
-            rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate, 1).await.unwrap(),
             RateLimitDecision::Rejected { .. }
         ));
 
         assert_eq!(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .set_if(&k, &rate, RateLimitComparator::Eq(capacity), 2)
                 .await
                 .unwrap(),
             (2, capacity)
         );
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 2);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 2);
 
         // A previously queued capacity commit must not arrive after the reset and
         // raise the total again.
         runtime::async_sleep(Duration::from_millis(sync_interval + 100)).await;
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 2);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 2);
     });
 }
 
@@ -1756,41 +1512,26 @@ fn set_if_invalidates_local_state_so_next_inc_observes_written_total() {
         assert_eq!(capacity, 24);
 
         for _ in 0..2 {
-            let d = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
         // Unconditional overwrite to 20 (the folded pending 2 are part of old_total).
-        let (new_total, old_total) = rl
-            .hybrid()
+        let outcome = rl
             .absolute()
-            .set_if(&k, &rate_limit, RateLimitComparator::Nil, 20)
+            .set_if(&k, &rate_limit, RateLimitComparator::Always, 20)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (20, 2));
 
         // No stale local fast-path: budget continues from the written total (4 left of 24).
         for i in 0..4_u64 {
-            let d = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "i: {i}, d: {d:?}");
         }
 
-        let d = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
     });
 }
@@ -1811,9 +1552,8 @@ fn set_if_window_limit_is_sticky_for_other_instances() {
         // Instance A defines the window limit via a positive set: 6s * 2/s = 12.
         let rate_a = RateLimit::per_second(2f64).unwrap();
         assert_eq!(
-            rl_a.hybrid()
-                .absolute()
-                .set_if(&k, &rate_a, RateLimitComparator::Nil, 1)
+            rl_a.absolute()
+                .set_if(&k, &rate_a, RateLimitComparator::Always, 1)
                 .await
                 .unwrap(),
             (1, 0)
@@ -1823,11 +1563,11 @@ fn set_if_window_limit_is_sticky_for_other_instances() {
         let rate_b = RateLimit::per_second(100f64).unwrap();
 
         for i in 0..11_u64 {
-            let d = rl_b.hybrid().absolute().inc(&k, &rate_b, 1).await.unwrap();
+            let d = rl_b.absolute().inc(&k, &rate_b, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "i: {i}, d: {d:?}");
         }
 
-        let d = rl_b.hybrid().absolute().inc(&k, &rate_b, 1).await.unwrap();
+        let d = rl_b.absolute().inc(&k, &rate_b, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
     });
 }
@@ -1842,14 +1582,13 @@ fn set_if_preserve_history_includes_pending_and_guard_miss_keeps_local_state() {
 
         for _ in 0..4 {
             assert!(matches!(
-                rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap(),
+                rl.absolute().inc(&k, &rate, 1).await.unwrap(),
                 RateLimitDecision::Allowed
             ));
         }
 
         assert_eq!(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .set_if_preserve_history(
                     &k,
                     &rate,
@@ -1861,15 +1600,14 @@ fn set_if_preserve_history_includes_pending_and_guard_miss_keeps_local_state() {
                 .unwrap(),
             (4, 4)
         );
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 4);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 4);
 
         assert_eq!(
-            rl.hybrid()
-                .absolute()
+            rl.absolute()
                 .set_if_preserve_history(
                     &k,
                     &rate,
-                    RateLimitComparator::Nil,
+                    RateLimitComparator::Always,
                     10,
                     HistoryPreservation::PreserveNewest,
                 )
@@ -1877,7 +1615,7 @@ fn set_if_preserve_history_includes_pending_and_guard_miss_keeps_local_state() {
                 .unwrap(),
             (10, 4)
         );
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 10);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 10);
     });
 }
 
@@ -1901,7 +1639,7 @@ fn concurrent_increments_remain_exact_across_background_refreshes() {
             let rate = rate.clone();
             tasks.push(runtime::spawn(async move {
                 for index in 0..increments_per_worker {
-                    let decision = rl.hybrid().absolute().inc(&k, &rate, 1).await.unwrap();
+                    let decision = rl.absolute().inc(&k, &rate, 1).await.unwrap();
                     assert_allowed(decision, "concurrent increment");
 
                     if index % 25 == 0 {
@@ -1917,7 +1655,7 @@ fn concurrent_increments_remain_exact_across_background_refreshes() {
         wait_for_hybrid_sync(sync_interval).await;
         let observer = build_limiter_with_prefix(&url, 60, 1_000, sync_interval, prefix).await;
         assert_eq!(
-            observer.hybrid().absolute().get(&k).await.unwrap(),
+            observer.absolute().get(&k).await.unwrap(),
             worker_count * increments_per_worker
         );
     });
@@ -1942,30 +1680,20 @@ fn volume_non_integer_rate_uses_truncating_capacity() {
         assert_eq!(capacity, 2);
 
         for _ in 0..capacity {
-            let decision = rl
-                .hybrid()
-                .absolute()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "decision: {decision:?}"
             );
         }
 
-        let decision = rl.hybrid().absolute().is_allowed(&k).await.unwrap();
+        let decision = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Rejected { .. }),
             "the truncated capacity must be full: {decision:?}"
         );
 
-        let decision = rl
-            .hybrid()
-            .absolute()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Rejected { .. }),
             "decision: {decision:?}"

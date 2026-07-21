@@ -8,10 +8,10 @@ use crate::common::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, SuppressionFactorCachePeriod, WindowSize,
 };
-use crate::{AbsoluteLocalRateLimiter, LocalRateLimiterOptions};
+use crate::{builder::ProviderConfig, local::AbsoluteLocalRateLimiter};
 
 fn window_limit(window_size: u64, rate_limit: &RateLimit) -> f64 {
-    window_size as f64 * **rate_limit
+    window_size as f64 * rate_limit.as_per_second()
 }
 
 fn window_capacity(window_size: u64, rate_limit: &RateLimit) -> u64 {
@@ -42,7 +42,7 @@ fn record_decision(
 }
 
 fn limiter(window_size: u64, bucket_size: u64) -> AbsoluteLocalRateLimiter {
-    AbsoluteLocalRateLimiter::new(LocalRateLimiterOptions {
+    AbsoluteLocalRateLimiter::new(ProviderConfig {
         window_size: WindowSize::seconds(window_size).unwrap(),
         bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
         hard_limit_factor: HardLimitFactor::default(),
@@ -50,10 +50,11 @@ fn limiter(window_size: u64, bucket_size: u64) -> AbsoluteLocalRateLimiter {
     })
 }
 
-fn assert_retry_after_between(retry_after_ms: u128, min_ms: u128, max_ms: u128) {
+fn assert_retry_after_between(retry_after: Duration, min_ms: u128, max_ms: u128) {
+    let retry_after = retry_after.as_millis();
     assert!(
-        retry_after_ms >= min_ms && retry_after_ms <= max_ms,
-        "retry_after_ms={retry_after_ms}, expected {min_ms} <= retry_after_ms <= {max_ms}"
+        retry_after >= min_ms && retry_after <= max_ms,
+        "retry_after={retry_after}, expected {min_ms} <= retry_after <= {max_ms}"
     );
 }
 
@@ -213,17 +214,17 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds: window_size,
-        retry_after_ms,
+        window_size,
+        retry_after,
         remaining_after_waiting,
     } = decision
     else {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size, 1);
+    assert_eq!(window_size.as_seconds(), 1);
     assert_eq!(remaining_after_waiting, 1);
-    assert_retry_after_between(retry_after_ms, 800, 1_000);
+    assert_retry_after_between(retry_after, 800, 1_000);
 }
 
 #[test]
@@ -244,17 +245,17 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_6() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds: window_size,
-        retry_after_ms,
+        window_size,
+        retry_after,
         remaining_after_waiting,
     } = decision
     else {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size, 6);
+    assert_eq!(window_size.as_seconds(), 6);
     assert_eq!(remaining_after_waiting, 2);
-    assert_retry_after_between(retry_after_ms, 5_000, 6_000);
+    assert_retry_after_between(retry_after, 5_000, 6_000);
 }
 
 #[test]
@@ -275,17 +276,17 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds: window_size,
-        retry_after_ms,
+        window_size,
+        retry_after,
         remaining_after_waiting,
     } = decision
     else {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size, 10);
+    assert_eq!(window_size.as_seconds(), 10);
     assert_eq!(remaining_after_waiting, 3);
-    assert_retry_after_between(retry_after_ms, 9_000, 10_000);
+    assert_retry_after_between(retry_after, 9_000, 10_000);
 
     let decision = limiter.inc(key, &rate_limit, 1);
     let RateLimitDecision::Rejected {
@@ -322,17 +323,17 @@ fn rejected_metadata_window_6_with_nonzero_grouping_separates_buckets() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds: window_size,
-        retry_after_ms,
+        window_size,
+        retry_after,
         remaining_after_waiting,
     } = decision
     else {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size, 6);
+    assert_eq!(window_size.as_seconds(), 6);
     assert_eq!(remaining_after_waiting, 2);
-    assert_retry_after_between(retry_after_ms, 5_000, 6_000);
+    assert_retry_after_between(retry_after, 5_000, 6_000);
 }
 
 #[test]
@@ -354,17 +355,17 @@ fn rejected_metadata_window_10_with_nonzero_grouping_separates_buckets() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        window_size_seconds: window_size,
-        retry_after_ms,
+        window_size,
+        retry_after,
         remaining_after_waiting,
     } = decision
     else {
         panic!("expected rejected decision");
     };
 
-    assert_eq!(window_size, 10);
+    assert_eq!(window_size.as_seconds(), 10);
     assert_eq!(remaining_after_waiting, 3);
-    assert_retry_after_between(retry_after_ms, 9_000, 10_000);
+    assert_retry_after_between(retry_after, 9_000, 10_000);
 }
 
 #[test]
@@ -386,7 +387,7 @@ fn rejected_metadata_window_6_with_nonzero_grouping_merges_within_group() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        retry_after_ms,
+        retry_after,
         remaining_after_waiting,
         ..
     } = decision
@@ -395,7 +396,7 @@ fn rejected_metadata_window_6_with_nonzero_grouping_merges_within_group() {
     };
 
     assert_eq!(remaining_after_waiting, 6);
-    assert_retry_after_between(retry_after_ms, 5_000, 6_000);
+    assert_retry_after_between(retry_after, 5_000, 6_000);
 }
 
 #[test]
@@ -417,7 +418,7 @@ fn rejected_metadata_window_10_with_nonzero_grouping_merges_within_group() {
 
     let decision = limiter.is_allowed(key);
     let RateLimitDecision::Rejected {
-        retry_after_ms,
+        retry_after,
         remaining_after_waiting,
         ..
     } = decision
@@ -426,7 +427,7 @@ fn rejected_metadata_window_10_with_nonzero_grouping_merges_within_group() {
     };
 
     assert_eq!(remaining_after_waiting, 10);
-    assert_retry_after_between(retry_after_ms, 9_000, 10_000);
+    assert_retry_after_between(retry_after, 9_000, 10_000);
 }
 
 #[test]
@@ -1053,10 +1054,10 @@ fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
     drop(held_read_guard);
     worker.join().expect("worker thread panicked");
 
-    assert_eq!(
-        result.expect("guard-miss conditional sets blocked on a shared DashMap guard"),
-        ((3, 3), (3, 3))
-    );
+    let (replace, preserve) =
+        result.expect("guard-miss conditional sets blocked on a shared DashMap guard");
+    assert_eq!(replace, (3, 3));
+    assert_eq!(preserve, (3, 3));
 }
 
 #[test]
@@ -1103,12 +1104,12 @@ fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
     let limiter = limiter(6, 1000);
     let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-    let (new_total, old_total) =
-        limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (100, 0));
 
-    let (new_total, old_total) =
-        limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (100, 100));
 
     assert_eq!(limiter.get("k"), 100);
@@ -1124,7 +1125,8 @@ fn set_if_lt_with_lower_target_is_noop() {
         (100, 0)
     );
 
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(50), 50);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(50), 50);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (100, 100));
     assert_eq!(limiter.get("k"), 100);
     let series = limiter.series().get("k").expect("series should exist");
@@ -1142,16 +1144,17 @@ fn set_if_lt_with_lower_target_is_noop() {
 }
 
 #[test]
-fn set_if_nil_overwrites_unconditionally_including_lowering() {
+fn set_if_always_overwrites_unconditionally_including_lowering() {
     let limiter = limiter(6, 1000);
     let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
-        limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 100),
+        limiter.set_if("k", &rate_limit, RateLimitComparator::Always, 100),
         (100, 0)
     );
 
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 30);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Always, 30);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (30, 100));
     assert_eq!(limiter.get("k"), 30);
     {
@@ -1170,7 +1173,8 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
     }
 
     // Overwriting to 0 removes the key entirely; admission resumes from empty.
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 0);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Always, 0);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (0, 30));
     assert_eq!(limiter.get("k"), 0);
     assert!(!limiter.series().contains_key("k"));
@@ -1184,10 +1188,12 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
     let limiter = limiter(6, 1000);
     let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 25);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 25);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (25, 0));
 
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 99);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 99);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (25, 25));
     assert_eq!(limiter.get("k"), 25);
 }
@@ -1198,20 +1204,23 @@ fn set_if_gt_and_ne_guards_follow_current_total() {
     let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
-        limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 10),
+        limiter.set_if("k", &rate_limit, RateLimitComparator::Always, 10),
         (10, 0)
     );
 
     // Gt(5): 10 > 5 matches → lowered to 3.
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Gt(5), 3);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Gt(5), 3);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (3, 10));
 
     // Ne(3): current is exactly 3 → no match.
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Ne(3), 7);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Ne(3), 7);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (3, 3));
 
     // Ne(5): current is 3 → match.
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Ne(5), 7);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Ne(5), 7);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (7, 3));
     assert_eq!(limiter.get("k"), 7);
 }
@@ -1225,7 +1234,8 @@ fn set_if_prime_then_inc_enforces_remaining_budget() {
     assert_eq!(capacity, 30);
 
     // Prime 27 of 30: exactly 3 units of budget remain.
-    let (new_total, _) = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(27), 27);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(27), 27);
+    let new_total = outcome.current_total;
     assert_eq!(new_total, 27);
 
     for i in 0..3_u64 {
@@ -1252,12 +1262,13 @@ fn set_if_prime_at_capacity_rejects_next_inc() {
     let rate_limit = RateLimit::per_second(5f64).unwrap();
     let capacity = window_capacity(window_size, &rate_limit);
 
-    let (new_total, _) = limiter.set_if(
+    let outcome = limiter.set_if(
         "k",
         &rate_limit,
         RateLimitComparator::Lt(capacity),
         capacity,
     );
+    let new_total = outcome.current_total;
     assert_eq!(new_total, capacity);
 
     let decision = limiter.inc("k", &rate_limit, 1);
@@ -1291,7 +1302,7 @@ fn set_if_redefines_sticky_rate_limit() {
     // Unlike inc (sticky limit), set_if redefines the stored window limit: 6 * 10 = 60.
     let rate_ten = RateLimit::per_second(10f64).unwrap();
     assert_eq!(
-        limiter.set_if("k", &rate_ten, RateLimitComparator::Nil, 1),
+        limiter.set_if("k", &rate_ten, RateLimitComparator::Always, 1),
         (1, 6)
     );
 
@@ -1339,7 +1350,8 @@ fn set_if_evicts_expired_buckets_before_comparing() {
     thread::sleep(Duration::from_millis(1_100));
 
     // Eq(0) must observe the post-eviction total.
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 9);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 9);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (9, 0));
     let series = limiter.series().get("k").expect("series should exist");
     assert_eq!(series.buckets.len(), 1);
@@ -1360,7 +1372,8 @@ fn set_if_unmatched_guard_on_unknown_key_writes_no_counts() {
     let limiter = limiter(6, 1000);
     let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Gt(5), 9);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Gt(5), 9);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (0, 0));
     assert_eq!(limiter.get("k"), 0);
     assert!(!limiter.series().contains_key("k"));
@@ -1388,7 +1401,7 @@ fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
     let result = limiter.set_if_preserve_history(
         "k",
         &rate,
-        RateLimitComparator::Nil,
+        RateLimitComparator::Always,
         8,
         HistoryPreservation::PreserveNewest,
     );
@@ -1408,7 +1421,7 @@ fn set_if_preserve_newest_reduces_from_front_and_increases_newest() {
     let result = limiter.set_if_preserve_history(
         "k",
         &rate,
-        RateLimitComparator::Nil,
+        RateLimitComparator::Always,
         11,
         HistoryPreservation::PreserveNewest,
     );
@@ -1446,7 +1459,7 @@ fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
         limiter.set_if_preserve_history(
             "k",
             &rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             8,
             HistoryPreservation::PreserveOldest,
         ),
@@ -1467,7 +1480,7 @@ fn set_if_preserve_oldest_reduces_from_back_and_increases_oldest() {
         limiter.set_if_preserve_history(
             "k",
             &rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             11,
             HistoryPreservation::PreserveOldest,
         ),
@@ -1583,7 +1596,7 @@ fn set_if_preserve_history_zero_removes_key() {
         limiter.set_if_preserve_history(
             "k",
             &rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             0,
             HistoryPreservation::PreserveOldest,
         ),
@@ -1631,14 +1644,14 @@ fn conditional_set_present_zero_removes_key() {
     ));
 
     assert_eq!(
-        limiter.set_if("replace", &rate, RateLimitComparator::Nil, 0),
+        limiter.set_if("replace", &rate, RateLimitComparator::Always, 0),
         (0, 3)
     );
     assert_eq!(
         limiter.set_if_preserve_history(
             "preserve",
             &rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             0,
             HistoryPreservation::PreserveNewest,
         ),

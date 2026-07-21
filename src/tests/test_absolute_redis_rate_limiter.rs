@@ -5,16 +5,15 @@ use super::{
     runtime,
 };
 
-use crate::common::SuppressionFactorCachePeriod;
-use crate::hybrid::SyncInterval;
 use crate::{
-    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
-    RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions,
-    RedisRateLimiterOptions, WindowSize,
+    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
+    RateLimiterBuilder, WindowSize,
+    hybrid::{HybridRateLimiterProvider, SyncInterval},
+    redis::RedisRateLimiterProvider,
 };
 
 fn window_capacity(window_size: u64, rate_limit: &RateLimit) -> u64 {
-    ((window_size as f64) * **rate_limit) as u64
+    ((window_size as f64) * rate_limit.as_per_second()) as u64
 }
 
 fn record_decision(
@@ -51,30 +50,18 @@ async fn build_limiter(
     url: &str,
     window_size: u64,
     bucket_size: u64,
-) -> std::sync::Arc<RateLimiter> {
+) -> std::sync::Arc<RedisRateLimiterProvider> {
     let client = redis::Client::open(url).unwrap();
     let cm = client.get_connection_manager().await.unwrap();
     let prefix = unique_prefix();
 
-    let options = RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager: cm,
-            prefix: Some(prefix.clone()),
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::default(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-            sync_interval: SyncInterval::default(),
-        },
-    };
-
-    std::sync::Arc::new(RateLimiter::new(options))
+    RedisRateLimiterProvider::builder(cm)
+        .prefix(prefix)
+        .window_size(WindowSize::seconds(window_size).unwrap())
+        .bucket_size(BucketSize::milliseconds(bucket_size).unwrap())
+        .cleanup_enabled(false)
+        .build()
+        .unwrap()
 }
 
 #[test]
@@ -88,17 +75,17 @@ fn rejects_at_exact_window_limit() {
         let rate_limit = RateLimit::per_second(2f64).unwrap();
 
         assert!(matches!(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             RateLimitDecision::Allowed
         ));
 
         assert!(matches!(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             RateLimitDecision::Allowed
         ));
 
         // The third call is over the 1s window capacity (1 * 2 = 2).
-        let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Rejected { .. }));
     });
 }
@@ -114,15 +101,13 @@ fn inc_uses_the_first_rate_limit_for_existing_keys() {
         let high_rate = RateLimit::per_second(10f64).unwrap();
 
         assert_allowed(
-            rl.redis()
-                .absolute()
+            rl.absolute()
                 .inc(&low_then_high, &low_rate, 2)
                 .await
                 .unwrap(),
             "the first increment should fill the original capacity",
         );
         let decision = rl
-            .redis()
             .absolute()
             .inc(&low_then_high, &high_rate, 1)
             .await
@@ -131,26 +116,24 @@ fn inc_uses_the_first_rate_limit_for_existing_keys() {
             matches!(decision, RateLimitDecision::Rejected { .. }),
             "a later larger rate must not increase the sticky capacity: {decision:?}"
         );
-        assert_eq!(rl.redis().absolute().get(&low_then_high).await.unwrap(), 2);
+        assert_eq!(rl.absolute().get(&low_then_high).await.unwrap(), 2);
 
         let high_then_low = key("high-then-low");
         assert_allowed(
-            rl.redis()
-                .absolute()
+            rl.absolute()
                 .inc(&high_then_low, &high_rate, 8)
                 .await
                 .unwrap(),
             "the first increment should establish the larger capacity",
         );
         assert_allowed(
-            rl.redis()
-                .absolute()
+            rl.absolute()
                 .inc(&high_then_low, &low_rate, 2)
                 .await
                 .unwrap(),
             "a later smaller rate must not reduce the sticky capacity",
         );
-        assert_eq!(rl.redis().absolute().get(&high_then_low).await.unwrap(), 10);
+        assert_eq!(rl.absolute().get(&high_then_low).await.unwrap(), 10);
     });
 }
 
@@ -167,10 +150,10 @@ fn per_key_state_is_independent() {
 
         // Saturate key a.
         assert_allowed(
-            rl.redis().absolute().inc(&a, &rate_limit, 2).await.unwrap(),
+            rl.absolute().inc(&a, &rate_limit, 2).await.unwrap(),
             "filling key a",
         );
-        let decision_a = rl.redis().absolute().inc(&a, &rate_limit, 1).await.unwrap();
+        let decision_a = rl.absolute().inc(&a, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(decision_a, RateLimitDecision::Rejected { .. }),
             "decision_a: {:?}",
@@ -178,7 +161,7 @@ fn per_key_state_is_independent() {
         );
 
         // Key b should still be allowed.
-        let decision_b = rl.redis().absolute().inc(&b, &rate_limit, 1).await.unwrap();
+        let decision_b = rl.absolute().inc(&b, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(decision_b, RateLimitDecision::Allowed),
             "decision_b: {:?}",
@@ -199,18 +182,18 @@ fn rate_grouping_merges_within_group_affects_remaining_after_waiting() {
 
         // Create a single bucket by staying within the rate-group coalescing window.
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 2).await.unwrap(),
             "creating the oldest grouped usage",
         );
         thread::sleep(Duration::from_millis(50));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 4).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 4).await.unwrap(),
             "coalescing usage into the oldest bucket",
         );
         thread::sleep(Duration::from_millis(100));
 
         // At capacity (6 * 1 = 6). Next increment should be rejected.
-        let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         let RateLimitDecision::Rejected {
             remaining_after_waiting,
             ..
@@ -240,7 +223,7 @@ fn unblocks_after_window_expires() {
 
         assert!(
             matches!(
-                rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
+                rl.absolute().inc(&k, &rate_limit, 3).await.unwrap(),
                 RateLimitDecision::Allowed
             ),
             "first increment should be allowed"
@@ -248,7 +231,7 @@ fn unblocks_after_window_expires() {
 
         assert!(
             matches!(
-                rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+                rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
                 RateLimitDecision::Rejected { .. }
             ),
             "second increment should be rejected"
@@ -258,7 +241,7 @@ fn unblocks_after_window_expires() {
 
         assert!(
             matches!(
-                rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+                rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
                 RateLimitDecision::Allowed
             ),
             "third increment should be allowed"
@@ -278,30 +261,31 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
 
         // Create two buckets.
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "creating the oldest bucket",
         );
         thread::sleep(Duration::from_millis(250));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 7).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 7).await.unwrap(),
             "creating the newest bucket",
         );
 
         // At capacity (10 * 1 = 10). Next increment should be rejected.
-        let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         let RateLimitDecision::Rejected {
-            window_size_seconds: window_size,
-            retry_after_ms,
+            window_size,
+            retry_after,
             remaining_after_waiting,
         } = decision
         else {
             panic!("expected rejected decision");
         };
 
-        assert_eq!(window_size, 10, "window size should be 10");
+        assert_eq!(window_size.as_seconds(), 10, "window size should be 10");
         assert!(
-            retry_after_ms >= 8_500 && retry_after_ms <= 10_000,
-            "retry after should be the remaining lifetime of the oldest bucket, got {retry_after_ms}"
+            retry_after >= Duration::from_millis(8_500)
+                && retry_after <= Duration::from_millis(10_000),
+            "retry after should be the remaining lifetime of the oldest bucket, got {retry_after:?}"
         );
         // The oldest bucket releases exactly its count when it expires.
         assert_eq!(
@@ -319,7 +303,7 @@ fn is_allowed_unknown_key_is_allowed() {
         let rl = build_limiter(&url, 1, 50).await;
 
         let k = key("missing");
-        let decision = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let decision = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
     });
 }
@@ -335,19 +319,19 @@ fn rejected_inc_does_not_consume_capacity() {
         let rate_limit = RateLimit::per_second(2f64).unwrap();
 
         assert!(matches!(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             RateLimitDecision::Allowed
         ));
 
         // Capacity is 2 (1s * 2/s). current_total=1; count=2 would push to 3, so reject.
-        let decision = rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap();
+        let decision = rl.absolute().inc(&k, &rate_limit, 2).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Rejected { .. }),
             "should be rejected, received decision: {decision:?}"
         );
 
         // If the rejected increment mutated state, this would be rejected.
-        let decision2 = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let decision2 = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(decision2, RateLimitDecision::Allowed),
             "should be allowed, received decision: {decision2:?}"
@@ -367,13 +351,12 @@ fn oversized_request_on_empty_key_has_no_backoff_wait() {
         let capacity = window_capacity(window_size, &rate_limit);
 
         let decision = rl
-            .redis()
             .absolute()
             .inc(&k, &rate_limit, capacity + 1)
             .await
             .unwrap();
         let RateLimitDecision::Rejected {
-            retry_after_ms,
+            retry_after,
             remaining_after_waiting,
             ..
         } = decision
@@ -381,9 +364,13 @@ fn oversized_request_on_empty_key_has_no_backoff_wait() {
             panic!("expected oversized request to be rejected, got {decision:?}");
         };
 
-        assert_eq!(retry_after_ms, 0, "no existing bucket needs to expire");
+        assert_eq!(
+            retry_after,
+            Duration::ZERO,
+            "no existing bucket needs to expire"
+        );
         assert_eq!(remaining_after_waiting, 0, "no bucket releases capacity");
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 0);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 0);
     });
 }
 
@@ -400,17 +387,17 @@ fn is_allowed_evicts_old_buckets_and_updates_total_count() {
 
         // Two buckets (sleep > group size).
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the oldest bucket",
         );
         thread::sleep(Duration::from_millis(750));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the newest bucket",
         );
 
         // At exact capacity: should be rejected.
-        let d0 = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let d0 = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(
             matches!(d0, RateLimitDecision::Rejected { .. }),
             "should be rejected, instead got {d0:?}"
@@ -419,13 +406,13 @@ fn is_allowed_evicts_old_buckets_and_updates_total_count() {
         // Wait until the first bucket is out of window (2s) but the second is still in-window.
         thread::sleep(Duration::from_millis(1350));
 
-        let decision = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let decision = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Allowed),
             "should be allowed, instead got {decision:?}"
         );
         assert_eq!(
-            rl.redis().absolute().get(&k).await.unwrap(),
+            rl.absolute().get(&k).await.unwrap(),
             1,
             "only the newest bucket should remain live"
         );
@@ -445,23 +432,23 @@ fn inc_evicts_expired_buckets_before_admission() {
 
         // Two buckets.
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the oldest bucket",
         );
         thread::sleep(Duration::from_millis(250));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
             "creating the newest bucket",
         );
 
         // Wait past the window so both buckets are expired.
         thread::sleep(Duration::from_millis(1200));
-        let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Allowed),
             "post-expiry increment should be allowed, instead got {decision:?}"
         );
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 1);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 1);
     });
 }
 
@@ -476,14 +463,14 @@ fn is_allowed_reflects_rejected_after_hitting_limit_then_allows_after_expiry() {
         let rate_limit = RateLimit::per_second(2f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 2).await.unwrap(),
             "filling the window",
         );
-        let d1 = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let d1 = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(matches!(d1, RateLimitDecision::Rejected { .. }));
 
         thread::sleep(Duration::from_millis(1100));
-        let d2 = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let d2 = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(matches!(d2, RateLimitDecision::Allowed));
     });
 }
@@ -499,19 +486,19 @@ fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 3).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "creating the oldest bucket",
         );
         thread::sleep(Duration::from_millis(250));
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 7).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 7).await.unwrap(),
             "creating the newest bucket",
         );
 
-        let decision = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let decision = rl.absolute().is_allowed(&k).await.unwrap();
         let RateLimitDecision::Rejected {
-            window_size_seconds: window_size,
-            retry_after_ms,
+            window_size,
+            retry_after,
             remaining_after_waiting,
         } = decision
         else {
@@ -519,12 +506,14 @@ fn is_allowed_rejected_includes_retry_after_and_remaining_after_waiting() {
         };
 
         assert_eq!(
-            window_size, 10,
-            "window size should be 10 instead got {window_size}"
+            window_size.as_seconds(),
+            10,
+            "window size should be 10 instead got {window_size:?}"
         );
         assert!(
-            retry_after_ms >= 8_500 && retry_after_ms <= 10_000,
-            "retry after should be the remaining lifetime of the oldest bucket, got {retry_after_ms}"
+            retry_after >= Duration::from_millis(8_500)
+                && retry_after <= Duration::from_millis(10_000),
+            "retry after should be the remaining lifetime of the oldest bucket, got {retry_after:?}"
         );
         assert_eq!(
             remaining_after_waiting, 3,
@@ -544,10 +533,10 @@ fn is_allowed_returns_allowed_when_below_limit() {
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 5).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 5).await.unwrap(),
             "seeding usage below the limit",
         );
-        let decision = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let decision = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Allowed),
             "should be allowed"
@@ -574,7 +563,7 @@ fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
         let mut rejected_ops = 0_u64;
 
         for _ in 0..80_u64 {
-            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             record_decision(
                 decision,
                 1,
@@ -611,7 +600,7 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
         let mut rejected_ops = 0_u64;
 
         // Allowed: consumes 9 of 10.
-        let d1 = rl.redis().absolute().inc(&k, &rate_limit, 9).await.unwrap();
+        let d1 = rl.absolute().inc(&k, &rate_limit, 9).await.unwrap();
         record_decision(
             d1,
             9,
@@ -622,7 +611,7 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
         );
 
         // Rejected: would push total to 11.
-        let d2 = rl.redis().absolute().inc(&k, &rate_limit, 2).await.unwrap();
+        let d2 = rl.absolute().inc(&k, &rate_limit, 2).await.unwrap();
         assert!(
             matches!(d2, RateLimitDecision::Rejected { .. }),
             "d2: {d2:?}"
@@ -637,7 +626,7 @@ fn volume_batch_increment_is_all_or_nothing_and_matches_expected_volumes() {
         );
 
         // Allowed: proves the rejected batch did not consume capacity.
-        let d3 = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let d3 = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         record_decision(
             d3,
             1,
@@ -669,7 +658,7 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
 
         // Fill capacity.
         for _ in 0..capacity {
-            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "decision: {decision:?}"
@@ -679,7 +668,7 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
         // Many rejected attempts should not change what we can do after the window expires.
         let mut rejected_ops = 0_u64;
         for _ in 0..20_u64 {
-            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Rejected { .. }),
                 "decision: {decision:?}"
@@ -692,7 +681,7 @@ fn volume_rejections_do_not_consume_and_capacity_resets_after_window_expiry() {
 
         let mut accepted_after_expiry = 0_u64;
         for _ in 0..capacity {
-            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "decision: {decision:?}"
@@ -717,20 +706,20 @@ fn volume_non_integer_rate_uses_truncating_capacity() {
         assert_eq!(capacity, 2);
 
         for _ in 0..capacity {
-            let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "decision: {decision:?}"
             );
         }
 
-        let decision = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let decision = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Rejected { .. }),
             "the truncated capacity must be full: {decision:?}"
         );
 
-        let decision = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let decision = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Rejected { .. }),
             "decision: {decision:?}"
@@ -745,7 +734,7 @@ fn get_returns_zero_for_untouched_key() {
     runtime::block_on(async {
         let rl = build_limiter(&url, 6, 1000).await;
 
-        let total = rl.redis().absolute().get(&key("k")).await.unwrap();
+        let total = rl.absolute().get(&key("k")).await.unwrap();
         assert_eq!(total, 0);
     });
 }
@@ -761,12 +750,12 @@ fn get_returns_exact_window_total() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         for _ in 0..3 {
-            let d = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
         // Pure Redis provider: every inc is committed immediately, so get is exact.
-        let total = rl.redis().absolute().get(&k).await.unwrap();
+        let total = rl.absolute().get(&k).await.unwrap();
         assert_eq!(total, 3);
     });
 }
@@ -783,14 +772,14 @@ fn get_evicts_expired_buckets() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_allowed(
-            rl.redis().absolute().inc(&k, &rate_limit, 5).await.unwrap(),
+            rl.absolute().inc(&k, &rate_limit, 5).await.unwrap(),
             "seeding usage before expiry",
         );
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 5);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 5);
 
         // Wait for the window to pass; get must observe the evicted (empty) window.
         runtime::async_sleep(Duration::from_millis(1_100)).await;
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 0);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 0);
     });
 }
 
@@ -804,23 +793,23 @@ fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (100, 0));
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (100, 100));
 
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 100);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 100);
     });
 }
 
@@ -835,26 +824,25 @@ fn set_if_lt_with_lower_target_is_noop() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
-            rl.redis()
-                .absolute()
+            rl.absolute()
                 .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
                 .await
                 .unwrap(),
             (100, 0)
         );
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(50), 50)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (100, 100));
     });
 }
 
 #[test]
-fn set_if_nil_overwrites_unconditionally_including_lowering() {
+fn set_if_always_overwrites_unconditionally_including_lowering() {
     let url = redis_url();
 
     runtime::block_on(async {
@@ -864,34 +852,33 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
-            rl.redis()
-                .absolute()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 100)
+            rl.absolute()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 100)
                 .await
                 .unwrap(),
             (100, 0)
         );
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
-            .set_if(&k, &rate_limit, RateLimitComparator::Nil, 30)
+            .set_if(&k, &rate_limit, RateLimitComparator::Always, 30)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (30, 100));
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 30);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 30);
 
         // Overwriting to 0 clears the window; admission resumes from empty.
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
-            .set_if(&k, &rate_limit, RateLimitComparator::Nil, 0)
+            .set_if(&k, &rate_limit, RateLimitComparator::Always, 0)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (0, 30));
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 0);
+        assert_eq!(rl.absolute().get(&k).await.unwrap(), 0);
 
-        let d = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
     });
 }
@@ -906,20 +893,20 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Eq(0), 25)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (25, 0));
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Eq(0), 99)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (25, 25));
     });
 }
@@ -935,39 +922,38 @@ fn set_if_gt_and_ne_guards_follow_current_total() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
-            rl.redis()
-                .absolute()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 10)
+            rl.absolute()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 10)
                 .await
                 .unwrap(),
             (10, 0)
         );
 
         // Gt(5): 10 > 5 matches → lowered to 3.
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Gt(5), 3)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (3, 10));
 
         // Ne(3): current is exactly 3 → no match.
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Ne(3), 7)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (3, 3));
 
         // Ne(5): current is 3 → match.
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Ne(5), 7)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (7, 3));
     });
 }
@@ -986,20 +972,20 @@ fn set_if_prime_then_inc_enforces_remaining_budget() {
         assert_eq!(capacity, 30);
 
         // Prime 27 of 30: exactly 3 units of budget remain.
-        let (new_total, _) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(27), 27)
             .await
             .unwrap();
+        let new_total = outcome.current_total;
         assert_eq!(new_total, 27);
 
         for i in 0..3_u64 {
-            let d = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+            let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "i: {i}, d: {d:?}");
         }
 
-        let d = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
     });
 }
@@ -1016,19 +1002,19 @@ fn set_if_prime_at_capacity_rejects_inc_and_is_allowed() {
         let rate_limit = RateLimit::per_second(5f64).unwrap();
         let capacity = window_capacity(window_size, &rate_limit);
 
-        let (new_total, _) = rl
-            .redis()
+        let outcome = rl
             .absolute()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(capacity), capacity)
             .await
             .unwrap();
+        let new_total = outcome.current_total;
         assert_eq!(new_total, capacity);
 
-        let d = rl.redis().absolute().inc(&k, &rate_limit, 1).await.unwrap();
+        let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
 
         // is_allowed reads the window limit stored by set_if.
-        let d = rl.redis().absolute().is_allowed(&k).await.unwrap();
+        let d = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Rejected { .. }), "d: {d:?}");
     });
 }
@@ -1047,7 +1033,6 @@ fn set_if_preserve_history_creates_missing_positive_keys_in_both_directions() {
         ] {
             let k = key(name);
             let result = rl
-                .redis()
                 .absolute()
                 .set_if_preserve_history(
                     &k,
@@ -1059,7 +1044,7 @@ fn set_if_preserve_history_creates_missing_positive_keys_in_both_directions() {
                 .await
                 .unwrap();
             assert_eq!(result, (5, 0));
-            assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 5);
+            assert_eq!(rl.absolute().get(&k).await.unwrap(), 5);
         }
     });
 }
@@ -1075,16 +1060,11 @@ fn set_if_preserve_history_redefines_limit_when_total_is_unchanged() {
         let replacement_rate = RateLimit::per_second(6f64).unwrap();
 
         assert_allowed(
-            rl.redis()
-                .absolute()
-                .inc(&k, &initial_rate, 5)
-                .await
-                .unwrap(),
+            rl.absolute().inc(&k, &initial_rate, 5).await.unwrap(),
             "seeding usage under the initial limit",
         );
         assert_eq!(
-            rl.redis()
-                .absolute()
+            rl.absolute()
                 .set_if_preserve_history(
                     &k,
                     &replacement_rate,
@@ -1098,19 +1078,10 @@ fn set_if_preserve_history_redefines_limit_when_total_is_unchanged() {
         );
 
         assert_allowed(
-            rl.redis()
-                .absolute()
-                .inc(&k, &initial_rate, 1)
-                .await
-                .unwrap(),
+            rl.absolute().inc(&k, &initial_rate, 1).await.unwrap(),
             "one unit should remain under the redefined capacity",
         );
-        let decision = rl
-            .redis()
-            .absolute()
-            .inc(&k, &initial_rate, 1)
-            .await
-            .unwrap();
+        let decision = rl.absolute().inc(&k, &initial_rate, 1).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Rejected { .. }),
             "the matched conditional set must redefine the sticky limit: {decision:?}"
@@ -1123,35 +1094,52 @@ fn set_if_and_get_do_not_cross_provider_keyspaces() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let rl = build_limiter(&url, 6, 1000).await;
+        let prefix = unique_prefix();
+        let client = redis::Client::open(url.as_str()).unwrap();
+        let connection = client.get_connection_manager().await.unwrap();
+        let redis = RedisRateLimiterProvider::builder(connection.clone())
+            .prefix(prefix.clone())
+            .window_size(WindowSize::seconds_or_panic(6))
+            .bucket_size(BucketSize::milliseconds_or_panic(1_000))
+            .cleanup_enabled(false)
+            .build()
+            .unwrap();
+        let hybrid = HybridRateLimiterProvider::builder(connection)
+            .prefix(prefix)
+            .window_size(WindowSize::seconds_or_panic(6))
+            .bucket_size(BucketSize::milliseconds_or_panic(1_000))
+            .sync_interval(SyncInterval::milliseconds_or_panic(25))
+            .cleanup_enabled(false)
+            .build()
+            .unwrap();
 
         let k = key("k");
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         // Write through the pure Redis provider only.
         assert_eq!(
-            rl.redis()
+            redis
                 .absolute()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 40)
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 40)
                 .await
                 .unwrap(),
             (40, 0)
         );
 
         // The hybrid provider (same prefix) uses a separate keyspace and must see nothing.
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 0);
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 40);
+        assert_eq!(hybrid.absolute().get(&k).await.unwrap(), 0);
+        assert_eq!(redis.absolute().get(&k).await.unwrap(), 40);
 
         // And the reverse: hybrid writes stay invisible to the pure Redis provider.
         assert_eq!(
-            rl.hybrid()
+            hybrid
                 .absolute()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 7)
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 7)
                 .await
                 .unwrap(),
             (7, 0)
         );
-        assert_eq!(rl.redis().absolute().get(&k).await.unwrap(), 40);
-        assert_eq!(rl.hybrid().absolute().get(&k).await.unwrap(), 7);
+        assert_eq!(redis.absolute().get(&k).await.unwrap(), 40);
+        assert_eq!(hybrid.absolute().get(&k).await.unwrap(), 7);
     });
 }

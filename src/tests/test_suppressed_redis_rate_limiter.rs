@@ -3,11 +3,10 @@ use std::{env, time::Duration};
 use super::runtime;
 
 use crate::common::SuppressionFactorCachePeriod;
-use crate::hybrid::SyncInterval;
 use crate::{
-    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
-    RateLimitComparator, RateLimitDecision, RateLimiter, RateLimiterOptions, RedisKey,
-    RedisRateLimiterOptions, SuppressedRateLimitSnapshot, WindowSize,
+    BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
+    RateLimitDecision, RateLimiterBuilder, SuppressedRateLimitSnapshot, WindowSize,
+    redis::{RedisKey, RedisRateLimiterProvider},
 };
 
 fn redis_url() -> String {
@@ -32,13 +31,13 @@ async fn build_limiter(
     window_size: u64,
     bucket_size: u64,
     hard_limit_factor: f64,
-) -> std::sync::Arc<RateLimiter> {
+) -> std::sync::Arc<RedisRateLimiterProvider> {
     build_limiter_with_cache_ms(
         url,
         window_size,
         bucket_size,
         hard_limit_factor,
-        *SuppressionFactorCachePeriod::default(),
+        SuppressionFactorCachePeriod::default().as_milliseconds(),
     )
     .await
 }
@@ -49,36 +48,22 @@ async fn build_limiter_with_cache_ms(
     bucket_size: u64,
     hard_limit_factor: f64,
     suppression_factor_cache_period: u64,
-) -> std::sync::Arc<RateLimiter> {
+) -> std::sync::Arc<RedisRateLimiterProvider> {
     let client = redis::Client::open(url).unwrap();
     let cm = client.get_connection_manager().await.unwrap();
     let prefix = unique_prefix();
 
-    let options = RateLimiterOptions {
-        local: LocalRateLimiterOptions {
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
-                suppression_factor_cache_period,
-            )
-            .unwrap(),
-        },
-        redis: RedisRateLimiterOptions {
-            connection_manager: cm,
-            prefix: Some(prefix.clone()),
-            window_size: WindowSize::seconds(window_size).unwrap(),
-            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-            hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-            suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
-                suppression_factor_cache_period,
-            )
-            .unwrap(),
-            sync_interval: SyncInterval::default(),
-        },
-    };
-
-    std::sync::Arc::new(RateLimiter::new(options))
+    RedisRateLimiterProvider::builder(cm)
+        .prefix(prefix)
+        .window_size(WindowSize::seconds(window_size).unwrap())
+        .bucket_size(BucketSize::milliseconds(bucket_size).unwrap())
+        .hard_limit_factor(HardLimitFactor::try_from(hard_limit_factor).unwrap())
+        .suppression_factor_cache_period(
+            SuppressionFactorCachePeriod::milliseconds(suppression_factor_cache_period).unwrap(),
+        )
+        .cleanup_enabled(false)
+        .build()
+        .unwrap()
 }
 
 #[test]
@@ -90,12 +75,7 @@ fn get_suppression_factor_fresh_key_returns_zero() {
         let k = key("k");
 
         // With no usage, suppression factor resolves to 0.
-        let sf = rl
-            .redis()
-            .suppressed()
-            .get_suppression_factor(&k)
-            .await
-            .unwrap();
+        let sf = rl.suppressed().get_suppression_factor(&k).await.unwrap();
         assert!((sf - 0.0).abs() < 1e-12, "sf: {sf}");
     })
 }
@@ -118,20 +98,14 @@ fn get_suppression_factor_computed_uses_last_second_peak_rate_at_threshold_bound
         // bucket with no declines and no cached factor, so the read below must calculate the
         // factor from exactly 11 accepted requests.
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 11)
+            rl.suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 11)
                 .await
                 .unwrap(),
             (11, 0)
         );
 
-        let sf = rl
-            .redis()
-            .suppressed()
-            .get_suppression_factor(&k)
-            .await
-            .unwrap();
+        let sf = rl.suppressed().get_suppression_factor(&k).await.unwrap();
 
         // accepted(11) > soft(10) and total(11) < hard(20): enter ramp zone.
         // rate_in_last_1s = 11, average_rate = 11/10 = 1.1.
@@ -162,32 +136,17 @@ fn get_suppression_factor_evicts_out_of_window_usage_and_resets_admission() {
         // We record 2 calls in the window, then wait for the full window to pass. If eviction
         // does not occur, the next increment would see total_count >= hard_window_limit and go to full
         // suppression (sf=1.0). If eviction occurs, the next increment is Allowed.
-        let d1 = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 2)
-            .await
-            .unwrap();
+        let d1 = rl.suppressed().inc(&k, &rate_limit, 2).await.unwrap();
 
         assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {:?}", d1);
 
         std::thread::sleep(Duration::from_millis(window_size * 1000 + 50));
         std::thread::sleep(Duration::from_millis(cache_ms + 25));
 
-        let sf = rl
-            .redis()
-            .suppressed()
-            .get_suppression_factor(&k)
-            .await
-            .unwrap();
+        let sf = rl.suppressed().get_suppression_factor(&k).await.unwrap();
         assert!((sf - 0.0).abs() < 1e-12, "sf: {sf}");
 
-        let d2 = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d2 = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d2, RateLimitDecision::Allowed), "d2: {:?}", d2);
     });
 }
@@ -204,9 +163,8 @@ fn verify_suppression_factor_calculation_spread_redis() {
         // Seed one public-API bucket containing 20 accepted requests. Waiting until that bucket is
         // outside the last-second peak interval leaves an average accepted rate of 2 requests/s.
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 20)
+            rl.suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 20)
                 .await
                 .unwrap(),
             (20, 0)
@@ -217,12 +175,7 @@ fn verify_suppression_factor_calculation_spread_redis() {
 
         let expected_suppression_factor = 1f64 - (1f64 / 2f64);
 
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
 
         assert!(
             matches!(
@@ -247,12 +200,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
-        let first = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 10)
-            .await
-            .unwrap();
+        let first = rl.suppressed().inc(&k, &rate_limit, 10).await.unwrap();
         assert!(
             matches!(first, RateLimitDecision::Allowed),
             "first: {first:?}"
@@ -261,12 +209,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
         // wait for 1s to pass
         runtime::async_sleep(Duration::from_millis(1001)).await;
 
-        let second = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 20)
-            .await
-            .unwrap();
+        let second = rl.suppressed().inc(&k, &rate_limit, 20).await.unwrap();
         assert!(
             matches!(
                 second,
@@ -283,12 +226,7 @@ fn verify_suppression_factor_calculation_last_second_redis() {
 
         let expected_suppression_factor = 1f64 - (1f64 / 20f64);
 
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
 
         assert!(
             matches!(
@@ -313,23 +251,13 @@ fn verify_hard_limit_rejects() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
-        let reaches_hard = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 100)
-            .await
-            .unwrap();
+        let reaches_hard = rl.suppressed().inc(&k, &rate_limit, 100).await.unwrap();
         assert!(
             matches!(reaches_hard, RateLimitDecision::Allowed),
             "reaches_hard: {reaches_hard:?}"
         );
 
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
 
         assert!(
             matches!(
@@ -344,7 +272,7 @@ fn verify_hard_limit_rejects() {
         );
 
         assert_eq!(
-            rl.redis().suppressed().get(&k).await.unwrap(),
+            rl.suppressed().get(&k).await.unwrap(),
             SuppressedRateLimitSnapshot {
                 total: 101,
                 total_declined: 1,
@@ -364,12 +292,7 @@ fn public_suppressed_decisions_never_return_absolute_rejection_metadata() {
         let rate_limit = RateLimit::per_second(5f64).unwrap();
 
         for observed_after in 1..=10_u64 {
-            let decision = rl
-                .redis()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
 
             match decision {
                 RateLimitDecision::Allowed if observed_after <= 5 => {}
@@ -387,7 +310,7 @@ fn public_suppressed_decisions_never_return_absolute_rejection_metadata() {
         }
 
         assert_eq!(
-            rl.redis().suppressed().get(&k).await.unwrap(),
+            rl.suppressed().get(&k).await.unwrap(),
             SuppressedRateLimitSnapshot {
                 total: 10,
                 total_declined: 5,
@@ -414,7 +337,6 @@ fn suppressed_is_deterministically_allowed_until_base_capacity_boundary_redis() 
 
         // The projected accepted total includes the current increment exactly once.
         let d1 = rl
-            .redis()
             .suppressed()
             .inc(&k, &rate_limit, base_capacity - 1)
             .await
@@ -422,12 +344,7 @@ fn suppressed_is_deterministically_allowed_until_base_capacity_boundary_redis() 
         assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {d1:?}");
 
         // Landing exactly on the soft boundary is still deterministically allowed.
-        let d2 = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d2 = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d2, RateLimitDecision::Allowed), "d2: {d2:?}");
     });
 }
@@ -444,24 +361,14 @@ fn suppressed_fractional_hard_limit_preserves_local_soft_and_hard_boundaries_red
         let rate_limit = RateLimit::per_second(0.5).unwrap();
 
         for accepted_after in 1..=4_u64 {
-            let decision = rl
-                .redis()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(decision, RateLimitDecision::Allowed),
                 "accepted_after={accepted_after}, decision={decision:?}"
             );
         }
 
-        let over_hard = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let over_hard = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(
                 over_hard,
@@ -473,7 +380,7 @@ fn suppressed_fractional_hard_limit_preserves_local_soft_and_hard_boundaries_red
             "over_hard={over_hard:?}"
         );
         assert_eq!(
-            rl.redis().suppressed().get(&k).await.unwrap(),
+            rl.suppressed().get(&k).await.unwrap(),
             SuppressedRateLimitSnapshot {
                 total: 5,
                 total_declined: 1,
@@ -502,29 +409,18 @@ fn suppressed_is_fully_denied_after_hard_limit_observed_redis() {
 
         // The increment that lands exactly on the hard limit is admitted and caches factor 1.
         let d1 = rl
-            .redis()
             .suppressed()
             .inc(&k, &rate_limit, hard_capacity)
             .await
             .unwrap();
         assert!(matches!(d1, RateLimitDecision::Allowed), "d1: {d1:?}");
 
-        let factor = rl
-            .redis()
-            .suppressed()
-            .get_suppression_factor(&k)
-            .await
-            .unwrap();
+        let factor = rl.suppressed().get_suppression_factor(&k).await.unwrap();
         assert!((factor - 1.0).abs() < 1e-12, "factor: {factor}");
 
         // The cached exact-hard factor makes every immediate subsequent call fully suppressed.
         for i in 0..5u64 {
-            let d = rl
-                .redis()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
 
             assert!(
                 matches!(
@@ -559,7 +455,8 @@ fn suppressed_redis_window_eviction_allows_fresh_burst_after_expiry() {
 
         let rate_limit = RateLimit::per_second(5f64).unwrap();
         // hard_window_limit = 1s * 5 req/s * 1.0 = 5
-        let hard_window_limit = (window_size as f64 * *rate_limit * hard_limit_factor) as u64;
+        let hard_window_limit =
+            (window_size as f64 * rate_limit.as_per_second() * hard_limit_factor) as u64;
 
         let rl = build_limiter_with_cache_ms(&url, window_size, 1_000, hard_limit_factor, cache_ms)
             .await;
@@ -568,7 +465,6 @@ fn suppressed_redis_window_eviction_allows_fresh_burst_after_expiry() {
 
         // Drive observed count to the hard limit in one call.
         let d1 = rl
-            .redis()
             .suppressed()
             .inc(&k, &rate_limit, hard_window_limit)
             .await
@@ -579,12 +475,7 @@ fn suppressed_redis_window_eviction_allows_fresh_burst_after_expiry() {
         runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
 
         // Confirm full suppression before the window expires.
-        let sf_before = rl
-            .redis()
-            .suppressed()
-            .get_suppression_factor(&k)
-            .await
-            .unwrap();
+        let sf_before = rl.suppressed().get_suppression_factor(&k).await.unwrap();
         assert!(
             (sf_before - 1.0).abs() < 1e-12,
             "expected sf=1.0 before window expiry, got {sf_before}"
@@ -595,12 +486,7 @@ fn suppressed_redis_window_eviction_allows_fresh_burst_after_expiry() {
         runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
 
         // After the window has expired, eviction must have cleared the old buckets.
-        let sf_after = rl
-            .redis()
-            .suppressed()
-            .get_suppression_factor(&k)
-            .await
-            .unwrap();
+        let sf_after = rl.suppressed().get_suppression_factor(&k).await.unwrap();
         assert!(
             (sf_after - 0.0).abs() < 1e-12,
             "expected sf=0.0 after window expiry but got {sf_after} — \
@@ -608,12 +494,7 @@ fn suppressed_redis_window_eviction_allows_fresh_burst_after_expiry() {
         );
 
         // A new request must be admitted.
-        let d2 = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d2 = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(d2, RateLimitDecision::Allowed),
             "expected Allowed after window expiry, got {d2:?}"
@@ -639,7 +520,7 @@ fn suppressed_redis_throughput_over_multiple_windows_stays_at_rate_limit() {
 
         let rate_limit = RateLimit::per_second(10f64).unwrap();
         // soft_window_limit = 10, hard_window_limit = 15
-        let soft_window_limit = (window_size as f64 * *rate_limit) as u64;
+        let soft_window_limit = (window_size as f64 * rate_limit.as_per_second()) as u64;
         let hard_window_limit = (soft_window_limit as f64 * hard_limit_factor) as u64;
 
         let rl =
@@ -652,12 +533,7 @@ fn suppressed_redis_throughput_over_multiple_windows_stays_at_rate_limit() {
             // Hammer at 10× the rate limit to ensure we hit the ceiling each window.
             let burst = soft_window_limit * 10;
             for _ in 0..burst {
-                let d = rl
-                    .redis()
-                    .suppressed()
-                    .inc(&k, &rate_limit, 1)
-                    .await
-                    .unwrap();
+                let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
                 match d {
                     RateLimitDecision::Allowed => total_allowed += 1,
                     RateLimitDecision::Suppressed { is_allowed, .. } => {
@@ -694,7 +570,7 @@ fn get_returns_empty_snapshot_for_untouched_key() {
     runtime::block_on(async {
         let rl = build_limiter(&url, 6, 1000, 1.0).await;
 
-        let snapshot = rl.redis().suppressed().get(&key("k")).await.unwrap();
+        let snapshot = rl.suppressed().get(&key("k")).await.unwrap();
         assert_eq!(snapshot, SuppressedRateLimitSnapshot::default());
     });
 }
@@ -710,16 +586,11 @@ fn get_returns_observed_snapshot() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         for _ in 0..3 {
-            let d = rl
-                .redis()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
         }
 
-        let snapshot = rl.redis().suppressed().get(&k).await.unwrap();
+        let snapshot = rl.suppressed().get(&k).await.unwrap();
         assert_eq!(
             snapshot,
             SuppressedRateLimitSnapshot {
@@ -742,7 +613,6 @@ fn inc_uses_the_first_rate_limit_for_existing_keys() {
         let high_rate = RateLimit::per_second(10f64).unwrap();
 
         let decision = rl
-            .redis()
             .suppressed()
             .inc(&low_then_high, &low_rate, 2)
             .await
@@ -752,7 +622,6 @@ fn inc_uses_the_first_rate_limit_for_existing_keys() {
             "the first increment should fill the original hard capacity: {decision:?}"
         );
         let decision = rl
-            .redis()
             .suppressed()
             .inc(&low_then_high, &high_rate, 1)
             .await
@@ -767,12 +636,11 @@ fn inc_uses_the_first_rate_limit_for_existing_keys() {
             ),
             "a later larger rate must not increase the sticky hard capacity: {decision:?}"
         );
-        let snapshot = rl.redis().suppressed().get(&low_then_high).await.unwrap();
+        let snapshot = rl.suppressed().get(&low_then_high).await.unwrap();
         assert_eq!((snapshot.total, snapshot.total_declined), (3, 1));
 
         let high_then_low = key("high-then-low");
         let decision = rl
-            .redis()
             .suppressed()
             .inc(&high_then_low, &high_rate, 8)
             .await
@@ -782,7 +650,6 @@ fn inc_uses_the_first_rate_limit_for_existing_keys() {
             "the first increment should establish the larger hard capacity: {decision:?}"
         );
         let decision = rl
-            .redis()
             .suppressed()
             .inc(&high_then_low, &low_rate, 2)
             .await
@@ -791,7 +658,7 @@ fn inc_uses_the_first_rate_limit_for_existing_keys() {
             matches!(decision, RateLimitDecision::Allowed),
             "a later smaller rate must not reduce the sticky hard capacity: {decision:?}"
         );
-        let snapshot = rl.redis().suppressed().get(&high_then_low).await.unwrap();
+        let snapshot = rl.suppressed().get(&high_then_low).await.unwrap();
         assert_eq!((snapshot.total, snapshot.total_declined), (10, 0));
     });
 }
@@ -806,23 +673,23 @@ fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (100, 0));
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (100, 100));
 
-        assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 100);
+        assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 100);
     });
 }
 
@@ -837,26 +704,25 @@ fn set_if_lt_with_lower_target_is_noop() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
-            rl.redis()
-                .suppressed()
+            rl.suppressed()
                 .set_if(&k, &rate_limit, RateLimitComparator::Lt(100), 100)
                 .await
                 .unwrap(),
             (100, 0)
         );
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(50), 50)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (100, 100));
     });
 }
 
 #[test]
-fn set_if_nil_overwrites_unconditionally_including_lowering() {
+fn set_if_always_overwrites_unconditionally_including_lowering() {
     let url = redis_url();
 
     runtime::block_on(async {
@@ -866,22 +732,21 @@ fn set_if_nil_overwrites_unconditionally_including_lowering() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 100)
+            rl.suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 100)
                 .await
                 .unwrap(),
             (100, 0)
         );
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
-            .set_if(&k, &rate_limit, RateLimitComparator::Nil, 30)
+            .set_if(&k, &rate_limit, RateLimitComparator::Always, 30)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (30, 100));
-        assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 30);
+        assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 30);
     });
 }
 
@@ -895,20 +760,20 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
             .set_if(&k, &rate_limit, RateLimitComparator::Eq(0), 25)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (25, 0));
 
-        let (new_total, old_total) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
             .set_if(&k, &rate_limit, RateLimitComparator::Eq(0), 99)
             .await
             .unwrap();
+        let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
         assert_eq!((new_total, old_total), (25, 25));
     });
 }
@@ -923,38 +788,34 @@ fn set_if_gt_and_ne_guards_follow_current_total() {
         let rate_limit = RateLimit::per_second(100f64).unwrap();
 
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 10)
+            rl.suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 10)
                 .await
                 .unwrap(),
             (10, 0)
         );
         assert_eq!(
-            rl.redis()
-                .suppressed()
+            rl.suppressed()
                 .set_if(&k, &rate_limit, RateLimitComparator::Gt(5), 3)
                 .await
                 .unwrap(),
             (3, 10)
         );
         assert_eq!(
-            rl.redis()
-                .suppressed()
+            rl.suppressed()
                 .set_if(&k, &rate_limit, RateLimitComparator::Ne(3), 7)
                 .await
                 .unwrap(),
             (3, 3)
         );
         assert_eq!(
-            rl.redis()
-                .suppressed()
+            rl.suppressed()
                 .set_if(&k, &rate_limit, RateLimitComparator::Ne(5), 7)
                 .await
                 .unwrap(),
             (7, 3)
         );
-        assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 7);
+        assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 7);
     });
 }
 
@@ -972,8 +833,7 @@ fn set_if_preserve_history_creates_missing_positive_keys_in_both_directions() {
         ] {
             let k = key(name);
             assert_eq!(
-                rl.redis()
-                    .suppressed()
+                rl.suppressed()
                     .set_if_preserve_history(
                         &k,
                         &rate_limit,
@@ -985,7 +845,7 @@ fn set_if_preserve_history_creates_missing_positive_keys_in_both_directions() {
                     .unwrap(),
                 (5, 0)
             );
-            let snapshot = rl.redis().suppressed().get(&k).await.unwrap();
+            let snapshot = rl.suppressed().get(&k).await.unwrap();
             assert_eq!((snapshot.total, snapshot.total_declined), (5, 0));
         }
     });
@@ -1001,16 +861,10 @@ fn set_if_preserve_history_redefines_limit_when_total_is_unchanged() {
         let initial_rate = RateLimit::per_second(10f64).unwrap();
         let replacement_rate = RateLimit::per_second(6f64).unwrap();
 
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &initial_rate, 5)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &initial_rate, 5).await.unwrap();
         assert!(matches!(decision, RateLimitDecision::Allowed));
         assert_eq!(
-            rl.redis()
-                .suppressed()
+            rl.suppressed()
                 .set_if_preserve_history(
                     &k,
                     &replacement_rate,
@@ -1023,22 +877,12 @@ fn set_if_preserve_history_redefines_limit_when_total_is_unchanged() {
             (5, 5)
         );
 
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &initial_rate, 1)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &initial_rate, 1).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Allowed),
             "one unit should remain under the redefined hard capacity: {decision:?}"
         );
-        let decision = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &initial_rate, 1)
-            .await
-            .unwrap();
+        let decision = rl.suppressed().inc(&k, &initial_rate, 1).await.unwrap();
         assert!(
             matches!(
                 decision,
@@ -1063,20 +907,15 @@ fn set_if_prime_below_soft_limit_allows_next_inc() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(5f64).unwrap();
 
-        let (new_total, _) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(27), 27)
             .await
             .unwrap();
+        let new_total = outcome.current_total;
         assert_eq!(new_total, 27);
 
-        let d = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
     });
 }
@@ -1091,20 +930,15 @@ fn set_if_prime_at_hard_limit_declines_next_inc() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(5f64).unwrap();
 
-        let (new_total, _) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
             .set_if(&k, &rate_limit, RateLimitComparator::Lt(30), 30)
             .await
             .unwrap();
+        let new_total = outcome.current_total;
         assert_eq!(new_total, 30);
 
-        let d = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
             matches!(
                 d,
@@ -1130,20 +964,14 @@ fn set_if_zero_count_resets_declines_and_suppression_state() {
 
         // Saturate the window and record some declines.
         assert_eq!(
-            rl.redis()
-                .suppressed()
-                .set_if(&k, &rate_limit, RateLimitComparator::Nil, 30)
+            rl.suppressed()
+                .set_if(&k, &rate_limit, RateLimitComparator::Always, 30)
                 .await
                 .unwrap(),
             (30, 0)
         );
         for _ in 0..3 {
-            let d = rl
-                .redis()
-                .suppressed()
-                .inc(&k, &rate_limit, 1)
-                .await
-                .unwrap();
+            let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
             assert!(
                 matches!(
                     d,
@@ -1158,21 +986,16 @@ fn set_if_zero_count_resets_declines_and_suppression_state() {
 
         // Clear the window: declines and the cached factor must be reset too,
         // so admission resumes immediately.
-        let (new_total, _) = rl
-            .redis()
+        let outcome = rl
             .suppressed()
-            .set_if(&k, &rate_limit, RateLimitComparator::Nil, 0)
+            .set_if(&k, &rate_limit, RateLimitComparator::Always, 0)
             .await
             .unwrap();
+        let new_total = outcome.current_total;
         assert_eq!(new_total, 0);
 
-        let d = rl
-            .redis()
-            .suppressed()
-            .inc(&k, &rate_limit, 1)
-            .await
-            .unwrap();
+        let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(matches!(d, RateLimitDecision::Allowed), "d: {d:?}");
-        assert_eq!(rl.redis().suppressed().get(&k).await.unwrap().total, 1);
+        assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 1);
     });
 }

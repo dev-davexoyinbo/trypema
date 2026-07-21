@@ -7,9 +7,9 @@ use std::{
 use dashmap::DashMap;
 
 use crate::{
-    BucketSize, HardLimitFactor, HistoryPreservation, LocalRateLimiterOptions, RateLimit,
-    RateLimitComparator, RateLimitDecision, SuppressedLocalRateLimiter,
-    SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, WindowSize, common::RandomState,
+    BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
+    RateLimitDecision, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, WindowSize,
+    builder::ProviderConfig, common::RandomState, local::SuppressedLocalRateLimiter,
     local::suppressed_local_rate_limiter::RateLimitSeries,
 };
 
@@ -33,7 +33,7 @@ fn limiter(
     bucket_size: u64,
     hard_limit_factor: f64,
 ) -> SuppressedLocalRateLimiter {
-    SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
+    SuppressedLocalRateLimiter::new(ProviderConfig {
         window_size: WindowSize::seconds(window_size).unwrap(),
         bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
         hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
@@ -47,7 +47,7 @@ fn limiter_with_cache_ms(
     hard_limit_factor: f64,
     suppression_factor_cache_period: u64,
 ) -> SuppressedLocalRateLimiter {
-    SuppressedLocalRateLimiter::new(LocalRateLimiterOptions {
+    SuppressedLocalRateLimiter::new(ProviderConfig {
         window_size: WindowSize::seconds(window_size).unwrap(),
         bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
         hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
@@ -73,7 +73,7 @@ fn fill_to_soft_window_limit(
     window_size: u64,
     desired_suppression_factor: f64,
 ) {
-    let soft_window_limit = (window_size as f64 * **rate_limit) as u64;
+    let soft_window_limit = (window_size as f64 * rate_limit.as_per_second()) as u64;
     // A single batch increment of exactly `soft_window_limit` puts accepted = soft_window_limit.
     let decision = limiter.inc(key, rate_limit, soft_window_limit);
     assert!(
@@ -1005,12 +1005,12 @@ fn set_if_lt_primes_empty_key_and_reprime_is_noop() {
     let limiter = limiter(6, 1000, 1.0);
     let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-    let (new_total, old_total) =
-        limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (100, 0));
 
-    let (new_total, old_total) =
-        limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(100), 100);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (100, 100));
 
     assert_eq!(limiter.get("k").total, 100);
@@ -1026,22 +1026,24 @@ fn set_if_lt_with_lower_target_is_noop() {
         (100, 0)
     );
 
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(50), 50);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Lt(50), 50);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (100, 100));
     assert_eq!(limiter.get("k").total, 100);
 }
 
 #[test]
-fn set_if_nil_overwrites_unconditionally_including_lowering() {
+fn set_if_always_overwrites_unconditionally_including_lowering() {
     let limiter = limiter(6, 1000, 1.0);
     let rate_limit = RateLimit::per_second(100f64).unwrap();
 
     assert_eq!(
-        limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 100),
+        limiter.set_if("k", &rate_limit, RateLimitComparator::Always, 100),
         (100, 0)
     );
 
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 30);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Always, 30);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (30, 100));
     assert_eq!(limiter.get("k").total, 30);
 }
@@ -1051,10 +1053,12 @@ fn set_if_eq_zero_sets_only_when_window_is_empty() {
     let limiter = limiter(6, 1000, 1.0);
     let rate_limit = RateLimit::per_second(100f64).unwrap();
 
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 25);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 25);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (25, 0));
 
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 99);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Eq(0), 99);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (25, 25));
 }
 
@@ -1102,7 +1106,7 @@ fn set_if_zero_count_resets_declines_and_suppression_state() {
 
     // Saturate the window and record some declines.
     assert_eq!(
-        limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 30),
+        limiter.set_if("k", &rate_limit, RateLimitComparator::Always, 30),
         (30, 0)
     );
     for _ in 0..3 {
@@ -1126,7 +1130,8 @@ fn set_if_zero_count_resets_declines_and_suppression_state() {
     assert!(limiter.test_get_suppression_factor("k").is_some());
 
     // Clearing the window removes all per-key state, including the cached factor.
-    let (new_total, old_total) = limiter.set_if("k", &rate_limit, RateLimitComparator::Nil, 0);
+    let outcome = limiter.set_if("k", &rate_limit, RateLimitComparator::Always, 0);
+    let (new_total, old_total) = (outcome.current_total, outcome.previous_total);
     assert_eq!((new_total, old_total), (0, 33));
     assert!(!limiter.series().contains_key("k"));
     assert!(limiter.test_get_suppression_factor("k").is_none());
@@ -1146,7 +1151,7 @@ fn set_if_replacement_resets_declined_history_and_cached_factor() {
     let rate = RateLimit::per_second(5f64).unwrap();
 
     assert_eq!(
-        limiter.set_if("k", &rate, RateLimitComparator::Nil, 30),
+        limiter.set_if("k", &rate, RateLimitComparator::Always, 30),
         (30, 0)
     );
     let denied = limiter.inc("k", &rate, 3);
@@ -1160,7 +1165,7 @@ fn set_if_replacement_resets_declined_history_and_cached_factor() {
     assert!(limiter.test_get_suppression_factor("k").is_some());
 
     assert_eq!(
-        limiter.set_if("k", &rate, RateLimitComparator::Nil, 5),
+        limiter.set_if("k", &rate, RateLimitComparator::Always, 5),
         (5, 33)
     );
     let series = limiter.series().get("k").expect("series should exist");
@@ -1211,7 +1216,7 @@ fn set_if_replacement_with_unchanged_total_still_replaces_history() {
     );
 
     assert_eq!(
-        limiter.set_if("k", &rate, RateLimitComparator::Nil, 27),
+        limiter.set_if("k", &rate, RateLimitComparator::Always, 27),
         (27, 27)
     );
 
@@ -1235,7 +1240,7 @@ fn set_if_redefines_sticky_hard_window_limit() {
     let rate_one = RateLimit::per_second(1f64).unwrap();
 
     assert_eq!(
-        limiter.set_if("k", &rate_one, RateLimitComparator::Nil, 6),
+        limiter.set_if("k", &rate_one, RateLimitComparator::Always, 6),
         (6, 0)
     );
     {
@@ -1258,7 +1263,7 @@ fn set_if_redefines_sticky_hard_window_limit() {
     // unlike inc where the limit is sticky.
     let rate_ten = RateLimit::per_second(10f64).unwrap();
     assert_eq!(
-        limiter.set_if("k", &rate_ten, RateLimitComparator::Nil, 1),
+        limiter.set_if("k", &rate_ten, RateLimitComparator::Always, 1),
         (1, 7)
     );
     {
@@ -1330,7 +1335,7 @@ fn set_if_preserve_history_scales_partial_declines_proportionally() {
         limiter.set_if_preserve_history(
             "k",
             &rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             10,
             HistoryPreservation::PreserveNewest,
         ),
@@ -1377,7 +1382,7 @@ fn set_if_preserve_history_keeps_exact_decline_ratio_for_large_counters() {
     let rate = RateLimit::per_second(HARD_LIMIT as f64).unwrap();
 
     assert_eq!(
-        limiter.set_if("k", &rate, RateLimitComparator::Nil, HARD_LIMIT),
+        limiter.set_if("k", &rate, RateLimitComparator::Always, HARD_LIMIT),
         (HARD_LIMIT, 0)
     );
     let declined = limiter.inc("k", &rate, DECLINED);
@@ -1404,7 +1409,7 @@ fn set_if_preserve_history_keeps_exact_decline_ratio_for_large_counters() {
         limiter.set_if_preserve_history(
             "k",
             &rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             TARGET,
             HistoryPreservation::PreserveNewest,
         ),
@@ -1474,7 +1479,7 @@ fn set_if_preserve_oldest_keeps_oldest_suppressed_history() {
         limiter.set_if_preserve_history(
             "k",
             &rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             7,
             HistoryPreservation::PreserveOldest,
         ),
@@ -1518,7 +1523,7 @@ fn set_if_preserve_history_increases_the_selected_edge_bucket() {
         limiter.set_if_preserve_history(
             "newest",
             &rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             10,
             HistoryPreservation::PreserveNewest,
         ),
@@ -1528,7 +1533,7 @@ fn set_if_preserve_history_increases_the_selected_edge_bucket() {
         limiter.set_if_preserve_history(
             "oldest",
             &rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             10,
             HistoryPreservation::PreserveOldest,
         ),
@@ -1611,7 +1616,13 @@ fn set_if_preserve_history_prunes_expired_buckets_before_matching_update() {
         ("oldest", HistoryPreservation::PreserveOldest),
     ] {
         assert_eq!(
-            limiter.set_if_preserve_history(key, &rate, RateLimitComparator::Nil, 3, preservation,),
+            limiter.set_if_preserve_history(
+                key,
+                &rate,
+                RateLimitComparator::Always,
+                3,
+                preservation,
+            ),
             (3, 5)
         );
 
@@ -1647,7 +1658,7 @@ fn unchanged_preserve_history_uses_shared_lock_and_keeps_cached_factor() {
             let result = limiter.set_if_preserve_history(
                 "k",
                 &rate,
-                RateLimitComparator::Nil,
+                RateLimitComparator::Always,
                 3,
                 HistoryPreservation::PreserveNewest,
             );
@@ -1685,7 +1696,7 @@ fn unchanged_total_with_a_new_limit_updates_limit_and_invalidates_cache() {
         limiter.set_if_preserve_history(
             "k",
             &new_rate,
-            RateLimitComparator::Nil,
+            RateLimitComparator::Always,
             3,
             HistoryPreservation::PreserveOldest,
         ),
@@ -1828,7 +1839,9 @@ fn conditional_set_guard_miss_uses_shared_dashmap_lock() {
     let result = receiver.recv_timeout(Duration::from_secs(2));
     drop(held_read_guard);
     worker.join().unwrap();
-    assert_eq!(result.unwrap(), ((3, 3), (3, 3)));
+    let (replace, preserve) = result.unwrap();
+    assert_eq!(replace, (3, 3));
+    assert_eq!(preserve, (3, 3));
 }
 
 #[test]
@@ -1908,7 +1921,7 @@ fn conditional_set_present_zero_removes_suppressed_key_completely() {
 
     for (key, preserve) in [("replace", false), ("preserve", true)] {
         assert_eq!(
-            limiter.set_if(key, &rate, RateLimitComparator::Nil, 9),
+            limiter.set_if(key, &rate, RateLimitComparator::Always, 9),
             (9, 0)
         );
         let declined = limiter.inc(key, &rate, 3);
@@ -1934,12 +1947,12 @@ fn conditional_set_present_zero_removes_suppressed_key_completely() {
             limiter.set_if_preserve_history(
                 key,
                 &rate,
-                RateLimitComparator::Nil,
+                RateLimitComparator::Always,
                 0,
                 HistoryPreservation::PreserveOldest,
             )
         } else {
-            limiter.set_if(key, &rate, RateLimitComparator::Nil, 0)
+            limiter.set_if(key, &rate, RateLimitComparator::Always, 0)
         };
 
         assert_eq!(result, (0, 12));
