@@ -27,6 +27,7 @@
 /// }
 /// ```
 #[derive(Debug, thiserror::Error, PartialEq)]
+#[non_exhaustive]
 pub enum TrypemaError {
     /// Redis operation failed.
     ///
@@ -192,4 +193,8 @@ pub enum TrypemaError {
     /// millisecond representation.
     #[error("invalid sync interval: {0}")]
     InvalidSyncInterval(String),
+
+    /// Stale-state cleanup timing is invalid.
+    #[error("invalid cleanup configuration: {0}")]
+    InvalidCleanupConfiguration(String),
 }

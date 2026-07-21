@@ -17,9 +17,8 @@
 //! | [`RateLimitComparator`] | Guard condition for conditional writes (`set_if`) against the current window total |
 
 use std::{
-    ops::{Deref, DerefMut},
     sync::atomic::AtomicU64,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::TrypemaError;
@@ -50,6 +49,16 @@ pub(crate) fn checked_duration(
         .ok_or_else(|| error(format!("{name} is too large")))
 }
 
+pub(crate) fn duration_from_milliseconds(milliseconds: u128) -> Duration {
+    let seconds = milliseconds / u128::from(MILLISECONDS_PER_SECOND);
+    if seconds > u128::from(u64::MAX) {
+        return Duration::MAX;
+    }
+
+    let subsec_milliseconds = milliseconds % u128::from(MILLISECONDS_PER_SECOND);
+    Duration::new(seconds as u64, (subsec_milliseconds as u32) * 1_000_000)
+}
+
 /// Hash builder used by Trypema's internal concurrent maps.
 ///
 /// AHash is the default because these maps are private, hot-path data structures. Alternatives
@@ -78,36 +87,39 @@ pub(crate) struct Bucket {
 ///
 /// # Important Notes
 ///
-/// - Rejection metadata (`retry_after_ms`, `remaining_after_waiting`) is **best-effort**
+/// - Rejection metadata (`retry_after`, `remaining_after_waiting`) is **best-effort**
 /// - Metadata accuracy degrades with bucket coalescing and concurrent access
 /// - Use for backoff hints, not strict guarantees
 ///
 /// # Examples
 ///
 /// ```
-/// # let rl = trypema::__doctest_helpers::rate_limiter();
-/// use trypema::{RateLimitDecision, RateLimit};
+/// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+/// # let rl = LocalRateLimiterProvider::builder().cleanup_enabled(false).build().unwrap();
+/// use trypema::{RateLimit, RateLimitDecision};
 ///
 /// let rate = RateLimit::per_second(10.0).unwrap();
 ///
-/// match rl.local().absolute().inc("user_123", &rate, 1) {
+/// match rl.absolute().inc("user_123", &rate, 1) {
 ///     RateLimitDecision::Allowed => {
 ///         println!("Request allowed");
 ///     }
-///     RateLimitDecision::Rejected { retry_after_ms, remaining_after_waiting, .. } => {
-///         println!("Rate limited, retry in {}ms", retry_after_ms);
+///     RateLimitDecision::Rejected { retry_after, remaining_after_waiting, .. } => {
+///         println!("Rate limited, retry in {retry_after:?}");
 ///         println!("Capacity after waiting: {}", remaining_after_waiting);
 ///     }
-///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
+///     RateLimitDecision::Suppressed { is_allowed, suppression_factor, .. } => {
 ///         if is_allowed {
 ///             println!("Allowed with suppression factor {}", suppression_factor);
 ///         } else {
 ///             println!("Suppressed");
 ///         }
 ///     }
+///     _ => {}
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, strum_macros::Display)]
+#[non_exhaustive]
 pub enum RateLimitDecision {
     /// Request is allowed to proceed.
     ///
@@ -117,11 +129,12 @@ pub enum RateLimitDecision {
     /// Request exceeds the rate limit and is rejected.
     ///
     /// The increment was **not** recorded. Includes best-effort metadata for backoff.
+    #[non_exhaustive]
     Rejected {
-        /// Sliding window size used for this decision (in seconds).
-        window_size_seconds: u64,
+        /// Sliding window duration used for this decision.
+        window_size: WindowSize,
 
-        /// **Best-effort** estimate of milliseconds until capacity becomes available.
+        /// **Best-effort** duration until capacity becomes available.
         ///
         /// Computed from the oldest active bucket's remaining TTL. May be inaccurate due to:
         /// - Bucket coalescing (merges nearby increments)
@@ -129,10 +142,10 @@ pub enum RateLimitDecision {
         /// - New increments extending bucket lifetimes
         ///
         /// Use as a backoff hint, not a guarantee.
-        retry_after_ms: u128,
+        retry_after: Duration,
 
         /// **Best-effort** estimate of how much capacity becomes available after
-        /// `retry_after_ms` elapses.
+        /// `retry_after` elapses.
         ///
         /// This is the count released when the oldest live bucket expires. For example, if a
         /// full window contains buckets with counts `3` and `7`, this value is `3`: the caller
@@ -154,6 +167,7 @@ pub enum RateLimitDecision {
     /// accepted rate near the limit.
     ///
     /// **Always check `is_allowed`** to determine if this specific call was admitted.
+    #[non_exhaustive]
     Suppressed {
         /// Current suppression rate (0.0 = no suppression, 1.0 = full suppression).
         ///
@@ -176,6 +190,7 @@ pub enum RateLimitDecision {
 /// buckets that are live at the time of the read. Under concurrent use, individual fields may be
 /// observed while another request is updating the limiter.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct SuppressedRateLimitSnapshot {
     /// Total observed usage in the live window, including accepted and declined usage.
     pub total: u64,
@@ -185,6 +200,45 @@ pub struct SuppressedRateLimitSnapshot {
 
     /// Current suppression factor in the inclusive range `0.0..=1.0`.
     pub suppression_factor: f64,
+}
+
+/// Result of a conditional total update.
+///
+/// Distinguishes comparator misses from successful updates that leave total unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConditionalSetOutcome {
+    /// Whether comparator matched and update semantics were applied.
+    pub matched: bool,
+    /// Live total observed before conditional update.
+    pub previous_total: u64,
+    /// Live total after operation, or unchanged total when comparator missed.
+    pub current_total: u64,
+}
+
+impl ConditionalSetOutcome {
+    pub(crate) fn matched(current_total: u64, previous_total: u64) -> Self {
+        Self {
+            matched: true,
+            previous_total,
+            current_total,
+        }
+    }
+
+    pub(crate) fn not_matched(current_total: u64) -> Self {
+        Self {
+            matched: false,
+            previous_total: current_total,
+            current_total,
+        }
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<(u64, u64)> for ConditionalSetOutcome {
+    fn eq(&self, other: &(u64, u64)) -> bool {
+        (self.current_total, self.previous_total) == *other
+    }
 }
 
 /// Per-second rate limit for a key.
@@ -206,13 +260,18 @@ pub struct SuppressedRateLimitSnapshot {
 /// use trypema::RateLimit;
 ///
 /// let rate = RateLimit::per_second(10.0).unwrap();
-/// assert_eq!(*rate, 10.0);
+/// assert_eq!(rate.as_per_second(), 10.0);
+/// assert_eq!(rate.as_per_minute(), 600.0);
+/// assert_eq!(rate.as_per_hour(), 36_000.0);
+/// assert_eq!(rate.as_per_day(), 864_000.0);
+/// assert_eq!(rate.as_per_week(), 6_048_000.0);
+/// assert_eq!(rate.as_per_month(), 25_920_000.0);
 ///
 /// let rate = RateLimit::per_second(5.5).unwrap();
-/// assert_eq!(*rate, 5.5);
+/// assert_eq!(rate.as_per_second(), 5.5);
 ///
 /// let rate = RateLimit::per_second_or_panic(2.5);
-/// assert_eq!(*rate, 2.5);
+/// assert_eq!(rate.as_per_second(), 2.5);
 ///
 /// // Invalid: must be positive
 /// assert!(RateLimit::per_second(0.0).is_err());
@@ -236,10 +295,40 @@ impl RateLimit {
     /// use trypema::RateLimit;
     ///
     /// let unlimited = RateLimit::max();
-    /// assert_eq!(*unlimited, f64::MAX);
+    /// assert_eq!(unlimited.as_per_second(), f64::MAX);
     /// ```
     pub fn max() -> Self {
         Self(f64::MAX)
+    }
+
+    /// Return rate expressed as count per second.
+    pub fn as_per_second(self) -> f64 {
+        self.0
+    }
+
+    /// Return rate expressed as count per minute.
+    pub fn as_per_minute(self) -> f64 {
+        self.as_per_period(SECONDS_PER_MINUTE)
+    }
+
+    /// Return rate expressed as count per hour.
+    pub fn as_per_hour(self) -> f64 {
+        self.as_per_period(SECONDS_PER_HOUR)
+    }
+
+    /// Return rate expressed as count per day.
+    pub fn as_per_day(self) -> f64 {
+        self.as_per_period(SECONDS_PER_DAY)
+    }
+
+    /// Return rate expressed as count per week.
+    pub fn as_per_week(self) -> f64 {
+        self.as_per_period(SECONDS_PER_WEEK)
+    }
+
+    /// Return rate expressed as count per 30-day month.
+    pub fn as_per_month(self) -> f64 {
+        self.as_per_period(SECONDS_PER_MONTH)
     }
 
     /// Create a rate limit expressed as count per second.
@@ -251,7 +340,7 @@ impl RateLimit {
     ///
     /// # Panics
     ///
-    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    /// Panics when the value does not produce a greater than 0 per-second rate.
     pub fn per_second_or_panic(value: f64) -> Self {
         Self::per_second(value).unwrap()
     }
@@ -265,7 +354,7 @@ impl RateLimit {
     ///
     /// # Panics
     ///
-    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    /// Panics when the value does not produce a greater than 0 per-second rate.
     pub fn per_minute_or_panic(value: f64) -> Self {
         Self::per_minute(value).unwrap()
     }
@@ -279,7 +368,7 @@ impl RateLimit {
     ///
     /// # Panics
     ///
-    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    /// Panics when the value does not produce a greater than 0 per-second rate.
     pub fn per_hour_or_panic(value: f64) -> Self {
         Self::per_hour(value).unwrap()
     }
@@ -293,7 +382,7 @@ impl RateLimit {
     ///
     /// # Panics
     ///
-    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    /// Panics when the value does not produce a greater than 0 per-second rate.
     pub fn per_day_or_panic(value: f64) -> Self {
         Self::per_day(value).unwrap()
     }
@@ -307,7 +396,7 @@ impl RateLimit {
     ///
     /// # Panics
     ///
-    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    /// Panics when the value does not produce a greater than 0 per-second rate.
     pub fn per_week_or_panic(value: f64) -> Self {
         Self::per_week(value).unwrap()
     }
@@ -321,7 +410,7 @@ impl RateLimit {
     ///
     /// # Panics
     ///
-    /// Panics when `value` does not produce a per-second rate greater than `0`.
+    /// Panics when the value does not produce a greater than 0 per-second rate.
     pub fn per_month_or_panic(value: f64) -> Self {
         Self::per_month(value).unwrap()
     }
@@ -330,28 +419,18 @@ impl RateLimit {
         Self::from_per_second(value / (period_seconds as f64))
     }
 
+    fn as_per_period(self, period_seconds: u64) -> f64 {
+        self.0 * (period_seconds as f64)
+    }
+
     fn from_per_second(value: f64) -> Result<Self, TrypemaError> {
-        if value <= 0f64 {
+        if !value.is_finite() || value <= 0f64 {
             Err(TrypemaError::InvalidRateLimit(
                 "rate limit must be greater than 0".to_string(),
             ))
         } else {
             Ok(Self(value))
         }
-    }
-}
-
-impl Deref for RateLimit {
-    type Target = f64;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for RateLimit {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
     }
 }
 
@@ -373,13 +452,24 @@ impl DerefMut for RateLimit {
 /// use trypema::WindowSize;
 ///
 /// let window = WindowSize::seconds(60).unwrap();
-/// assert_eq!(*window, 60);
+/// assert_eq!(window.as_seconds(), 60);
+/// assert_eq!(window.as_milliseconds(), 60_000);
+/// assert_eq!(window.as_minutes(), 1.0);
+/// assert_eq!(window.as_hours(), 1.0 / 60.0);
 ///
 /// let window = WindowSize::seconds_or_panic(30);
-/// assert_eq!(*window, 30);
+/// assert_eq!(window.as_seconds(), 30);
 ///
 /// // Invalid: too small
 /// assert!(WindowSize::seconds(0).is_err());
+/// ```
+///
+/// Validated values do not expose mutable dereferencing:
+///
+/// ```compile_fail
+/// use trypema::WindowSize;
+/// let mut window = WindowSize::seconds_or_panic(10);
+/// *window = 0;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct WindowSize(u64);
@@ -392,6 +482,41 @@ impl Default for WindowSize {
 }
 
 impl WindowSize {
+    /// Return window duration in seconds.
+    pub fn as_seconds(self) -> u64 {
+        self.0
+    }
+
+    /// Return window duration in milliseconds.
+    pub fn as_milliseconds(self) -> u128 {
+        u128::from(self.0) * u128::from(MILLISECONDS_PER_SECOND)
+    }
+
+    /// Return the window duration in minutes.
+    pub fn as_minutes(self) -> f64 {
+        self.as_period(SECONDS_PER_MINUTE)
+    }
+
+    /// Return the window duration in hours.
+    pub fn as_hours(self) -> f64 {
+        self.as_period(SECONDS_PER_HOUR)
+    }
+
+    /// Return the window duration in days.
+    pub fn as_days(self) -> f64 {
+        self.as_period(SECONDS_PER_DAY)
+    }
+
+    /// Return the window duration in weeks.
+    pub fn as_weeks(self) -> f64 {
+        self.as_period(SECONDS_PER_WEEK)
+    }
+
+    /// Return the window duration in 30-day months.
+    pub fn as_months(self) -> f64 {
+        self.as_period(SECONDS_PER_MONTH)
+    }
+
     /// Create a window size expressed in seconds.
     pub fn seconds(value: u64) -> Result<Self, TrypemaError> {
         Self::from_seconds(value, 1)
@@ -485,19 +610,9 @@ impl WindowSize {
         )
         .map(Self)
     }
-}
 
-impl Deref for WindowSize {
-    type Target = u64;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for WindowSize {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+    fn as_period(self, period_seconds: u64) -> f64 {
+        (self.0 as f64) / (period_seconds as f64)
     }
 }
 
@@ -531,7 +646,7 @@ impl DerefMut for WindowSize {
 /// use trypema::BucketSize;
 ///
 /// let coalescing = BucketSize::milliseconds(10).unwrap();
-/// assert_eq!(*coalescing, 10);
+/// assert_eq!(coalescing.as_milliseconds(), 10);
 ///
 /// let aggressive = BucketSize::milliseconds(100).unwrap();
 /// let precise = BucketSize::milliseconds_or_panic(1);
@@ -551,6 +666,11 @@ impl Default for BucketSize {
 }
 
 impl BucketSize {
+    /// Return bucket-coalescing interval in milliseconds.
+    pub fn as_milliseconds(self) -> u64 {
+        self.0
+    }
+
     /// Create a bucket size expressed in milliseconds.
     pub fn milliseconds(value: u64) -> Result<Self, TrypemaError> {
         Self::from_milliseconds(value, 1)
@@ -660,20 +780,6 @@ impl BucketSize {
     }
 }
 
-impl Deref for BucketSize {
-    type Target = u64;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for BucketSize {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
 /// Hard cutoff multiplier for the suppressed strategy.
 ///
 /// Defines the absolute maximum rate as: `rate_limit × hard_limit_factor`
@@ -704,7 +810,7 @@ impl DerefMut for BucketSize {
 /// use trypema::{HardLimitFactor, RateLimit};
 ///
 /// let factor = HardLimitFactor::default();
-/// assert_eq!(*factor, 1.0);
+/// assert_eq!(factor.as_multiplier(), 1.0);
 ///
 /// let factor = HardLimitFactor::new(1.5).unwrap();
 /// let rate = RateLimit::per_second(10.0).unwrap();
@@ -729,6 +835,11 @@ impl Default for HardLimitFactor {
 }
 
 impl HardLimitFactor {
+    /// Return hard-limit multiplier.
+    pub fn as_multiplier(self) -> f64 {
+        self.0
+    }
+
     /// Fallible constructor. Equivalent to `TryFrom` but more ergonomic as a direct call.
     pub fn new(value: f64) -> Result<Self, TrypemaError> {
         Self::try_from(value)
@@ -736,15 +847,7 @@ impl HardLimitFactor {
 
     /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
     pub fn new_or_panic(value: f64) -> Self {
-        Self::try_from(value).expect("HardLimitFactor must be >= 1.0")
-    }
-}
-
-impl Deref for HardLimitFactor {
-    type Target = f64;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+        Self::try_from(value).unwrap()
     }
 }
 
@@ -752,7 +855,7 @@ impl TryFrom<f64> for HardLimitFactor {
     type Error = TrypemaError;
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
-        if value < 1f64 {
+        if !value.is_finite() || value < 1f64 {
             Err(TrypemaError::InvalidHardLimitFactor(
                 "Hard limit factor must be greater than or equal to 1".to_string(),
             ))
@@ -799,7 +902,7 @@ pub(crate) enum RateType {
 /// use trypema::SuppressionFactorCachePeriod;
 ///
 /// let cache = SuppressionFactorCachePeriod::default();
-/// assert_eq!(*cache, 100);
+/// assert_eq!(cache.as_milliseconds(), 100);
 ///
 /// let cache = SuppressionFactorCachePeriod::milliseconds(50).unwrap();
 /// let fast = SuppressionFactorCachePeriod::milliseconds_or_panic(10);
@@ -819,6 +922,11 @@ impl Default for SuppressionFactorCachePeriod {
 }
 
 impl SuppressionFactorCachePeriod {
+    /// Return cache period in milliseconds.
+    pub fn as_milliseconds(self) -> u64 {
+        self.0
+    }
+
     /// Create a suppression-factor cache period expressed in milliseconds.
     pub fn milliseconds(value: u64) -> Result<Self, TrypemaError> {
         Self::from_milliseconds(value, 1)
@@ -900,14 +1008,6 @@ impl SuppressionFactorCachePeriod {
     }
 }
 
-impl Deref for SuppressionFactorCachePeriod {
-    type Target = u64;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 /// Guard condition for conditional writes against a key's current window total.
 ///
 /// Used by `set_if`-style operations: the write is applied only when the key's
@@ -920,7 +1020,7 @@ impl Deref for SuppressionFactorCachePeriod {
 /// - [`Lt`](RateLimitComparator::Lt): matches when the current total is **less than** the operand
 /// - [`Gt`](RateLimitComparator::Gt): matches when the current total is **greater than** the operand
 /// - [`Ne`](RateLimitComparator::Ne): matches when the current total is **not equal to** the operand
-/// - [`Nil`](RateLimitComparator::Nil): **always** matches (unconditional write through the guarded path)
+/// - [`Always`](RateLimitComparator::Always): **always** matches (unconditional write through the guarded path)
 ///
 /// # Common Idioms
 ///
@@ -928,7 +1028,7 @@ impl Deref for SuppressionFactorCachePeriod {
 ///   window total to at least `count` and never lowers it. Idempotent, safe to retry — the
 ///   canonical priming pattern.
 /// - `Eq(0)` — initialize only when the window is empty.
-/// - `Nil` — unconditional overwrite.
+/// - `Always` — unconditional overwrite.
 ///
 /// # Examples
 ///
@@ -947,8 +1047,8 @@ impl Deref for SuppressionFactorCachePeriod {
 /// assert!(RateLimitComparator::Ne(5).matches(6));
 /// assert!(!RateLimitComparator::Ne(5).matches(5));
 ///
-/// assert!(RateLimitComparator::Nil.matches(0));
-/// assert!(RateLimitComparator::Nil.matches(u64::MAX));
+/// assert!(RateLimitComparator::Always.matches(0));
+/// assert!(RateLimitComparator::Always.matches(u64::MAX));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitComparator {
@@ -964,7 +1064,7 @@ pub enum RateLimitComparator {
     ///
     /// This is primarily useful for delegating unconditional writes through the
     /// conditional write path.
-    Nil,
+    Always,
 }
 
 impl RateLimitComparator {
@@ -975,13 +1075,13 @@ impl RateLimitComparator {
             Self::Lt(operand) => current < operand,
             Self::Gt(operand) => current > operand,
             Self::Ne(operand) => current != operand,
-            Self::Nil => true,
+            Self::Always => true,
         }
     }
 
     /// Wire encoding used by the Redis Lua scripts: `(op, operand)`.
     ///
-    /// `Nil` carries no operand; `0` is sent as a placeholder and ignored by the script.
+    /// `Always` carries no operand; `0` is sent as a placeholder and ignored by the script.
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     pub(crate) fn redis_args(self) -> (&'static str, u64) {
         match self {
@@ -989,7 +1089,7 @@ impl RateLimitComparator {
             Self::Lt(operand) => ("lt", operand),
             Self::Gt(operand) => ("gt", operand),
             Self::Ne(operand) => ("ne", operand),
-            Self::Nil => ("nil", 0),
+            Self::Always => ("nil", 0),
         }
     }
 }
