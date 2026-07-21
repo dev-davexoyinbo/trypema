@@ -1,203 +1,111 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
 };
-use std::time::{Duration, Instant};
 
 use burster::Limiter;
 use dashmap::DashMap;
 use governor::{DefaultKeyedRateLimiter, Quota};
-use hdrhistogram::Histogram;
+use trypema::{RateLimit, RateLimitDecision};
 
-use trypema::RateLimit;
-
-use crate::args::{Args, LocalLimiter, Strategy};
-use crate::runner::{Counts, ErrorStats, WorkerLoop, print_error_stats, print_results};
-
-// ---------------------------------------------------------------------------
-// Burster support
-//
-// burster::SlidingWindowLog<_, W> has the window width in ms baked into the
-// const generic.  We support 10 s, 60 s and 300 s windows; other values
-// produce a friendly error at startup.
-// ---------------------------------------------------------------------------
+use crate::{
+    args::{Args, LocalLimiter, Strategy, build_keys},
+    runner::{RunState, StartGate, WorkerLoop, finish_run},
+};
 
 static BURSTER_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 fn burster_now() -> Duration {
     BURSTER_EPOCH.get_or_init(Instant::now).elapsed()
-}
+} // end fn burster_now
 
-type BursterMap<const W: usize> =
-    Arc<DashMap<String, std::sync::Mutex<burster::SlidingWindowLog<fn() -> Duration, W>>>>;
+type BursterMap<const WINDOW_MS: usize> =
+    Arc<DashMap<String, std::sync::Mutex<burster::SlidingWindowLog<fn() -> Duration, WINDOW_MS>>>>;
 
 enum BursterStore {
-    W10(BursterMap<10_000>),
-    W60(BursterMap<60_000>),
-    W300(BursterMap<300_000>),
+    Window10(BursterMap<10_000>),
+    Window60(BursterMap<60_000>),
+    Window300(BursterMap<300_000>),
 }
 
 impl BursterStore {
-    fn for_window_s(window_s: u64) -> Option<Self> {
-        match window_s {
-            10 => Some(BursterStore::W10(Arc::new(DashMap::new()))),
-            60 => Some(BursterStore::W60(Arc::new(DashMap::new()))),
-            300 => Some(BursterStore::W300(Arc::new(DashMap::new()))),
+    fn for_window_seconds(window_size: u64) -> Option<Self> {
+        match window_size {
+            10 => Some(Self::Window10(Arc::new(DashMap::new()))),
+            60 => Some(Self::Window60(Arc::new(DashMap::new()))),
+            300 => Some(Self::Window300(Arc::new(DashMap::new()))),
             _ => None,
         }
-    }
+    } // end fn for_window_seconds
 
-    fn try_consume_one(&self, key: &str, capacity: u64) -> bool {
+    fn try_consume_one(&self, key: &str, window_limit: u64) -> bool {
         macro_rules! consume {
-            ($map:expr, $w:literal) => {{
-                // get_or_insert pattern: try existing entry first, insert on miss.
-                if let Some(entry) = $map.get(key) {
-                    entry.value().lock().unwrap().try_consume_one().is_ok()
-                } else {
-                    $map.insert(
-                        key.to_owned(),
-                        std::sync::Mutex::new(burster::SlidingWindowLog::new_with_time_provider(
-                            capacity,
-                            burster_now as fn() -> Duration,
-                        )),
-                    );
-                    $map.get(key)
-                        .unwrap()
-                        .value()
-                        .lock()
-                        .unwrap()
-                        .try_consume_one()
-                        .is_ok()
-                }
+            ($series:expr) => {{
+                let series = match $series.get(key) {
+                    Some(series) => series,
+                    None => $series
+                        .entry(key.to_owned())
+                        .or_insert_with(|| {
+                            std::sync::Mutex::new(
+                                burster::SlidingWindowLog::new_with_time_provider(
+                                    window_limit,
+                                    burster_now as fn() -> Duration,
+                                ),
+                            )
+                        })
+                        .downgrade(),
+                };
+
+                series
+                    .value()
+                    .lock()
+                    .expect("burster series mutex poisoned")
+                    .try_consume_one()
+                    .is_ok()
             }};
         }
 
         match self {
-            BursterStore::W10(m) => consume!(m, 10_000),
-            BursterStore::W60(m) => consume!(m, 60_000),
-            BursterStore::W300(m) => consume!(m, 300_000),
+            Self::Window10(series) => consume!(series),
+            Self::Window60(series) => consume!(series),
+            Self::Window300(series) => consume!(series),
         }
-    }
+    } // end fn try_consume_one
+} // end impl
+
+enum LocalIterationOutcome {
+    Decision(RateLimitDecision),
+    Allowed(bool),
 }
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
 pub(crate) fn run(args: &Args) {
-    if args.mode != crate::args::Mode::Max && args.target_qps.is_none() {
-        eprintln!("note: --mode target-qps without --target-qps behaves like --mode max");
-    }
-    if args.local_limiter != LocalLimiter::Trypema && args.strategy == Strategy::Suppressed {
-        eprintln!(
-            "note: --strategy suppressed is ignored for --local-limiter {:?}",
-            args.local_limiter
-        );
-    }
-
     match args.local_limiter {
         LocalLimiter::Trypema => run_trypema(args),
         LocalLimiter::Burster => run_burster(args),
         LocalLimiter::Governor => run_governor(args),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Trypema local
-// ---------------------------------------------------------------------------
+} // end fn run
 
 fn run_trypema(args: &Args) {
-    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    eprintln!(
-        "note: built with redis support; local runs still open a Redis connection to satisfy RateLimiterOptions"
-    );
+    let rate_limiter = crate::args::build_local_provider(args);
+    let rate_limit = RateLimit::per_second(args.rate_limit_per_s).unwrap();
+    let strategy = args.strategy;
 
-    let rl = Arc::new(build_trypema_rl(args));
-    let rate = RateLimit::try_from(args.rate_limit_per_s).unwrap();
-    let keys = crate::args::build_keys(args);
-
-    let counts = Arc::new(Counts::default());
-    let total_ops = Arc::new(AtomicU64::new(0));
-    let error_stats = Arc::new(ErrorStats::default());
-
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(args.duration_s);
-
-    let mut handles = Vec::with_capacity(args.threads);
-    for t in 0..args.threads {
-        let rl = Arc::clone(&rl);
-        let rate = rate.clone();
-        let keys = keys.clone();
-        let counts = Arc::clone(&counts);
-        let total_ops = Arc::clone(&total_ops);
-        let error_stats = Arc::clone(&error_stats);
-        let args = args.clone();
-
-        handles.push(
-            std::thread::Builder::new()
-                .spawn(move || {
-                    let mut wl = WorkerLoop::new(
-                        args.clone(),
-                        keys,
-                        counts,
-                        total_ops,
-                        error_stats,
-                        t,
-                        started,
-                        deadline,
-                    );
-
-                    while wl.should_continue() {
-                        wl.pace_sync();
-                        let idx = wl.pick_idx();
-                        let key = wl.key(idx).to_owned();
-                        let t0 = wl.begin_iter();
-
-                        let decision = match args.strategy {
-                            Strategy::Absolute => rl.local().absolute().inc(&key, &rate, 1),
-                            Strategy::Suppressed => rl.local().suppressed().inc(&key, &rate, 1),
-                        };
-
-                        wl.end_iter(t0);
-                        wl.record_decision(decision);
-                    }
-
-                    wl.into_hist()
-                })
-                .unwrap(),
-        );
-    }
-
-    std::thread::sleep(Duration::from_secs(args.duration_s));
-
-    let mut merged = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
-    for h in handles {
-        merged.add(h.join().unwrap()).unwrap();
-    }
-
-    let elapsed = started.elapsed();
-    let ops = total_ops.load(Ordering::Relaxed);
-    print_results(
-        args,
-        elapsed,
-        ops,
-        ops as f64 / elapsed.as_secs_f64(),
-        &merged,
-        &counts,
-    );
-    print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
-}
-
-// ---------------------------------------------------------------------------
-// Burster local
-// ---------------------------------------------------------------------------
+    println!("local_limiter=Trypema");
+    run_sync(args, None, move |key| {
+        let decision = match strategy {
+            Strategy::Absolute => rate_limiter.absolute().inc(key, &rate_limit, 1),
+            Strategy::Suppressed => rate_limiter.suppressed().inc(key, &rate_limit, 1),
+        };
+        LocalIterationOutcome::Decision(decision)
+    });
+} // end fn run_trypema
 
 fn run_burster(args: &Args) {
-    // burster stores a [u64; W] on the stack — give threads extra stack space.
     const STACK_SIZE: usize = 16 * 1024 * 1024;
 
-    let store = match BursterStore::for_window_s(args.window_s) {
-        Some(s) => Arc::new(s),
+    let store = match BursterStore::for_window_seconds(args.window_s) {
+        Some(store) => Arc::new(store),
         None => {
             eprintln!(
                 "unsupported --window-s {} for burster (supported: 10, 60, 300)",
@@ -206,201 +114,108 @@ fn run_burster(args: &Args) {
             std::process::exit(2);
         }
     };
+    let window_limit = (args.rate_limit_per_s * args.window_s as f64) as u64;
 
-    let capacity = (args.rate_limit_per_s * args.window_s as f64)
-        .max(1.0)
-        .round() as u64;
-    let keys = crate::args::build_keys(args);
-
-    let counts = Arc::new(Counts::default());
-    let total_ops = Arc::new(AtomicU64::new(0));
-    let error_stats = Arc::new(ErrorStats::default());
-
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(args.duration_s);
-
-    let mut handles = Vec::with_capacity(args.threads);
-    for t in 0..args.threads {
-        let store = Arc::clone(&store);
-        let keys = keys.clone();
-        let counts = Arc::clone(&counts);
-        let total_ops = Arc::clone(&total_ops);
-        let error_stats = Arc::clone(&error_stats);
-        let args = args.clone();
-
-        handles.push(
-            std::thread::Builder::new()
-                .stack_size(STACK_SIZE)
-                .spawn(move || {
-                    let mut wl = WorkerLoop::new(
-                        args,
-                        keys,
-                        counts,
-                        total_ops,
-                        error_stats,
-                        t,
-                        started,
-                        deadline,
-                    );
-
-                    while wl.should_continue() {
-                        wl.pace_sync();
-                        let idx = wl.pick_idx();
-                        let key = wl.key(idx).to_owned();
-                        let t0 = wl.begin_iter();
-
-                        let allowed = store.try_consume_one(&key, capacity);
-
-                        wl.end_iter(t0);
-                        wl.record_allowed(allowed);
-                    }
-
-                    wl.into_hist()
-                })
-                .unwrap(),
-        );
-    }
-
-    std::thread::sleep(Duration::from_secs(args.duration_s));
-
-    let mut merged = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
-    for h in handles {
-        merged.add(h.join().unwrap()).unwrap();
-    }
-
-    let elapsed = started.elapsed();
-    let ops = total_ops.load(Ordering::Relaxed);
-    println!("local_limiter=Burster burster_capacity_per_window={capacity}");
-    print_results(
-        args,
-        elapsed,
-        ops,
-        ops as f64 / elapsed.as_secs_f64(),
-        &merged,
-        &counts,
-    );
-    print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
-}
-
-// ---------------------------------------------------------------------------
-// Governor local
-// ---------------------------------------------------------------------------
+    println!("local_limiter=Burster window_limit={window_limit}");
+    run_sync(args, Some(STACK_SIZE), move |key| {
+        LocalIterationOutcome::Allowed(store.try_consume_one(key, window_limit))
+    });
+} // end fn run_burster
 
 fn run_governor(args: &Args) {
-    // governor also uses extra stack space with many keys.
     const STACK_SIZE: usize = 16 * 1024 * 1024;
 
-    let rate_u32 =
-        u32::try_from((args.rate_limit_per_s.max(1.0).round() as u64).min(u32::MAX as u64))
-            .unwrap_or(u32::MAX);
-
-    let burst_u32 = u32::try_from(
-        ((args.rate_limit_per_s * args.window_s as f64)
-            .max(1.0)
-            .round() as u64)
-            .min(u32::MAX as u64),
+    let rate_limit_per_second = args.rate_limit_per_s as u32;
+    let burst_count = (args.rate_limit_per_s * args.window_s as f64) as u32;
+    let quota = Quota::per_second(
+        std::num::NonZeroU32::new(rate_limit_per_second)
+            .expect("validated governor rate must be non-zero"),
     )
-    .unwrap_or(u32::MAX)
-    .max(1);
+    .allow_burst(
+        std::num::NonZeroU32::new(burst_count).expect("validated governor burst must be non-zero"),
+    );
+    let rate_limiter: Arc<DefaultKeyedRateLimiter<String>> =
+        Arc::new(governor::RateLimiter::keyed(quota));
 
-    let quota = Quota::per_second(std::num::NonZeroU32::new(rate_u32).unwrap())
-        .allow_burst(std::num::NonZeroU32::new(burst_u32).unwrap());
-    let rl: Arc<DefaultKeyedRateLimiter<String>> = Arc::new(governor::RateLimiter::keyed(quota));
+    println!(
+        "local_limiter=Governor rate_limit_per_s={rate_limit_per_second} burst_count={burst_count}"
+    );
+    run_sync(args, Some(STACK_SIZE), move |key| {
+        LocalIterationOutcome::Allowed(rate_limiter.check_key(key).is_ok())
+    });
+} // end fn run_governor
 
-    let capacity = burst_u32 as u64;
-    let keys = crate::args::build_keys(args);
-
-    let counts = Arc::new(Counts::default());
-    let total_ops = Arc::new(AtomicU64::new(0));
-    let error_stats = Arc::new(ErrorStats::default());
-
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(args.duration_s);
-
+fn run_sync(
+    args: &Args,
+    stack_size: Option<usize>,
+    operation: impl Fn(&String) -> LocalIterationOutcome + Send + Sync + 'static,
+) {
+    let args = Arc::new(args.clone());
+    let keys = build_keys(&args);
+    let operation = Arc::new(operation);
+    let state = RunState::default();
+    let start_gate = Arc::new(StartGate::new(args.threads));
     let mut handles = Vec::with_capacity(args.threads);
-    for t in 0..args.threads {
-        let rl = Arc::clone(&rl);
-        let keys = keys.clone();
-        let counts = Arc::clone(&counts);
-        let total_ops = Arc::clone(&total_ops);
-        let error_stats = Arc::clone(&error_stats);
-        let args = args.clone();
+
+    for worker_index in 0..args.threads {
+        let args = Arc::clone(&args);
+        let keys = Arc::clone(&keys);
+        let operation = Arc::clone(&operation);
+        let state = state.clone();
+        let start_gate = Arc::clone(&start_gate);
+        let mut builder = std::thread::Builder::new();
+        if let Some(stack_size) = stack_size {
+            builder = builder.stack_size(stack_size);
+        }
 
         handles.push(
-            std::thread::Builder::new()
-                .stack_size(STACK_SIZE)
+            builder
                 .spawn(move || {
-                    let mut wl = WorkerLoop::new(
-                        args,
-                        keys,
-                        counts,
-                        total_ops,
-                        error_stats,
-                        t,
+                    let started = start_gate.wait_sync();
+                    let mut worker = WorkerLoop::new(
+                        Arc::clone(&args),
+                        keys.len(),
+                        state,
+                        worker_index,
                         started,
-                        deadline,
                     );
 
-                    while wl.should_continue() {
-                        wl.pace_sync();
-                        let idx = wl.pick_idx();
-                        let key = wl.key(idx).to_owned();
-                        let t0 = wl.begin_iter();
+                    while worker.should_continue() {
+                        if let Some(delay) = worker.pacing_delay() {
+                            std::thread::sleep(delay);
+                        }
+                        if !worker.should_continue() {
+                            break;
+                        }
 
-                        let allowed = rl.check_key(&key).is_ok();
+                        let key_index = worker.pick_index();
+                        let key = &keys[key_index];
+                        let sample_started = worker.begin_iteration();
+                        let outcome = operation(key);
+                        worker.end_iteration(sample_started);
 
-                        wl.end_iter(t0);
-                        wl.record_allowed(allowed);
+                        match outcome {
+                            LocalIterationOutcome::Decision(decision) => {
+                                worker.record_decision(args.strategy, decision, || {
+                                    format!("provider=local key={key}")
+                                })
+                            }
+                            LocalIterationOutcome::Allowed(is_allowed) => {
+                                worker.record_allowed(is_allowed)
+                            }
+                        }
                     }
 
-                    wl.into_hist()
+                    worker.into_histogram()
                 })
                 .unwrap(),
         );
     }
 
-    std::thread::sleep(Duration::from_secs(args.duration_s));
-
-    let mut merged = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
-    for h in handles {
-        merged.add(h.join().unwrap()).unwrap();
-    }
-
-    let elapsed = started.elapsed();
-    let ops = total_ops.load(Ordering::Relaxed);
-    println!("local_limiter=Governor governor_capacity_per_window={capacity}");
-    print_results(
-        args,
-        elapsed,
-        ops,
-        ops as f64 / elapsed.as_secs_f64(),
-        &merged,
-        &counts,
-    );
-    print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
-}
-
-// ---------------------------------------------------------------------------
-// RateLimiter construction helper
-// ---------------------------------------------------------------------------
-
-fn build_trypema_rl(args: &Args) -> trypema::RateLimiter {
-    #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-    {
-        trypema::RateLimiter::new(trypema::RateLimiterOptions {
-            local: crate::args::build_local_options(args),
-        })
-    }
-
-    #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-    {
-        let connection_manager = crate::runtime::block_on(async {
-            let client = redis::Client::open(args.redis_url.as_str()).unwrap();
-            client.get_connection_manager().await.unwrap()
-        });
-        trypema::RateLimiter::new(trypema::RateLimiterOptions {
-            local: crate::args::build_local_options(args),
-            redis: crate::args::build_redis_options(args, connection_manager),
-        })
-    }
-}
+    let started = start_gate.start_sync();
+    let histograms = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("stress worker thread panicked"))
+        .collect::<Vec<_>>();
+    finish_run(&args, started, histograms, &state);
+} // end fn run_sync

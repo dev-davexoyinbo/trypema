@@ -1,252 +1,18 @@
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
-    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey,
-    RedisRateLimiterOptions, TrypemaError, WindowSizeSeconds,
-    common::{RateType, SuppressionFactorCacheMs},
-    redis::RedisKeyGenerator,
+    BucketSize, ConditionalSetOutcome, HardLimitFactor, HistoryPreservation, RateLimit,
+    RateLimitComparator, RateLimitDecision, SuppressedRateLimitSnapshot, TrypemaError, WindowSize,
+    common::{HistoryUpdateMode, RateType, SuppressionFactorCachePeriod},
+    redis::{
+        RedisKey, RedisKeyGenerator,
+        redis_rate_limiter_provider::RedisRateLimiterConfig,
+        scripts::{
+            SUPPRESSED_CLEANUP_LUA, SUPPRESSED_GET_FACTOR_LUA, SUPPRESSED_GET_STATE_LUA,
+            SUPPRESSED_INC_LUA, SUPPRESSED_SET_IF_LUA, lua_script, suppressed_lua_script,
+        },
+    },
 };
-
-const CLEANUP_LUA: &str = r#"
-    local time_array = redis.call("TIME")
-    local timestamp_ms = tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-
-    local prefix = KEYS[1]
-    local rate_type = KEYS[2]
-    local active_entities_key = KEYS[3]
-
-    local stale_after_ms = tonumber(ARGV[1]) or 0
-    local hash_suffix = ARGV[2]
-    local window_limit_suffix = ARGV[3]
-    local total_count_suffix = ARGV[4]
-    local active_keys_suffix = ARGV[5]
-    local suppression_factor_key_suffix = ARGV[6]
-    local total_declined_suffix = ARGV[7]
-    local hash_declined_suffix = ARGV[8]
-
-
-    local active_entities = redis.call("ZRANGE", active_entities_key, "-inf", timestamp_ms - stale_after_ms, "BYSCORE")
-
-    if #active_entities == 0 then
-        return 
-    end
-
-    local remove_keys = {}
-
-    local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix, total_declined_suffix, hash_declined_suffix}
-    for i = 1, #active_entities do
-        local entity = active_entities[i]
-
-        for i = 1, #suffixes do
-            table.insert(remove_keys, prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[i])
-        end
-    end
-
-    if #remove_keys > 0 then
-        redis.call("DEL", unpack(remove_keys))
-        redis.call("ZREM", active_entities_key, unpack(active_entities))
-    end
-
-    return
-"#;
-
-const LUA_HELPERS: &str = r#"
-    local function now_ms()
-        local time_array = redis.call("TIME")
-        return tonumber(time_array[1]) * 1000 + math.floor(tonumber(time_array[2]) / 1000)
-    end
-
-    local function cleanup_expired_keys(hash_key, hash_declined_key, active_keys, total_count_key, total_declined_key, timestamp_ms, window_size_seconds)
-        local to_remove_keys = redis.call("ZRANGE", active_keys, "-inf", timestamp_ms - window_size_seconds * 1000, "BYSCORE")
-
-        if #to_remove_keys == 0 then
-            return
-        end
-
-        local to_remove_counts = redis.call("HMGET", hash_key, unpack(to_remove_keys))
-        local to_remove_declines = redis.call("HMGET", hash_declined_key, unpack(to_remove_keys))
-
-        redis.call("HDEL", hash_key, unpack(to_remove_keys))
-        redis.call("HDEL", hash_declined_key, unpack(to_remove_keys))
-
-        local remove_count_sum = 0
-        local remove_declined_sum = 0
-
-        for i = 1, #to_remove_counts do
-            remove_count_sum = remove_count_sum + (tonumber(to_remove_counts[i]) or 0)
-            remove_declined_sum = remove_declined_sum + (tonumber(to_remove_declines[i]) or 0)
-        end
-
-        redis.call("DECRBY", total_count_key, remove_count_sum)
-        redis.call("DECRBY", total_declined_key, remove_declined_sum)
-        redis.call("ZREM", active_keys, unpack(to_remove_keys))
-    end
-
-    local function calculate_suppression_factor(hash_key, active_keys, total_count, total_declined, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
-        if window_limit == nil then
-            return 0
-        end
-
-        local soft_window_limit = window_limit / hard_limit_factor
-
-        if (total_count - total_declined) < soft_window_limit then
-            return 0
-        elseif (total_count - total_declined) == soft_window_limit then
-            if soft_window_limit == window_limit then
-                return 1
-            end
-        elseif total_count >= window_limit then
-            return 1
-        end
-
-        local active_keys_in_1s = redis.call("ZRANGE", active_keys, "+inf", timestamp_ms - 1000, "BYSCORE", "REV")
-        local total_in_last_second = 0
-
-        if #active_keys_in_1s > 0 then
-            local values = redis.call("HMGET", hash_key, unpack(active_keys_in_1s))
-            for i = 1, #values do
-                total_in_last_second = total_in_last_second + (tonumber(values[i]) or 0)
-            end
-        end
-
-        local average_rate_in_window = total_count / window_size_seconds
-        local perceived_rate_limit = average_rate_in_window
-
-        if total_in_last_second > average_rate_in_window then
-            perceived_rate_limit = total_in_last_second
-        end
-
-        local rate_limit = window_limit / window_size_seconds / hard_limit_factor
-
-        return 1 - (rate_limit / perceived_rate_limit)
-    end
-"#;
-
-const SUPPRESSED_INC_LUA: &str = r#"
-    local timestamp_ms = now_ms()
-
-    local hash_key = KEYS[1]
-    local active_keys = KEYS[2]
-    local window_limit_key = KEYS[3]
-    local total_count_key = KEYS[4]
-    local get_active_entities_key = KEYS[5]
-    local suppression_factor_key = KEYS[6]
-    local total_declined_key = KEYS[7]
-    local hash_declined_key = KEYS[8]
-
-    local entity = ARGV[1]
-    local window_size_seconds = tonumber(ARGV[2])
-    local window_limit_to_consider = tonumber(ARGV[3])
-    local rate_group_size_ms = tonumber(ARGV[4])
-    local suppression_factor_cache_ms = tonumber(ARGV[5])
-    local hard_limit_factor = tonumber(ARGV[6])
-    local count = tonumber(ARGV[7])
-
-    local window_limit = tonumber(redis.call("GET", window_limit_key)) or window_limit_to_consider
-
-    redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
-
-    cleanup_expired_keys(hash_key, hash_declined_key, active_keys, total_count_key, total_declined_key, timestamp_ms, window_size_seconds)
-
-    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
-    local total_declined = tonumber(redis.call("GET", total_declined_key)) or 0
-
-    local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
-
-    if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
-        suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, total_declined, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
-
-        redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
-    end
-
-
-    local should_allow = true
-
-    if suppression_factor == 0 then
-        should_allow = true
-    elseif suppression_factor == 1 then
-        should_allow = false
-    else
-        should_allow = math.random() < (1 - suppression_factor)
-    end
-
-    local latest_hash_field_entry = redis.call("ZRANGE", active_keys, 0, 0, "REV", "WITHSCORES")
-    if #latest_hash_field_entry > 0 then
-        local latest_hash_field = latest_hash_field_entry[1]
-        local latest_hash_field_group_timestamp = tonumber(latest_hash_field_entry[2])
-        local latest_hash_field_age_ms = timestamp_ms - latest_hash_field_group_timestamp
-
-        if latest_hash_field_age_ms >= 0 and latest_hash_field_age_ms < rate_group_size_ms then
-            timestamp_ms = tonumber(latest_hash_field)
-        end
-    end
-
-    local hash_field = tostring(timestamp_ms)
-
-    local new_count = redis.call("HINCRBY", hash_key, hash_field, count)
-    redis.call("INCRBY", total_count_key, count)
-
-    if not should_allow then
-        redis.call("HINCRBY", hash_declined_key, hash_field, count)
-        redis.call("INCRBY", total_declined_key, count)
-    end
-
-    if new_count == count then
-        redis.call("ZADD", active_keys, timestamp_ms, hash_field)
-        redis.call("SET", window_limit_key, window_limit)
-    end
-
-    redis.call("EXPIRE", window_limit_key, window_size_seconds)
-
-    local soft_window_limit = window_limit / hard_limit_factor
-
-    if (total_count - total_declined) < soft_window_limit then
-        return {"allowed", 0, 0}
-    else
-        return {"suppressed", tostring(suppression_factor), should_allow and "1" or "0"}
-    end
-"#;
-
-const SUPPRESSED_GET_FACTOR_LUA: &str = r#"
-    local timestamp_ms = now_ms()
-
-    local hash_key = KEYS[1]
-    local active_keys = KEYS[2]
-    local window_limit_key = KEYS[3]
-    local total_count_key = KEYS[4]
-    local get_active_entities_key = KEYS[5]
-    local suppression_factor_key = KEYS[6]
-    local total_declined_key = KEYS[7]
-    local hash_declined_key = KEYS[8]
-
-    local entity = ARGV[1]
-    local window_size_seconds = tonumber(ARGV[2])
-    local rate_group_size_ms = tonumber(ARGV[3])
-    local suppression_factor_cache_ms = tonumber(ARGV[4])
-    local hard_limit_factor = tonumber(ARGV[5])
-
-    redis.call("ZADD", get_active_entities_key, timestamp_ms, entity)
-
-    cleanup_expired_keys(hash_key, hash_declined_key, active_keys, total_count_key, total_declined_key, timestamp_ms, window_size_seconds)
-
-    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
-    local total_declined = tonumber(redis.call("GET", total_declined_key)) or 0
-
-    local suppression_factor = tonumber(redis.call("GET", suppression_factor_key))
-
-    if suppression_factor == nil or suppression_factor < 0 or suppression_factor > 1 then
-        local window_limit = tonumber(redis.call("GET", window_limit_key)) 
-        if window_limit == nil then
-            suppression_factor = 0
-        else
-            suppression_factor = calculate_suppression_factor(hash_key, active_keys, total_count, total_declined, timestamp_ms, window_size_seconds, window_limit, hard_limit_factor)
-        end
-
-        redis.call("SET", suppression_factor_key, suppression_factor, "PX", suppression_factor_cache_ms)
-    end
-
-    return tostring(suppression_factor)
-"#;
 
 /// Probabilistic suppression rate limiter backed by Redis.
 ///
@@ -266,7 +32,7 @@ const SUPPRESSED_GET_FACTOR_LUA: &str = r#"
 /// - `P:K:suppressed:h` — Hash of `timestamp_ms → count` (total observed per bucket)
 /// - `P:K:suppressed:hd` — Hash of `timestamp_ms → declined_count` (declined per bucket)
 /// - `P:K:suppressed:a` — Sorted set of active bucket timestamps
-/// - `P:K:suppressed:w` — Window limit (set on first call)
+/// - `P:K:suppressed:w` — Hard window limit (set on first call)
 /// - `P:K:suppressed:t` — Total observed count across all buckets
 /// - `P:K:suppressed:d` — Total declined count across all buckets
 /// - `P:K:suppressed:sf` — Cached suppression factor (string with `PX` TTL)
@@ -282,32 +48,33 @@ pub struct SuppressedRedisRateLimiter {
     connection_manager: ConnectionManager,
     key_generator: RedisKeyGenerator,
     hard_limit_factor: HardLimitFactor,
-    rate_group_size_ms: RateGroupSizeMs,
-    window_size_seconds: WindowSizeSeconds,
-    suppression_factor_cache_ms: SuppressionFactorCacheMs,
+    bucket_size: BucketSize,
+    window_size: WindowSize,
+    suppression_factor_cache_period: SuppressionFactorCachePeriod,
     inc_script: Script,
     cleanup_script: Script,
     suppression_factor_script: Script,
+    get_state_script: Script,
+    set_if_script: Script,
 }
 
 impl SuppressedRedisRateLimiter {
-    pub(crate) fn new(options: RedisRateLimiterOptions) -> Self {
+    pub(crate) fn new(options: RedisRateLimiterConfig) -> Self {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
         let key_generator = RedisKeyGenerator::new(prefix, RateType::Suppressed);
 
         Self {
             connection_manager: options.connection_manager,
-            window_size_seconds: options.window_size_seconds,
-            rate_group_size_ms: options.rate_group_size_ms,
-            hard_limit_factor: options.hard_limit_factor,
-            suppression_factor_cache_ms: options.suppression_factor_cache_ms,
+            window_size: options.provider.window_size,
+            bucket_size: options.provider.bucket_size,
+            hard_limit_factor: options.provider.hard_limit_factor,
+            suppression_factor_cache_period: options.provider.suppression_factor_cache_period,
             key_generator,
-            inc_script: Script::new(&format!("{}\n{}", LUA_HELPERS, SUPPRESSED_INC_LUA)),
-            cleanup_script: Script::new(CLEANUP_LUA),
-            suppression_factor_script: Script::new(&format!(
-                "{}\n{}",
-                LUA_HELPERS, SUPPRESSED_GET_FACTOR_LUA
-            )),
+            inc_script: suppressed_lua_script(SUPPRESSED_INC_LUA),
+            cleanup_script: lua_script(SUPPRESSED_CLEANUP_LUA),
+            suppression_factor_script: suppressed_lua_script(SUPPRESSED_GET_FACTOR_LUA),
+            get_state_script: suppressed_lua_script(SUPPRESSED_GET_STATE_LUA),
+            set_if_script: lua_script(SUPPRESSED_SET_IF_LUA),
         }
     }
 
@@ -327,28 +94,33 @@ impl SuppressedRedisRateLimiter {
     ///
     /// # Returns
     ///
-    /// - `Ok(Allowed)` — below capacity, no suppression active
-    /// - `Ok(Suppressed { is_allowed, suppression_factor })` — at/above capacity, check `is_allowed`
+    /// - `Ok(Allowed)` — the increment remains within soft capacity or reaches the hard limit
+    ///   exactly
+    /// - `Ok(Suppressed { is_allowed, suppression_factor })` — the forecasted accepted total is
+    ///   above soft capacity without landing exactly on the hard limit; check `is_allowed`
     /// - `Err(TrypemaError)` — Redis connectivity or script error
     ///
-    /// The total observed counter is **always** incremented, regardless of the decision.
-    /// If `is_allowed` is `false`, the declined counter is also incremented.
+    /// The total observed counter is **always** incremented, regardless of the decision. If the
+    /// increment reaches the hard limit exactly, it is admitted and a factor of `1.0` is cached
+    /// for subsequent calls. If `is_allowed` is `false`, the declined counter is also incremented.
     ///
     /// # Examples
     ///
-    /// ```
-    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     /// use trypema::redis::RedisKey;
     ///
-    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// // Under limit → Allowed
     /// assert!(matches!(
-    ///     rl.redis().suppressed().inc(&key, &rate, 1).await.unwrap(),
+    ///     rl.suppressed().inc(&key, &rate, 1).await.unwrap(),
     ///     RateLimitDecision::Allowed
     /// ));
-    /// # });
+    /// # }
     /// ```
     pub async fn inc(
         &self,
@@ -356,9 +128,10 @@ impl SuppressedRedisRateLimiter {
         rate_limit: &RateLimit,
         count: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
-        let window_limit =
-            *self.window_size_seconds as f64 * **rate_limit * *self.hard_limit_factor;
         let mut connection_manager = self.connection_manager.clone();
+        let hard_window_limit = self.window_size.as_seconds() as f64
+            * rate_limit.as_per_second()
+            * self.hard_limit_factor.as_multiplier();
 
         let (result, suppression_factor, should_allow): (String, f64, u8) = self
             .inc_script
@@ -371,11 +144,11 @@ impl SuppressedRedisRateLimiter {
             .key(self.key_generator.get_total_declined_key(key))
             .key(self.key_generator.get_hash_declined_key(key))
             .arg(key.to_string())
-            .arg(*self.window_size_seconds)
-            .arg(window_limit)
-            .arg(*self.rate_group_size_ms)
-            .arg(*self.suppression_factor_cache_ms)
-            .arg(*self.hard_limit_factor)
+            .arg(self.window_size.as_seconds())
+            .arg(hard_window_limit)
+            .arg(self.bucket_size.as_milliseconds())
+            .arg(self.suppression_factor_cache_period.as_milliseconds())
+            .arg(self.hard_limit_factor.as_multiplier())
             .arg(count)
             .invoke_async(&mut connection_manager)
             .await?;
@@ -394,12 +167,52 @@ impl SuppressedRedisRateLimiter {
         }
     } // end method inc
 
+    async fn set_if_with_history_mode(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        mode: HistoryUpdateMode,
+    ) -> Result<(u64, u64), TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+        let (comparator_op, comparator_operand) = comparator.redis_args();
+
+        let (new_total, old_total, _changed): (u64, u64, u64) = self
+            .set_if_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_suppression_factor_key(key))
+            .key(self.key_generator.get_total_declined_key(key))
+            .key(self.key_generator.get_hash_declined_key(key))
+            .arg(key.to_string())
+            .arg(self.window_size.as_seconds())
+            .arg(
+                self.window_size.as_seconds() as f64
+                    * rate_limit.as_per_second()
+                    * self.hard_limit_factor.as_multiplier(),
+            )
+            .arg(comparator_op)
+            .arg(comparator_operand)
+            .arg(count)
+            .arg(mode.redis_arg())
+            .arg(0_u64)
+            .arg(0_u64)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok((new_total, old_total))
+    }
+
     /// Get the current suppression factor for `key`.
     ///
     /// Returns a value in the range `[0.0, 1.0]`:
     /// - `0.0` — no suppression (below capacity or key not found)
     /// - `0.0 < sf < 1.0` — partial suppression (at capacity)
-    /// - `1.0` — full suppression (over hard limit)
+    /// - `1.0` — full suppression (cached at the hard boundary or on a forecast above it)
     ///
     /// This method is read-only with respect to request counts — it does not record any
     /// increment. It is useful for exporting metrics, building dashboards, or debugging
@@ -407,19 +220,23 @@ impl SuppressedRedisRateLimiter {
     ///
     /// **Caching:** If a cached value exists in Redis (set via `SET ... PX`), it is returned
     /// directly. Otherwise, this recomputes the factor via the same algorithm used in `inc()`
-    /// and writes it back to Redis with a `suppression_factor_cache_ms` TTL. If the cached
+    /// and writes it back to Redis with a `suppression_factor_cache_period` TTL. If the cached
     /// value is outside `[0.0, 1.0]`, it is treated as stale and recomputed.
+    /// Unknown keys return `0.0` without creating cache or active-entity state. Evicting
+    /// expired history invalidates any factor cached from that history.
     ///
     /// # Examples
     ///
-    /// ```
-    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::redis::RedisKey;
     ///
-    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let key = RedisKey::try_from("user_123").unwrap();
     /// // No state yet → 0.0 (no suppression)
-    /// assert_eq!(rl.redis().suppressed().get_suppression_factor(&key).await.unwrap(), 0.0);
-    /// # });
+    /// assert_eq!(rl.suppressed().get_suppression_factor(&key).await.unwrap(), 0.0);
+    /// # }
     /// ```
     pub async fn get_suppression_factor(&self, key: &RedisKey) -> Result<f64, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
@@ -435,15 +252,180 @@ impl SuppressedRedisRateLimiter {
             .key(self.key_generator.get_total_declined_key(key))
             .key(self.key_generator.get_hash_declined_key(key))
             .arg(key.to_string())
-            .arg(*self.window_size_seconds)
-            .arg(*self.rate_group_size_ms)
-            .arg(*self.suppression_factor_cache_ms)
-            .arg(*self.hard_limit_factor)
+            .arg(self.window_size.as_seconds())
+            .arg(self.bucket_size.as_milliseconds())
+            .arg(self.suppression_factor_cache_period.as_milliseconds())
+            .arg(self.hard_limit_factor.as_multiplier())
             .invoke_async(&mut connection_manager)
             .await?;
 
         Ok(suppression_factor)
     } // end method calculate_suppression_factor
+
+    /// Current live window state for `key`.
+    ///
+    /// Executes an atomic Lua script that evicts expired buckets (keeping the declined counters
+    /// in step) and returns the observed total, declined total, and current suppression factor.
+    /// The observed total includes accepted and declined calls, matching the counter that
+    /// suppression decisions are based on.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
+    /// use trypema::RateLimit;
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// let snapshot = rl.suppressed().get(&key).await.unwrap();
+    /// assert_eq!(snapshot.total, 0);
+    /// assert_eq!(snapshot.total_declined, 0);
+    /// assert_eq!(snapshot.suppression_factor, 0.0);
+    ///
+    /// let rate = RateLimit::per_second(10.0).unwrap();
+    /// rl.suppressed().inc(&key, &rate, 3).await.unwrap();
+    /// assert_eq!(rl.suppressed().get(&key).await.unwrap().total, 3);
+    /// # }
+    /// ```
+    pub async fn get(&self, key: &RedisKey) -> Result<SuppressedRateLimitSnapshot, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let (total, total_declined, suppression_factor): (u64, u64, f64) = self
+            .get_state_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_total_declined_key(key))
+            .key(self.key_generator.get_hash_declined_key(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_suppression_factor_key(key))
+            .arg(key.to_string())
+            .arg(self.window_size.as_seconds())
+            .arg(self.suppression_factor_cache_period.as_milliseconds())
+            .arg(self.hard_limit_factor.as_multiplier())
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(SuppressedRateLimitSnapshot {
+            total,
+            total_declined,
+            suppression_factor,
+        })
+    } // end method get
+
+    /// Conditionally replace the window total for `key` (atomic on Redis).
+    ///
+    /// Executes an atomic Lua script that computes the live total without writing,
+    /// evaluates `comparator`, and — on a match — prunes expired buckets and replaces
+    /// the window contents with a single current-timestamp bucket holding `count`,
+    /// with **no declines** recorded against it. On a match the key's hard window
+    /// limit is (re)defined as `window_size × rate_limit × hard_limit_factor`
+    /// and the cached suppression factor is deleted so it is recomputed from the new
+    /// state on the next call. A comparator miss leaves history, limit, TTL, and
+    /// cached suppression metadata untouched. A matched `count` of zero removes all
+    /// count, decline, limit, cache, history, and active-entity state for the key.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Validated [`RedisKey`] identifying the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit used to (re)define the hard window limit
+    /// - `comparator`: Guard evaluated against the current window total
+    /// - `count`: The total to write when the guard matches
+    ///
+    /// # Returns
+    ///
+    /// A [`ConditionalSetOutcome`] describing whether the comparator matched and the totals
+    /// before and after the operation.
+    ///
+    /// # Priming Idiom
+    ///
+    /// `set_if(key, rate, RateLimitComparator::Lt(count), count)` raises the window
+    /// total to at least `count` and never lowers it — idempotent and safe to retry.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
+    /// use trypema::{RateLimit, RateLimitComparator};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
+    ///
+    /// // Prime the window to 40.
+    /// let outcome = rl
+    ///     .suppressed()
+    ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
+    ///     .await
+    ///     .unwrap();
+    /// assert!(outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 0));
+    ///
+    /// // Re-priming is a no-op: the guard no longer matches.
+    /// let outcome = rl
+    ///     .suppressed()
+    ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
+    ///     .await
+    ///     .unwrap();
+    /// assert!(!outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 40));
+    /// # }
+    /// ```
+    pub async fn set_if(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+    ) -> Result<ConditionalSetOutcome, TrypemaError> {
+        let (current_total, previous_total) = self
+            .set_if_with_history_mode(
+                key,
+                rate_limit,
+                comparator,
+                count,
+                HistoryUpdateMode::Replace,
+            )
+            .await?;
+
+        Ok(ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        })
+    } // end method set_if
+
+    /// Conditionally set the observed total while retaining the selected side of
+    /// the Redis sliding-window history.
+    pub async fn set_if_preserve_history(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        preservation: HistoryPreservation,
+    ) -> Result<ConditionalSetOutcome, TrypemaError> {
+        let (current_total, previous_total) = self
+            .set_if_with_history_mode(
+                key,
+                rate_limit,
+                comparator,
+                count,
+                HistoryUpdateMode::Preserve(preservation),
+            )
+            .await?;
+
+        Ok(ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        })
+    } // end method set_if_preserve_history
 
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();

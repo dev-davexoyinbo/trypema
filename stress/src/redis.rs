@@ -1,30 +1,22 @@
-//! Redis provider benchmark runner.
-//!
-//! Supports three limiter backends (controlled by `--redis-limiter`):
-//!   - `trypema`  — trypema's own Redis Lua-script provider; `--strategy` selects
-//!                  absolute vs suppressed
-//!   - `cell`     — redis-cell module (`CL.THROTTLE`)
-//!   - `gcra`     — GCRA Lua script (port of go-redis/redis_rate)
+//! Redis-provider and Redis-backend comparison stress runner.
 
 #![cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::sync::Arc;
+
+use trypema::{
+    BucketSize, HardLimitFactor, RateLimit, RateLimiterBuilder, SuppressionFactorCachePeriod,
+    WindowSize,
+    redis::{RedisKey, RedisRateLimiterProvider},
 };
-use std::time::{Duration, Instant};
 
-use hdrhistogram::Histogram;
-use trypema::{RateLimit, RateLimiter, RateLimiterOptions, redis::RedisKey};
+use crate::{
+    args::{Args, RedisLimiter, Strategy, build_keys},
+    runner::{RunState, StartGate, WorkerLoop, finish_run},
+    runtime::{async_sleep, join_task, spawn_task},
+};
 
-use crate::args::{Args, RedisLimiter, Strategy, build_keys};
-use crate::runner::{Counts, ErrorStats, WorkerLoop, print_error_stats, print_results};
-use crate::runtime::{async_sleep, join_task, spawn_task};
-
-// ---------------------------------------------------------------------------
-// GCRA Lua script (verbatim from go-redis/redis_rate)
-// ---------------------------------------------------------------------------
-
+// Port of go-redis/redis_rate's allow-N GCRA script.
 const GCRA_ALLOW_N_LUA: &str = r#"
 redis.replicate_commands()
 
@@ -71,10 +63,6 @@ end
 return { cost, remaining, tostring(-1), tostring(reset_after) }
 "#;
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
 pub(crate) fn run(args: &Args) {
     #[cfg(feature = "redis-tokio")]
     {
@@ -88,151 +76,151 @@ pub(crate) fn run(args: &Args) {
     }
 
     #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-    {
-        let args = args.clone();
-        smol::block_on(run_async(args));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Async core (runtime-agnostic — uses runtime.rs primitives)
-// ---------------------------------------------------------------------------
+    smol::block_on(run_async(args.clone()));
+} // end fn run
 
 async fn run_async(args: Args) {
-    let client = redis::Client::open(args.redis_url.as_str()).unwrap();
-    let cm = Arc::new(client.get_connection_manager().await.unwrap());
+    let connection_manager = Arc::new(
+        crate::runtime::create_redis_connection_manager(&args.redis_url)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("failed to connect to Redis: {error}");
+                std::process::exit(2);
+            }),
+    );
+    let rate_limiter = RedisRateLimiterProvider::builder((*connection_manager).clone())
+        .prefix(RedisKey::try_from(args.redis_prefix.as_str()).unwrap())
+        .window_size(WindowSize::seconds_or_panic(args.window_s))
+        .bucket_size(BucketSize::milliseconds_or_panic(args.group_ms))
+        .hard_limit_factor(HardLimitFactor::new_or_panic(args.hard_limit_factor))
+        .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(
+            args.suppression_cache_ms,
+        ))
+        .cleanup_enabled(false)
+        .build()
+        .unwrap();
+    let rate_limit = RateLimit::per_second(args.rate_limit_per_s).unwrap();
 
-    // Build trypema rate limiter (used for RedisLimiter::Trypema arm).
-    let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
-        local: crate::args::build_local_options(&args),
-        redis: crate::args::build_redis_options(&args, (*cm).clone()),
-    }));
-    let rate = RateLimit::try_from(args.rate_limit_per_s).unwrap();
+    warmup(&args, &connection_manager, &rate_limiter, &rate_limit).await;
 
-    // Warm up scripts / modules before the measurement window.
-    warmup(&args, &cm).await;
-
+    let args = Arc::new(args);
     let keys = build_keys(&args);
-    let counts = Arc::new(Counts::default());
-    let total_ops = Arc::new(AtomicU64::new(0));
-    let error_stats = Arc::new(ErrorStats::default());
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(args.duration_s);
-
+    let trypema_keys: Arc<[RedisKey]> = keys
+        .iter()
+        .cloned()
+        .map(RedisKey::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("generated stress keys must be valid Redis keys")
+        .into();
+    let external_keys: Arc<[String]> = keys
+        .iter()
+        .map(|key| format!("{}:{key}", args.redis_prefix))
+        .collect::<Vec<_>>()
+        .into();
+    let state = RunState::default();
+    let start_gate = Arc::new(StartGate::new(args.threads));
     let mut join_handles = Vec::with_capacity(args.threads);
 
-    for t in 0..args.threads {
-        let stop = Arc::clone(&stop);
-        let counts = Arc::clone(&counts);
-        let total_ops = Arc::clone(&total_ops);
-        let error_stats = Arc::clone(&error_stats);
-        let args = args.clone();
-        let keys = keys.clone();
-        let cm = Arc::clone(&cm);
-        let rl = Arc::clone(&rl);
-        let rate = rate.clone();
-
-        // Pre-build RedisKeys for the trypema arm.
-        let trypema_keys: Vec<RedisKey> = keys
-            .iter()
-            .map(|k| RedisKey::try_from(k.clone()).unwrap())
-            .collect();
+    for worker_index in 0..args.threads {
+        let args = Arc::clone(&args);
+        let trypema_keys = Arc::clone(&trypema_keys);
+        let external_keys = Arc::clone(&external_keys);
+        let connection_manager = Arc::clone(&connection_manager);
+        let rate_limiter = Arc::clone(&rate_limiter);
+        let state = state.clone();
+        let start_gate = Arc::clone(&start_gate);
 
         join_handles.push(spawn_task(async move {
-            let mut wl = WorkerLoop::new(
-                args.clone(),
-                keys,
-                counts,
-                total_ops,
-                error_stats,
-                t,
+            let started = start_gate.wait_async().await;
+            let mut worker = WorkerLoop::new(
+                Arc::clone(&args),
+                trypema_keys.len(),
+                state,
+                worker_index,
                 started,
-                deadline,
             );
-
-            // Per-task connection manager clone.
-            let mut conn = (*cm).clone();
+            let mut connection = (*connection_manager).clone();
             let gcra_script = redis::Script::new(GCRA_ALLOW_N_LUA);
 
-            while !stop.load(Ordering::Relaxed) && wl.should_continue() {
-                // Async QPS pacing.
-                if args.mode != crate::args::Mode::Max {
-                    if let Some(qps) = crate::runner::qps_for_now(&args, started) {
-                        let per_op_ns = 1_000_000_000u64 / qps.max(1);
-                        let now = Instant::now();
-                        if now < wl.next_deadline {
-                            async_sleep(wl.next_deadline - now).await;
-                        }
-                        wl.next_deadline += Duration::from_nanos(per_op_ns);
-                    }
+            while worker.should_continue() {
+                if let Some(delay) = worker.pacing_delay() {
+                    async_sleep(delay).await;
+                }
+                if !worker.should_continue() {
+                    break;
                 }
 
-                let idx = wl.pick_idx();
-                let t0 = wl.begin_iter();
+                let key_index = worker.pick_index();
+                let sample_started = worker.begin_iteration();
 
                 match args.redis_limiter {
                     RedisLimiter::Trypema => {
-                        let k = &trypema_keys[idx % trypema_keys.len()];
-                        let res = match args.strategy {
-                            Strategy::Absolute => rl.redis().absolute().inc(k, &rate, 1).await,
-                            Strategy::Suppressed => rl.redis().suppressed().inc(k, &rate, 1).await,
+                        let key = &trypema_keys[key_index];
+                        let result = match args.strategy {
+                            Strategy::Absolute => {
+                                rate_limiter.absolute().inc(key, &rate_limit, 1).await
+                            }
+                            Strategy::Suppressed => {
+                                rate_limiter.suppressed().inc(key, &rate_limit, 1).await
+                            }
                         };
-                        wl.end_iter(t0);
-                        match res {
-                            Ok(decision) => wl.record_decision(decision),
-                            Err(err) => wl.record_error(
-                                err.to_string(),
+                        worker.end_iteration(sample_started);
+
+                        match result {
+                            Ok(decision) => worker.record_decision(args.strategy, decision, || {
+                                format!("provider=redis limiter=trypema key={key:?}")
+                            }),
+                            Err(error) => worker.record_error(
+                                error.to_string(),
                                 Some(format!(
-                                    "provider=redis limiter=trypema key={k:?} err={err:?}"
+                                    "provider=redis limiter=trypema key={key:?} error={error:?}"
                                 )),
                             ),
                         }
                     }
-
                     RedisLimiter::Cell => {
-                        let key = wl.key(idx);
-                        let full_key = format!("{}:{}", args.redis_prefix, key);
-                        let res: redis::RedisResult<(i64, i64, i64, i64, i64)> =
+                        let key = &external_keys[key_index];
+                        let result: redis::RedisResult<(i64, i64, i64, i64, i64)> =
                             redis::cmd("CL.THROTTLE")
-                                .arg(&full_key)
+                                .arg(key)
                                 .arg(args.cell_burst)
-                                .arg(args.rate_limit_per_s.max(1.0).round() as u64)
-                                .arg(1u64) // period = 1 s
-                                .arg(1u64) // quantity = 1
-                                .query_async(&mut conn)
+                                .arg(args.rate_limit_per_s as u64)
+                                .arg(1u64)
+                                .arg(1u64)
+                                .query_async(&mut connection)
                                 .await;
-                        wl.end_iter(t0);
-                        match res {
-                            Ok((limited, _, _, _, _)) => wl.record_allowed(limited == 0),
-                            Err(err) => wl.record_error(
-                                err.to_string(),
+                        worker.end_iteration(sample_started);
+
+                        match result {
+                            Ok((is_limited, _, _, _, _)) => worker.record_allowed(is_limited == 0),
+                            Err(error) => worker.record_error(
+                                error.to_string(),
                                 Some(format!(
-                                    "provider=redis limiter=cell key={full_key} err={err:?}"
+                                    "provider=redis limiter=cell key={key} error={error:?}"
                                 )),
                             ),
                         }
                     }
-
                     RedisLimiter::Gcra => {
-                        let key = wl.key(idx);
-                        let full_key = format!("{}:{}", args.redis_prefix, key);
-                        let res: redis::RedisResult<(i64, f64, String, String)> = gcra_script
-                            .key(&full_key)
+                        let key = &external_keys[key_index];
+                        let result: redis::RedisResult<(i64, f64, String, String)> = gcra_script
+                            .key(key)
                             .arg(args.gcra_burst)
-                            .arg(args.rate_limit_per_s.max(1.0).round() as u64)
-                            .arg(1u64) // period = 1 s
-                            .arg(1u64) // cost = 1
-                            .invoke_async(&mut conn)
+                            .arg(args.rate_limit_per_s as u64)
+                            .arg(1u64)
+                            .arg(1u64)
+                            .invoke_async(&mut connection)
                             .await;
-                        wl.end_iter(t0);
-                        match res {
-                            Ok((allowed, _, _, _)) => wl.record_allowed(allowed != 0),
-                            Err(err) => wl.record_error(
-                                err.to_string(),
+                        worker.end_iteration(sample_started);
+
+                        match result {
+                            Ok((allowed_count, _, _, _)) => {
+                                worker.record_allowed(allowed_count != 0)
+                            }
+                            Err(error) => worker.record_error(
+                                error.to_string(),
                                 Some(format!(
-                                    "provider=redis limiter=gcra key={full_key} err={err:?}"
+                                    "provider=redis limiter=gcra key={key} error={error:?}"
                                 )),
                             ),
                         }
@@ -240,62 +228,78 @@ async fn run_async(args: Args) {
                 }
             }
 
-            wl.into_hist()
+            worker.into_histogram()
         }));
     }
 
-    async_sleep(Duration::from_secs(args.duration_s)).await;
-    stop.store(true, Ordering::Relaxed);
-
-    let mut merged = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+    let started = start_gate.start_async().await;
+    let mut histograms = Vec::with_capacity(join_handles.len());
     for handle in join_handles {
-        merged.add(join_task(handle).await).unwrap();
+        histograms.push(join_task(handle).await);
     }
-
-    let elapsed = started.elapsed();
-    let ops = total_ops.load(Ordering::Relaxed);
-    println!("redis_limiter={:?}", args.redis_limiter);
-    print_results(
-        &args,
-        elapsed,
-        ops,
-        ops as f64 / elapsed.as_secs_f64(),
-        &merged,
-        &counts,
-    );
-    print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
-}
-
-// ---------------------------------------------------------------------------
-// Warmup
-// ---------------------------------------------------------------------------
-
-async fn warmup(args: &Args, cm: &Arc<redis::aio::ConnectionManager>) {
-    let mut conn = (**cm).clone();
-    let key = format!("{}:warmup", args.redis_prefix);
-
     match args.redis_limiter {
+        RedisLimiter::Trypema => println!("redis_limiter=Trypema"),
+        RedisLimiter::Cell => println!("redis_limiter=Cell cell_burst={}", args.cell_burst),
+        RedisLimiter::Gcra => println!("redis_limiter=Gcra gcra_burst={}", args.gcra_burst),
+    }
+    finish_run(&args, started, histograms, &state);
+} // end fn run_async
+
+async fn warmup(
+    args: &Args,
+    connection_manager: &redis::aio::ConnectionManager,
+    rate_limiter: &RedisRateLimiterProvider,
+    rate_limit: &RateLimit,
+) {
+    let result = match args.redis_limiter {
+        RedisLimiter::Trypema => {
+            let key = RedisKey::new_or_panic("stress_warmup".to_string());
+            match args.strategy {
+                Strategy::Absolute => rate_limiter
+                    .absolute()
+                    .inc(&key, rate_limit, 1)
+                    .await
+                    .map(|_| ()),
+                Strategy::Suppressed => rate_limiter
+                    .suppressed()
+                    .inc(&key, rate_limit, 1)
+                    .await
+                    .map(|_| ()),
+            }
+            .map_err(|error| error.to_string())
+        }
         RedisLimiter::Cell => {
-            let _: redis::RedisResult<(i64, i64, i64, i64, i64)> = redis::cmd("CL.THROTTLE")
-                .arg(&key)
+            let mut connection = connection_manager.clone();
+            let key = format!("{}:warmup", args.redis_prefix);
+            redis::cmd("CL.THROTTLE")
+                .arg(key)
                 .arg(args.cell_burst)
-                .arg(args.rate_limit_per_s.max(1.0).round() as u64)
+                .arg(args.rate_limit_per_s as u64)
                 .arg(1u64)
                 .arg(1u64)
-                .query_async(&mut conn)
-                .await;
+                .query_async::<(i64, i64, i64, i64, i64)>(&mut connection)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
         }
         RedisLimiter::Gcra => {
-            let script = redis::Script::new(GCRA_ALLOW_N_LUA);
-            let _: redis::RedisResult<(i64, f64, String, String)> = script
-                .key(&key)
+            let mut connection = connection_manager.clone();
+            let key = format!("{}:warmup", args.redis_prefix);
+            redis::Script::new(GCRA_ALLOW_N_LUA)
+                .key(key)
                 .arg(args.gcra_burst)
-                .arg(args.rate_limit_per_s.max(1.0).round() as u64)
+                .arg(args.rate_limit_per_s as u64)
                 .arg(1u64)
                 .arg(1u64)
-                .invoke_async(&mut conn)
-                .await;
+                .invoke_async::<(i64, f64, String, String)>(&mut connection)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
         }
-        RedisLimiter::Trypema => {} // no script warmup needed
+    };
+
+    if let Err(error) = result {
+        eprintln!("redis backend warmup failed: {error}");
+        std::process::exit(2);
     }
-}
+} // end fn warmup

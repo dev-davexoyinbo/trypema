@@ -1,17 +1,11 @@
-use std::{
-    hash::Hash,
-    ops::{Deref, DerefMut},
-    sync::{LazyLock, Mutex},
-};
-
-use regex::Regex;
-
-static REDIS_KEY_STRIP_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r":").expect("REDIS_KEY_STRIP_RE is valid"));
+use std::{fmt, hash::Hash, sync::Mutex};
 
 use dashmap::{DashMap, mapref::one::RefMut, try_result::TryResult};
 
-use crate::{TrypemaError, common::RateType};
+use crate::{
+    TrypemaError,
+    common::{RandomState, RateType},
+};
 
 /// A validated newtype for Redis rate limiting keys.
 ///
@@ -48,6 +42,11 @@ use crate::{TrypemaError, common::RateType};
 pub struct RedisKey(String);
 
 impl RedisKey {
+    /// Return key as string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Create a new default prefix.
     pub fn default_prefix() -> Self {
         Self("trypema".to_string())
@@ -64,52 +63,13 @@ impl RedisKey {
 
     /// Panicking constructor. The `_or_panic` suffix signals that this call can panic.
     pub fn new_or_panic(value: String) -> Self {
-        Self::try_from(value).expect("invalid RedisKey")
-    }
-
-    /// Strip colons from `value`, then validate and return a [`RedisKey`].
-    ///
-    /// Colons are stripped because they are used internally as key separators
-    /// (e.g. `{prefix}:{key}:{rate_type}:{suffix}`). Returns `Err` if the sanitized
-    /// string is still invalid — for example, if `value` was entirely colons (empty
-    /// after stripping) or exceeds 255 bytes after stripping.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use trypema::redis::RedisKey;
-    ///
-    /// let key = RedisKey::try_sanitize("user:123".to_string()).unwrap();
-    /// assert_eq!(*key, "user123");
-    ///
-    /// // Entirely colons → empty after stripping → Err
-    /// assert!(RedisKey::try_sanitize(":".to_string()).is_err());
-    /// ```
-    pub fn try_sanitize(value: String) -> Result<Self, crate::TrypemaError> {
-        let sanitized = REDIS_KEY_STRIP_RE.replace_all(&value, "").into_owned();
-        Self::try_from(sanitized)
-    }
-
-    /// Strip colons from `value`, then return a [`RedisKey`].
-    ///
-    /// Panics if the sanitized string is still invalid (e.g. was entirely colons, or too long).
-    /// The `_or_panic` suffix signals that this call can panic.
-    pub fn sanitize_or_panic(value: String) -> Self {
-        Self::try_sanitize(value).expect("sanitized RedisKey value is still invalid")
+        Self::try_from(value).unwrap()
     }
 }
 
-impl Deref for RedisKey {
-    type Target = String;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for RedisKey {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+impl fmt::Display for RedisKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -132,6 +92,14 @@ impl TryFrom<String> for RedisKey {
         } else {
             Ok(Self(value))
         }
+    }
+}
+
+impl TryFrom<&str> for RedisKey {
+    type Error = TrypemaError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from(value.to_string())
     }
 }
 
@@ -166,7 +134,7 @@ impl RedisKeyGenerator {
     }
 
     fn get_key_with_suffix(&self, key: &RedisKey, suffix: &str) -> String {
-        format!("{}:{}:{}:{}", *self.prefix, **key, self.rate_type, suffix)
+        format!("{}:{}:{}:{}", self.prefix, key, self.rate_type, suffix)
     }
 
     pub(crate) fn get_hash_key(&self, key: &RedisKey) -> String {
@@ -196,7 +164,7 @@ impl RedisKeyGenerator {
     pub(crate) fn get_active_entities_key(&self) -> String {
         format!(
             "{}:{}:{}",
-            *self.prefix, self.rate_type, self.active_entities_key_suffix
+            self.prefix, self.rate_type, self.active_entities_key_suffix
         )
     }
 
@@ -234,7 +202,7 @@ pub(crate) fn mutex_lock<'a, T>(
 pub(crate) const _GET_MUT_TIMEOUT_MS: u64 = 3;
 
 pub(crate) async fn _try_get_mut_async_with_timeout<'a, K, V>(
-    map: &'a DashMap<K, V>,
+    map: &'a DashMap<K, V, RandomState>,
     key: &K,
     timeout_ms: u64,
 ) -> Option<RefMut<'a, K, V>>

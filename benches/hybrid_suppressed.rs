@@ -8,83 +8,108 @@ mod common;
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 mod enabled {
-    use std::time::Duration;
+    use std::{hint::black_box, time::Duration};
 
-    use criterion::Criterion;
-    use std::hint::black_box;
-
+    use criterion::{BatchSize, Criterion};
     use trypema::redis::RedisKey;
     use trypema::{HistoryPreservation, RateLimit, RateLimitComparator};
 
-    use super::common::{LimiterConfig, redis::build_redis_limiter};
+    use super::common::{LimiterConfig, redis::build_hybrid_limiter};
     use super::runtime;
 
-    pub fn bench_inc(c: &mut Criterion) {
-        let mut group = c.benchmark_group("redis_suppressed");
+    pub fn bench_public_api(c: &mut Criterion) {
+        let mut group = c.benchmark_group("hybrid_suppressed");
         group.sample_size(40);
-
         let rt = runtime::build();
-
         let rl = runtime::block_on(
             &rt,
-            build_redis_limiter(LimiterConfig {
+            build_hybrid_limiter(LimiterConfig {
                 hard_limit_factor: 1.5,
-                prefix: "bench_redis_suppressed",
+                prefix: "bench_hybrid_suppressed",
                 ..LimiterConfig::default()
             }),
         );
-
-        let key = RedisKey::try_from("user_1".to_string()).unwrap();
-        let rate = RateLimit::per_second(5.0).unwrap();
-
-        // Warm.
+        let rate = RateLimit::max();
+        let hot_key = RedisKey::try_from("hot_key".to_string()).unwrap();
         runtime::block_on(&rt, async {
-            let _ = rl.suppressed().inc(&key, &rate, 1).await.unwrap();
-            let _ = rl.suppressed().get_suppression_factor(&key).await.unwrap();
+            rl.suppressed().inc(&hot_key, &rate, 1).await.unwrap();
         });
 
         group.bench_function("inc/hot_key", |b| {
             b.iter(|| {
-                let _ = runtime::block_on(&rt, async {
-                    let res = rl
-                        .suppressed()
-                        .inc(black_box(&key), black_box(&rate), black_box(1))
-                        .await;
-                    black_box(res)
-                });
-            });
-        });
-
-        group.bench_function("get_suppression_factor/hot_key", |b| {
-            b.iter(|| {
-                let _ = runtime::block_on(&rt, async {
-                    let res = rl
-                        .suppressed()
-                        .get_suppression_factor(black_box(&key))
-                        .await;
-                    black_box(res)
-                });
-            });
-        });
-
-        let set_key = RedisKey::try_from("set_user".to_string()).unwrap();
-        runtime::block_on(&rt, async {
-            rl.suppressed()
-                .set_if(&set_key, &rate, RateLimitComparator::Always, 100)
-                .await
-                .unwrap();
-        });
-        group.bench_function("set_if/guard_miss", |b| {
-            b.iter(|| {
                 black_box(runtime::block_on(&rt, async {
                     rl.suppressed()
-                        .set_if(&set_key, &rate, RateLimitComparator::Eq(0), 50)
+                        .inc(black_box(&hot_key), black_box(&rate), black_box(1))
                         .await
                 }))
             });
         });
 
-        let replace_key = RedisKey::try_from("replace_user".to_string()).unwrap();
+        group.bench_function("get/redis_synchronized", |b| {
+            b.iter(|| {
+                black_box(runtime::block_on(&rt, async {
+                    rl.suppressed().get(black_box(&hot_key)).await
+                }))
+            });
+        });
+
+        group.bench_function("get_estimate/local_fast_path", |b| {
+            b.iter(|| {
+                black_box(runtime::block_on(&rt, async {
+                    rl.suppressed().get_estimate(black_box(&hot_key)).await
+                }))
+            });
+        });
+
+        let refresh_key = RedisKey::try_from("refresh_key".to_string()).unwrap();
+        group.bench_function("get_estimate/redis_refresh", |b| {
+            b.iter_batched(
+                || {
+                    runtime::block_on(&rt, async {
+                        rl.suppressed()
+                            .set_if(&refresh_key, &rate, RateLimitComparator::Always, 1)
+                            .await
+                            .unwrap();
+                    });
+                },
+                |_| {
+                    black_box(runtime::block_on(&rt, async {
+                        rl.suppressed().get_estimate(black_box(&refresh_key)).await
+                    }))
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.bench_function("get_suppression_factor/hot_key", |b| {
+            b.iter(|| {
+                black_box(runtime::block_on(&rt, async {
+                    rl.suppressed()
+                        .get_suppression_factor(black_box(&hot_key))
+                        .await
+                }))
+            });
+        });
+
+        let guard_key = RedisKey::try_from("guard".to_string()).unwrap();
+        runtime::block_on(&rt, async {
+            rl.suppressed()
+                .set_if(&guard_key, &rate, RateLimitComparator::Always, 100)
+                .await
+                .unwrap();
+        });
+
+        group.bench_function("set_if/guard_miss", |b| {
+            b.iter(|| {
+                black_box(runtime::block_on(&rt, async {
+                    rl.suppressed()
+                        .set_if(&guard_key, &rate, RateLimitComparator::Eq(0), 50)
+                        .await
+                }))
+            });
+        });
+
+        let replace_key = RedisKey::try_from("replace".to_string()).unwrap();
         runtime::block_on(&rt, async {
             rl.suppressed()
                 .set_if(&replace_key, &rate, RateLimitComparator::Always, 100)
@@ -141,12 +166,12 @@ mod enabled {
 }
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-fn bench_inc(c: &mut Criterion) {
-    enabled::bench_inc(c)
+fn bench_public_api(c: &mut Criterion) {
+    enabled::bench_public_api(c)
 }
 
 #[cfg(not(any(feature = "redis-tokio", feature = "redis-smol")))]
-fn bench_inc(_: &mut Criterion) {}
+fn bench_public_api(_: &mut Criterion) {}
 
-criterion_group!(benches, bench_inc);
+criterion_group!(benches, bench_public_api);
 criterion_main!(benches);

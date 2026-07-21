@@ -20,10 +20,20 @@ Local microbenchmarks:
 make bench-local
 ```
 
-Redis microbenchmarks (starts Redis via docker compose):
+Redis microbenchmarks (every target starts Redis via Docker Compose and stops it afterward):
 
 ```bash
 make bench-redis
+make bench-redis-tokio
+make bench-redis-smol
+```
+
+Hybrid microbenchmarks use the same lifecycle:
+
+```bash
+make bench-hybrid
+make bench-hybrid-tokio
+make bench-hybrid-smol
 ```
 
 Local stress test (max throughput):
@@ -47,8 +57,20 @@ Bench binaries:
 
 - `benches/local_absolute.rs`
 - `benches/local_suppressed.rs`
-- `benches/redis_absolute.rs` (requires `--features redis-tokio`)
-- `benches/redis_suppressed.rs` (requires `--features redis-tokio`)
+- `benches/redis_absolute.rs` (requires a Redis feature)
+- `benches/redis_suppressed.rs` (requires a Redis feature)
+- `benches/hybrid_absolute.rs` (requires a Redis feature)
+- `benches/hybrid_suppressed.rs` (requires a Redis feature)
+
+The local suites include fresh hot-key `get` benchmarks for a single thread and
+for 2, 8, and 16 concurrent readers of the same DashMap entry. These cases make
+shared-to-exclusive lock regressions visible as contended-throughput changes. The suppressed
+cases consume the complete `SuppressedRateLimitSnapshot`, including both counters and the factor.
+All six suites compare conditional-set guard misses with matched replacement,
+`PreserveNewest`, and `PreserveOldest` history adjustments. Each hybrid suite also benchmarks
+every strategy-specific public operation: `inc`, reads, admission checks where applicable, and
+both conditional-set forms. Both hybrid strategies measure the local `get_estimate` fast path,
+its Redis-refresh path, and Redis-synchronized `get` reads separately.
 
 Run one bench directly:
 
@@ -59,6 +81,27 @@ cargo bench --bench local_absolute
 ## Stress Harness
 
 The stress harness lives in a separate workspace crate: `stress/` (package: `trypema-stress`).
+
+Harness guarantees:
+
+- `--target-qps` and `--burst-qps` are aggregate rates across all worker threads or tasks, not
+  per-worker rates.
+- Workers are created before a synchronized start, and no operation begins after the configured
+  deadline.
+- Every completed operation is classified exactly once as allowed, rejected, suppressed-allowed,
+  suppressed-denied, or errored. An accounting mismatch or limiter-operation error fails the run.
+- Hot-key distributions allocate one key; uniform and skewed distributions allocate exactly
+  `--key-space` keys shared by all workers.
+- Redis and hybrid runs append a process/time namespace to `--redis-prefix`, so repeated matrix
+  runs do not inherit history from earlier runs.
+- Limiter warmup, worker creation, key generation, and external Redis-key formatting are outside
+  the measured interval. Latency sampling covers only the limiter operation.
+- Invalid or misleading configurations are rejected. Burster, Governor, redis-cell, and GCRA
+  support only `--strategy absolute`; Redis and hybrid providers require exactly one runtime
+  feature.
+
+Use the no-feature build for isolated local measurements. A Redis-enabled build can still
+construct and benchmark the local provider independently.
 
 Examples:
 
@@ -126,6 +169,10 @@ Notes:
 
 - `redis-cell` is loaded into the Redis container as a module via `compose.yaml`.
 - `--redis-limiter cell|gcra` uses different semantics than trypema's sliding window; treat results as backend cost comparisons, not strict behavioral equivalence.
+
+> The result tables below predate the synchronized, globally paced, run-isolated harness. Keep
+> them as historical context only; rerun the documented targets before using numbers as a current
+> regression baseline.
 
 ## Redis Uniform Matrix (trypema vs redis-cell vs GCRA)
 
@@ -258,6 +305,8 @@ Notes:
 
 - For `burster`, the window is a const-generic (`W` ms). The harness currently supports `--window-s 10|60|300`.
 - For `governor`, we configure `Quota::per_second(rate).allow_burst(rate * window_s)` to roughly match "capacity per window". This is still not a strict sliding window.
+- Burster and Governor reject `--strategy suppressed`; they do not silently substitute absolute
+  behavior.
 
 Run:
 

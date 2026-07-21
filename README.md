@@ -1,8 +1,147 @@
-# Trypema Rate Limiter
+# Trypema
 
-[![Crates.io](https://img.shields.io/crates/v/trypema.svg)](https://crates.io/crates/trypema)
-[![Documentation](https://docs.rs/trypema/badge.svg)](https://docs.rs/trypema)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+High-performance sliding-window rate limiting primitives for Rust, designed for concurrency
+safety, low overhead, and predictable latency.
+
+Trypema offers two strategies:
+
+- Absolute: rejects requests after the configured window capacity is reached.
+- Suppressed: progressively suppresses traffic between a soft target and a hard cutoff.
+
+And three independently constructed providers:
+
+- Local: in-process, synchronous, always available.
+- Redis: distributed, async, one atomic Redis script per operation.
+- Hybrid: local fast path with mandatory periodic Redis synchronization.
+
+## Install
+
+```toml
+[dependencies]
+trypema = "2"
+```
+
+For Redis or hybrid providers, enable exactly one runtime feature:
+
+```toml
+trypema = { version = "2", features = ["redis-tokio"] }
+# or: features = ["redis-smol"]
+```
+
+Redis-backed providers require Redis 7.2 or newer.
+
+## Local example
+
+```rust
+use std::time::Duration;
+use trypema::{
+    BucketSize, RateLimit, RateLimitDecision, RateLimiterBuilder, WindowSize,
+    local::LocalRateLimiterProvider,
+};
+
+let provider = LocalRateLimiterProvider::builder()
+    .window_size(WindowSize::minutes_or_panic(1))
+    .bucket_size(BucketSize::milliseconds_or_panic(10))
+    .cleanup_interval(Duration::from_secs(30))
+    .build()
+    .unwrap();
+
+let rate = RateLimit::per_second_or_panic(10.0);
+let decision = provider.absolute().inc("user-123", &rate, 1);
+assert!(matches!(decision, RateLimitDecision::Allowed));
+```
+
+All concrete builders implement the shared `RateLimiterBuilder` trait. `build()` returns an
+`Arc` and starts stale-state cleanup by default. Use `.disable_cleanup()` to opt out, or control
+conditional builder configuration with `.enable_cleanup()`. After construction, use the provider's
+idempotent `start_cleanup_loop()` and `stop_cleanup_loop()` methods.
+
+## Redis and hybrid construction
+
+```rust,ignore
+use trypema::{BucketSize, RateLimiterBuilder, WindowSize};
+use trypema::redis::{RedisKey, RedisRateLimiterProvider};
+
+let connection = redis::Client::open("redis://127.0.0.1/")?
+    .get_connection_manager()
+    .await?;
+let provider = RedisRateLimiterProvider::builder(connection)
+    .prefix(RedisKey::try_from("my-service")?)
+    .window_size(WindowSize::minutes_or_panic(1))
+    .bucket_size(BucketSize::milliseconds_or_panic(10))
+    .build()?;
+```
+
+Hybrid adds a provider-specific synchronization interval:
+
+```rust,ignore
+use trypema::{RateLimiterBuilder, hybrid::{HybridRateLimiterProvider, SyncInterval}};
+
+let provider = HybridRateLimiterProvider::builder(connection)
+    .sync_interval(SyncInterval::milliseconds_or_panic(10))
+    .build()?;
+```
+
+Redis and hybrid operations accept `&RedisKey`. Local operations accept `&str`. Invalid Redis
+keys are rejected; keys are never silently sanitized.
+
+## Semantic time values
+
+The public API uses validated, unit-aware values:
+
+| Type | Constructors |
+| --- | --- |
+| `RateLimit` | `per_second`, `per_minute`, `per_hour`, `per_day`, `per_week`, `per_month` |
+| `WindowSize` | `seconds`, `minutes`, `hours`, `days`, `weeks`, `months` |
+| `BucketSize` | `milliseconds`, `seconds`, `minutes`, `hours`, `days`, `weeks`, `months` |
+| `SuppressionFactorCachePeriod` | `milliseconds`, `seconds`, `minutes`, `hours`, `days` |
+| `hybrid::SyncInterval` | `milliseconds`, `seconds`, `minutes`, `hours` |
+
+Provider builders require `bucket_size` to be less than or equal to `window_size`; equality is
+valid. The relationship is checked by `build()`, regardless of setter order.
+
+One month is defined as 30 days. Every constructor has an `_or_panic` counterpart. `RateLimit`
+provides matching `as_per_second()`, `as_per_minute()`, `as_per_hour()`, `as_per_day()`,
+`as_per_week()`, and `as_per_month()` getters. `WindowSize` provides `as_seconds()`,
+`as_milliseconds()`, `as_minutes()`, `as_hours()`, `as_days()`, `as_weeks()`, and `as_months()`;
+the minute-and-larger getters return `f64`. `SyncInterval` provides `as_milliseconds()`,
+`as_seconds()`, `as_minutes()`, and `as_hours()`; the second-and-larger getters return `f64`.
+These getters expose values without leaking or permitting mutation of their representation.
+
+## Conditional updates
+
+`set_if` and `set_if_preserve_history` return `ConditionalSetOutcome`:
+
+- `matched` distinguishes a comparator miss from a successful no-op.
+- `previous_total` is the live total used by the comparison.
+- `current_total` is the total after the operation.
+
+Use `RateLimitComparator::Always` for an unconditional update through the conditional path.
+Matched zero targets delete state. Matched updates also replace the sticky window capacity.
+`set_if_preserve_history` additionally retains one side of live history:
+
+- `PreserveNewest` consumes oldest buckets first; increases extend newest history.
+- `PreserveOldest` consumes newest buckets first; increases extend oldest history.
+
+## Decisions and behavior
+
+`RateLimitDecision::Rejected` exposes `window_size: WindowSize`, `retry_after: Duration`, and
+`remaining_after_waiting`. Metadata is best-effort under bucket coalescing and concurrency.
+Suppressed decisions expose `is_allowed` and `suppression_factor`.
+
+Absolute `get` returns the live total as `u64`. Suppressed `get` returns
+`SuppressedRateLimitSnapshot` with observed usage, declined usage, and suppression factor.
+Unknown keys return zero-valued results without creating state. Hybrid reads include this
+instance's pending local counts; `get_estimate` may answer from local state without Redis I/O.
+
+`RateLimitDecision` is exhaustive, while the fields of its `Rejected` and `Suppressed` variants
+are non-exhaustive; match those variants with `{ .. }`. Other public result structs and the error
+model are non-exhaustive. Absolute admission is best-effort under concurrency and may temporarily
+overshoot. Reads report live state and may lazily evict expired buckets.
+
+## License
+
+MIT
 
 ## Name and Biblical Inspiration
 
@@ -19,307 +158,3 @@ meaning "hole" or "opening." It appears in the phrase **"διὰ τρυπήμα�
 
 Just as the eye of a needle is a narrow passage that restricts what can pass through,
 a rate limiter is a narrow gate that controls the flow of requests into a system.
-
-## Overview
-
-Trypema is a sliding-window rate limiting crate with:
-
-- **Local** in-memory limiting for single-process workloads
-- **Redis** best-effort distributed limiting with atomic Lua scripts
-- **Hybrid** best-effort distributed limiting with a local fast path and periodic Redis sync
-
-Each provider offers:
-
-- **Absolute** deterministic allow/reject decisions
-- **Suppressed** probabilistic degradation near or above the target rate
-
-## Picking a Provider
-
-| Provider   | Best for                                   | Trade-off                                        |
-| ---------- | ------------------------------------------ | ------------------------------------------------ |
-| **Local**  | single-process services, jobs, CLIs        | not shared across processes                      |
-| **Redis**  | shared limits across processes or machines | every check performs Redis I/O                   |
-| **Hybrid** | high-throughput distributed request paths  | state can lag behind Redis by `sync_interval_ms` |
-
-Redis and hybrid providers require Redis 7.2+ and exactly one runtime feature: `redis-tokio` or
-`redis-smol`.
-
-## Installation
-
-Local-only:
-
-```toml
-[dependencies]
-trypema = "1"
-```
-
-Redis with Tokio:
-
-```toml
-[dependencies]
-trypema = { version = "1", features = ["redis-tokio"] }
-```
-
-Redis with Smol:
-
-```toml
-[dependencies]
-trypema = { version = "1", features = ["redis-smol"] }
-```
-
-## Quick Start
-
-### Common Types
-
-`RateLimit` is the per-second limit value used by all providers. `RedisKey` is the validated key
-type required by the Redis and hybrid providers. `RateLimitDecision` is the result returned by
-`inc()` and `is_allowed()`, and `RateLimiter` is the top-level entry point used throughout the
-examples.
-
-```rust,no_run
-use trypema::RateLimit;
-use trypema::redis::RedisKey;
-
-let _rate_a = RateLimit::new(5.0).unwrap();
-let _rate_b = RateLimit::try_from(5.0).unwrap();
-let _rate_c = RateLimit::new_or_panic(5.0);
-
-let _key_a = RedisKey::new("user_123".to_string()).unwrap();
-let _key_b = RedisKey::try_from("user_123".to_string()).unwrap();
-let _key_c = RedisKey::new_or_panic("user_123".to_string());
-```
-
-### Create a `RateLimiter`
-
-These examples show the local-only and Redis-enabled builder paths.
-
-```rust
-use trypema::{RateLimit, RateLimitDecision, RateLimiterBuilder};
-
-let rl = RateLimiterBuilder::default()
-    // Optional: override the sliding window size.
-    .window_size_seconds(60)
-    // Optional: override bucket coalescing.
-    .rate_group_size_ms(10)
-    // Optional: tune suppressed-mode headroom.
-    .hard_limit_factor(1.5)
-    // Optional: tune cleanup cadence.
-    .cleanup_interval_ms(15_000)
-    .build()
-    .unwrap();
-
-let rate = RateLimit::try_from(5.0).unwrap();
-
-assert!(matches!(
-    rl.local().absolute().inc("user_123", &rate, 1),
-    RateLimitDecision::Allowed
-));
-```
-
-```rust
-use trypema::{RateLimit, RateLimitDecision, RateLimiter};
-
-let rl = RateLimiter::builder().build().unwrap();
-let rate = RateLimit::try_from(5.0).unwrap();
-
-assert!(matches!(
-    rl.local().absolute().inc("user_123", &rate, 1),
-    RateLimitDecision::Allowed
-));
-```
-
-```rust,no_run
-use trypema::{RateLimit, RateLimitDecision, RateLimiter};
-use trypema::redis::RedisKey;
-
-async fn example() -> Result<(), trypema::TrypemaError> {
-    let url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-    let connection_manager = redis::Client::open(url)?
-        .get_connection_manager()
-        .await?;
-
-    let rl = RateLimiter::builder(connection_manager)
-        // Optional: override the sliding window size.
-        .window_size_seconds(60)
-        // Optional: override bucket coalescing.
-        .rate_group_size_ms(10)
-        // Optional: tune suppressed-mode headroom.
-        .hard_limit_factor(1.5)
-        // Optional: only available with `redis-tokio` or `redis-smol`.
-        .redis_prefix(RedisKey::new_or_panic("docs".to_string()))
-        // Optional: only available with `redis-tokio` or `redis-smol`.
-        .sync_interval_ms(10)
-        .build()?;
-
-    let key = RedisKey::try_from("user_123".to_string())?;
-    let rate = RateLimit::try_from(5.0).unwrap();
-
-    assert!(matches!(
-        rl.redis().absolute().inc(&key, &rate, 1).await?,
-        RateLimitDecision::Allowed
-    ));
-
-    Ok(())
-}
-```
-
-```rust
-use std::sync::Arc;
-
-use trypema::{
-    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, RateLimiter,
-    RateLimiterOptions, SuppressionFactorCacheMs, WindowSizeSeconds,
-};
-use trypema::local::LocalRateLimiterOptions;
-
-let options = RateLimiterOptions {
-    local: LocalRateLimiterOptions {
-        window_size_seconds: WindowSizeSeconds::new_or_panic(60),
-        rate_group_size_ms: RateGroupSizeMs::new_or_panic(10),
-        hard_limit_factor: HardLimitFactor::new_or_panic(1.5),
-        suppression_factor_cache_ms: SuppressionFactorCacheMs::new_or_panic(100),
-    },
-};
-
-let rl = Arc::new(RateLimiter::new(options));
-rl.run_cleanup_loop();
-
-let rate = RateLimit::try_from(5.0).unwrap();
-
-assert!(matches!(
-    rl.local().absolute().inc("user_123", &rate, 1),
-    RateLimitDecision::Allowed
-));
-```
-
-`build()` starts the cleanup loop automatically. `RateLimiter::new(...)` does not, so call
-`run_cleanup_loop()` yourself when you want background cleanup of stale keys.
-
-### Local Read-Only Check
-
-```rust
-use trypema::{RateLimit, RateLimitDecision, RateLimiter};
-
-let rl = RateLimiter::builder().build().unwrap();
-let limiter = rl.local().absolute();
-let rate = RateLimit::try_from(5.0).unwrap();
-
-assert!(matches!(limiter.is_allowed("user_123"), RateLimitDecision::Allowed));
-assert!(matches!(
-    limiter.inc("user_123", &rate, 1),
-    RateLimitDecision::Allowed
-));
-```
-
-### Read Current Suppression State
-
-```rust
-use trypema::RateLimiter;
-
-let rl = RateLimiter::builder().build().unwrap();
-
-let sf = rl.local().suppressed().get_suppression_factor("user_123");
-assert_eq!(sf, 0.0);
-```
-
-### Redis Absolute
-
-```rust,no_run
-use trypema::{RateLimit, RateLimitDecision, RateLimiter};
-use trypema::redis::RedisKey;
-
-async fn example() -> Result<(), trypema::TrypemaError> {
-    let url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-    let connection_manager = redis::Client::open(url)?
-        .get_connection_manager()
-        .await?;
-
-    let rl = RateLimiter::builder(connection_manager).build()?;
-    let key = RedisKey::try_from("user_123".to_string())?;
-    let rate = RateLimit::try_from(5.0).unwrap();
-
-    assert!(matches!(
-        rl.redis().absolute().inc(&key, &rate, 1).await?,
-        RateLimitDecision::Allowed
-    ));
-
-    Ok(())
-}
-```
-
-### Redis Suppressed State
-
-```rust,no_run
-use trypema::RateLimiter;
-use trypema::redis::RedisKey;
-
-async fn example() -> Result<(), trypema::TrypemaError> {
-    let url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-    let connection_manager = redis::Client::open(url)?
-        .get_connection_manager()
-        .await?;
-
-    let rl = RateLimiter::builder(connection_manager).build()?;
-    let key = RedisKey::try_from("user_123".to_string())?;
-
-    assert_eq!(rl.redis().suppressed().get_suppression_factor(&key).await?, 0.0);
-
-    Ok(())
-}
-```
-
-### Hybrid Absolute
-
-```rust,no_run
-use trypema::{RateLimit, RateLimitDecision, RateLimiter};
-use trypema::redis::RedisKey;
-
-async fn example() -> Result<(), trypema::TrypemaError> {
-    let url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-    let connection_manager = redis::Client::open(url)?
-        .get_connection_manager()
-        .await?;
-
-    let rl = RateLimiter::builder(connection_manager).build()?;
-    let key = RedisKey::try_from("user_123".to_string())?;
-    let rate = RateLimit::try_from(10.0).unwrap();
-
-    assert!(matches!(
-        rl.hybrid().absolute().inc(&key, &rate, 1).await?,
-        RateLimitDecision::Allowed
-    ));
-
-    Ok(())
-}
-```
-
-## Rate Limit Decisions
-
-Every strategy returns `RateLimitDecision`:
-
-- `Allowed` means the request should proceed.
-- `Rejected` means the absolute strategy denied the request and includes best-effort backoff
-  hints.
-- `Suppressed` means the suppressed strategy is active; check `is_allowed` for the admission
-  result.
-
-## Notes
-
-- Rate limits are sticky per key: the first `inc()` stores the key's rate limit.
-- Bucket coalescing trades timing precision for lower overhead.
-- Redis and hybrid modes provide best-effort distributed limiting, not strict linearizability.
-
-## Testing Redis-Backed Docs
-
-The canonical runnable examples live in the crate docs and API docs. Redis and hybrid doctests
-need a live Redis instance and `REDIS_URL`, for example:
-
-```bash
-REDIS_URL=redis://127.0.0.1:6379/ cargo test -p trypema --doc --features redis-tokio
-```
-
-Use `redis-smol` instead when validating the Smol-backed feature set.

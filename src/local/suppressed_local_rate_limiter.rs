@@ -4,30 +4,33 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 
 use crate::{
-    LocalRateLimiterOptions, RateGroupSizeMs, RateLimitDecision,
+    BucketSize, ConditionalSetOutcome, HistoryPreservation, RateLimitComparator, RateLimitDecision,
+    SuppressedRateLimitSnapshot,
+    builder::ProviderConfig,
     common::{
-        HardLimitFactor, InstantRate, RateLimit, SuppressionFactorCacheMs, WindowSizeSeconds,
+        Bucket, HardLimitFactor, HistoryUpdateMode, RandomState, RateLimit,
+        SuppressionFactorCachePeriod, WindowSize,
     },
 };
 
 #[derive(Debug)]
 pub(crate) struct RateLimitSeries {
-    pub limit: f64,
-    pub series: VecDeque<InstantRate>,
-    pub total: AtomicU64,
-    pub total_declined: AtomicU64,
+    pub hard_window_limit: f64,
+    pub buckets: VecDeque<Bucket>,
+    pub total_count: AtomicU64,
+    pub total_declined_count: AtomicU64,
 }
 
 impl RateLimitSeries {
-    pub fn new(limit: f64) -> Self {
+    pub fn new(hard_window_limit: f64) -> Self {
         Self {
-            limit,
-            series: VecDeque::new(),
-            total: AtomicU64::new(0),
-            total_declined: AtomicU64::new(0),
+            hard_window_limit,
+            buckets: VecDeque::new(),
+            total_count: AtomicU64::new(0),
+            total_declined_count: AtomicU64::new(0),
         }
     }
 }
@@ -74,24 +77,26 @@ impl RateLimitSeries {
 /// - Returns: [`RateLimitDecision::Allowed`]
 /// - Behavior: All requests admitted
 ///
-/// ## 2. At Capacity (Probabilistic Suppression)
+/// ## 2. Above Capacity (Probabilistic Suppression)
 ///
-/// When the observed usage is at/above capacity but below the hard cutoff, the limiter returns
-/// [`RateLimitDecision::Suppressed`]. Callers must check `is_allowed`.
+/// When the forecasted accepted usage is above capacity but below the hard cutoff, the limiter
+/// returns [`RateLimitDecision::Suppressed`]. Callers must check `is_allowed`. The increment that
+/// reaches capacity exactly is still [`RateLimitDecision::Allowed`].
 ///
 /// - Returns: [`RateLimitDecision::Suppressed { is_allowed, suppression_factor }`]
 /// - Behavior: Probabilistically deny requests to maintain target rate
 ///
-/// ## 3. Over Hard Limit (Full Suppression)
+/// ## 3. After the Hard Limit (Full Suppression)
 ///
-/// When the observed usage reaches the hard cutoff, the suppression factor becomes `1.0`.
+/// The increment that reaches the hard cutoff exactly is admitted and caches a suppression factor
+/// of `1.0`. Subsequent increments are fully suppressed while that factor remains applicable.
 ///
 /// - Returns: [`RateLimitDecision::Suppressed { is_allowed: false, suppression_factor: 1.0 }`]
 /// - Behavior: All requests denied
 ///
 /// # Hard Limit
 ///
-/// `hard_limit = rate_limit × hard_limit_factor`
+/// `hard_window_limit = rate_limit × window_size × hard_limit_factor`
 ///
 /// - Acts as an absolute ceiling beyond which no requests are admitted
 /// - Prevents runaway acceptance if suppression calculation fails
@@ -110,15 +115,16 @@ impl RateLimitSeries {
 /// # Examples
 ///
 /// ```
-/// # let rl = trypema::__doctest_helpers::rate_limiter();
+/// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+/// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
 /// use trypema::{RateLimit, RateLimitDecision};
 ///
-/// let limiter = rl.local().suppressed();
-/// let rate = RateLimit::try_from(10.0).unwrap();
+/// let limiter = rl.suppressed();
+/// let rate = RateLimit::per_second(10.0).unwrap();
 ///
 /// match limiter.inc("user_123", &rate, 1) {
 ///     RateLimitDecision::Allowed => {}
-///     RateLimitDecision::Suppressed { is_allowed, suppression_factor } => {
+///     RateLimitDecision::Suppressed { is_allowed, suppression_factor, .. } => {
 ///         println!("suppression: {suppression_factor:.2}, allowed: {is_allowed}");
 ///     }
 ///     RateLimitDecision::Rejected { .. } => unreachable!(),
@@ -126,25 +132,25 @@ impl RateLimitSeries {
 /// ```
 #[derive(Debug)]
 pub struct SuppressedLocalRateLimiter {
-    window_size_seconds: WindowSizeSeconds,
+    window_size: WindowSize,
     window_size_ms: u128,
     window_duration: Duration,
-    rate_group_size_ms: RateGroupSizeMs,
-    series: DashMap<String, RateLimitSeries>,
+    bucket_size: BucketSize,
+    pub(crate) series: DashMap<String, RateLimitSeries, RandomState>,
     hard_limit_factor: HardLimitFactor,
-    suppression_factor_cache_ms: SuppressionFactorCacheMs,
-    suppression_factors: DashMap<String, (Instant, f64)>,
+    suppression_factor_cache_period: SuppressionFactorCachePeriod,
+    pub(crate) suppression_factors: DashMap<String, (Instant, f64), RandomState>,
 }
 
 impl SuppressedLocalRateLimiter {
-    pub(crate) fn new(options: LocalRateLimiterOptions) -> Self {
+    pub(crate) fn new(options: ProviderConfig) -> Self {
         Self {
             hard_limit_factor: options.hard_limit_factor,
-            window_size_ms: (*options.window_size_seconds as u128).saturating_mul(1000),
-            window_size_seconds: options.window_size_seconds,
-            window_duration: Duration::from_secs(*options.window_size_seconds),
-            suppression_factor_cache_ms: options.suppression_factor_cache_ms,
-            rate_group_size_ms: options.rate_group_size_ms,
+            window_size_ms: options.window_size.as_milliseconds(),
+            window_size: options.window_size,
+            window_duration: Duration::from_secs(options.window_size.as_seconds()),
+            suppression_factor_cache_period: options.suppression_factor_cache_period,
+            bucket_size: options.bucket_size,
             series: DashMap::default(),
             suppression_factors: DashMap::default(),
         }
@@ -164,19 +170,23 @@ impl SuppressedLocalRateLimiter {
     ///
     /// # Returns
     ///
-    /// - [`RateLimitDecision::Allowed`]: Below capacity, no suppression active
-    /// - [`RateLimitDecision::Suppressed`]: At or above capacity. **Check `is_allowed`** for admission.
-    ///   When over the hard limit, returns `Suppressed { is_allowed: false, suppression_factor: 1.0 }`.
+    /// - [`RateLimitDecision::Allowed`]: The increment remains within soft capacity or reaches the
+    ///   hard limit exactly
+    /// - [`RateLimitDecision::Suppressed`]: The forecasted accepted total is above soft capacity
+    ///   without landing exactly on the hard limit. **Check `is_allowed`** for admission. When over
+    ///   the hard limit, returns `Suppressed { is_allowed: false, suppression_factor: 1.0 }`.
     ///
     /// This method never returns [`RateLimitDecision::Rejected`].
     ///
     /// # Behaviour
     ///
     /// 1. The increment is **always** recorded in the sliding window (both allowed and denied calls)
-    /// 2. If the forecasted accepted usage is below the soft window capacity, return `Allowed`
-    /// 3. If above the hard limit (`rate_limit × hard_limit_factor`), return
+    /// 2. If the forecasted accepted usage is at or below the soft window capacity, return `Allowed`
+    /// 3. If the increment reaches the hard limit exactly, admit it and cache full suppression for
+    ///    subsequent calls
+    /// 4. If above the hard limit (`window_size × rate_limit × hard_limit_factor`), return
     ///    `Suppressed { is_allowed: false, suppression_factor: 1.0 }`
-    /// 4. Otherwise, compute (or retrieve cached) suppression factor and probabilistically decide
+    /// 5. Otherwise, compute (or retrieve cached) suppression factor and probabilistically decide
     ///
     /// # Concurrency
     ///
@@ -186,11 +196,12 @@ impl SuppressedLocalRateLimiter {
     /// # Examples
     ///
     /// ```
-    /// # let rl = trypema::__doctest_helpers::rate_limiter();
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
-    /// let limiter = rl.local().suppressed();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let limiter = rl.suppressed();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     ///
     /// // Under limit → Allowed
     /// assert!(matches!(limiter.inc("user_123", &rate, 1), RateLimitDecision::Allowed));
@@ -208,91 +219,76 @@ impl SuppressedLocalRateLimiter {
         count: u64,
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> RateLimitDecision {
-        let rate_limit_series = match self.series.get(key) {
-            Some(rate_limit_series) => rate_limit_series,
-            None => {
-                self.series.entry(key.to_string()).or_insert_with(|| {
+        let series = match self.series.get(key) {
+            Some(series) => series,
+            None => self
+                .series
+                .entry(key.to_string())
+                .or_insert_with(|| {
                     RateLimitSeries::new(
-                        **rate_limit * *self.hard_limit_factor * *self.window_size_seconds as f64,
+                        rate_limit.as_per_second()
+                            * self.hard_limit_factor.as_multiplier()
+                            * self.window_size.as_seconds() as f64,
                     )
-                });
-
-                let Some(rate_limit_series) = self.series.get(key) else {
-                    unreachable!("AbsoluteLocalRateLimiter::inc: key should be in map");
-                };
-
-                rate_limit_series
-            }
+                })
+                .downgrade(),
         };
 
         // delete expired buckets if necessary
-        let rate_limit_series = match rate_limit_series.series.front() {
-            None => rate_limit_series,
-            Some(instant_rate)
-                if instant_rate.timestamp.elapsed().as_millis() > self.window_size_ms =>
+        let series = match series.buckets.front() {
+            Some(oldest_bucket)
+                if oldest_bucket.timestamp.elapsed().as_millis() > self.window_size_ms =>
             {
-                drop(rate_limit_series);
-                let mut rate_limit_series =
-                    self.series.get_mut(key).expect("Key should be present");
-                let now = Instant::now();
+                drop(series);
 
-                let split = rate_limit_series
-                    .series
-                    .partition_point(|r| now.duration_since(r.timestamp) > self.window_duration);
+                let mut series = self.series.entry(key.to_string()).or_insert_with(|| {
+                    RateLimitSeries::new(
+                        rate_limit.as_per_second()
+                            * self.hard_limit_factor.as_multiplier()
+                            * self.window_size.as_seconds() as f64,
+                    )
+                });
 
-                let (removed_count, removed_declined) = rate_limit_series
-                    .series
-                    .drain(..split)
-                    .fold((0u64, 0u64), |(count, declined), r| {
-                        (
-                            count + r.count.load(Ordering::Acquire),
-                            declined + r.declined.load(Ordering::Acquire),
-                        )
-                    });
+                let (_, evicted) = Self::evict_expired(&mut series, self.window_duration);
 
-                rate_limit_series
-                    .total
-                    .fetch_sub(removed_count, Ordering::AcqRel);
-                rate_limit_series
-                    .total_declined
-                    .fetch_sub(removed_declined, Ordering::AcqRel);
+                if evicted {
+                    self.suppression_factors.remove(key);
+                }
 
-                drop(rate_limit_series);
-
-                self.series.get(key).expect("Key should be present")
+                series.downgrade()
             }
-            _ => rate_limit_series,
+            _ => series,
         };
 
-        let hard_window_limit = rate_limit_series.limit;
-        let soft_window_limit = hard_window_limit / *self.hard_limit_factor;
+        let soft_window_limit =
+            (series.hard_window_limit / self.hard_limit_factor.as_multiplier()) as u64;
+        let hard_window_limit = series.hard_window_limit as u64;
+        let total_count = series.total_count.load(Ordering::Acquire);
+        let total_declined_count = series.total_declined_count.load(Ordering::Acquire);
+        let forecasted_allowed_count = total_count
+            .saturating_sub(total_declined_count)
+            .saturating_add(count);
 
-        let total = rate_limit_series.total.fetch_add(count, Ordering::AcqRel) + count;
-        let total_declined = rate_limit_series.total_declined.load(Ordering::Acquire);
-        let forcasted_allowed = total.saturating_sub(total_declined).saturating_add(count);
+        let reached_hard_window_limit = forecasted_allowed_count == hard_window_limit;
+        let should_return_allowed =
+            forecasted_allowed_count <= soft_window_limit || reached_hard_window_limit;
+
         let suppression_factor;
         let should_allow;
 
-        let soft = soft_window_limit as u64;
-
-        if forcasted_allowed < soft {
+        if should_return_allowed {
             should_allow = true;
-            suppression_factor = 0f64;
-        } else if forcasted_allowed == soft {
-            // Exactly at soft limit: full suppression only when soft == hard (no headroom).
-            if soft_window_limit == hard_window_limit {
-                suppression_factor = 1f64;
-                should_allow = false;
-                rate_limit_series
-                    .total_declined
-                    .fetch_add(count, Ordering::AcqRel);
+
+            if reached_hard_window_limit {
+                // Admit the increment that reaches the hard limit, then cache full
+                // suppression so the next increment is declined.
+                suppression_factor = self.persist_suppression_factor(key, 1f64).1;
             } else {
-                should_allow = true;
                 suppression_factor = 0f64;
             }
         } else {
-            suppression_factor = if forcasted_allowed as f64 >= hard_window_limit {
-                1f64
+            suppression_factor = if forecasted_allowed_count > hard_window_limit {
+                self.persist_suppression_factor(key, 1f64).1
             } else {
                 self.get_suppression_factor_without_bucket_expire(key)
             };
@@ -306,34 +302,53 @@ impl SuppressedLocalRateLimiter {
             };
 
             if !should_allow {
-                rate_limit_series
-                    .total_declined
+                series
+                    .total_declined_count
                     .fetch_add(count, Ordering::AcqRel);
             }
         }
 
-        if let Some(last_entry) = rate_limit_series.series.back()
-            && last_entry.timestamp.elapsed().as_millis() <= *self.rate_group_size_ms as u128
+        series.total_count.fetch_add(count, Ordering::AcqRel);
+
+        if let Some(latest_bucket) = series.buckets.back()
+            && latest_bucket.timestamp.elapsed().as_millis()
+                <= self.bucket_size.as_milliseconds() as u128
         {
-            last_entry.count.fetch_add(count, Ordering::AcqRel);
+            latest_bucket.count.fetch_add(count, Ordering::AcqRel);
+
             if !should_allow {
-                last_entry.declined.fetch_add(count, Ordering::AcqRel);
+                latest_bucket
+                    .declined_count
+                    .fetch_add(count, Ordering::AcqRel);
             }
         } else {
-            drop(rate_limit_series);
+            let hard_window_limit = series.hard_window_limit;
+            drop(series);
 
-            let Some(mut rate_limit_series) = self.series.get_mut(key) else {
-                unreachable!("SuppressedLocalRateLimiter::inc: key should be in map");
+            let bucket = Bucket {
+                count: count.into(),
+                declined_count: AtomicU64::new(if should_allow { 0 } else { count }),
+                timestamp: Instant::now(),
             };
 
-            rate_limit_series.series.push_back(InstantRate {
-                count: count.into(),
-                declined: AtomicU64::new(if should_allow { 0 } else { count }),
-                timestamp: Instant::now(),
-            });
+            match self.series.entry(key.to_string()) {
+                Entry::Occupied(mut entry) => entry.get_mut().buckets.push_back(bucket),
+                Entry::Vacant(entry) => {
+                    let mut series = RateLimitSeries::new(hard_window_limit);
+
+                    series.total_count.store(count, Ordering::Release);
+
+                    if !should_allow {
+                        series.total_declined_count.store(count, Ordering::Release);
+                    }
+
+                    series.buckets.push_back(bucket);
+                    entry.insert(series);
+                }
+            }
         }
 
-        if total.saturating_sub(total_declined).saturating_add(count) <= soft_window_limit as u64 {
+        if should_return_allowed {
             RateLimitDecision::Allowed
         } else {
             RateLimitDecision::Suppressed {
@@ -344,47 +359,30 @@ impl SuppressedLocalRateLimiter {
     }
 
     fn remove_expired_buckets(&self, key: &str) {
-        let Some(rate_limit_series) = self.series.get(key) else {
+        let Some(series) = self.series.get(key) else {
             return;
         };
 
-        let Some(instant_rate) = rate_limit_series.series.front() else {
+        let Some(oldest_bucket) = series.buckets.front() else {
             return;
         };
 
-        if instant_rate.timestamp.elapsed().as_millis() <= self.window_size_ms {
+        if oldest_bucket.timestamp.elapsed().as_millis() <= self.window_size_ms {
             return;
         }
 
-        drop(rate_limit_series);
+        drop(series);
 
-        let Some(mut rate_limit_series) = self.series.get_mut(key) else {
+        let Some(mut series) = self.series.get_mut(key) else {
             return;
         };
 
-        let now = Instant::now();
+        let (_, evicted) = Self::evict_expired(&mut series, self.window_duration);
+        drop(series);
 
-        let split = rate_limit_series
-            .series
-            .partition_point(|r| now.duration_since(r.timestamp) > self.window_duration);
-
-        let (removed_count, removed_declined) =
-            rate_limit_series
-                .series
-                .drain(..split)
-                .fold((0u64, 0u64), |(count, declined), r| {
-                    (
-                        count + r.count.load(Ordering::Acquire),
-                        declined + r.declined.load(Ordering::Acquire),
-                    )
-                });
-
-        rate_limit_series
-            .total
-            .fetch_sub(removed_count, Ordering::AcqRel);
-        rate_limit_series
-            .total_declined
-            .fetch_sub(removed_declined, Ordering::AcqRel);
+        if evicted {
+            self.suppression_factors.remove(key);
+        }
     } // end method remove_expired_buckets
 
     /// Get the current suppression factor for `key`.
@@ -392,19 +390,20 @@ impl SuppressedLocalRateLimiter {
     /// Returns a value in the range `[0.0, 1.0]`:
     /// - `0.0` — no suppression (below capacity or key not found)
     /// - `0.0 < sf < 1.0` — partial suppression (at capacity)
-    /// - `1.0` — full suppression (over hard limit)
+    /// - `1.0` — full suppression (cached at the hard boundary or on a forecast above it)
     ///
     /// This method is read-only and does not record any increment. It is useful for
     /// exporting metrics, building dashboards, or debugging why calls are being suppressed.
     ///
-    /// **Caching:** Returns the cached value if it was computed within `suppression_factor_cache_ms`.
+    /// **Caching:** Returns the cached value if it was computed within `suppression_factor_cache_period`.
     /// Otherwise, evicts expired buckets and recomputes the factor from the current sliding window.
     ///
     /// # Examples
     ///
     /// ```
-    /// # let rl = trypema::__doctest_helpers::rate_limiter();
-    /// let limiter = rl.local().suppressed();
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
+    /// let limiter = rl.suppressed();
     ///
     /// // No state yet → 0.0 (no suppression)
     /// assert_eq!(limiter.get_suppression_factor("unknown_key"), 0.0);
@@ -418,7 +417,8 @@ impl SuppressedLocalRateLimiter {
         let suppression_factor = match self.suppression_factors.get(key) {
             None => self.calculate_suppression_factor(key).1,
             Some(val)
-                if val.0.elapsed().as_millis() < *self.suppression_factor_cache_ms as u128 =>
+                if val.0.elapsed().as_millis()
+                    < self.suppression_factor_cache_period.as_milliseconds() as u128 =>
             {
                 val.1
             }
@@ -441,17 +441,6 @@ impl SuppressedLocalRateLimiter {
         suppression_factor
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_set_suppression_factor(&self, key: &str, at: Instant, value: f64) {
-        self.suppression_factors
-            .insert(key.to_string(), (at, value));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_get_suppression_factor(&self, key: &str) -> Option<(Instant, f64)> {
-        self.suppression_factors.get(key).map(|v| *v)
-    }
-
     #[inline(always)]
     fn persist_suppression_factor(&self, key: &str, value: f64) -> (Instant, f64) {
         let persist = (Instant::now(), value);
@@ -464,64 +453,464 @@ impl SuppressedLocalRateLimiter {
             return self.persist_suppression_factor(key, 0f64);
         };
 
-        if series.series.is_empty() {
+        if series.buckets.is_empty() {
             return self.persist_suppression_factor(key, 0f64);
         }
 
-        let hard_window_limit = series.limit as u64;
-        let soft_window_limit = (hard_window_limit as f64 / *self.hard_limit_factor) as u64;
+        let soft_window_limit =
+            (series.hard_window_limit / self.hard_limit_factor.as_multiplier()) as u64;
 
-        let total = series.total.load(Ordering::Acquire);
-        let total_declined = series.total_declined.load(Ordering::Acquire);
+        let total_count = series.total_count.load(Ordering::Acquire);
+        let total_declined_count = series.total_declined_count.load(Ordering::Acquire);
 
-        if total >= hard_window_limit {
+        if total_count >= series.hard_window_limit as u64 {
             return self.persist_suppression_factor(key, 1f64);
         }
 
-        let accepted = total.saturating_sub(total_declined);
+        let accepted_count = total_count.saturating_sub(total_declined_count);
 
-        if accepted < soft_window_limit {
+        if accepted_count < soft_window_limit {
             return self.persist_suppression_factor(key, 0f64);
         }
 
-        if accepted == soft_window_limit && soft_window_limit == hard_window_limit {
+        if accepted_count == soft_window_limit
+            && soft_window_limit == series.hard_window_limit as u64
+        {
             return self.persist_suppression_factor(key, 1f64);
         }
 
         let mut total_in_last_second = 0u64;
 
-        for instant_rate in series.series.iter().rev() {
-            if instant_rate.timestamp.elapsed().as_millis() > 1000 {
+        for bucket in series.buckets.iter().rev() {
+            if bucket.timestamp.elapsed().as_millis() > 1000 {
                 break;
             }
 
             total_in_last_second =
-                total_in_last_second.saturating_add(instant_rate.count.load(Ordering::Acquire));
+                total_in_last_second.saturating_add(bucket.count.load(Ordering::Acquire));
         }
 
-        let average_rate_in_window: f64 = total as f64 / *self.window_size_seconds as f64;
+        let average_rate_in_window: f64 = total_count as f64 / self.window_size.as_seconds() as f64;
 
         let perceived_rate_limit = average_rate_in_window.max(total_in_last_second as f64);
 
         let suppression_factor = 1f64
-            - (soft_window_limit as f64 / *self.window_size_seconds as f64 / perceived_rate_limit);
+            - (soft_window_limit as f64
+                / self.window_size.as_seconds() as f64
+                / perceived_rate_limit);
 
         self.persist_suppression_factor(key, suppression_factor)
     } // end method calculate_suppression_factor
 
+    /// Current live window state for `key`.
+    ///
+    /// Evicts expired buckets first, then returns the observed total, declined total,
+    /// and current suppression factor. The observed total includes accepted and declined
+    /// calls, matching the counter that suppression decisions are based on. Unknown keys
+    /// return [`SuppressedRateLimitSnapshot::default()`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
+    /// use trypema::RateLimit;
+    ///
+    /// let limiter = rl.suppressed();
+    /// let snapshot = limiter.get("user_123");
+    /// assert_eq!(snapshot.total, 0);
+    /// assert_eq!(snapshot.total_declined, 0);
+    /// assert_eq!(snapshot.suppression_factor, 0.0);
+    ///
+    /// let rate = RateLimit::per_second(10.0).unwrap();
+    /// limiter.inc("user_123", &rate, 3);
+    /// assert_eq!(limiter.get("user_123").total, 3);
+    /// ```
+    pub fn get(&self, key: &str) -> SuppressedRateLimitSnapshot {
+        let Some(series) = self.series.get(key) else {
+            return SuppressedRateLimitSnapshot::default();
+        };
+
+        let (total_count, contained_expired) =
+            Self::inspect_live_total(&series, self.window_duration);
+
+        if !contained_expired {
+            let total_declined_count = series.total_declined_count.load(Ordering::Acquire);
+            drop(series);
+
+            return SuppressedRateLimitSnapshot {
+                total: total_count,
+                total_declined: total_declined_count,
+                suppression_factor: self.get_suppression_factor_without_bucket_expire(key),
+            };
+        }
+
+        drop(series);
+
+        let Some(mut series) = self.series.get_mut(key) else {
+            return SuppressedRateLimitSnapshot::default();
+        };
+
+        let (total_count, evicted) = Self::evict_expired(&mut series, self.window_duration);
+        let total_declined_count = series.total_declined_count.load(Ordering::Acquire);
+
+        drop(series);
+
+        if evicted {
+            self.suppression_factors.remove(key);
+        }
+
+        SuppressedRateLimitSnapshot {
+            total: total_count,
+            total_declined: total_declined_count,
+            suppression_factor: self.get_suppression_factor_without_bucket_expire(key),
+        }
+    } // end method get
+
+    fn evict_expired(series: &mut RateLimitSeries, window_duration: Duration) -> (u64, bool) {
+        let now = Instant::now();
+        let split = series
+            .buckets
+            .partition_point(|bucket| now.duration_since(bucket.timestamp) > window_duration);
+
+        if split == 0 {
+            return (series.total_count.load(Ordering::Acquire), false);
+        }
+
+        let (removed_count, removed_declined_count) =
+            series
+                .buckets
+                .drain(..split)
+                .fold((0u64, 0u64), |(count, declined_count), bucket| {
+                    (
+                        count + bucket.count.load(Ordering::Acquire),
+                        declined_count + bucket.declined_count.load(Ordering::Acquire),
+                    )
+                });
+
+        let total_count = series
+            .total_count
+            .fetch_sub(removed_count, Ordering::AcqRel)
+            - removed_count;
+        series
+            .total_declined_count
+            .fetch_sub(removed_declined_count, Ordering::AcqRel);
+
+        (total_count, true)
+    }
+
+    fn inspect_live_total(series: &RateLimitSeries, window_duration: Duration) -> (u64, bool) {
+        let now = Instant::now();
+        let split = series
+            .buckets
+            .partition_point(|bucket| now.duration_since(bucket.timestamp) > window_duration);
+
+        if split == 0 {
+            return (series.total_count.load(Ordering::Acquire), split > 0);
+        }
+
+        let total_count = series
+            .buckets
+            .iter()
+            .skip(split)
+            .map(|bucket| bucket.count.load(Ordering::Acquire))
+            .sum();
+
+        (total_count, split > 0)
+    }
+
+    fn apply_history_update(
+        series: &mut RateLimitSeries,
+        count: u64,
+        old_total: u64,
+        mode: HistoryUpdateMode,
+    ) {
+        match mode {
+            HistoryUpdateMode::Replace => {
+                series.buckets.clear();
+                series.buckets.push_back(Bucket {
+                    count: count.into(),
+                    declined_count: AtomicU64::new(0),
+                    timestamp: Instant::now(),
+                });
+            }
+            HistoryUpdateMode::Preserve(preservation) if count > old_total => {
+                let delta = count - old_total;
+                let bucket = match preservation {
+                    HistoryPreservation::PreserveNewest => series.buckets.back(),
+                    HistoryPreservation::PreserveOldest => series.buckets.front(),
+                };
+
+                if let Some(bucket) = bucket {
+                    bucket.count.fetch_add(delta, Ordering::AcqRel);
+                } else {
+                    series.buckets.push_back(Bucket {
+                        count: delta.into(),
+                        declined_count: AtomicU64::new(0),
+                        timestamp: Instant::now(),
+                    });
+                }
+            }
+            HistoryUpdateMode::Preserve(preservation) if count < old_total => {
+                let mut to_remove = old_total - count;
+                let mut bucket;
+                let mut bucket_count;
+                let mut declined_count;
+                let mut retained_count;
+                let mut retained_declined_count;
+
+                while to_remove > 0 {
+                    bucket = match preservation {
+                        HistoryPreservation::PreserveNewest => series.buckets.front(),
+                        HistoryPreservation::PreserveOldest => series.buckets.back(),
+                    };
+
+                    let Some(bucket) = bucket else {
+                        break;
+                    };
+
+                    bucket_count = bucket.count.load(Ordering::Acquire);
+
+                    if bucket_count <= to_remove {
+                        to_remove -= bucket_count;
+
+                        match preservation {
+                            HistoryPreservation::PreserveNewest => {
+                                series.buckets.pop_front();
+                            }
+
+                            HistoryPreservation::PreserveOldest => {
+                                series.buckets.pop_back();
+                            }
+                        }
+                    } else {
+                        declined_count = bucket.declined_count.load(Ordering::Acquire);
+                        retained_count = bucket_count - to_remove;
+                        retained_declined_count =
+                            ((declined_count as u128 * retained_count as u128)
+                                / bucket_count as u128) as u64;
+
+                        bucket.count.store(retained_count, Ordering::Release);
+                        bucket
+                            .declined_count
+                            .store(retained_declined_count, Ordering::Release);
+
+                        to_remove = 0;
+                    }
+                }
+            }
+            HistoryUpdateMode::Preserve(_) => {}
+        }
+
+        let total_declined_count = series
+            .buckets
+            .iter()
+            .map(|bucket| bucket.declined_count.load(Ordering::Acquire))
+            .sum();
+        series.total_count.store(count, Ordering::Release);
+        series
+            .total_declined_count
+            .store(total_declined_count, Ordering::Release);
+    }
+
+    fn set_if_with_history_mode(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        mode: HistoryUpdateMode,
+    ) -> (u64, u64) {
+        let existing = match self.series.get(key) {
+            Some(series) => {
+                let (old_total, contains_expired) =
+                    Self::inspect_live_total(&series, self.window_duration);
+
+                if !comparator.matches(old_total) {
+                    return (old_total, old_total);
+                }
+
+                let hard_window_limit = rate_limit.as_per_second()
+                    * self.hard_limit_factor.as_multiplier()
+                    * self.window_size.as_seconds() as f64;
+
+                let unchanged = count > 0
+                    && matches!(mode, HistoryUpdateMode::Preserve(_))
+                    && !contains_expired
+                    && old_total == count
+                    && series.hard_window_limit == hard_window_limit;
+
+                if unchanged {
+                    return (old_total, old_total);
+                }
+
+                true
+            }
+            None => false,
+        };
+
+        if !existing && (!comparator.matches(0) || count == 0) {
+            return (0, 0);
+        }
+
+        let (new_total, old_total) = match self.series.entry(key.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let (old_total, contains_expired) =
+                    Self::inspect_live_total(entry.get(), self.window_duration);
+
+                if !comparator.matches(old_total) {
+                    return (old_total, old_total);
+                }
+
+                if count == 0 {
+                    entry.remove();
+                    (0, old_total)
+                } else {
+                    let series = entry.get_mut();
+
+                    if contains_expired {
+                        Self::evict_expired(series, self.window_duration);
+                    }
+
+                    series.hard_window_limit = rate_limit.as_per_second()
+                        * self.hard_limit_factor.as_multiplier()
+                        * self.window_size.as_seconds() as f64;
+
+                    Self::apply_history_update(series, count, old_total, mode);
+
+                    (count, old_total)
+                }
+            }
+            Entry::Vacant(entry) => {
+                if !comparator.matches(0) || count == 0 {
+                    return (0, 0);
+                }
+
+                let mut series = RateLimitSeries::new(
+                    rate_limit.as_per_second()
+                        * self.hard_limit_factor.as_multiplier()
+                        * self.window_size.as_seconds() as f64,
+                );
+
+                Self::apply_history_update(&mut series, count, 0, mode);
+                entry.insert(series);
+
+                (count, 0)
+            }
+        };
+
+        self.suppression_factors.remove(key);
+
+        (new_total, old_total)
+    } // end fn set_if_with_history_mode
+
+    /// Conditionally replace the window total for `key`.
+    ///
+    /// When `comparator` matches the key's current post-eviction window total, the
+    /// window contents are replaced by a single current-timestamp bucket holding
+    /// `count` with **no declines** recorded against it; otherwise nothing is
+    /// written. On a match, the key's stored hard window limit is redefined from
+    /// `rate_limit` (`window_size × rate_limit × hard_limit_factor`) — unlike
+    /// `inc`, where the limit is sticky after the first call — and the cached
+    /// suppression factor is dropped so it is recomputed from the new state on the
+    /// next call. A comparator miss leaves both the limit and cache untouched. A
+    /// matched `count` of zero removes both the series and cached factor completely.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Unique identifier for the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit; redefines the stored hard limit
+    /// - `comparator`: Guard evaluated against the current window total
+    /// - `count`: The total to write when the guard matches
+    ///
+    /// # Returns
+    ///
+    /// A [`ConditionalSetOutcome`] describing whether the comparator matched and the totals
+    /// before and after the operation.
+    ///
+    /// # Priming Idiom
+    ///
+    /// `set_if(key, rate, RateLimitComparator::Lt(count), count)` raises the window
+    /// total to at least `count` and never lowers it — idempotent and safe to retry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
+    /// use trypema::{RateLimit, RateLimitComparator};
+    ///
+    /// let limiter = rl.suppressed();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
+    ///
+    /// // Prime the window to 40.
+    /// let outcome = limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
+    /// assert!(outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 0));
+    ///
+    /// // Re-priming is a no-op: the guard no longer matches.
+    /// let outcome = limiter.set_if("user_123", &rate, RateLimitComparator::Lt(40), 40);
+    /// assert!(!outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 40));
+    /// ```
+    pub fn set_if(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+    ) -> ConditionalSetOutcome {
+        let (current_total, previous_total) = self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Replace,
+        );
+
+        ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        }
+    } // end method set_if
+
+    /// Conditionally set the observed total while retaining the selected side of
+    /// the existing sliding-window history.
+    pub fn set_if_preserve_history(
+        &self,
+        key: &str,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        preservation: HistoryPreservation,
+    ) -> ConditionalSetOutcome {
+        let (current_total, previous_total) = self.set_if_with_history_mode(
+            key,
+            rate_limit,
+            comparator,
+            count,
+            HistoryUpdateMode::Preserve(preservation),
+        );
+
+        ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        }
+    } // end method set_if_preserve_history
+
     pub(crate) fn cleanup(&self, stale_after_ms: u64) {
         self.suppression_factors
             .retain(|_, (instant, _)| instant.elapsed().as_millis() < stale_after_ms as u128);
-        self.series.retain(
-            |_, rate_limit_series| match rate_limit_series.series.back() {
-                None => false,
-                Some(instant_rate)
-                    if instant_rate.timestamp.elapsed().as_millis() > stale_after_ms as u128 =>
-                {
-                    false
-                }
-                Some(_) => true,
-            },
-        );
+        self.series.retain(|_, series| match series.buckets.back() {
+            None => false,
+            Some(latest_bucket)
+                if latest_bucket.timestamp.elapsed().as_millis() > stale_after_ms as u128 =>
+            {
+                false
+            }
+            Some(_) => true,
+        });
     } // end method cleanup
 } // end impl

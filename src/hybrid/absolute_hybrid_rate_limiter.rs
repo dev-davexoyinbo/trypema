@@ -7,23 +7,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry, mapref::one::Ref};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    RateGroupSizeMs, RateLimit, RateLimitDecision, RedisKey, RedisRateLimiterOptions, TrypemaError,
-    WindowSizeSeconds,
+    ConditionalSetOutcome, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
+    TrypemaError, WindowSize,
+    common::{HistoryUpdateMode, RandomState, duration_from_milliseconds},
     hybrid::{
-        AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, SyncIntervalMs,
+        AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
         absolute_hybrid_redis_proxy::{
             AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyOptions,
             AbsoluteHybridRedisProxyReadStateResult,
         },
         common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal},
+        hybrid_rate_limiter_provider::HybridRateLimiterConfig,
     },
-    redis::{mutex_lock, spawn_task},
+    redis::{RedisKey, mutex_lock, spawn_task},
     runtime,
 };
+
+mod helpers;
 
 #[derive(Debug)]
 enum AbsoluteRedisLimitingState {
@@ -33,8 +37,8 @@ enum AbsoluteRedisLimitingState {
         starting_count: Mutex<u64>,
         count: AtomicU64,
         time_instant: Mutex<Instant>,
-        last_rate_group_ttl: Mutex<Option<u64>>,
-        last_rate_group_count: Mutex<Option<u64>>,
+        oldest_bucket_ttl: Mutex<Option<u64>>,
+        oldest_bucket_count: Mutex<Option<u64>>,
         last_modified: Mutex<Instant>,
     },
     Undefined,
@@ -47,7 +51,7 @@ enum AbsoluteRedisLimitingState {
     },
 }
 
-/// Strict sliding-window rate limiter with a local fast-path and periodic Redis sync.
+/// Sliding-window allow/reject limiter with a local fast path and periodic Redis sync.
 ///
 /// This is the hybrid counterpart to [`AbsoluteRedisRateLimiter`](crate::redis::AbsoluteRedisRateLimiter).
 /// Instead of executing a Redis round-trip on every `inc()` call, it maintains local
@@ -79,26 +83,24 @@ enum AbsoluteRedisLimitingState {
 ///
 /// Use this over the pure Redis provider when per-request Redis latency is unacceptable.
 /// The trade-off is that admission decisions may lag behind the true Redis state by up
-/// to `sync_interval_ms`.
+/// to `sync_interval`.
 #[derive(Debug)]
 pub struct AbsoluteHybridRateLimiter {
-    window_size_seconds: WindowSizeSeconds,
-    rate_group_size_ms: RateGroupSizeMs,
+    window_size: WindowSize,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
-    limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState>,
+    limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState, RandomState>,
     /// Per-key async mutex that serializes the "Redis read + state update" operation.
     /// Only one tokio task at a time may perform the read+update for a given key;
     /// all other tasks wait on this lock and then re-check the (now-updated) state.
-    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>>,
-    sync_interval_ms: SyncIntervalMs,
+    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>, RandomState>,
     epoch: AtomicU64,
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
 }
 
 impl AbsoluteHybridRateLimiter {
-    pub(crate) fn new(options: RedisRateLimiterOptions) -> Arc<Self> {
+    pub(crate) fn new(options: HybridRateLimiterConfig) -> Arc<Self> {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
         let (tx, rx) = mpsc::channel::<RedisRateLimiterSignal>(1);
@@ -106,14 +108,14 @@ impl AbsoluteHybridRateLimiter {
         let redis_proxy = AbsoluteHybridRedisProxy::new(AbsoluteHybridRedisProxyOptions {
             prefix: prefix.clone(),
             connection_manager: options.connection_manager,
-            window_size_seconds: options.window_size_seconds,
-            rate_group_size_ms: options.rate_group_size_ms,
+            window_size: options.provider.window_size,
+            bucket_size: options.provider.bucket_size,
         });
 
         let is_active_watch = watch::Sender::new(0u64);
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
-            sync_interval: Duration::from_millis(*options.sync_interval_ms),
+            sync_interval: Duration::from_millis(options.sync_interval.as_milliseconds()),
             channel_capacity: 8192,
             max_batch_size: 4,
             limiter_sender: tx,
@@ -122,13 +124,11 @@ impl AbsoluteHybridRateLimiter {
         });
 
         let limiter = Self {
-            window_size_seconds: options.window_size_seconds,
-            rate_group_size_ms: options.rate_group_size_ms,
+            window_size: options.provider.window_size,
             commiter_sender,
             redis_proxy,
-            limiting_state: DashMap::new(),
-            reset_locks: DashMap::new(),
-            sync_interval_ms: options.sync_interval_ms,
+            limiting_state: DashMap::default(),
+            reset_locks: DashMap::default(),
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
             is_active_watch,
@@ -143,7 +143,7 @@ impl AbsoluteHybridRateLimiter {
     } // end method with_rate_type
 
     fn epoch_change_task(self: &Arc<Self>) {
-        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         let limiter = Arc::downgrade(self);
 
         spawn_task(async move {
@@ -152,7 +152,8 @@ impl AbsoluteHybridRateLimiter {
                 let Some(limiter) = limiter.upgrade() else {
                     break;
                 };
-                limiter.epoch.fetch_add(1, Ordering::Relaxed);
+
+                limiter.epoch.fetch_add(1, Ordering::AcqRel);
             }
         });
     }
@@ -180,13 +181,13 @@ impl AbsoluteHybridRateLimiter {
         });
     } // end method listen_for_committer_signals
 
-    #[inline(always)]
+    // #[inline(always)]
     fn send_epoch_change_if_needed(&self) {
-        let epoch = self.epoch.load(Ordering::Relaxed);
+        let epoch = self.epoch.load(Ordering::Acquire);
 
-        if self.last_commited_epoch.load(Ordering::Relaxed) < epoch {
+        if self.last_commited_epoch.load(Ordering::Acquire) < epoch {
             let _ = self.is_active_watch.send(epoch);
-            self.last_commited_epoch.store(epoch, Ordering::Relaxed);
+            self.last_commited_epoch.store(epoch, Ordering::Release);
         }
     }
 
@@ -195,10 +196,26 @@ impl AbsoluteHybridRateLimiter {
         if let Some(lock) = self.reset_locks.get(key) {
             return Arc::clone(&lock);
         }
+
         self.reset_locks
             .entry(key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .downgrade()
             .clone()
+    }
+
+    fn get_or_create_limiting_state(
+        &self,
+        key: &RedisKey,
+    ) -> Ref<'_, RedisKey, AbsoluteRedisLimitingState> {
+        match self.limiting_state.get(key) {
+            Some(state) => state,
+            None => self
+                .limiting_state
+                .entry(key.clone())
+                .or_insert_with(|| AbsoluteRedisLimitingState::Undefined)
+                .downgrade(),
+        }
     }
 
     /// Check admission and, if allowed, record the increment for `key`.
@@ -222,18 +239,20 @@ impl AbsoluteHybridRateLimiter {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     /// use trypema::redis::RedisKey;
     ///
-    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
-    /// let rate = RateLimit::try_from(10.0).unwrap();
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
     /// assert!(matches!(
-    ///     rl.hybrid().absolute().inc(&key, &rate, 1).await.unwrap(),
+    ///     rl.absolute().inc(&key, &rate, 1).await.unwrap(),
     ///     RateLimitDecision::Allowed
     /// ));
-    /// # });
+    /// # }
     /// ```
     pub async fn inc(
         &self,
@@ -265,17 +284,19 @@ impl AbsoluteHybridRateLimiter {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # trypema::__doctest_helpers::with_redis_rate_limiter(|rl| async move {
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     /// use trypema::redis::RedisKey;
     ///
-    /// let key = RedisKey::try_from(trypema::__doctest_helpers::unique_key()).unwrap();
+    /// let key = RedisKey::try_from("user_123").unwrap();
     /// assert!(matches!(
-    ///     rl.hybrid().absolute().is_allowed(&key).await.unwrap(),
+    ///     rl.absolute().is_allowed(&key).await.unwrap(),
     ///     RateLimitDecision::Allowed
     /// ));
-    /// # });
+    /// # }
     /// ```
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
         self.send_epoch_change_if_needed();
@@ -283,478 +304,410 @@ impl AbsoluteHybridRateLimiter {
         self.is_allowed_with_count_increment(key, 1, 0, None).await
     } // end method is_allowed
 
-    async fn reset_state_from_redis_read_result_and_get_decision(
-        &self,
-        key: &RedisKey,
-        check_count: u64,
-        increment: u64,
-        rate_limit: Option<&RateLimit>,
-    ) -> Result<RateLimitDecision, TrypemaError> {
-        // Acquire the per-key lock so that only one task at a time runs the
-        // Redis read + state update for this key.  All other tasks wait here
-        // and then re-check the (now-updated) state via the fast path below.
-        let lock = self.get_or_create_reset_lock(key);
-        let _guard = lock.lock().await;
+    /// Infer the current window total for `key` from this instance's limiting state.
+    ///
+    /// This follows the same state-refresh path as [`Self::is_allowed`], without checking or
+    /// recording an increment. An initialized, usable state stays on the local fast path. An
+    /// undefined state or expired rejection cache is refreshed from Redis first, then the total
+    /// is inferred from the updated state. The result can still lag later commits from other
+    /// instances and Redis-side expiration. Use [`Self::get`] when every read must consult Redis.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when required Redis or locally cached state cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
+    /// use trypema::RateLimit;
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// assert_eq!(
+    ///     rl.absolute().get_estimate(&key).await.unwrap(),
+    ///     0
+    /// );
+    ///
+    /// let rate = RateLimit::per_second(10.0).unwrap();
+    /// rl.absolute().inc(&key, &rate, 3).await.unwrap();
+    /// assert_eq!(
+    ///     rl.absolute().get_estimate(&key).await.unwrap(),
+    ///     3
+    /// );
+    /// # }
+    /// ```
+    pub async fn get_estimate(&self, key: &RedisKey) -> Result<u64, TrypemaError> {
+        self.send_epoch_change_if_needed();
 
-        // Re-check the current state now that we hold the lock.  If another
-        // task already transitioned us to Accepting while we were waiting, we
-        // can serve the request from the local counter without another Redis
-        // read.
-        {
-            let state_entry = self.limiting_state.get(key);
-            if let Some(ref state_entry) = state_entry
-                && let AbsoluteRedisLimitingState::Accepting {
-                    accept_limit,
-                    count,
-                    last_modified,
-                    ..
-                } = state_entry.deref()
-            {
-                let accept_limit_val =
-                    *mutex_lock(accept_limit, "accepting.accept_limit (recheck)")?;
-                let current = count.load(Ordering::Acquire);
-                if current + check_count <= accept_limit_val {
-                    *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
-                    count.fetch_add(increment, Ordering::AcqRel);
-                    return Ok(RateLimitDecision::Allowed);
-                }
-                // Still over limit after lock — fall through to Redis read.
-            } else if let Some(state_entry) = state_entry
-                && let AbsoluteRedisLimitingState::Rejecting {
-                    time_instant,
-                    ttl_ms,
-                    count_after_release,
-                    ..
-                } = state_entry.deref()
-            {
-                let elapsed_ms = mutex_lock(time_instant, "rejecting.time_instant")?
-                    .elapsed()
-                    .as_millis();
-                let ttl_ms_val = *mutex_lock(ttl_ms, "rejecting.ttl_ms")? as u128;
+        self.is_allowed_with_count_increment(key, 0, 0, None)
+            .await?;
 
-                if elapsed_ms < ttl_ms_val {
-                    let remaining_after_waiting =
-                        *mutex_lock(count_after_release, "rejecting.count_after_release")?;
-                    return Ok(RateLimitDecision::Rejected {
-                        window_size_seconds: *self.window_size_seconds,
-                        retry_after_ms: ttl_ms_val.saturating_sub(elapsed_ms),
-                        remaining_after_waiting,
-                    });
-                }
-
-                // Rejection has expired - fail through to Redis read.
-            }
-        }
-
-        let read_state_result =
-            self.redis_proxy.read_state(key).await.map_err(|err| {
-                TrypemaError::CustomError(format!("Failed to read state: {err:?}"))
-            })?;
-
-        self.reset_single_state_from_read_result(
-            read_state_result,
-            check_count,
-            increment,
-            rate_limit,
-        )
-        .await
-    } // end method reset_state_from_redis_read_result_and_get_decision
-
-    async fn reset_single_state_from_read_result(
-        &self,
-        read_state_result: AbsoluteHybridRedisProxyReadStateResult,
-        check_count: u64,
-        increment: u64,
-        rate_limit: Option<&RateLimit>,
-    ) -> Result<RateLimitDecision, TrypemaError> {
-        let redis_total = read_state_result.current_total_count;
-        let mut current_total_count = redis_total;
-        let mut current_window_limit = read_state_result.window_limit;
-        let key = &read_state_result.key;
-
-        let state = match self.limiting_state.get(key) {
-            Some(state) => state,
-            None => {
-                self.limiting_state
-                    .entry(key.clone())
-                    .or_insert_with(|| AbsoluteRedisLimitingState::Undefined);
-
-                self.limiting_state.get(key).expect("Key should be present")
-            }
+        let Some(state) = self.limiting_state.get(key) else {
+            return Ok(0);
         };
 
-        let state = match state.deref() {
-            AbsoluteRedisLimitingState::Undefined => state,
+        match state.deref() {
+            AbsoluteRedisLimitingState::Accepting {
+                starting_count,
+                count,
+                ..
+            } => {
+                let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
+
+                Ok(starting_count.saturating_add(count.load(Ordering::Acquire)))
+            }
             AbsoluteRedisLimitingState::Rejecting {
                 committed_count,
                 committed_at,
                 ..
-            } => {
-                let window_size_ms = (*self.window_size_seconds as u128).saturating_mul(1_000);
-                let age_ms = committed_at.elapsed().as_millis();
-
-                let effective_committed = if age_ms < window_size_ms {
-                    *committed_count
-                } else {
-                    0
-                };
-
-                current_total_count = current_total_count.max(effective_committed);
-
-                state
+            } if committed_at.elapsed() < Duration::from_secs(self.window_size.as_seconds()) => {
+                Ok(*committed_count)
             }
-            AbsoluteRedisLimitingState::Accepting {
-                window_limit,
-                count,
-                ..
-            } => {
-                let local_count = count.load(Ordering::Acquire);
+            AbsoluteRedisLimitingState::Undefined
+            | AbsoluteRedisLimitingState::Rejecting { .. } => Ok(0),
+        }
+    } // end method get_estimate
 
-                if current_window_limit.is_none() {
-                    current_window_limit =
-                        Some(*mutex_lock(window_limit, "accepting.window_limit")?);
+    /// Read the current live window total for `key` from Redis and local state.
+    ///
+    /// Returns the Redis window total after lazily evicting expired buckets, plus this
+    /// instance's pending local increments for the key (increments accepted on the
+    /// fast-path that have not been flushed yet). Pending increments held by
+    /// **other** instances are not visible until their next flush, so the result
+    /// may lag the true global total by up to `sync_interval`.
+    ///
+    /// Unlike [`Self::get_estimate`], this method performs a Redis round-trip on every call rather
+    /// than using a valid local state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Redis cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
+    /// use trypema::RateLimit;
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// assert_eq!(rl.absolute().get(&key).await.unwrap(), 0);
+    ///
+    /// let rate = RateLimit::per_second(10.0).unwrap();
+    /// rl.absolute().inc(&key, &rate, 3).await.unwrap();
+    /// assert_eq!(rl.absolute().get(&key).await.unwrap(), 3);
+    /// # }
+    /// ```
+    pub async fn get(&self, key: &RedisKey) -> Result<u64, TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        let lock = self.get_or_create_reset_lock(key);
+        let _guard = lock.lock().await;
+
+        let read_state_result = self.redis_proxy.read_state(key).await?;
+
+        let mut total_count = read_state_result.current_total_count;
+
+        if let Some(state) = self.limiting_state.get(key) {
+            match state.deref() {
+                AbsoluteRedisLimitingState::Accepting { count, .. } => {
+                    total_count = total_count.saturating_add(count.load(Ordering::Acquire));
                 }
-
-                current_total_count = current_total_count.saturating_add(local_count);
-
-                if local_count > 0 {
-                    let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
-
-                    let commit = AbsoluteHybridCommit {
-                        key: key.clone(),
-                        window_limit,
-                        count: local_count,
-                    };
-
-                    drop(state);
-                    self.send_commit(commit).await?;
-
-                    self.limiting_state.get(key).expect("Key should be present")
-                } else {
-                    state
+                AbsoluteRedisLimitingState::Rejecting {
+                    committed_count,
+                    committed_at,
+                    ..
+                } if committed_at.elapsed()
+                    < Duration::from_secs(self.window_size.as_seconds()) =>
+                {
+                    total_count = total_count.max(*committed_count);
                 }
+                AbsoluteRedisLimitingState::Undefined
+                | AbsoluteRedisLimitingState::Rejecting { .. } => {}
             }
-        };
-
-        let new_window_limit = match current_window_limit {
-            Some(window_limit) => window_limit,
-            None => {
-                let Some(rate_limit) = rate_limit else {
-                    let is_undefined =
-                        matches!(state.deref(), AbsoluteRedisLimitingState::Undefined);
-
-                    if !is_undefined {
-                        drop(state);
-                        *self
-                            .limiting_state
-                            .get_mut(key)
-                            .expect("key should be present") =
-                            AbsoluteRedisLimitingState::Undefined;
-                    }
-
-                    return Ok(RateLimitDecision::Allowed);
-                };
-
-                ((*self.window_size_seconds as f64) * **rate_limit) as u64
-            }
-        };
-
-        let new_time_instant = Instant::now();
-
-        if current_total_count.saturating_add(check_count) > new_window_limit {
-            let new_ttl_ms = read_state_result
-                .last_rate_group_ttl
-                .unwrap_or((*self.sync_interval_ms).min(*self.rate_group_size_ms))
-                .max(*self.sync_interval_ms);
-
-            let new_count_after_release = read_state_result.last_rate_group_count.unwrap_or(0);
-
-            if let AbsoluteRedisLimitingState::Rejecting {
-                time_instant,
-                ttl_ms,
-                count_after_release,
-                ..
-            } = state.deref()
-            {
-                *mutex_lock(time_instant, "rejecting.time_instant")? = new_time_instant;
-                *mutex_lock(ttl_ms, "rejecting.ttl_ms")? = new_ttl_ms;
-                *mutex_lock(count_after_release, "rejecting.count_after_release")? =
-                    new_count_after_release;
-            } else {
-                drop(state);
-                let mut state = self
-                    .limiting_state
-                    .get_mut(key)
-                    .expect("key should be present");
-
-                *state = AbsoluteRedisLimitingState::Rejecting {
-                    time_instant: Mutex::new(new_time_instant),
-                    ttl_ms: Mutex::new(new_ttl_ms),
-                    count_after_release: Mutex::new(new_count_after_release),
-                    committed_count: current_total_count,
-                    committed_at: new_time_instant,
-                };
-            }
-
-            return Ok(RateLimitDecision::Rejected {
-                window_size_seconds: *self.window_size_seconds,
-                retry_after_ms: new_ttl_ms as u128,
-                remaining_after_waiting: new_count_after_release,
-            });
         }
 
-        let new_accept_limit = (new_window_limit as u64).saturating_sub(current_total_count);
+        Ok(total_count)
+    } // end method get
 
-        if let AbsoluteRedisLimitingState::Accepting {
-            window_limit,
-            accept_limit,
-            starting_count,
-            count,
-            time_instant,
-            last_rate_group_ttl,
-            last_rate_group_count,
-            last_modified,
-        } = state.deref()
-        {
-            *mutex_lock(window_limit, "accepting.window_limit")? = new_window_limit;
-            *mutex_lock(accept_limit, "accepting.accept_limit")? = new_accept_limit;
-            *mutex_lock(starting_count, "accepting.starting_count")? = redis_total;
-            *mutex_lock(time_instant, "accepting.time_instant")? = new_time_instant;
-            *mutex_lock(last_modified, "accepting.last_modified")? = new_time_instant;
-            *mutex_lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")? =
-                read_state_result.last_rate_group_ttl;
-            *mutex_lock(last_rate_group_count, "accepting.last_rate_group_count")? =
-                read_state_result.last_rate_group_count;
-            count.store(increment, Ordering::Release);
-        } else {
-            drop(state);
-            let mut state = self
-                .limiting_state
-                .get_mut(key)
-                .expect("key should be present");
-
-            *state = AbsoluteRedisLimitingState::Accepting {
-                window_limit: Mutex::new(new_window_limit),
-                accept_limit: Mutex::new(new_accept_limit),
-                starting_count: Mutex::new(redis_total),
-                count: AtomicU64::new(increment),
-                time_instant: Mutex::new(new_time_instant),
-                last_modified: Mutex::new(new_time_instant),
-                last_rate_group_ttl: Mutex::new(read_state_result.last_rate_group_ttl),
-                last_rate_group_count: Mutex::new(read_state_result.last_rate_group_count),
-            };
-        }
-
-        Ok(RateLimitDecision::Allowed)
-    }
-
-    async fn send_commit(&self, commit: AbsoluteHybridCommit) -> Result<(), TrypemaError> {
-        self.commiter_sender
-            .send(commit.into())
-            .await
-            .map_err(|err| TrypemaError::CustomError(format!("Failed to send commit: {err:?}")))?;
-
-        Ok(())
-    } // end method send_commit
-
-    async fn is_allowed_with_count_increment(
+    /// Conditionally replace the window total for `key` (atomic on Redis).
+    ///
+    /// When `comparator` matches the key's current post-eviction window total, the
+    /// window contents are replaced by a single current-timestamp bucket holding
+    /// `count`; otherwise nothing is written. On a match the key's window limit is
+    /// (re)defined as `window_size × rate_limit` and its TTL refreshed.
+    /// A matched target of zero removes the committed entity state; increments that
+    /// race after the protected pending snapshot are committed on top of that reset.
+    ///
+    /// This instance's pending local increments are included in the atomic Redis
+    /// comparison as a newest virtual bucket. Local state remains untouched on a
+    /// miss. After a match it is invalidated, and increments that arrived after the
+    /// snapshot are committed on top of the requested target, so:
+    ///
+    /// - the comparator evaluates a total that includes this instance's own traffic, and
+    /// - the next `inc` on this instance re-reads Redis and observes the new total.
+    ///
+    /// Pending increments on **other** instances flush later (within
+    /// `sync_interval`) and land *on top of* the written value, so after a
+    /// matched write the total may drift above `count` — it is never lowered below
+    /// it by those flushes.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: Validated [`RedisKey`] identifying the rate-limited resource
+    /// - `rate_limit`: Per-second rate limit used to (re)define the window limit
+    /// - `comparator`: Guard evaluated against the current window total
+    /// - `count`: The total to write when the guard matches
+    ///
+    /// # Returns
+    ///
+    /// A [`ConditionalSetOutcome`] describing whether the comparator matched and the totals
+    /// before and after the operation.
+    ///
+    /// # Priming Idiom
+    ///
+    /// `set_if(key, rate, RateLimitComparator::Lt(count), count)` raises the window
+    /// total to at least `count` and never lowers it — idempotent and safe to retry,
+    /// e.g. for seeding a quota window from an external usage store.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
+    /// use trypema::{RateLimit, RateLimitComparator};
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
+    ///
+    /// // Prime the window to 40.
+    /// let outcome = rl
+    ///     .absolute()
+    ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
+    ///     .await
+    ///     .unwrap();
+    /// assert!(outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 0));
+    ///
+    /// // Re-priming is a no-op: the guard no longer matches.
+    /// let outcome = rl
+    ///     .absolute()
+    ///     .set_if(&key, &rate, RateLimitComparator::Lt(40), 40)
+    ///     .await
+    ///     .unwrap();
+    /// assert!(!outcome.matched);
+    /// assert_eq!((outcome.current_total, outcome.previous_total), (40, 40));
+    /// # }
+    /// ```
+    pub async fn set_if(
         &self,
         key: &RedisKey,
-        check_count: u64,
-        increment: u64,
-        rate_limit: Option<&RateLimit>,
-    ) -> Result<RateLimitDecision, TrypemaError> {
-        let state_entry = match self.limiting_state.get(key) {
-            Some(state) => state,
-            None => {
-                self.limiting_state
-                    .entry(key.clone())
-                    .or_insert_with(|| AbsoluteRedisLimitingState::Undefined);
-
-                self.limiting_state.get(key).expect("Key should be present")
-            }
-        };
-
-        if let AbsoluteRedisLimitingState::Rejecting {
-            time_instant,
-            ttl_ms,
-            count_after_release,
-            ..
-        } = state_entry.deref()
-        {
-            let elapsed_ms = mutex_lock(time_instant, "rejecting.time_instant")?
-                .elapsed()
-                .as_millis();
-            let ttl_ms_val = *mutex_lock(ttl_ms, "rejecting.ttl_ms")? as u128;
-
-            if elapsed_ms < ttl_ms_val {
-                let remaining_after_waiting =
-                    *mutex_lock(count_after_release, "rejecting.count_after_release")?;
-                return Ok(RateLimitDecision::Rejected {
-                    window_size_seconds: *self.window_size_seconds,
-                    retry_after_ms: ttl_ms_val.saturating_sub(elapsed_ms),
-                    remaining_after_waiting,
-                });
-            }
-
-            drop(state_entry);
-        } else if let AbsoluteRedisLimitingState::Accepting {
-            accept_limit,
-            count,
-            last_modified,
-            ..
-        } = state_entry.deref()
-        {
-            let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
-            if count.load(Ordering::Acquire) + check_count <= accept_limit {
-                *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
-                count.fetch_add(increment, Ordering::AcqRel);
-                return Ok(RateLimitDecision::Allowed);
-            }
-
-            drop(state_entry);
-
-            let permit = self.commiter_sender.reserve().await.map_err(|_| {
-                TrypemaError::CustomError("Failed to reserve commiter sender".to_string())
-            })?;
-
-            let mut state_entry = self
-                .limiting_state
-                .get_mut(key)
-                .expect("key should be present after drop");
-
-            if let AbsoluteRedisLimitingState::Accepting {
-                window_limit,
-                starting_count,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+    ) -> Result<ConditionalSetOutcome, TrypemaError> {
+        let (current_total, previous_total) = self
+            .set_if_with_history_mode(
+                key,
+                rate_limit,
+                comparator,
                 count,
-                time_instant,
-                last_rate_group_ttl,
-                last_rate_group_count,
-                accept_limit,
-                last_modified,
-                ..
-            } = state_entry.deref()
-            {
-                let local_count = count.load(Ordering::Acquire);
-                let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
-                let window_limit = *mutex_lock(window_limit, "accepting.window_limit")?;
-                let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
+                HistoryUpdateMode::Replace,
+            )
+            .await?;
 
-                if local_count + check_count <= accept_limit {
-                    *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
-                    count.fetch_add(increment, Ordering::AcqRel);
-                    return Ok(RateLimitDecision::Allowed);
-                }
+        Ok(ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        })
+    } // end method set_if
 
-                // True expected Redis total once the commit we're about to send lands.
-                let expected_redis_total = starting_count.saturating_add(local_count);
+    /// Conditionally set the total while retaining the selected side of the shared
+    /// Redis sliding-window history.
+    pub async fn set_if_preserve_history(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        preservation: HistoryPreservation,
+    ) -> Result<ConditionalSetOutcome, TrypemaError> {
+        let (current_total, previous_total) = self
+            .set_if_with_history_mode(
+                key,
+                rate_limit,
+                comparator,
+                count,
+                HistoryUpdateMode::Preserve(preservation),
+            )
+            .await?;
 
-                let last_rate_group_ttl: u128 =
-                    (*mutex_lock(last_rate_group_ttl, "accepting.last_rate_group_ttl")?)
-                        .map(|el| el as u128)
-                        .unwrap_or((*self.sync_interval_ms).min(*self.rate_group_size_ms) as u128);
-                let elapsed = mutex_lock(time_instant, "accepting.time_instant")?
-                    .elapsed()
-                    .as_millis();
-                let retry_after_ms = last_rate_group_ttl
-                    .saturating_sub(elapsed)
-                    .max(*self.sync_interval_ms as u128);
-                let remaining_after_waiting =
-                    (*mutex_lock(last_rate_group_count, "accepting.last_rate_group_count")?)
-                        .unwrap_or(expected_redis_total);
+        Ok(ConditionalSetOutcome {
+            matched: comparator.matches(previous_total),
+            previous_total,
+            current_total,
+        })
+    } // end method set_if_preserve_history
 
-                if local_count >= accept_limit {
-                    if local_count > 0 {
-                        let commit = AbsoluteHybridCommit {
-                            key: key.clone(),
-                            window_limit,
-                            count: local_count,
-                        };
+    #[cfg(test)]
+    pub(crate) fn local_state_count(&self) -> usize {
+        self.limiting_state.len()
+    }
 
-                        permit.send(commit.into());
-                    }
-
-                    *state_entry = AbsoluteRedisLimitingState::Rejecting {
-                        time_instant: Mutex::new(Instant::now()),
-                        ttl_ms: Mutex::new(retry_after_ms as u64),
-                        count_after_release: Mutex::new(remaining_after_waiting),
-                        // Use the full expected Redis total, not just the local count.
-                        committed_count: expected_redis_total,
-                        committed_at: Instant::now(),
-                    };
-                }
-
-                return Ok(RateLimitDecision::Rejected {
-                    window_size_seconds: *self.window_size_seconds,
-                    retry_after_ms,
-                    remaining_after_waiting,
-                });
-            } else if let AbsoluteRedisLimitingState::Rejecting {
-                time_instant,
-                ttl_ms,
-                count_after_release,
-                ..
-            } = state_entry.deref()
-            {
-                let elapsed_ms = mutex_lock(time_instant, "rejecting.time_instant")?
-                    .elapsed()
-                    .as_millis();
-                let ttl_ms = *mutex_lock(ttl_ms, "rejecting.ttl_ms")? as u128;
-
-                if elapsed_ms < ttl_ms {
-                    let remaining_after_waiting =
-                        *mutex_lock(count_after_release, "rejecting.count_after_release")?;
-                    return Ok(RateLimitDecision::Rejected {
-                        window_size_seconds: *self.window_size_seconds,
-                        retry_after_ms: ttl_ms.saturating_sub(elapsed_ms),
-                        remaining_after_waiting,
-                    });
-                }
-            }
-
-            drop(state_entry);
-        } else {
-            drop(state_entry);
-        }
-
-        self.reset_state_from_redis_read_result_and_get_decision(
-            key,
-            check_count,
-            increment,
-            rate_limit,
-        )
-        .await
-    } // end method is_allowed_with_count_increment
-
-    /// Evict expired buckets and update the total count.
-    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        self.redis_proxy.cleanup(stale_after_ms).await?;
-        self.limiting_state.retain(|_, state| match state {
-            AbsoluteRedisLimitingState::Undefined => false,
-            AbsoluteRedisLimitingState::Accepting {
-                last_modified: time_instant,
-                ..
-            }
-            | AbsoluteRedisLimitingState::Rejecting { time_instant, .. } => {
-                let time_instant = match time_instant.get_mut() {
-                    Ok(time_instant) => time_instant,
+    fn should_cleanup_local_state(state: &AbsoluteRedisLimitingState, stale_after_ms: u64) -> bool {
+        match state {
+            AbsoluteRedisLimitingState::Undefined => true,
+            AbsoluteRedisLimitingState::Accepting { last_modified, .. } => {
+                let last_modified = match last_modified.lock() {
+                    Ok(last_modified) => last_modified,
                     Err(err) => {
-                        tracing::warn!("time_instant is poisoned: {err:?}");
-                        return false;
+                        tracing::warn!("last_modified is poisoned: {err:?}");
+                        return true;
                     }
                 };
 
-                time_instant.elapsed().as_millis() < stale_after_ms as u128
+                last_modified.elapsed().as_millis() >= stale_after_ms as u128
             }
-        });
+            AbsoluteRedisLimitingState::Rejecting {
+                time_instant,
+                ttl_ms,
+                ..
+            } => {
+                let elapsed_ms = match time_instant.lock() {
+                    Ok(time_instant) => time_instant.elapsed().as_millis(),
+                    Err(err) => {
+                        tracing::warn!("time_instant is poisoned: {err:?}");
+                        return true;
+                    }
+                };
+
+                let retry_ttl_ms = match ttl_ms.lock() {
+                    Ok(ttl_ms) => *ttl_ms as u128,
+                    Err(err) => {
+                        tracing::warn!("ttl_ms is poisoned: {err:?}");
+                        return true;
+                    }
+                };
+
+                elapsed_ms.saturating_sub(retry_ttl_ms) >= stale_after_ms as u128
+            }
+        }
+    } // end fn should_cleanup_local_state
+
+    async fn set_if_with_history_mode(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+        comparator: RateLimitComparator,
+        count: u64,
+        mode: HistoryUpdateMode,
+    ) -> Result<(u64, u64), TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        let lock = self.get_or_create_reset_lock(key);
+        let _guard = lock.lock().await;
+
+        let pending_count = self
+            .limiting_state
+            .get(key)
+            .and_then(|state| match state.deref() {
+                AbsoluteRedisLimitingState::Accepting { count, .. } => {
+                    Some(count.load(Ordering::Acquire))
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        let window_limit =
+            ((self.window_size.as_seconds() as f64) * rate_limit.as_per_second()) as u64;
+
+        let (new_total, old_total, changed) = self
+            .redis_proxy
+            .set_if(key, window_limit, comparator, count, mode, pending_count)
+            .await?;
+
+        if !changed {
+            return Ok((new_total, old_total));
+        }
+
+        if let Some((_, state)) = self.limiting_state.remove(key)
+            && let AbsoluteRedisLimitingState::Accepting {
+                count: local_count, ..
+            } = state
+        {
+            let extra_count = local_count.into_inner().saturating_sub(pending_count);
+            if extra_count > 0 {
+                let commit = AbsoluteHybridCommit {
+                    key: key.clone(),
+                    window_limit,
+                    count: extra_count,
+                };
+
+                self.send_commit(commit).await?;
+
+                // if let Err(err) = self
+                //     .redis_proxy
+                //     .batch_commit_state(std::slice::from_ref(&commit))
+                //     .await
+                // {
+                //     tracing::warn!(error = ?err, "direct post-set commit failed; queued for retry");
+                //     self.send_commit(commit).await?;
+                // }
+            }
+        }
+
+        Ok((new_total, old_total))
+    }
+
+    /// Remove stale Redis state and local state stale since its rejection TTL elapsed.
+    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+        self.redis_proxy.cleanup(stale_after_ms).await?;
+
+        let candidates = self
+            .limiting_state
+            .iter()
+            .filter(|state| Self::should_cleanup_local_state(state.value(), stale_after_ms))
+            .map(|state| state.key().clone())
+            .collect::<Vec<_>>();
+
+        for key in candidates {
+            let lock = self.get_or_create_reset_lock(&key);
+            let _guard = lock.lock().await;
+
+            let should_remove = self.limiting_state.get(&key).is_some_and(|state| {
+                Self::should_cleanup_local_state(state.value(), stale_after_ms)
+            });
+
+            if !should_remove {
+                continue;
+            }
+
+            match self.limiting_state.entry(key) {
+                Entry::Occupied(entry)
+                    if Self::should_cleanup_local_state(entry.get(), stale_after_ms) =>
+                {
+                    entry.remove();
+                }
+                Entry::Occupied(_) | Entry::Vacant(_) => {}
+            }
+        }
 
         Ok(())
     }
 
     async fn flush(&self) -> Result<(), TrypemaError> {
         let mut resets: Vec<RedisKey> = Vec::new();
+        let mut stale: Vec<RedisKey> = Vec::new();
 
-        for mut state in self.limiting_state.iter_mut() {
+        for state in self.limiting_state.iter() {
             let key = state.key();
 
             if let AbsoluteRedisLimitingState::Accepting {
@@ -775,9 +728,8 @@ impl AbsoluteHybridRateLimiter {
                     last_modified.elapsed()
                 };
 
-                if elapsed.as_millis() > (*self.window_size_seconds * 1000) as u128 {
-                    *state = AbsoluteRedisLimitingState::Undefined;
-
+                if elapsed.as_millis() > self.window_size.as_milliseconds() {
+                    stale.push(key.clone());
                     continue;
                 }
 
@@ -787,6 +739,56 @@ impl AbsoluteHybridRateLimiter {
 
                 resets.push(key.clone());
             }
+        }
+
+        let mut guards = Vec::with_capacity(resets.len() + stale.len());
+        for key in resets.iter().chain(&stale) {
+            guards.push(self.get_or_create_reset_lock(key).lock_owned().await);
+        }
+
+        for key in stale {
+            let should_reset = self.limiting_state.get(&key).is_some_and(|state| {
+                matches!(
+                    state.deref(),
+                    AbsoluteRedisLimitingState::Accepting { last_modified, .. }
+                        if mutex_lock(last_modified, "accepting.last_modified")
+                            .is_ok_and(|last_modified| {
+                                last_modified.elapsed().as_millis()
+                                    > self.window_size.as_milliseconds()
+                            })
+                )
+            });
+
+            if !should_reset {
+                continue;
+            }
+
+            if let Some(mut state) = self.limiting_state.get_mut(&key)
+                && let AbsoluteRedisLimitingState::Accepting { last_modified, .. } = state.deref()
+            {
+                let is_stale = mutex_lock(last_modified, "accepting.last_modified")?
+                    .elapsed()
+                    .as_millis()
+                    > self.window_size.as_milliseconds();
+
+                if is_stale {
+                    *state = AbsoluteRedisLimitingState::Undefined;
+                }
+            }
+        }
+
+        resets.retain(|key| {
+            self.limiting_state.get(key).is_some_and(|state| {
+                matches!(
+                    state.deref(),
+                    AbsoluteRedisLimitingState::Accepting { count, .. }
+                        if count.load(Ordering::Acquire) > 0
+                )
+            })
+        });
+
+        if resets.is_empty() {
+            return Ok(());
         }
 
         let read_state_results = self.redis_proxy.batch_read_state(&resets).await?;

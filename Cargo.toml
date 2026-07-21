@@ -37,21 +37,20 @@ features = ["redis-tokio"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-dashmap = "6.1.0"
-rand = "0.10.0"
-redis = { version = "1.2", optional = true, default-features = false, features = [
+dashmap = "6.2"
+rand = "0.10.2"
+redis = { version = "1.4.1", optional = true, default-features = false, features = [
   "script",
 ] }
 strum = "0.28.0"
 strum_macros = "0.28.0"
-thiserror = "2.0.18"
+thiserror = "2.0.19"
 tracing = "0.1.44"
-tokio = { version = "1.51", optional = true, default-features = false }
+tokio = { version = "1.53", optional = true, default-features = false }
 smol = { version = "2.0.2", optional = true }
 ahash = "0.8.12"
-regex = { version = "1", optional = true }
-futures = { version = "0.3.32", optional = true }
-async-trait = { version = "0.1.89", optional = true }
+futures = { version = "0.3.33", optional = true }
+async-trait = { version = "0.1.91", optional = true }
 
 [features]
 redis-tokio = [
@@ -66,7 +65,6 @@ redis-tokio = [
   "tokio/rt-multi-thread",
   "dep:async-trait",
   "dep:futures",
-  "dep:regex",
 ]
 redis-smol = [
   "redis",
@@ -78,11 +76,10 @@ redis-smol = [
   "tokio/sync",
   "dep:async-trait",
   "dep:futures",
-  "dep:regex",
 ]
 
 [dev-dependencies]
-tokio = { version = "1.51", features = ["rt-multi-thread"] }
+tokio = { version = "1.53", features = ["rt-multi-thread"] }
 criterion = { version = "0.8", default-features = false, features = [
   "cargo_bench_support",
   "rayon",
@@ -103,4 +100,12 @@ harness = false
 
 [[bench]]
 name = "redis_suppressed"
+harness = false
+
+[[bench]]
+name = "hybrid_absolute"
+harness = false
+
+[[bench]]
+name = "hybrid_suppressed"
 harness = false

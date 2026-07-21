@@ -14,7 +14,14 @@ mod redis;
 use args::{Args, Provider};
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    if let Err(error) = args.validate() {
+        eprintln!("invalid stress configuration: {error}");
+        std::process::exit(2);
+    }
+
+    args.add_run_namespace();
 
     match args.provider {
         Provider::Local => local::run(&args),
@@ -47,4 +54,4 @@ fn main() {
             }
         }
     }
-}
+} // end fn main

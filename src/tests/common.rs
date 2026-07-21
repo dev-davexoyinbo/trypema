@@ -2,7 +2,10 @@
 
 use std::{env, time::Duration};
 
-use crate::{RedisKey, common::RateType, redis::common::RedisKeyGenerator};
+use crate::{
+    common::RateType,
+    redis::{RedisKey, common::RedisKeyGenerator},
+};
 
 use super::runtime;
 
@@ -14,6 +17,15 @@ pub fn redis_url() -> String {
              (e.g. REDIS_URL=redis://127.0.0.1:16379/)"
         )
     })
+}
+
+/// Create a Redis connection manager for provider tests.
+pub async fn connection_manager() -> redis::aio::ConnectionManager {
+    redis::Client::open(redis_url())
+        .unwrap()
+        .get_connection_manager()
+        .await
+        .unwrap()
 }
 
 /// Generate a unique, random test prefix so parallel tests don't collide.
@@ -33,6 +45,6 @@ pub fn key_gen(prefix: &RedisKey, rate_type: RateType) -> RedisKeyGenerator {
 }
 
 /// Wait long enough for the background hybrid committer to flush two ticks.
-pub async fn wait_for_hybrid_sync(sync_interval_ms: u64) {
-    runtime::async_sleep(Duration::from_millis(sync_interval_ms * 2 + 50)).await;
+pub async fn wait_for_hybrid_sync(sync_interval: u64) {
+    runtime::async_sleep(Duration::from_millis(sync_interval * 2 + 50)).await;
 }

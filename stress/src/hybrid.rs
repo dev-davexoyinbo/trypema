@@ -1,27 +1,21 @@
-//! Hybrid provider benchmark runner.
-//!
-//! Calls `rl.hybrid().absolute()` or `rl.hybrid().suppressed()` depending on
-//! `--strategy`.  The hybrid limiter maintains local state synchronised with
-//! Redis in the background, giving lower latency than the pure Redis provider.
+//! Hybrid-provider stress runner.
 
 #![cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::sync::Arc;
+
+use trypema::{
+    BucketSize, HardLimitFactor, RateLimit, RateLimiterBuilder, SuppressionFactorCachePeriod,
+    WindowSize,
+    hybrid::{HybridRateLimiterProvider, SyncInterval},
+    redis::RedisKey,
 };
-use std::time::{Duration, Instant};
 
-use hdrhistogram::Histogram;
-use trypema::{RateLimit, RateLimitDecision, RateLimiter, RateLimiterOptions, redis::RedisKey};
-
-use crate::args::{Args, Strategy, build_keys};
-use crate::runner::{Counts, ErrorStats, WorkerLoop, print_error_stats, print_results};
-use crate::runtime::{async_sleep, join_task, spawn_task};
-
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
+use crate::{
+    args::{Args, Strategy, build_keys},
+    runner::{RunState, StartGate, WorkerLoop, finish_run},
+    runtime::{async_sleep, join_task, spawn_task},
+};
 
 pub(crate) fn run(args: &Args) {
     #[cfg(feature = "redis-tokio")]
@@ -36,131 +30,113 @@ pub(crate) fn run(args: &Args) {
     }
 
     #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-    {
-        let args = args.clone();
-        smol::block_on(run_async(args));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Async core
-// ---------------------------------------------------------------------------
+    smol::block_on(run_async(args.clone()));
+} // end fn run
 
 async fn run_async(args: Args) {
-    let client = redis::Client::open(args.redis_url.as_str()).unwrap();
-    let cm = client.get_connection_manager().await.unwrap();
+    let connection_manager = crate::runtime::create_redis_connection_manager(&args.redis_url)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("failed to connect to Redis: {error}");
+            std::process::exit(2);
+        });
+    let rate_limiter = HybridRateLimiterProvider::builder(connection_manager)
+        .prefix(RedisKey::try_from(args.redis_prefix.as_str()).unwrap())
+        .window_size(WindowSize::seconds_or_panic(args.window_s))
+        .bucket_size(BucketSize::milliseconds_or_panic(args.group_ms))
+        .hard_limit_factor(HardLimitFactor::new_or_panic(args.hard_limit_factor))
+        .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(
+            args.suppression_cache_ms,
+        ))
+        .sync_interval(SyncInterval::default())
+        .cleanup_enabled(false)
+        .build()
+        .unwrap();
+    let rate_limit = RateLimit::per_second(args.rate_limit_per_s).unwrap();
 
-    let rl = Arc::new(RateLimiter::new(RateLimiterOptions {
-        local: crate::args::build_local_options(&args),
-        redis: crate::args::build_redis_options(&args, cm),
-    }));
-    let rate = RateLimit::try_from(args.rate_limit_per_s).unwrap();
+    warmup(&args, &rate_limiter, &rate_limit).await;
 
+    let args = Arc::new(args);
     let keys = build_keys(&args);
-    let counts = Arc::new(Counts::default());
-    let total_ops = Arc::new(AtomicU64::new(0));
-    let error_stats = Arc::new(ErrorStats::default());
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(args.duration_s);
-
+    let redis_keys: Arc<[RedisKey]> = keys
+        .iter()
+        .cloned()
+        .map(RedisKey::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("generated stress keys must be valid Redis keys")
+        .into();
+    let state = RunState::default();
+    let start_gate = Arc::new(StartGate::new(args.threads));
     let mut join_handles = Vec::with_capacity(args.threads);
 
-    for t in 0..args.threads {
-        let stop = Arc::clone(&stop);
-        let counts = Arc::clone(&counts);
-        let total_ops = Arc::clone(&total_ops);
-        let error_stats = Arc::clone(&error_stats);
-        let args = args.clone();
-        let keys = keys.clone();
-        let rl = Arc::clone(&rl);
-
-        let redis_keys: Vec<RedisKey> = keys
-            .iter()
-            .map(|k| RedisKey::try_from(k.clone()).unwrap())
-            .collect();
+    for worker_index in 0..args.threads {
+        let args = Arc::clone(&args);
+        let redis_keys = Arc::clone(&redis_keys);
+        let rate_limiter = Arc::clone(&rate_limiter);
+        let state = state.clone();
+        let start_gate = Arc::clone(&start_gate);
 
         join_handles.push(spawn_task(async move {
-            let mut wl = WorkerLoop::new(
-                args.clone(),
-                keys,
-                counts,
-                total_ops,
-                error_stats,
-                t,
+            let started = start_gate.wait_async().await;
+            let mut worker = WorkerLoop::new(
+                Arc::clone(&args),
+                redis_keys.len(),
+                state,
+                worker_index,
                 started,
-                deadline,
             );
 
-            while !stop.load(Ordering::Relaxed) && wl.should_continue() {
-                // Async QPS pacing.
-                if args.mode != crate::args::Mode::Max
-                    && let Some(qps) = crate::runner::qps_for_now(&args, started)
-                {
-                    let per_op_ns = 1_000_000_000u64 / qps.max(1);
-                    let now = Instant::now();
-                    if now < wl.next_deadline {
-                        async_sleep(wl.next_deadline - now).await;
-                    }
-                    wl.next_deadline += Duration::from_nanos(per_op_ns);
+            while worker.should_continue() {
+                if let Some(delay) = worker.pacing_delay() {
+                    async_sleep(delay).await;
+                }
+                if !worker.should_continue() {
+                    break;
                 }
 
-                let idx = wl.pick_idx();
-                let k = &redis_keys[idx % redis_keys.len()];
-                let t0 = wl.begin_iter();
-
-                let res = match args.strategy {
-                    Strategy::Absolute => rl.hybrid().absolute().inc(k, &rate, 1).await,
-                    Strategy::Suppressed => rl.hybrid().suppressed().inc(k, &rate, 1).await,
-                };
-
-                wl.end_iter(t0);
-
-                match res {
-                    Ok(decision) => {
-                        // Hybrid absolute must never return Suppressed.
-                        if args.strategy == Strategy::Absolute
-                            && matches!(decision, RateLimitDecision::Suppressed { .. })
-                        {
-                            wl.record_error(
-                                "unexpected suppressed decision".to_string(),
-                                Some(format!(
-                                    "provider=hybrid key={k:?} err=unexpected_suppressed"
-                                )),
-                            );
-                        } else {
-                            wl.record_decision(decision);
-                        }
+                let key_index = worker.pick_index();
+                let key = &redis_keys[key_index];
+                let sample_started = worker.begin_iteration();
+                let result = match args.strategy {
+                    Strategy::Absolute => rate_limiter.absolute().inc(key, &rate_limit, 1).await,
+                    Strategy::Suppressed => {
+                        rate_limiter.suppressed().inc(key, &rate_limit, 1).await
                     }
-                    Err(err) => wl.record_error(
-                        err.to_string(),
-                        Some(format!("provider=hybrid key={k:?} err={err:?}")),
+                };
+                worker.end_iteration(sample_started);
+
+                match result {
+                    Ok(decision) => worker.record_decision(args.strategy, decision, || {
+                        format!("provider=hybrid key={key:?}")
+                    }),
+                    Err(error) => worker.record_error(
+                        error.to_string(),
+                        Some(format!("provider=hybrid key={key:?} error={error:?}")),
                     ),
                 }
             }
 
-            wl.into_hist()
+            worker.into_histogram()
         }));
     }
 
-    async_sleep(Duration::from_secs(args.duration_s)).await;
-    stop.store(true, Ordering::Relaxed);
-
-    let mut merged = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+    let started = start_gate.start_async().await;
+    let mut histograms = Vec::with_capacity(join_handles.len());
     for handle in join_handles {
-        merged.add(join_task(handle).await).unwrap();
+        histograms.push(join_task(handle).await);
     }
+    finish_run(&args, started, histograms, &state);
+} // end fn run_async
 
-    let elapsed = started.elapsed();
-    let ops = total_ops.load(Ordering::Relaxed);
-    print_results(
-        &args,
-        elapsed,
-        ops,
-        ops as f64 / elapsed.as_secs_f64(),
-        &merged,
-        &counts,
-    );
-    print_error_stats(counts.errors.load(Ordering::Relaxed), &error_stats);
-}
+async fn warmup(args: &Args, rate_limiter: &HybridRateLimiterProvider, rate_limit: &RateLimit) {
+    let key = RedisKey::new_or_panic("stress_warmup".to_string());
+    let result = match args.strategy {
+        Strategy::Absolute => rate_limiter.absolute().inc(&key, rate_limit, 1).await,
+        Strategy::Suppressed => rate_limiter.suppressed().inc(&key, rate_limit, 1).await,
+    };
+
+    if let Err(error) = result {
+        eprintln!("hybrid warmup failed: {error}");
+        std::process::exit(2);
+    }
+} // end fn warmup

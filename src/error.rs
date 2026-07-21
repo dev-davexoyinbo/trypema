@@ -3,8 +3,8 @@
 /// Errors fall into two categories:
 ///
 /// - **Validation errors** — Returned when constructing configuration types with invalid values
-///   (e.g., a rate limit of `0.0`, an empty Redis key). These are returned as `Err` from
-///   `TryFrom` implementations and are deterministic.
+///   (e.g., a rate limit of `0.0`, an empty Redis key). These are returned as deterministic
+///   `Err` values from validated constructors and conversions.
 ///
 /// - **Redis errors** — Returned from async Redis operations when the connection fails, a Lua
 ///   script encounters an error, or Redis returns an unexpected result. Only available when the
@@ -18,8 +18,8 @@
 /// ```
 /// use trypema::{RateLimit, TrypemaError};
 ///
-/// // Validation errors are returned by TryFrom implementations
-/// match RateLimit::try_from(-1.0) {
+/// // Validation errors are returned by unit-explicit constructors
+/// match RateLimit::per_second(-1.0) {
 ///     Err(TrypemaError::InvalidRateLimit(msg)) => {
 ///         println!("Invalid rate: {}", msg);
 ///     }
@@ -27,6 +27,7 @@
 /// }
 /// ```
 #[derive(Debug, thiserror::Error, PartialEq)]
+#[non_exhaustive]
 pub enum TrypemaError {
     /// Redis operation failed.
     ///
@@ -57,11 +58,11 @@ pub enum TrypemaError {
     /// use trypema::{RateLimit, TrypemaError};
     ///
     /// assert!(matches!(
-    ///     RateLimit::try_from(0.0),
+    ///     RateLimit::per_second(0.0),
     ///     Err(TrypemaError::InvalidRateLimit(_))
     /// ));
     /// assert!(matches!(
-    ///     RateLimit::try_from(-5.0),
+    ///     RateLimit::per_second(-5.0),
     ///     Err(TrypemaError::InvalidRateLimit(_))
     /// ));
     /// ```
@@ -75,32 +76,33 @@ pub enum TrypemaError {
     /// # Examples
     ///
     /// ```
-    /// use trypema::{WindowSizeSeconds, TrypemaError};
+    /// use trypema::{WindowSize, TrypemaError};
     ///
     /// assert!(matches!(
-    ///     WindowSizeSeconds::try_from(0),
-    ///     Err(TrypemaError::InvalidWindowSizeSeconds(_))
+    ///     WindowSize::seconds(0),
+    ///     Err(TrypemaError::InvalidWindowSize(_))
     /// ));
     /// ```
     #[error("invalid window size: {0}")]
-    InvalidWindowSizeSeconds(String),
+    InvalidWindowSize(String),
 
-    /// Rate group size is invalid.
+    /// Bucket size is invalid.
     ///
-    /// Rate group size must be >= 1 millisecond.
+    /// Bucket size must be >= 1 millisecond. When building a provider, it must also be less than
+    /// or equal to the configured window size.
     ///
     /// # Examples
     ///
     /// ```
-    /// use trypema::{RateGroupSizeMs, TrypemaError};
+    /// use trypema::{BucketSize, TrypemaError};
     ///
     /// assert!(matches!(
-    ///     RateGroupSizeMs::try_from(0),
-    ///     Err(TrypemaError::InvalidRateGroupSizeMs(_))
+    ///     BucketSize::milliseconds(0),
+    ///     Err(TrypemaError::InvalidBucketSize(_))
     /// ));
     /// ```
-    #[error("invalid rate group size: {0}")]
-    InvalidRateGroupSizeMs(String),
+    #[error("invalid bucket size: {0}")]
+    InvalidBucketSize(String),
 
     /// Hard limit factor is invalid.
     ///
@@ -180,9 +182,20 @@ pub enum TrypemaError {
     #[error("custom error: {0}")]
     CustomError(String),
 
-    /// Invalid suppression factor cache duration.
+    /// Suppression-factor cache period is invalid.
     ///
     /// The duration must be greater than 0.
-    #[error("invalid suppression factor cache duration: {0}")]
-    InvalidSuppressionFactorCacheMs(String),
+    #[error("invalid suppression-factor cache period: {0}")]
+    InvalidSuppressionFactorCachePeriod(String),
+
+    /// Hybrid sync interval is invalid.
+    ///
+    /// The interval must be greater than 0 milliseconds and fit in the internal `u64`
+    /// millisecond representation.
+    #[error("invalid sync interval: {0}")]
+    InvalidSyncInterval(String),
+
+    /// Stale-state cleanup timing is invalid.
+    #[error("invalid cleanup configuration: {0}")]
+    InvalidCleanupConfiguration(String),
 }

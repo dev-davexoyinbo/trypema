@@ -6,18 +6,17 @@
 #[cfg(all(feature = "redis-tokio", feature = "redis-smol"))]
 compile_error!("Features `redis-tokio` and `redis-smol` are mutually exclusive");
 
-mod rate_limiter;
-pub use rate_limiter::*;
+mod builder;
+pub use builder::RateLimiterBuilder;
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 pub(crate) mod runtime;
 
 pub mod local;
-use local::*;
 
 /// Redis-backed distributed rate limiter implementations.
 ///
-/// Provides [`RedisRateLimiterProvider`], which executes
+/// Provides [`RedisRateLimiterProvider`](redis::RedisRateLimiterProvider), which executes
 /// all operations as atomic Lua scripts against Redis 7.2+. Each `inc()` or `is_allowed()`
 /// call results in one Redis round-trip.
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -34,21 +33,15 @@ pub mod redis;
 #[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
 pub mod hybrid;
 
-#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
-use redis::*;
-
 mod error;
-pub use error::*;
+pub use error::TrypemaError;
 
 mod common;
 pub use common::{
-    HardLimitFactor, RateGroupSizeMs, RateLimit, RateLimitDecision, SuppressionFactorCacheMs,
-    WindowSizeSeconds,
+    BucketSize, ConditionalSetOutcome, HardLimitFactor, HistoryPreservation, RateLimit,
+    RateLimitComparator, RateLimitDecision, SuppressedRateLimitSnapshot,
+    SuppressionFactorCachePeriod, WindowSize,
 };
 
 #[cfg(test)]
 mod tests;
-
-#[doc(hidden)]
-pub mod __doctest_helpers;
