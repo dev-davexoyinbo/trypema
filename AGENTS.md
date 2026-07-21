@@ -157,10 +157,10 @@ For `is_allowed`:
 - Fresh under-limit checks stay on the shared fast path.
 - Expiration maintenance is lazy and may require exclusive access.
 - Rejected decisions expose best-effort metadata:
-  - `retry_after_ms` is the remaining wait until the oldest live bucket expires, not the bucket's
+  - `retry_after` is the remaining `Duration` until the oldest live bucket expires, not the bucket's
     elapsed age.
   - `remaining_after_waiting` is the capacity released when that oldest bucket expires: the
-    amount the caller can send after `retry_after_ms`. For a full window with buckets containing
+    amount the caller can send after `retry_after`. For a full window with buckets containing
     `3` then `7`, this value is `3`, not `7` and not the `7` count units still in the window.
   - If grouping merged all usage into the oldest bucket, `remaining_after_waiting` is the full
     merged bucket count.
@@ -550,17 +550,18 @@ Minimize test-only helpers in production impl blocks:
 - Express numeric timing bounds with direct comparisons:
 
   ```rust
-  assert!(retry_after_ms >= min_ms && retry_after_ms <= max_ms);
+  assert!(retry_after >= Duration::from_millis(min_ms)
+      && retry_after <= Duration::from_millis(max_ms));
   ```
 
-- Do not use `(min_ms..=max_ms).contains(&retry_after_ms)` for these assertions.
+- Do not use range containment for these assertions.
 - Keep waits as short as the public configuration allows. A one-second window is usually enough
   for expiry tests.
 - For separate buckets, sleep beyond `bucket_size` while staying comfortably inside the
   window.
 - For mixed expired/fresh history, create both buckets first, then wait until only the oldest has
   crossed the window.
-- Assert `remaining_after_waiting` independently from `retry_after_ms` so one failure does not
+- Assert `remaining_after_waiting` independently from `retry_after` so one failure does not
   obscure the other semantic.
 
 ### 8.4 Lock regression tests
@@ -765,9 +766,9 @@ Before handing work back, confirm all applicable items:
 - [ ] Expired buckets are excluded from logical totals and evicted when appropriate.
 - [ ] Absolute `get` returns a `u64`; suppressed `get` returns a snapshot whose total, declined
       total, and suppression factor all reflect live state and provider-specific pending overlays.
-- [ ] `retry_after_ms` is remaining time, not elapsed age.
+- [ ] `retry_after` is remaining time, not elapsed age.
 - [ ] `remaining_after_waiting` is the oldest live bucket count: the capacity available after
-      `retry_after_ms`, not the count that remains in the window.
+      `retry_after`, not the count that remains in the window.
 - [ ] Conditional-set comparator semantics use the live total.
 - [ ] Absolute values use `window_limit`; suppressed values use `hard_window_limit`; neither uses
       an ambiguous `limit` alias.
@@ -798,7 +799,7 @@ Before handing work back, confirm all applicable items:
 - Holding a shared guard and then trying to acquire a mutable guard without dropping it.
 - Assuming a read-only public method can never perform expiration maintenance.
 - Requiring expired-key reads to remain compatible with an artificially held shared guard.
-- Returning elapsed bucket age as `retry_after_ms`.
+- Returning elapsed bucket age as `retry_after`.
 - Treating the newest bucket count as `remaining_after_waiting`.
 - Computing `remaining_after_waiting` as `total_count - oldest_bucket_count`.
 - Ignoring setup `inc` decisions and accidentally testing a rejected increment.

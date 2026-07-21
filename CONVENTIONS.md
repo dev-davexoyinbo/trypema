@@ -168,7 +168,7 @@ Use words consistently across Rust, Lua, tests, benches, and documentation.
   time configuration, with unit-neutral option fields. Raw internal values retain unit suffixes.
   Internal state that describes a concrete bucket uses `bucket`, for example
   `oldest_bucket_ttl` and `oldest_bucket_count`.
-- `retry_after_ms` is the remaining wait until the oldest live bucket expires.
+- `retry_after` is the remaining `Duration` until the oldest live bucket expires.
   `remaining_after_waiting` is the capacity released at that point and therefore equals
   `oldest_bucket_count`; it is not the count still in the window and must not be calculated as
   `total_count - oldest_bucket_count`. For a full window with buckets `3` then `7`, it is `3`.
@@ -549,15 +549,17 @@ feature-gated link that breaks no-feature Rustdoc.
 
 ### 14.4 Builder and feature documentation
 
-Explain the local-only and Redis-enabled builder forms explicitly:
+Explain the provider-specific builder forms explicitly:
 
-- Local-only: `RateLimiterBuilder::default()` or `RateLimiter::builder()`.
-- Redis-enabled: `RateLimiter::builder(connection_manager)`.
+- Local: `LocalRateLimiterProvider::builder()`.
+- Redis: `RedisRateLimiterProvider::builder(connection_manager)`.
+- Hybrid: `HybridRateLimiterProvider::builder(connection_manager)`.
 
 Document the cleanup lifecycle:
 
-- `RateLimiterBuilder::build()` starts cleanup automatically.
-- `RateLimiter::new(...)` does not.
+- The shared `RateLimiterBuilder::build()` starts cleanup automatically.
+- `cleanup_enabled(false)` disables automatic cleanup startup.
+- Provider `start_cleanup_loop()` and `stop_cleanup_loop()` methods are idempotent.
 
 In builder examples, put a short comment before optional chained setters. Use `Optional: ...` for
 general setters and `Optional: only available with 'redis-tokio' or 'redis-smol'` for Redis-only

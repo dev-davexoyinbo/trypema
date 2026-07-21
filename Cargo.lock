@@ -1831,7 +1831,6 @@ dependencies = [
  "futures",
  "rand 0.10.2",
  "redis",
- "regex",
  "smol",
  "strum",
  "strum_macros",

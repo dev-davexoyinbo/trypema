@@ -69,7 +69,7 @@ cases consume the complete `SuppressedRateLimitSnapshot`, including both counter
 All six suites compare conditional-set guard misses with matched replacement,
 `PreserveNewest`, and `PreserveOldest` history adjustments. Each hybrid suite also benchmarks
 every strategy-specific public operation: `inc`, reads, admission checks where applicable, and
-both conditional-set forms. Both hybrid strategies measure the local `get_inferred` fast path,
+both conditional-set forms. Both hybrid strategies measure the local `get_estimate` fast path,
 its Redis-refresh path, and Redis-synchronized `get` reads separately.
 
 Run one bench directly:
