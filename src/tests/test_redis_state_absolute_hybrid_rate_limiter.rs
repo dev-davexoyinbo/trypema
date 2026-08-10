@@ -79,6 +79,134 @@ fn assert_allowed(decision: RateLimitDecision, context: &str) {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[test]
+fn redis_state_hybrid_absolute_lifecycle_tracks_revisions() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let rl = build_limiter(&url, 10, 1_000, 2_000, prefix.clone()).await;
+        let first = key("first");
+        let second = key("second");
+        let initial_rate = RateLimit::per_second_or_panic(2.5);
+        let replacement_rate = RateLimit::per_second_or_panic(1.25);
+
+        assert_allowed(
+            rl.absolute().inc(&first, &initial_rate, 4).await.unwrap(),
+            "seed pending state",
+        );
+        assert_eq!(
+            rl.absolute()
+                .set_rate_limit(&first, &replacement_rate)
+                .await
+                .unwrap(),
+            Some(initial_rate)
+        );
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let key_generator = key_gen(&prefix, RateType::HybridAbsolute);
+        assert_eq!(
+            conn.get::<_, f64>(redis_key(&prefix, &first, "w"))
+                .await
+                .unwrap(),
+            12.5
+        );
+        assert_eq!(
+            conn.get::<_, u64>(redis_key(&prefix, &first, "t"))
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            conn.hget::<_, _, u64>(key_generator.get_key_state_revisions_key(), first.as_str())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.get::<_, Option<u64>>(key_generator.get_state_revision_key())
+                .await
+                .unwrap(),
+            None
+        );
+
+        let ttl_before: i64 = conn.pttl(redis_key(&prefix, &first, "w")).await.unwrap();
+        let membership_before: f64 = conn
+            .zscore(key_generator.get_active_entities_key(), first.as_str())
+            .await
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            rl.absolute()
+                .set_rate_limit(&first, &replacement_rate)
+                .await
+                .unwrap(),
+            Some(replacement_rate)
+        );
+        assert_eq!(
+            conn.hget::<_, _, u64>(key_generator.get_key_state_revisions_key(), first.as_str())
+                .await
+                .unwrap(),
+            1
+        );
+        let ttl_after: i64 = conn.pttl(redis_key(&prefix, &first, "w")).await.unwrap();
+        assert!(ttl_after < ttl_before);
+        assert_eq!(
+            conn.zscore::<_, _, f64>(key_generator.get_active_entities_key(), first.as_str())
+                .await
+                .unwrap(),
+            membership_before
+        );
+
+        assert_eq!(rl.absolute().delete(&first).await.unwrap(), Some(4));
+        assert_eq!(
+            conn.hget::<_, _, u64>(key_generator.get_key_state_revisions_key(), first.as_str())
+                .await
+                .unwrap(),
+            2
+        );
+        for entity_key in key_generator.get_all_entity_keys(&first) {
+            assert!(!conn.exists::<_, bool>(entity_key).await.unwrap());
+        }
+
+        for entity in [&first, &second] {
+            rl.absolute()
+                .set_if(entity, &initial_rate, RateLimitComparator::Always, 1)
+                .await
+                .unwrap();
+        }
+        rl.absolute().clear().await.unwrap();
+
+        assert_eq!(
+            conn.get::<_, u64>(key_generator.get_state_revision_key())
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !conn
+                .exists::<_, bool>(key_generator.get_key_state_revisions_key())
+                .await
+                .unwrap()
+        );
+        for entity in [&first, &second] {
+            for entity_key in key_generator.get_all_entity_keys(entity) {
+                assert!(!conn.exists::<_, bool>(entity_key).await.unwrap());
+            }
+        }
+        assert!(
+            !conn
+                .exists::<_, bool>(key_generator.get_active_entities_key())
+                .await
+                .unwrap()
+        );
+    });
+}
+
 /// Before the local accept budget is exhausted, no hybrid_absolute Redis keys should exist
 /// because the hybrid limiter has not yet committed any state.
 #[test]

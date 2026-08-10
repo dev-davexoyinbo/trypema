@@ -125,6 +125,151 @@ fn redis_state_after_single_allowed_inc() {
     });
 }
 
+#[test]
+fn redis_state_rate_update_delete_and_clear_cover_every_absolute_key() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let (rl, prefix) = build_limiter(&url, 10, 1_000).await;
+        let first = key("first");
+        let second = key("second");
+        let initial_rate = RateLimit::per_second_or_panic(2.5);
+        let replacement_rate = RateLimit::per_second_or_panic(1.25);
+
+        assert_allowed(
+            rl.absolute().inc(&first, &initial_rate, 4).await.unwrap(),
+            "seed first key",
+        );
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let hash_before: HashMap<String, u64> =
+            conn.hgetall(redis_key(&prefix, &first, "h")).await.unwrap();
+        let active_before: Vec<(String, f64)> = conn
+            .zrange_withscores(redis_key(&prefix, &first, "a"), 0, -1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rl.absolute()
+                .set_rate_limit(&first, &replacement_rate)
+                .await
+                .unwrap(),
+            Some(initial_rate)
+        );
+        assert_eq!(
+            conn.get::<_, f64>(redis_key(&prefix, &first, "w"))
+                .await
+                .unwrap(),
+            12.5
+        );
+        assert_eq!(
+            conn.get::<_, u64>(redis_key(&prefix, &first, "t"))
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            conn.hgetall::<_, HashMap<String, u64>>(redis_key(&prefix, &first, "h"))
+                .await
+                .unwrap(),
+            hash_before
+        );
+        assert_eq!(
+            conn.zrange_withscores::<_, Vec<(String, f64)>>(redis_key(&prefix, &first, "a"), 0, -1)
+                .await
+                .unwrap(),
+            active_before
+        );
+
+        let key_generator = key_gen(&prefix, RateType::Absolute);
+        let ttl_before: i64 = conn.pttl(redis_key(&prefix, &first, "w")).await.unwrap();
+        let membership_before: f64 = conn
+            .zscore(key_generator.get_active_entities_key(), first.as_str())
+            .await
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            rl.absolute()
+                .set_rate_limit(&first, &replacement_rate)
+                .await
+                .unwrap(),
+            Some(replacement_rate)
+        );
+        let ttl_after: i64 = conn.pttl(redis_key(&prefix, &first, "w")).await.unwrap();
+        assert!(ttl_after < ttl_before);
+        assert_eq!(
+            conn.zscore::<_, _, f64>(key_generator.get_active_entities_key(), first.as_str())
+                .await
+                .unwrap(),
+            membership_before
+        );
+
+        assert_eq!(rl.absolute().delete(&first).await.unwrap(), Some(4));
+        for entity_key in key_generator.get_all_entity_keys(&first) {
+            assert!(!conn.exists::<_, bool>(entity_key).await.unwrap());
+        }
+        assert_eq!(
+            conn.zscore::<_, _, Option<f64>>(
+                key_generator.get_active_entities_key(),
+                first.as_str(),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        let ghost = key("membership_ghost");
+        assert!(matches!(
+            rl.absolute().inc(&ghost, &initial_rate, 26).await.unwrap(),
+            RateLimitDecision::Rejected { .. }
+        ));
+        assert!(
+            conn.zscore::<_, _, Option<f64>>(
+                key_generator.get_active_entities_key(),
+                ghost.as_str(),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(rl.absolute().delete(&ghost).await.unwrap(), None);
+        assert_eq!(
+            conn.zscore::<_, _, Option<f64>>(
+                key_generator.get_active_entities_key(),
+                ghost.as_str(),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        assert_allowed(
+            rl.absolute().inc(&first, &initial_rate, 1).await.unwrap(),
+            "recreate first key",
+        );
+        assert_allowed(
+            rl.absolute().inc(&second, &initial_rate, 1).await.unwrap(),
+            "seed second key",
+        );
+        rl.absolute().clear().await.unwrap();
+
+        for entity in [&first, &second] {
+            for entity_key in key_generator.get_all_entity_keys(entity) {
+                assert!(!conn.exists::<_, bool>(entity_key).await.unwrap());
+            }
+        }
+        assert!(
+            !conn
+                .exists::<_, bool>(key_generator.get_active_entities_key())
+                .await
+                .unwrap()
+        );
+    });
+}
+
 /// The first accepted increment stores the sticky window limit. Later `inc` calls must use and
 /// retain that value even when their supplied rate differs.
 #[test]

@@ -1,4 +1,9 @@
-use std::{env, time::Duration};
+use std::{
+    env,
+    sync::{Arc, Barrier, mpsc},
+    thread,
+    time::Duration,
+};
 
 use super::runtime;
 
@@ -17,6 +22,384 @@ fn redis_url() -> String {
     })
 }
 
+#[test]
+fn rate_and_key_lifecycle_preserves_snapshot_and_resets_state() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter(&url, 6, 1_000, 2.0).await;
+        let first = key("first");
+        let second = key("second");
+        let missing = key("missing");
+        let initial_rate = RateLimit::per_second_or_panic(2.5);
+        let lower_rate = RateLimit::per_second_or_panic(0.5);
+
+        assert!(matches!(
+            rl.suppressed().inc(&first, &initial_rate, 4).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        let before = rl.suppressed().get(&first).await.unwrap();
+        assert_eq!(
+            rl.suppressed()
+                .set_rate_limit(&missing, &lower_rate)
+                .await
+                .unwrap(),
+            None
+        );
+        let zero = key("zero");
+        assert!(matches!(
+            rl.suppressed().inc(&zero, &initial_rate, 0).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(rl.suppressed().delete(&zero).await.unwrap(), Some(0));
+        assert_eq!(
+            rl.suppressed()
+                .set_rate_limit(&first, &lower_rate)
+                .await
+                .unwrap(),
+            Some(initial_rate)
+        );
+        let after = rl.suppressed().get(&first).await.unwrap();
+        assert_eq!(after.total, before.total);
+        assert_eq!(after.total_declined, before.total_declined);
+
+        assert_eq!(rl.suppressed().delete(&first).await.unwrap(), Some(4));
+        assert_eq!(rl.suppressed().delete(&first).await.unwrap(), None);
+        assert_eq!(rl.suppressed().get(&first).await.unwrap().total, 0);
+
+        assert!(matches!(
+            rl.suppressed().inc(&first, &initial_rate, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert!(matches!(
+            rl.suppressed()
+                .inc(&second, &initial_rate, 1)
+                .await
+                .unwrap(),
+            RateLimitDecision::Allowed
+        ));
+
+        rl.suppressed().clear().await.unwrap();
+        assert_eq!(rl.suppressed().get(&first).await.unwrap().total, 0);
+        assert_eq!(rl.suppressed().get(&second).await.unwrap().total, 0);
+        rl.suppressed().clear().await.unwrap();
+
+        let unbounded = key("unbounded");
+        assert!(matches!(
+            rl.suppressed()
+                .inc(&unbounded, &RateLimit::max(), 1)
+                .await
+                .unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(
+            rl.suppressed()
+                .set_rate_limit(&unbounded, &initial_rate)
+                .await
+                .unwrap(),
+            Some(RateLimit::max())
+        );
+    });
+}
+
+#[test]
+fn delete_returns_zero_for_expired_suppressed_redis_state() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter(&url, 1, 1_000, 2.0).await;
+        let key = key("expired");
+        let rate_limit = RateLimit::per_second_or_panic(1.0);
+
+        assert!(matches!(
+            rl.suppressed().inc(&key, &rate_limit, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        runtime::async_sleep(Duration::from_millis(1_050)).await;
+
+        assert_eq!(rl.suppressed().delete(&key).await.unwrap(), Some(0));
+    });
+}
+
+#[test]
+fn multi_instance_threaded_lifecycle_cutovers_preserve_exact_snapshot() {
+    const INSTANCES: usize = 4;
+    const INITIAL_INCREMENTS: u64 = 32;
+    const AFTER_RAISE_INCREMENTS: u64 = 8;
+    const RECREATED_INCREMENTS: u64 = 4;
+    const CLEAR_INCREMENTS: u64 = 2;
+
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let administrator = build_limiter_with_prefix(&url, 60, 1_000, 1.0, prefix.clone()).await;
+        let high_rate = RateLimit::per_second_or_panic(1_000.0);
+        let low_rate = RateLimit::per_second_or_panic(1.0);
+        let lifecycle_key = key("threaded_lifecycle");
+        let clear_even = key("threaded_clear_even");
+        let clear_odd = key("threaded_clear_odd");
+        let barrier = Arc::new(Barrier::new(INSTANCES + 1));
+        let (deleted_tx, deleted_rx) = mpsc::channel();
+        let mut workers = Vec::with_capacity(INSTANCES);
+
+        for worker_index in 0..INSTANCES {
+            let url = url.clone();
+            let prefix = prefix.clone();
+            let lifecycle_key = lifecycle_key.clone();
+            let clear_even = clear_even.clone();
+            let clear_odd = clear_odd.clone();
+            let barrier = Arc::clone(&barrier);
+            let deleted_tx = deleted_tx.clone();
+
+            workers.push(thread::spawn(move || {
+                runtime::block_on(async move {
+                    let limiter = build_limiter_with_prefix(&url, 60, 1_000, 1.0, prefix).await;
+
+                    barrier.wait();
+                    for _ in 0..INITIAL_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(&lifecycle_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    barrier.wait();
+
+                    barrier.wait();
+                    let decision = limiter
+                        .suppressed()
+                        .inc(&lifecycle_key, &high_rate, 1)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        decision,
+                        RateLimitDecision::Suppressed {
+                            is_allowed: false,
+                            ..
+                        }
+                    ));
+                    barrier.wait();
+
+                    barrier.wait();
+                    for _ in 0..AFTER_RAISE_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(&lifecycle_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    barrier.wait();
+
+                    barrier.wait();
+                    for _ in 0..RECREATED_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(&lifecycle_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    deleted_tx
+                        .send(
+                            limiter
+                                .suppressed()
+                                .delete(&lifecycle_key)
+                                .await
+                                .unwrap()
+                                .unwrap_or(0),
+                        )
+                        .unwrap();
+                    barrier.wait();
+
+                    barrier.wait();
+                    let clear_key = if worker_index % 2 == 0 {
+                        &clear_even
+                    } else {
+                        &clear_odd
+                    };
+                    for _ in 0..CLEAR_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(clear_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    barrier.wait();
+
+                    barrier.wait();
+                    for _ in 0..CLEAR_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(clear_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    barrier.wait();
+                });
+            }));
+        }
+        drop(deleted_tx);
+
+        barrier.wait();
+        barrier.wait();
+        let initial_total = INSTANCES as u64 * INITIAL_INCREMENTS;
+        assert_eq!(
+            administrator
+                .suppressed()
+                .get(&lifecycle_key)
+                .await
+                .unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: initial_total,
+                total_declined: 0,
+                suppression_factor: 0.0,
+            }
+        );
+        assert_eq!(
+            administrator
+                .suppressed()
+                .set_rate_limit(&lifecycle_key, &low_rate)
+                .await
+                .unwrap(),
+            Some(high_rate)
+        );
+
+        barrier.wait();
+        barrier.wait();
+        let declined_total = INSTANCES as u64;
+        let snapshot = administrator
+            .suppressed()
+            .get(&lifecycle_key)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.total, initial_total + declined_total);
+        assert_eq!(snapshot.total_declined, declined_total);
+        assert_eq!(snapshot.total - snapshot.total_declined, initial_total);
+        assert_eq!(
+            administrator
+                .suppressed()
+                .set_rate_limit(&lifecycle_key, &high_rate)
+                .await
+                .unwrap(),
+            Some(low_rate)
+        );
+
+        barrier.wait();
+        barrier.wait();
+        let accepted_before_delete = initial_total + INSTANCES as u64 * AFTER_RAISE_INCREMENTS;
+        let snapshot = administrator
+            .suppressed()
+            .get(&lifecycle_key)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.total, accepted_before_delete + declined_total);
+        assert_eq!(snapshot.total_declined, declined_total);
+        assert_eq!(
+            administrator
+                .suppressed()
+                .delete(&lifecycle_key)
+                .await
+                .unwrap(),
+            Some(snapshot.total - snapshot.total_declined)
+        );
+        assert_eq!(
+            administrator
+                .suppressed()
+                .delete(&lifecycle_key)
+                .await
+                .unwrap(),
+            None
+        );
+
+        barrier.wait();
+        barrier.wait();
+        let deleted_total = (0..INSTANCES)
+            .map(|_| deleted_rx.recv().unwrap())
+            .sum::<u64>();
+        assert_eq!(deleted_total, INSTANCES as u64 * RECREATED_INCREMENTS);
+        let observer = build_limiter_with_prefix(&url, 60, 1_000, 1.0, prefix.clone()).await;
+        assert_eq!(
+            observer
+                .suppressed()
+                .get(&lifecycle_key)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+
+        assert_eq!(
+            administrator
+                .suppressed()
+                .set_if(&clear_even, &high_rate, RateLimitComparator::Always, 10)
+                .await
+                .unwrap(),
+            (10, 0)
+        );
+        assert_eq!(
+            administrator
+                .suppressed()
+                .set_if(&clear_odd, &high_rate, RateLimitComparator::Always, 10)
+                .await
+                .unwrap(),
+            (10, 0)
+        );
+        barrier.wait();
+        barrier.wait();
+        let per_key_concurrent_total = INSTANCES as u64 / 2 * CLEAR_INCREMENTS;
+        assert_eq!(
+            administrator
+                .suppressed()
+                .get(&clear_even)
+                .await
+                .unwrap()
+                .total,
+            10 + per_key_concurrent_total
+        );
+        assert_eq!(
+            administrator
+                .suppressed()
+                .get(&clear_odd)
+                .await
+                .unwrap()
+                .total,
+            10 + per_key_concurrent_total
+        );
+        administrator.suppressed().clear().await.unwrap();
+
+        barrier.wait();
+        barrier.wait();
+        let observer = build_limiter_with_prefix(&url, 60, 1_000, 1.0, prefix).await;
+        assert_eq!(
+            observer.suppressed().get(&clear_even).await.unwrap().total,
+            per_key_concurrent_total
+        );
+        assert_eq!(
+            observer.suppressed().get(&clear_odd).await.unwrap().total,
+            per_key_concurrent_total
+        );
+        administrator.suppressed().clear().await.unwrap();
+        administrator.suppressed().clear().await.unwrap();
+        assert_eq!(
+            observer.suppressed().get(&clear_even).await.unwrap().total,
+            0
+        );
+        assert_eq!(
+            observer.suppressed().get(&clear_odd).await.unwrap().total,
+            0
+        );
+
+        for worker in workers {
+            worker.join().expect("Redis lifecycle worker panicked");
+        }
+    });
+}
+
 fn unique_prefix() -> RedisKey {
     let n: u64 = rand::random();
     RedisKey::try_from(format!("trypema_test_{n}")).unwrap()
@@ -32,12 +415,31 @@ async fn build_limiter(
     bucket_size: u64,
     hard_limit_factor: f64,
 ) -> std::sync::Arc<RedisRateLimiterProvider> {
-    build_limiter_with_cache_ms(
+    build_limiter_with_prefix_and_cache_ms(
         url,
         window_size,
         bucket_size,
         hard_limit_factor,
         SuppressionFactorCachePeriod::default().as_milliseconds(),
+        unique_prefix(),
+    )
+    .await
+}
+
+async fn build_limiter_with_prefix(
+    url: &str,
+    window_size: u64,
+    bucket_size: u64,
+    hard_limit_factor: f64,
+    prefix: RedisKey,
+) -> Arc<RedisRateLimiterProvider> {
+    build_limiter_with_prefix_and_cache_ms(
+        url,
+        window_size,
+        bucket_size,
+        hard_limit_factor,
+        SuppressionFactorCachePeriod::default().as_milliseconds(),
+        prefix,
     )
     .await
 }
@@ -49,9 +451,27 @@ async fn build_limiter_with_cache_ms(
     hard_limit_factor: f64,
     suppression_factor_cache_period: u64,
 ) -> std::sync::Arc<RedisRateLimiterProvider> {
+    build_limiter_with_prefix_and_cache_ms(
+        url,
+        window_size,
+        bucket_size,
+        hard_limit_factor,
+        suppression_factor_cache_period,
+        unique_prefix(),
+    )
+    .await
+}
+
+async fn build_limiter_with_prefix_and_cache_ms(
+    url: &str,
+    window_size: u64,
+    bucket_size: u64,
+    hard_limit_factor: f64,
+    suppression_factor_cache_period: u64,
+    prefix: RedisKey,
+) -> Arc<RedisRateLimiterProvider> {
     let client = redis::Client::open(url).unwrap();
     let cm = client.get_connection_manager().await.unwrap();
-    let prefix = unique_prefix();
 
     RedisRateLimiterProvider::builder(cm)
         .prefix(prefix)
