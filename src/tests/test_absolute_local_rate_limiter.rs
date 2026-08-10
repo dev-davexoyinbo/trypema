@@ -1699,3 +1699,188 @@ fn set_if_preserve_history_creates_missing_positive_target_for_both_directions()
         assert_eq!(series.total_count.load(Ordering::Acquire), 9);
     }
 }
+
+#[test]
+fn rate_and_key_lifecycle_preserves_usage_and_resets_state() {
+    let limiter = limiter(6, 1_000);
+    let initial_rate = RateLimit::per_second_or_panic(2.5);
+    let lower_rate = RateLimit::per_second_or_panic(0.5);
+
+    assert!(matches!(
+        limiter.inc("first", &initial_rate, 4),
+        RateLimitDecision::Allowed
+    ));
+    assert_eq!(limiter.set_rate_limit("missing", &lower_rate), None);
+    assert!(matches!(
+        limiter.inc("zero", &initial_rate, 0),
+        RateLimitDecision::Allowed
+    ));
+    assert_eq!(limiter.delete("zero"), Some(0));
+    assert_eq!(
+        limiter.set_rate_limit("first", &lower_rate),
+        Some(initial_rate)
+    );
+    assert_eq!(limiter.get("first"), 4);
+    assert!(matches!(
+        limiter.is_allowed("first"),
+        RateLimitDecision::Rejected { .. }
+    ));
+
+    assert_eq!(limiter.delete("first"), Some(4));
+    assert_eq!(limiter.delete("first"), None);
+    assert_eq!(limiter.get("first"), 0);
+    assert!(matches!(
+        limiter.inc("first", &initial_rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    assert!(matches!(
+        limiter.inc("second", &initial_rate, 1),
+        RateLimitDecision::Allowed
+    ));
+
+    limiter.clear();
+    assert_eq!(limiter.get("first"), 0);
+    assert_eq!(limiter.get("second"), 0);
+    limiter.clear();
+
+    assert!(matches!(
+        limiter.inc("unbounded", &RateLimit::max(), 1),
+        RateLimitDecision::Allowed
+    ));
+    assert_eq!(
+        limiter.set_rate_limit("unbounded", &initial_rate),
+        Some(RateLimit::max())
+    );
+}
+
+#[test]
+fn threaded_lifecycle_cutovers_preserve_exact_usage() {
+    const WORKERS: usize = 8;
+    const INITIAL_INCREMENTS: u64 = 64;
+    const AFTER_RAISE_INCREMENTS: u64 = 16;
+    const RECREATED_INCREMENTS: u64 = 8;
+    const CLEAR_INCREMENTS: u64 = 4;
+
+    let limiter = Arc::new(limiter(60, 1_000));
+    let high_rate = RateLimit::per_second_or_panic(1_000.0);
+    let low_rate = RateLimit::per_second_or_panic(1.0);
+    let barrier = Arc::new(Barrier::new(WORKERS + 1));
+    let (deleted_tx, deleted_rx) = mpsc::channel();
+    let mut workers = Vec::with_capacity(WORKERS);
+
+    for worker_index in 0..WORKERS {
+        let limiter = Arc::clone(&limiter);
+        let barrier = Arc::clone(&barrier);
+        let deleted_tx = deleted_tx.clone();
+
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..INITIAL_INCREMENTS {
+                let decision = limiter.inc("lifecycle", &high_rate, 1);
+                assert!(matches!(decision, RateLimitDecision::Allowed));
+            }
+            barrier.wait();
+
+            barrier.wait();
+            let decision = limiter.inc("lifecycle", &high_rate, 1);
+            assert!(matches!(decision, RateLimitDecision::Rejected { .. }));
+            barrier.wait();
+
+            barrier.wait();
+            for _ in 0..AFTER_RAISE_INCREMENTS {
+                let decision = limiter.inc("lifecycle", &high_rate, 1);
+                assert!(matches!(decision, RateLimitDecision::Allowed));
+            }
+            barrier.wait();
+
+            barrier.wait();
+            for _ in 0..RECREATED_INCREMENTS {
+                let decision = limiter.inc("lifecycle", &high_rate, 1);
+                assert!(matches!(decision, RateLimitDecision::Allowed));
+            }
+            deleted_tx
+                .send(limiter.delete("lifecycle").unwrap_or(0))
+                .unwrap();
+            barrier.wait();
+
+            barrier.wait();
+            let clear_key = if worker_index % 2 == 0 {
+                "clear_even"
+            } else {
+                "clear_odd"
+            };
+            for _ in 0..CLEAR_INCREMENTS {
+                let decision = limiter.inc(clear_key, &high_rate, 1);
+                assert!(matches!(decision, RateLimitDecision::Allowed));
+            }
+            barrier.wait();
+
+            barrier.wait();
+            for _ in 0..CLEAR_INCREMENTS {
+                let decision = limiter.inc(clear_key, &high_rate, 1);
+                assert!(matches!(decision, RateLimitDecision::Allowed));
+            }
+            barrier.wait();
+        }));
+    }
+    drop(deleted_tx);
+
+    barrier.wait();
+    barrier.wait();
+    let initial_total = WORKERS as u64 * INITIAL_INCREMENTS;
+    assert_eq!(limiter.get("lifecycle"), initial_total);
+    assert_eq!(
+        limiter.set_rate_limit("lifecycle", &low_rate),
+        Some(high_rate)
+    );
+
+    barrier.wait();
+    barrier.wait();
+    assert_eq!(limiter.get("lifecycle"), initial_total);
+    assert_eq!(
+        limiter.set_rate_limit("lifecycle", &high_rate),
+        Some(low_rate)
+    );
+
+    barrier.wait();
+    barrier.wait();
+    let before_delete = initial_total + WORKERS as u64 * AFTER_RAISE_INCREMENTS;
+    assert_eq!(limiter.delete("lifecycle"), Some(before_delete));
+    assert_eq!(limiter.delete("lifecycle"), None);
+
+    barrier.wait();
+    barrier.wait();
+    let deleted_total = (0..WORKERS)
+        .map(|_| deleted_rx.recv().unwrap())
+        .sum::<u64>();
+    assert_eq!(deleted_total, WORKERS as u64 * RECREATED_INCREMENTS);
+    assert_eq!(limiter.get("lifecycle"), 0);
+
+    assert_eq!(
+        limiter.set_if("clear_even", &high_rate, RateLimitComparator::Always, 10),
+        (10, 0)
+    );
+    assert_eq!(
+        limiter.set_if("clear_odd", &high_rate, RateLimitComparator::Always, 10),
+        (10, 0)
+    );
+    barrier.wait();
+    barrier.wait();
+    let per_key_concurrent_total = WORKERS as u64 / 2 * CLEAR_INCREMENTS;
+    assert_eq!(limiter.get("clear_even"), 10 + per_key_concurrent_total);
+    assert_eq!(limiter.get("clear_odd"), 10 + per_key_concurrent_total);
+    limiter.clear();
+
+    barrier.wait();
+    barrier.wait();
+    assert_eq!(limiter.get("clear_even"), per_key_concurrent_total);
+    assert_eq!(limiter.get("clear_odd"), per_key_concurrent_total);
+    limiter.clear();
+    limiter.clear();
+    assert_eq!(limiter.get("clear_even"), 0);
+    assert_eq!(limiter.get("clear_odd"), 0);
+
+    for worker in workers {
+        worker.join().expect("lifecycle worker panicked");
+    }
+}

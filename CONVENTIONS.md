@@ -203,7 +203,7 @@ Use `absolute` and `suppressed` consistently. Do not introduce synonyms such as 
 - A value of `RateLimitDecision` is named `decision`. Reserve `is_*` and `should_*` locals for
   booleans; do not name an enum result `is_allowed`.
 - Methods that mutate should use a verb that names the mutation: `inc`, `cleanup`, `commit`,
-  `invalidate`, `set_if`.
+  `invalidate`, `set_if`, `set_rate_limit`, `delete`, `clear`.
 - Keep corresponding method names aligned across local, Redis, and hybrid variants.
 
 Avoid names that expose incidental implementation details. Prefer `cleanup_expired_suppressed`
@@ -233,6 +233,11 @@ Public APIs should be predictable, type-safe, documented, and difficult to misus
 
 The local API is synchronous. Redis and hybrid APIs are asynchronous and return the repository's
 existing `Result` shape. Do not make local callers depend on a Redis runtime or feature.
+
+Lifecycle APIs stay aligned across all limiter variants: `set_rate_limit` returns the previous
+effective `RateLimit` when stored-rate state exists, `delete` returns `Option<u64>` containing live
+pre-delete usage, and `clear` is strategy- and prefix-scoped. Absolute deletion returns the live
+total; suppressed deletion returns accepted usage.
 
 ## 7. Values, Units, and Calculations
 
@@ -313,6 +318,8 @@ requires exclusive access.
 - Keep runtime-neutral behavior outside Tokio- or Smol-specific branches.
 - Use the existing runtime abstraction in production code and tests.
 - Coordinate per-key hybrid flush and conditional-set paths through the established per-key lock.
+- Carry namespace and per-key `state_revision` values through existing hybrid Redis reads and
+  commits. Lifecycle maintenance locks must not extend to the increment fast path.
 
 ## 9. State Transitions and Control Flow
 

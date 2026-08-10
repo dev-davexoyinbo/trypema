@@ -115,6 +115,8 @@ pub(crate) struct RedisKeyGenerator {
     pub total_declined_key_suffix: String,
     pub active_keys_key_suffix: String,
     pub suppression_factor_key_suffix: String,
+    pub state_revision_key_suffix: String,
+    pub key_state_revisions_key_suffix: String,
 }
 
 impl RedisKeyGenerator {
@@ -130,6 +132,8 @@ impl RedisKeyGenerator {
             total_declined_key_suffix: "d".to_string(),
             active_keys_key_suffix: "a".to_string(),
             suppression_factor_key_suffix: "sf".to_string(),
+            state_revision_key_suffix: "state_revision".to_string(),
+            key_state_revisions_key_suffix: "key_state_revisions".to_string(),
         }
     }
 
@@ -170,6 +174,20 @@ impl RedisKeyGenerator {
 
     pub(crate) fn get_suppression_factor_key(&self, key: &RedisKey) -> String {
         self.get_key_with_suffix(key, &self.suppression_factor_key_suffix)
+    }
+
+    pub(crate) fn get_state_revision_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.prefix, self.rate_type, self.state_revision_key_suffix
+        )
+    }
+
+    pub(crate) fn get_key_state_revisions_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.prefix, self.rate_type, self.key_state_revisions_key_suffix
+        )
     }
 
     /// All Redis keys associated with a single entity key.

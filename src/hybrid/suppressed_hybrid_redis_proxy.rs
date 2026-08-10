@@ -4,13 +4,14 @@ use crate::{
     BucketSize, HardLimitFactor, RateLimitComparator, SuppressionFactorCachePeriod, TrypemaError,
     WindowSize,
     common::{HistoryUpdateMode, RateType},
-    hybrid::RedisProxyCommitter,
+    hybrid::{RedisProxyCommitter, common::StateRevision},
     redis::{
         RedisKey, RedisKeyGenerator,
         scripts::{
-            SUPPRESSED_CLEANUP_LUA, SUPPRESSED_HYBRID_COMMIT_STATE_LUA,
-            SUPPRESSED_HYBRID_READ_STATE_LUA, SUPPRESSED_SET_IF_LUA, lua_script,
-            suppressed_lua_script,
+            SUPPRESSED_CLEANUP_LUA, SUPPRESSED_HYBRID_CLEAR_LUA,
+            SUPPRESSED_HYBRID_COMMIT_STATE_LUA, SUPPRESSED_HYBRID_DELETE_LUA,
+            SUPPRESSED_HYBRID_READ_STATE_LUA, SUPPRESSED_HYBRID_SET_RATE_LIMIT_LUA,
+            SUPPRESSED_SET_IF_LUA, lua_script, suppressed_lua_script,
         },
     },
 };
@@ -21,12 +22,14 @@ pub(crate) struct SuppressedHybridCommit {
     pub hard_window_limit: f64,
     pub count: u64,
     pub declined_count: u64,
+    pub state_revision: StateRevision,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SuppressedHybridPendingState {
     pub pending_count: u64,
     pub pending_declined_count: u64,
+    pub state_revision: StateRevision,
 }
 
 #[derive(Debug)]
@@ -37,6 +40,7 @@ pub(crate) struct SuppressedHybridRedisProxyReadStateResult {
     pub suppression_factor: f64,
     pub suppression_factor_ttl_ms: Option<u64>,
     pub hard_window_limit: Option<f64>,
+    pub state_revision: StateRevision,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +50,9 @@ pub(crate) struct SuppressedHybridRedisProxy {
     commit_state_script: Script,
     set_if_script: Script,
     cleanup_script: Script,
+    set_rate_limit_script: Script,
+    delete_script: Script,
+    clear_script: Script,
     connection_manager: ConnectionManager,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_period: SuppressionFactorCachePeriod,
@@ -80,6 +87,9 @@ impl SuppressedHybridRedisProxy {
             commit_state_script: suppressed_lua_script(SUPPRESSED_HYBRID_COMMIT_STATE_LUA),
             set_if_script: lua_script(SUPPRESSED_SET_IF_LUA),
             cleanup_script: lua_script(SUPPRESSED_CLEANUP_LUA),
+            set_rate_limit_script: lua_script(SUPPRESSED_HYBRID_SET_RATE_LIMIT_LUA),
+            delete_script: suppressed_lua_script(SUPPRESSED_HYBRID_DELETE_LUA),
+            clear_script: lua_script(SUPPRESSED_HYBRID_CLEAR_LUA),
             hard_limit_factor,
             suppression_factor_cache_period,
             connection_manager,
@@ -95,7 +105,7 @@ impl SuppressedHybridRedisProxy {
     ) -> Result<SuppressedHybridRedisProxyReadStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let res: (String, f64, u64, u64, f64, i64) = self
+        let res: (String, f64, u64, u64, f64, i64, u64, u64) = self
             .read_state_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
@@ -105,6 +115,8 @@ impl SuppressedHybridRedisProxy {
             .key(self.key_generator.get_suppression_factor_key(key))
             .key(self.key_generator.get_total_declined_key(key))
             .key(self.key_generator.get_hash_declined_key(key))
+            .key(self.key_generator.get_state_revision_key())
+            .key(self.key_generator.get_key_state_revisions_key())
             .arg(key.as_str())
             .arg(self.window_size.as_seconds())
             .arg(self.suppression_factor_cache_period.as_milliseconds())
@@ -137,6 +149,8 @@ impl SuppressedHybridRedisProxy {
                     .key(self.key_generator.get_suppression_factor_key(&commit.key))
                     .key(self.key_generator.get_total_declined_key(&commit.key))
                     .key(self.key_generator.get_hash_declined_key(&commit.key))
+                    .key(self.key_generator.get_state_revision_key())
+                    .key(self.key_generator.get_key_state_revisions_key())
                     .arg(commit.key.as_str())
                     .arg(self.window_size.as_seconds())
                     .arg(commit.hard_window_limit)
@@ -144,7 +158,9 @@ impl SuppressedHybridRedisProxy {
                     .arg(self.suppression_factor_cache_period.as_milliseconds())
                     .arg(self.hard_limit_factor.as_multiplier())
                     .arg(commit.count)
-                    .arg(commit.declined_count),
+                    .arg(commit.declined_count)
+                    .arg(commit.state_revision.namespace)
+                    .arg(commit.state_revision.key),
             );
         }
 
@@ -169,7 +185,9 @@ impl SuppressedHybridRedisProxy {
             let pipe = self.build_read_pipeline(chunk, false);
 
             let results = match pipe
-                .query_async::<Vec<(String, f64, u64, u64, f64, i64)>>(&mut connection_manager)
+                .query_async::<Vec<(String, f64, u64, u64, f64, i64, u64, u64)>>(
+                    &mut connection_manager,
+                )
                 .await
             {
                 Ok(results) => results,
@@ -183,7 +201,7 @@ impl SuppressedHybridRedisProxy {
                     let pipe = self.build_read_pipeline(chunk, true);
 
                     match pipe
-                        .query_async::<Vec<(String, f64, u64, u64, f64, i64)>>(
+                        .query_async::<Vec<(String, f64, u64, u64, f64, i64, u64, u64)>>(
                             &mut connection_manager,
                         )
                         .await
@@ -225,6 +243,8 @@ impl SuppressedHybridRedisProxy {
                     .key(self.key_generator.get_suppression_factor_key(key))
                     .key(self.key_generator.get_total_declined_key(key))
                     .key(self.key_generator.get_hash_declined_key(key))
+                    .key(self.key_generator.get_state_revision_key())
+                    .key(self.key_generator.get_key_state_revisions_key())
                     .arg(key.as_str())
                     .arg(self.window_size.as_seconds())
                     .arg(self.suppression_factor_cache_period.as_milliseconds())
@@ -280,6 +300,101 @@ impl SuppressedHybridRedisProxy {
 
         Ok((new_total, old_total, changed != 0))
     } // end method set_if
+
+    pub(crate) async fn set_rate_limit(
+        &self,
+        key: &RedisKey,
+        hard_window_limit: f64,
+    ) -> Result<Option<(f64, bool)>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let (status, previous, changed): (String, String, u8) = self
+            .set_rate_limit_script
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_suppression_factor_key(key))
+            .key(self.key_generator.get_key_state_revisions_key())
+            .arg(key.as_str())
+            .arg(self.window_size.as_seconds())
+            .arg(hard_window_limit)
+            .arg(self.hard_limit_factor.as_multiplier())
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        match status.as_str() {
+            "missing" => Ok(None),
+            "found" => previous
+                .parse::<f64>()
+                .map(|previous| Some((previous, changed == 1)))
+                .map_err(|_| {
+                    TrypemaError::CustomError(
+                        "invalid stored suppressed hybrid hard window limit".to_string(),
+                    )
+                }),
+            "invalid" => Err(TrypemaError::CustomError(
+                "invalid stored suppressed hybrid hard window limit".to_string(),
+            )),
+            _ => Err(TrypemaError::UnexpectedRedisScriptResult {
+                operation: "suppressed_hybrid.set_rate_limit",
+                key: key.to_string(),
+                result: status,
+            }),
+        }
+    }
+
+    pub(crate) async fn delete(
+        &self,
+        key: &RedisKey,
+        pending_count: u64,
+        pending_declined_count: u64,
+        local_existed: bool,
+    ) -> Result<Option<u64>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let (existed, accepted_count): (u8, u64) = self
+            .delete_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_hash_declined_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_total_declined_key(key))
+            .key(self.key_generator.get_suppression_factor_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_key_state_revisions_key())
+            .arg(key.as_str())
+            .arg(self.window_size.as_seconds())
+            .arg(pending_count)
+            .arg(pending_declined_count)
+            .arg(u8::from(local_existed))
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok((existed == 1).then_some(accepted_count))
+    }
+
+    pub(crate) async fn clear(&self) -> Result<(), TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let _: () = self
+            .clear_script
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_state_revision_key())
+            .key(self.key_generator.get_key_state_revisions_key())
+            .arg(self.key_generator.prefix.to_string())
+            .arg(self.key_generator.rate_type.to_string())
+            .arg(self.key_generator.hash_key_suffix.to_string())
+            .arg(self.key_generator.hash_declined_key_suffix.to_string())
+            .arg(self.key_generator.active_keys_key_suffix.to_string())
+            .arg(self.key_generator.window_limit_key_suffix.to_string())
+            .arg(self.key_generator.total_count_key_suffix.to_string())
+            .arg(self.key_generator.total_declined_key_suffix.to_string())
+            .arg(self.key_generator.suppression_factor_key_suffix.to_string())
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(())
+    }
 
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
@@ -346,7 +461,9 @@ fn map_redis_read_result_to_state(
         current_total_declined,
         hard_window_limit,
         suppression_factor_ttl_ms,
-    ): (String, f64, u64, u64, f64, i64),
+        state_revision,
+        key_state_revision,
+    ): (String, f64, u64, u64, f64, i64, u64, u64),
 ) -> SuppressedHybridRedisProxyReadStateResult {
     SuppressedHybridRedisProxyReadStateResult {
         key: RedisKey::from(entity),
@@ -362,6 +479,10 @@ fn map_redis_read_result_to_state(
             None
         } else {
             Some(suppression_factor_ttl_ms as u64)
+        },
+        state_revision: StateRevision {
+            namespace: state_revision,
+            key: key_state_revision,
         },
     }
 }

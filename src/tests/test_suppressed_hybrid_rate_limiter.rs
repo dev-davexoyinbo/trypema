@@ -1,4 +1,9 @@
-use std::{env, time::Duration};
+use std::{
+    env,
+    sync::{Arc, Barrier, mpsc},
+    thread,
+    time::Duration,
+};
 
 use super::runtime;
 
@@ -12,6 +17,524 @@ use crate::{
 
 fn window_capacity(window_size: u64, rate_limit: &RateLimit) -> u64 {
     ((window_size as f64) * rate_limit.as_per_second()) as u64
+}
+
+#[test]
+fn rate_and_key_lifecycle_handles_pending_state_and_remote_revisions() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let rl_a =
+            build_limiter_with_prefix(&url, 6, 1_000, 2.0, 1_000, 2_000, prefix.clone()).await;
+        let rl_b = build_limiter_with_prefix(&url, 6, 1_000, 2.0, 1_000, 2_000, prefix).await;
+        let first = key("first");
+        let second = key("second");
+        let missing = key("missing");
+        let initial_rate = RateLimit::per_second_or_panic(2.5);
+        let lower_rate = RateLimit::per_second_or_panic(0.5);
+
+        assert!(matches!(
+            rl_a.suppressed()
+                .inc(&first, &initial_rate, 4)
+                .await
+                .unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(
+            rl_a.suppressed()
+                .set_rate_limit(&missing, &lower_rate)
+                .await
+                .unwrap(),
+            None
+        );
+        let zero = key("zero");
+        assert!(matches!(
+            rl_a.suppressed()
+                .inc(&zero, &initial_rate, 0)
+                .await
+                .unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(rl_a.suppressed().delete(&zero).await.unwrap(), Some(0));
+        assert_eq!(
+            rl_a.suppressed()
+                .set_rate_limit(&first, &lower_rate)
+                .await
+                .unwrap(),
+            Some(initial_rate)
+        );
+        assert_eq!(rl_a.suppressed().get(&first).await.unwrap().total, 4);
+
+        let remote_decision = rl_b
+            .suppressed()
+            .inc(&first, &initial_rate, 2)
+            .await
+            .unwrap();
+        assert!(!matches!(
+            remote_decision,
+            RateLimitDecision::Rejected { .. }
+        ));
+        assert_eq!(
+            rl_a.suppressed()
+                .set_rate_limit(&first, &initial_rate)
+                .await
+                .unwrap(),
+            Some(lower_rate)
+        );
+        assert_eq!(
+            rl_b.suppressed().get(&first).await.unwrap().total,
+            6,
+            "remote pending delta must apply fresh after revision change"
+        );
+
+        assert_eq!(rl_a.suppressed().delete(&first).await.unwrap(), Some(6));
+        assert_eq!(rl_a.suppressed().delete(&first).await.unwrap(), None);
+        assert_eq!(rl_a.suppressed().get(&first).await.unwrap().total, 0);
+
+        let remote_pending = key("remote_pending");
+        rl_a.suppressed()
+            .set_if(
+                &remote_pending,
+                &initial_rate,
+                RateLimitComparator::Always,
+                4,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rl_b.suppressed()
+                .inc(&remote_pending, &initial_rate, 2)
+                .await
+                .unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(
+            rl_a.suppressed().delete(&remote_pending).await.unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            rl_b.suppressed().delete(&remote_pending).await.unwrap(),
+            Some(2),
+            "revision-mismatched pending accepted usage remains fresh"
+        );
+
+        assert!(matches!(
+            rl_a.suppressed()
+                .inc(&first, &initial_rate, 1)
+                .await
+                .unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert!(matches!(
+            rl_a.suppressed()
+                .inc(&second, &initial_rate, 1)
+                .await
+                .unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        rl_a.suppressed().clear().await.unwrap();
+        assert_eq!(rl_a.suppressed().get(&first).await.unwrap().total, 0);
+        assert_eq!(rl_a.suppressed().get(&second).await.unwrap().total, 0);
+        rl_a.suppressed().clear().await.unwrap();
+
+        let unbounded = key("unbounded");
+        assert!(matches!(
+            rl_a.suppressed()
+                .inc(&unbounded, &RateLimit::max(), 1)
+                .await
+                .unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(
+            rl_a.suppressed()
+                .set_rate_limit(&unbounded, &initial_rate)
+                .await
+                .unwrap(),
+            Some(RateLimit::max())
+        );
+    });
+}
+
+#[test]
+fn multi_instance_threaded_lifecycle_cutovers_fence_stale_snapshot() {
+    const INSTANCES: usize = 4;
+    const INITIAL_INCREMENTS: u64 = 32;
+    const AFTER_RAISE_INCREMENTS: u64 = 8;
+    const RECREATED_INCREMENTS: u64 = 4;
+    const CLEAR_PENDING_INCREMENTS: u64 = 2;
+    const CLEAR_AFTER_INCREMENTS: u64 = 2;
+    const SYNC_INTERVAL: u64 = 2_000;
+
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let administrator =
+            build_limiter_with_prefix(&url, 60, 1_000, 1.0, 1_000, SYNC_INTERVAL, prefix.clone())
+                .await;
+        let high_rate = RateLimit::per_second_or_panic(1_000.0);
+        let low_rate = RateLimit::per_second_or_panic(1.0);
+        let lifecycle_key = key("threaded_lifecycle");
+        let clear_even = key("threaded_clear_even");
+        let clear_odd = key("threaded_clear_odd");
+        let caller_pending = key("threaded_caller_pending");
+        let barrier = Arc::new(Barrier::new(INSTANCES + 1));
+        let (deleted_tx, deleted_rx) = mpsc::channel();
+        let mut workers = Vec::with_capacity(INSTANCES);
+
+        for worker_index in 0..INSTANCES {
+            let url = url.clone();
+            let prefix = prefix.clone();
+            let lifecycle_key = lifecycle_key.clone();
+            let clear_even = clear_even.clone();
+            let clear_odd = clear_odd.clone();
+            let barrier = Arc::clone(&barrier);
+            let deleted_tx = deleted_tx.clone();
+
+            workers.push(thread::spawn(move || {
+                runtime::block_on(async move {
+                    let limiter = build_limiter_with_prefix(
+                        &url,
+                        60,
+                        1_000,
+                        1.0,
+                        1_000,
+                        SYNC_INTERVAL,
+                        prefix,
+                    )
+                    .await;
+
+                    barrier.wait();
+                    for _ in 0..INITIAL_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(&lifecycle_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    assert_eq!(
+                        limiter
+                            .suppressed()
+                            .set_rate_limit(&lifecycle_key, &high_rate)
+                            .await
+                            .unwrap(),
+                        Some(high_rate)
+                    );
+                    barrier.wait();
+
+                    barrier.wait();
+                    let snapshot = limiter.suppressed().get(&lifecycle_key).await.unwrap();
+                    assert_eq!(
+                        snapshot,
+                        SuppressedRateLimitSnapshot {
+                            total: INSTANCES as u64 * INITIAL_INCREMENTS,
+                            total_declined: 0,
+                            suppression_factor: 1.0,
+                        }
+                    );
+                    let decision = limiter
+                        .suppressed()
+                        .inc(&lifecycle_key, &high_rate, 1)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        decision,
+                        RateLimitDecision::Suppressed {
+                            is_allowed: false,
+                            ..
+                        }
+                    ));
+                    assert_eq!(
+                        limiter
+                            .suppressed()
+                            .set_rate_limit(&lifecycle_key, &low_rate)
+                            .await
+                            .unwrap(),
+                        Some(low_rate)
+                    );
+                    barrier.wait();
+
+                    barrier.wait();
+                    let _ = limiter.suppressed().get(&lifecycle_key).await.unwrap();
+                    for _ in 0..AFTER_RAISE_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(&lifecycle_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    assert_eq!(
+                        limiter
+                            .suppressed()
+                            .set_rate_limit(&lifecycle_key, &high_rate)
+                            .await
+                            .unwrap(),
+                        Some(high_rate)
+                    );
+                    barrier.wait();
+
+                    barrier.wait();
+                    for _ in 0..RECREATED_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(&lifecycle_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    deleted_tx
+                        .send(
+                            limiter
+                                .suppressed()
+                                .delete(&lifecycle_key)
+                                .await
+                                .unwrap()
+                                .unwrap_or(0),
+                        )
+                        .unwrap();
+                    barrier.wait();
+
+                    barrier.wait();
+                    let clear_key = if worker_index % 2 == 0 {
+                        &clear_even
+                    } else {
+                        &clear_odd
+                    };
+                    for _ in 0..CLEAR_PENDING_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(clear_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    barrier.wait();
+
+                    barrier.wait();
+                    let _ = limiter.suppressed().get(clear_key).await.unwrap();
+                    for _ in 0..CLEAR_AFTER_INCREMENTS {
+                        let decision = limiter
+                            .suppressed()
+                            .inc(clear_key, &high_rate, 1)
+                            .await
+                            .unwrap();
+                        assert!(matches!(decision, RateLimitDecision::Allowed));
+                    }
+                    assert_eq!(
+                        limiter
+                            .suppressed()
+                            .set_rate_limit(clear_key, &high_rate)
+                            .await
+                            .unwrap(),
+                        Some(high_rate)
+                    );
+                    barrier.wait();
+                });
+            }));
+        }
+        drop(deleted_tx);
+
+        barrier.wait();
+        barrier.wait();
+        let initial_total = INSTANCES as u64 * INITIAL_INCREMENTS;
+        assert_eq!(
+            administrator
+                .suppressed()
+                .get(&lifecycle_key)
+                .await
+                .unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: initial_total,
+                total_declined: 0,
+                suppression_factor: 0.0,
+            }
+        );
+        assert_eq!(
+            administrator
+                .suppressed()
+                .set_rate_limit(&lifecycle_key, &low_rate)
+                .await
+                .unwrap(),
+            Some(high_rate)
+        );
+
+        barrier.wait();
+        barrier.wait();
+        let declined_total = INSTANCES as u64;
+        let snapshot = administrator
+            .suppressed()
+            .get(&lifecycle_key)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.total, initial_total + declined_total);
+        assert_eq!(snapshot.total_declined, declined_total);
+        assert_eq!(snapshot.total - snapshot.total_declined, initial_total);
+        assert_eq!(
+            administrator
+                .suppressed()
+                .set_rate_limit(&lifecycle_key, &high_rate)
+                .await
+                .unwrap(),
+            Some(low_rate)
+        );
+
+        barrier.wait();
+        barrier.wait();
+        let accepted_before_delete = initial_total + INSTANCES as u64 * AFTER_RAISE_INCREMENTS;
+        let snapshot = administrator
+            .suppressed()
+            .get(&lifecycle_key)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.total, accepted_before_delete + declined_total);
+        assert_eq!(snapshot.total_declined, declined_total);
+        assert_eq!(
+            administrator
+                .suppressed()
+                .delete(&lifecycle_key)
+                .await
+                .unwrap(),
+            Some(snapshot.total - snapshot.total_declined)
+        );
+        assert_eq!(
+            administrator
+                .suppressed()
+                .delete(&lifecycle_key)
+                .await
+                .unwrap(),
+            None
+        );
+
+        barrier.wait();
+        barrier.wait();
+        let deleted_total = (0..INSTANCES)
+            .map(|_| deleted_rx.recv().unwrap())
+            .sum::<u64>();
+        assert_eq!(deleted_total, INSTANCES as u64 * RECREATED_INCREMENTS);
+        let observer =
+            build_limiter_with_prefix(&url, 60, 1_000, 1.0, 1_000, SYNC_INTERVAL, prefix.clone())
+                .await;
+        assert_eq!(
+            observer
+                .suppressed()
+                .get(&lifecycle_key)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+
+        assert_eq!(
+            administrator
+                .suppressed()
+                .set_if(&clear_even, &high_rate, RateLimitComparator::Always, 10)
+                .await
+                .unwrap(),
+            (10, 0)
+        );
+        assert_eq!(
+            administrator
+                .suppressed()
+                .set_if(&clear_odd, &high_rate, RateLimitComparator::Always, 10)
+                .await
+                .unwrap(),
+            (10, 0)
+        );
+        let decision = administrator
+            .suppressed()
+            .inc(&caller_pending, &high_rate, 3)
+            .await
+            .unwrap();
+        assert!(matches!(decision, RateLimitDecision::Allowed));
+        barrier.wait();
+        barrier.wait();
+        assert_eq!(
+            administrator
+                .suppressed()
+                .get(&clear_even)
+                .await
+                .unwrap()
+                .total,
+            10
+        );
+        assert_eq!(
+            administrator
+                .suppressed()
+                .get(&clear_odd)
+                .await
+                .unwrap()
+                .total,
+            10
+        );
+        assert_eq!(
+            administrator
+                .suppressed()
+                .get(&caller_pending)
+                .await
+                .unwrap()
+                .total,
+            3
+        );
+        administrator.suppressed().clear().await.unwrap();
+        assert_eq!(
+            administrator
+                .suppressed()
+                .get(&caller_pending)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+
+        barrier.wait();
+        barrier.wait();
+        let observer =
+            build_limiter_with_prefix(&url, 60, 1_000, 1.0, 1_000, SYNC_INTERVAL, prefix).await;
+        let per_key_recreated_total =
+            INSTANCES as u64 / 2 * (CLEAR_PENDING_INCREMENTS + CLEAR_AFTER_INCREMENTS);
+        assert_eq!(
+            observer.suppressed().get(&clear_even).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: per_key_recreated_total,
+                total_declined: 0,
+                suppression_factor: 0.0,
+            }
+        );
+        assert_eq!(
+            observer.suppressed().get(&clear_odd).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: per_key_recreated_total,
+                total_declined: 0,
+                suppression_factor: 0.0,
+            }
+        );
+        assert_eq!(
+            observer
+                .suppressed()
+                .get(&caller_pending)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        administrator.suppressed().clear().await.unwrap();
+        administrator.suppressed().clear().await.unwrap();
+        assert_eq!(
+            observer.suppressed().get(&clear_even).await.unwrap().total,
+            0
+        );
+        assert_eq!(
+            observer.suppressed().get(&clear_odd).await.unwrap().total,
+            0
+        );
+
+        for worker in workers {
+            worker.join().expect("hybrid lifecycle worker panicked");
+        }
+    });
 }
 
 fn redis_url() -> String {

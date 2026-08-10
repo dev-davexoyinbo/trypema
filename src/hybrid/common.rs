@@ -30,6 +30,12 @@ pub(crate) enum RedisRateLimiterSignal {
     Flush,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StateRevision {
+    pub namespace: u64,
+    pub key: u64,
+}
+
 /// Sync interval stored in milliseconds for the hybrid provider's background flush.
 ///
 /// The hybrid provider batches local increments and periodically commits them to Redis via a

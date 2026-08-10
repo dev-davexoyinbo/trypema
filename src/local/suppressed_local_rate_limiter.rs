@@ -300,20 +300,21 @@ impl SuppressedLocalRateLimiter {
             } else {
                 random_bool(1f64 - suppression_factor)
             };
+        }
 
+        // Keep aggregate and bucket writes on the same series. A concurrent delete can remove
+        // this entry while the structural path switches from shared to exclusive access.
+        if let Some(latest_bucket) = series.buckets.back()
+            && latest_bucket.timestamp.elapsed().as_millis()
+                <= self.bucket_size.as_milliseconds() as u128
+        {
             if !should_allow {
                 series
                     .total_declined_count
                     .fetch_add(count, Ordering::AcqRel);
             }
-        }
 
-        series.total_count.fetch_add(count, Ordering::AcqRel);
-
-        if let Some(latest_bucket) = series.buckets.back()
-            && latest_bucket.timestamp.elapsed().as_millis()
-                <= self.bucket_size.as_milliseconds() as u128
-        {
+            series.total_count.fetch_add(count, Ordering::AcqRel);
             latest_bucket.count.fetch_add(count, Ordering::AcqRel);
 
             if !should_allow {
@@ -332,7 +333,18 @@ impl SuppressedLocalRateLimiter {
             };
 
             match self.series.entry(key.to_string()) {
-                Entry::Occupied(mut entry) => entry.get_mut().buckets.push_back(bucket),
+                Entry::Occupied(mut entry) => {
+                    let series = entry.get_mut();
+
+                    if !should_allow {
+                        series
+                            .total_declined_count
+                            .fetch_add(count, Ordering::AcqRel);
+                    }
+
+                    series.total_count.fetch_add(count, Ordering::AcqRel);
+                    series.buckets.push_back(bucket);
+                }
                 Entry::Vacant(entry) => {
                     let mut series = RateLimitSeries::new(hard_window_limit);
 
@@ -566,6 +578,69 @@ impl SuppressedLocalRateLimiter {
             suppression_factor: self.get_suppression_factor_without_bucket_expire(key),
         }
     } // end method get
+
+    /// Change the stored rate limit for an existing key without changing its history.
+    ///
+    /// Returns the previous effective rate limit, or `None` when the key does not exist. An
+    /// equivalent effective limit is a no-op and preserves any cached suppression factor. A
+    /// changed limit invalidates that cache.
+    pub fn set_rate_limit(&self, key: &str, rate_limit: &RateLimit) -> Option<RateLimit> {
+        let series = self.series.get(key)?;
+        let previous_rate_limit = RateLimit::from_stored_window_limit(
+            series.hard_window_limit,
+            self.window_size,
+            self.hard_limit_factor.as_multiplier(),
+        )
+        .expect("locally stored hard window limit must represent a valid rate limit");
+        let hard_window_limit = rate_limit.as_per_second()
+            * self.hard_limit_factor.as_multiplier()
+            * self.window_size.as_seconds() as f64;
+
+        if series.hard_window_limit == hard_window_limit {
+            return Some(previous_rate_limit);
+        }
+
+        drop(series);
+
+        let mut series = self.series.get_mut(key)?;
+        let previous_rate_limit = RateLimit::from_stored_window_limit(
+            series.hard_window_limit,
+            self.window_size,
+            self.hard_limit_factor.as_multiplier(),
+        )
+        .expect("locally stored hard window limit must represent a valid rate limit");
+
+        if series.hard_window_limit == hard_window_limit {
+            return Some(previous_rate_limit);
+        }
+
+        series.hard_window_limit = hard_window_limit;
+        drop(series);
+        self.suppression_factors.remove(key);
+
+        Some(previous_rate_limit)
+    } // end method set_rate_limit
+
+    /// Delete all rate-limit and cached suppression state for `key`.
+    ///
+    /// Returns the key's live accepted usage before deletion, or `None` when neither series nor
+    /// cached suppression state existed. A later increment starts with fresh history and the rate
+    /// supplied to that increment.
+    pub fn delete(&self, key: &str) -> Option<u64> {
+        let series = self.series.remove(key).map(|(_, mut series)| {
+            let (total_count, _) = Self::evict_expired(&mut series, self.window_duration);
+            total_count.saturating_sub(series.total_declined_count.load(Ordering::Acquire))
+        });
+        let cache_existed = self.suppression_factors.remove(key).is_some();
+
+        series.or(cache_existed.then_some(0))
+    } // end method delete
+
+    /// Delete all keys and cached suppression factors stored by this suppressed limiter.
+    pub fn clear(&self) {
+        self.series.clear();
+        self.suppression_factors.clear();
+    } // end method clear
 
     fn evict_expired(series: &mut RateLimitSeries, window_duration: Duration) -> (u64, bool) {
         let now = Instant::now();

@@ -123,6 +123,21 @@ Matched zero targets delete state. Matched updates also replace the sticky windo
 - `PreserveNewest` consumes oldest buckets first; increases extend newest history.
 - `PreserveOldest` consumes newest buckets first; increases extend oldest history.
 
+## Managing existing keys
+
+Every limiter exposes `set_rate_limit`, `delete`, and `clear`. `set_rate_limit` changes only an
+existing key's sticky capacity and returns its previous effective `RateLimit`; it preserves live
+history, totals, timestamps, and declined usage. Missing keys return `None`, and an equivalent
+effective rate is a no-op. Changed suppressed rates invalidate their cached suppression factor.
+
+`delete` removes one key and returns its live pre-delete usage in `Some`: the live total for
+absolute limiters and accepted usage (`total - total_declined`) for suppressed limiters. Existing
+zero-usage or cache-only state returns `Some(0)`; missing state returns `None`. `clear` removes all
+keys for only the called strategy and configured prefix. Local methods are synchronous; Redis and
+hybrid methods are asynchronous and return `Result`. Hybrid revisions prevent stale cached totals
+and limits from overriding these mutations, but concurrent or remote pending increments can still
+recreate a key afterward.
+
 ## Decisions and behavior
 
 `RateLimitDecision::Rejected` exposes `window_size: WindowSize`, `retry_after: Duration`, and

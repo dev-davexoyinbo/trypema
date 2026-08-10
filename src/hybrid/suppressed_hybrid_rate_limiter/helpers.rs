@@ -7,16 +7,18 @@ struct FrozenLocalState {
     pending_declined_count: u64,
     hard_window_limit: Option<f64>,
     suppression_factor_ttl_ms: Option<u64>,
+    state_revision: Option<StateRevision>,
 }
 
 #[derive(Debug)]
-struct ResolvedRedisState {
-    key: RedisKey,
-    current_total_count: u64,
-    current_declined_count: u64,
-    suppression_factor: f64,
-    suppression_factor_ttl_ms: Option<u64>,
-    hard_window_limit: Option<f64>,
+pub(super) struct ResolvedRedisState {
+    pub(super) key: RedisKey,
+    pub(super) current_total_count: u64,
+    pub(super) current_declined_count: u64,
+    pub(super) suppression_factor: f64,
+    pub(super) suppression_factor_ttl_ms: Option<u64>,
+    pub(super) hard_window_limit: Option<f64>,
+    pub(super) state_revision: StateRevision,
 }
 
 #[derive(Debug)]
@@ -57,6 +59,7 @@ impl SuppressedHybridRateLimiter {
                 count,
                 declined_count,
                 last_modified,
+                ..
             } => self.evaluate_accepting_state_and_increment(
                 AcceptingState {
                     hard_window_limit,
@@ -77,6 +80,7 @@ impl SuppressedHybridRateLimiter {
                 starting_declined_count,
                 count,
                 declined_count,
+                ..
             } => self.evaluate_suppressing_state_and_increment(
                 SuppressingState {
                     time_instant,
@@ -226,6 +230,7 @@ impl SuppressedHybridRateLimiter {
                 starting_declined_count,
                 hard_window_limit,
                 declined_count,
+                ..
             } => {
                 let hard_window_limit =
                     *mutex_lock(hard_window_limit, "suppressing.hard_window_limit")?;
@@ -346,6 +351,7 @@ impl SuppressedHybridRateLimiter {
             Some(SuppressedRedisLimitingState::Accepting {
                 hard_window_limit,
                 count,
+                state_revision,
                 ..
             }) => Ok((
                 count.load(Ordering::Acquire),
@@ -355,12 +361,14 @@ impl SuppressedHybridRateLimiter {
                     "accepting.hard_window_limit",
                 )?),
                 None,
+                Some(*mutex_lock(state_revision, "accepting.state_revision")?),
             )),
             Some(SuppressedRedisLimitingState::Suppressing {
                 hard_window_limit,
                 suppression_factor_ttl_ms,
                 count,
                 declined_count,
+                state_revision,
                 ..
             }) => Ok((
                 count.load(Ordering::Acquire),
@@ -373,21 +381,27 @@ impl SuppressedHybridRateLimiter {
                     suppression_factor_ttl_ms,
                     "suppressing.suppression_factor_ttl_ms",
                 )?),
+                Some(*mutex_lock(state_revision, "suppressing.state_revision")?),
             )),
-            Some(SuppressedRedisLimitingState::Undefined) | None => Ok((0, 0, None, None)),
+            Some(SuppressedRedisLimitingState::Undefined) | None => Ok((0, 0, None, None, None)),
         };
 
-        let (pending_count, pending_declined_count, hard_window_limit, suppression_factor_ttl_ms) =
-            match local_values {
-                Ok(values) => values,
-                Err(err) => {
-                    if let Some(state) = state {
-                        self.store_local_state(key, state);
-                    }
-
-                    return Err(err);
+        let (
+            pending_count,
+            pending_declined_count,
+            hard_window_limit,
+            suppression_factor_ttl_ms,
+            state_revision,
+        ) = match local_values {
+            Ok(values) => values,
+            Err(err) => {
+                if let Some(state) = state {
+                    self.store_local_state(key, state);
                 }
-            };
+
+                return Err(err);
+            }
+        };
 
         Ok(FrozenLocalState {
             state,
@@ -395,10 +409,11 @@ impl SuppressedHybridRateLimiter {
             pending_declined_count,
             hard_window_limit,
             suppression_factor_ttl_ms,
+            state_revision,
         })
     } // end fn freeze_local_state
 
-    fn store_local_state(&self, key: &RedisKey, state: SuppressedRedisLimitingState) {
+    pub(super) fn store_local_state(&self, key: &RedisKey, state: SuppressedRedisLimitingState) {
         match self.limiting_state.entry(key.clone()) {
             Entry::Occupied(mut entry) => *entry.get_mut() = state,
             Entry::Vacant(entry) => {
@@ -407,7 +422,66 @@ impl SuppressedHybridRateLimiter {
         }
     } // end fn store_local_state
 
-    async fn resolve_redis_state_and_commit(
+    pub(super) async fn flush_local_pending_for_lifecycle(
+        &self,
+        key: &RedisKey,
+    ) -> Result<bool, TrypemaError> {
+        let Some(state) = self.limiting_state.get(key) else {
+            return Ok(false);
+        };
+        let has_pending = match state.deref() {
+            SuppressedRedisLimitingState::Accepting { count, .. }
+            | SuppressedRedisLimitingState::Suppressing { count, .. } => {
+                count.load(Ordering::Acquire) > 0
+            }
+            SuppressedRedisLimitingState::Undefined => false,
+        };
+        drop(state);
+
+        if !has_pending {
+            return Ok(false);
+        }
+
+        let frozen = self.freeze_local_state(key)?;
+        if frozen.pending_count == 0 {
+            if let Some(state) = frozen.state {
+                self.store_local_state(key, state);
+            }
+            return Ok(false);
+        }
+
+        let Some(hard_window_limit) = frozen.hard_window_limit else {
+            if let Some(state) = frozen.state {
+                self.store_local_state(key, state);
+            }
+            return Err(TrypemaError::CustomError(
+                "suppressed hybrid pending state has no hard window limit".to_string(),
+            ));
+        };
+        let commit = SuppressedHybridCommit {
+            key: key.clone(),
+            hard_window_limit,
+            count: frozen.pending_count,
+            declined_count: frozen.pending_declined_count.min(frozen.pending_count),
+            state_revision: frozen.state_revision.unwrap_or_default(),
+        };
+
+        let _maintenance_guard = self.maintenance_lock.read().await;
+        if let Err(err) = self
+            .redis_proxy
+            .batch_commit_state(std::slice::from_ref(&commit))
+            .await
+        {
+            if let Some(state) = frozen.state {
+                self.store_local_state(key, state);
+            }
+            return Err(err);
+        }
+
+        Ok(true)
+    }
+
+    pub(super) async fn resolve_redis_state_and_commit(
         &self,
         read_state_result: SuppressedHybridRedisProxyReadStateResult,
     ) -> Result<ResolvedRedisState, TrypemaError> {
@@ -418,6 +492,7 @@ impl SuppressedHybridRateLimiter {
             suppression_factor,
             suppression_factor_ttl_ms,
             hard_window_limit,
+            state_revision,
         } = read_state_result;
 
         let frozen = self.freeze_local_state(&key)?;
@@ -427,8 +502,12 @@ impl SuppressedHybridRateLimiter {
             .saturating_add(frozen.pending_declined_count)
             .min(current_total_count);
         let hard_window_limit = hard_window_limit.or(frozen.hard_window_limit);
-        let suppression_factor_ttl_ms =
-            suppression_factor_ttl_ms.or(frozen.suppression_factor_ttl_ms);
+        let revisions_match = frozen.state_revision == Some(state_revision);
+        let suppression_factor_ttl_ms = if revisions_match {
+            suppression_factor_ttl_ms.or(frozen.suppression_factor_ttl_ms)
+        } else {
+            suppression_factor_ttl_ms
+        };
 
         if frozen.pending_count > 0 {
             let Some(commit_hard_window_limit) = hard_window_limit else {
@@ -446,8 +525,10 @@ impl SuppressedHybridRateLimiter {
                 hard_window_limit: commit_hard_window_limit,
                 count: frozen.pending_count,
                 declined_count: frozen.pending_declined_count.min(frozen.pending_count),
+                state_revision: frozen.state_revision.unwrap_or(state_revision),
             };
 
+            let _maintenance_guard = self.maintenance_lock.read().await;
             if let Err(err) = self
                 .redis_proxy
                 .batch_commit_state(std::slice::from_ref(&commit))
@@ -468,6 +549,7 @@ impl SuppressedHybridRateLimiter {
             suppression_factor,
             suppression_factor_ttl_ms,
             hard_window_limit,
+            state_revision,
         })
     } // end fn resolve_redis_state_and_commit
 
@@ -544,6 +626,7 @@ impl SuppressedHybridRateLimiter {
                     starting_declined_count: Mutex::new(state.current_declined_count),
                     count: AtomicU64::new(increment),
                     declined_count: AtomicU64::new(declined_count),
+                    state_revision: Mutex::new(state.state_revision),
                 },
             );
 
@@ -565,6 +648,7 @@ impl SuppressedHybridRateLimiter {
                 starting_count: Mutex::new(state.current_total_count),
                 declined_count: Mutex::new(state.current_declined_count),
                 count: AtomicU64::new(increment),
+                state_revision: Mutex::new(state.state_revision),
             },
         );
 
@@ -639,19 +723,28 @@ impl SuppressedHybridRateLimiter {
             .get(key)
             .map_or_else(SuppressedHybridPendingState::default, |state| {
                 match state.deref() {
-                    SuppressedRedisLimitingState::Accepting { count, .. } => {
-                        SuppressedHybridPendingState {
-                            pending_count: count.load(Ordering::Acquire),
-                            pending_declined_count: 0,
-                        }
-                    }
+                    SuppressedRedisLimitingState::Accepting {
+                        count,
+                        state_revision,
+                        ..
+                    } => SuppressedHybridPendingState {
+                        pending_count: count.load(Ordering::Acquire),
+                        pending_declined_count: 0,
+                        state_revision: mutex_lock(state_revision, "accepting.state_revision")
+                            .map(|value| *value)
+                            .unwrap_or_default(),
+                    },
                     SuppressedRedisLimitingState::Suppressing {
                         count,
                         declined_count,
+                        state_revision,
                         ..
                     } => SuppressedHybridPendingState {
                         pending_count: count.load(Ordering::Acquire),
                         pending_declined_count: declined_count.load(Ordering::Acquire),
+                        state_revision: mutex_lock(state_revision, "suppressing.state_revision")
+                            .map(|value| *value)
+                            .unwrap_or_default(),
                     },
                     SuppressedRedisLimitingState::Undefined => {
                         SuppressedHybridPendingState::default()
@@ -695,8 +788,10 @@ impl SuppressedHybridRateLimiter {
             hard_window_limit,
             count: extra_count,
             declined_count: extra_declined_count,
+            state_revision: pending_state.state_revision,
         };
 
+        let _maintenance_guard = self.maintenance_lock.read().await;
         if let Err(err) = self
             .redis_proxy
             .batch_commit_state(std::slice::from_ref(&commit))
