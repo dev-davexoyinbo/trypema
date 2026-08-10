@@ -8,8 +8,9 @@ use crate::{
         RedisKey, RedisKeyGenerator,
         redis_rate_limiter_provider::RedisRateLimiterConfig,
         scripts::{
-            SUPPRESSED_CLEANUP_LUA, SUPPRESSED_GET_FACTOR_LUA, SUPPRESSED_GET_STATE_LUA,
-            SUPPRESSED_INC_LUA, SUPPRESSED_SET_IF_LUA, lua_script, suppressed_lua_script,
+            SUPPRESSED_CLEANUP_LUA, SUPPRESSED_DELETE_LUA, SUPPRESSED_GET_FACTOR_LUA,
+            SUPPRESSED_GET_STATE_LUA, SUPPRESSED_INC_LUA, SUPPRESSED_SET_IF_LUA,
+            SUPPRESSED_SET_RATE_LIMIT_LUA, lua_script, suppressed_lua_script,
         },
     },
 };
@@ -56,6 +57,8 @@ pub struct SuppressedRedisRateLimiter {
     suppression_factor_script: Script,
     get_state_script: Script,
     set_if_script: Script,
+    set_rate_limit_script: Script,
+    delete_script: Script,
 }
 
 impl SuppressedRedisRateLimiter {
@@ -75,6 +78,8 @@ impl SuppressedRedisRateLimiter {
             suppression_factor_script: suppressed_lua_script(SUPPRESSED_GET_FACTOR_LUA),
             get_state_script: suppressed_lua_script(SUPPRESSED_GET_STATE_LUA),
             set_if_script: lua_script(SUPPRESSED_SET_IF_LUA),
+            set_rate_limit_script: lua_script(SUPPRESSED_SET_RATE_LIMIT_LUA),
+            delete_script: suppressed_lua_script(SUPPRESSED_DELETE_LUA),
         }
     }
 
@@ -315,6 +320,102 @@ impl SuppressedRedisRateLimiter {
             suppression_factor,
         })
     } // end method get
+
+    /// Change the stored rate limit for an existing key without changing its history.
+    ///
+    /// Returns the previous effective rate limit, or `None` when no stored limit exists. A
+    /// changed limit invalidates the cached suppression factor; an equivalent limit performs no
+    /// writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for Redis failures or an invalid legacy stored limit.
+    pub async fn set_rate_limit(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+    ) -> Result<Option<RateLimit>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+        let hard_window_limit = self.window_size.as_seconds() as f64
+            * rate_limit.as_per_second()
+            * self.hard_limit_factor.as_multiplier();
+
+        let (status, previous, _changed): (String, String, u8) = self
+            .set_rate_limit_script
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_suppression_factor_key(key))
+            .arg(key.to_string())
+            .arg(self.window_size.as_seconds())
+            .arg(hard_window_limit)
+            .arg(self.hard_limit_factor.as_multiplier())
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        match status.as_str() {
+            "missing" => Ok(None),
+            "found" => {
+                let previous_hard_window_limit = previous.parse::<f64>().map_err(|_| {
+                    TrypemaError::CustomError(
+                        "invalid stored suppressed hard window limit".to_string(),
+                    )
+                })?;
+                RateLimit::from_stored_window_limit(
+                    previous_hard_window_limit,
+                    self.window_size,
+                    self.hard_limit_factor.as_multiplier(),
+                )
+                .map(Some)
+            }
+            "invalid" => Err(TrypemaError::CustomError(
+                "invalid stored suppressed hard window limit".to_string(),
+            )),
+            _ => Err(TrypemaError::UnexpectedRedisScriptResult {
+                operation: "suppressed.set_rate_limit",
+                key: key.to_string(),
+                result: status,
+            }),
+        }
+    } // end method set_rate_limit
+
+    /// Delete all Redis state for `key` in this suppressed limiter.
+    ///
+    /// Returns the key's live accepted usage before deletion, or `None` when no per-key history,
+    /// limit, totals, or cached suppression state existed. Membership-only cleanup does not count
+    /// as an existing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Redis cannot complete the atomic deletion.
+    pub async fn delete(&self, key: &RedisKey) -> Result<Option<u64>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let (existed, accepted_count): (u8, u64) = self
+            .delete_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_hash_declined_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_total_declined_key(key))
+            .key(self.key_generator.get_suppression_factor_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .arg(key.to_string())
+            .arg(self.window_size.as_seconds())
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok((existed == 1).then_some(accepted_count))
+    } // end method delete
+
+    /// Delete every key tracked by this suppressed limiter's prefix and strategy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Redis cannot complete the atomic clear.
+    pub async fn clear(&self) -> Result<(), TrypemaError> {
+        self.cleanup(0).await
+    } // end method clear
 
     /// Conditionally replace the window total for `key` (atomic on Redis).
     ///

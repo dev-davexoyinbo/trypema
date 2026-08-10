@@ -4,11 +4,13 @@ use crate::{
     BucketSize, RateLimitComparator, TrypemaError, WindowSize,
     common::{HistoryUpdateMode, RateType},
     hybrid::RedisProxyCommitter,
+    hybrid::common::StateRevision,
     redis::{
         RedisKey, RedisKeyGenerator,
         scripts::{
-            ABSOLUTE_CLEANUP_LUA, ABSOLUTE_HYBRID_COMMIT_STATE_LUA, ABSOLUTE_HYBRID_READ_STATE_LUA,
-            ABSOLUTE_SET_IF_LUA, absolute_lua_script,
+            ABSOLUTE_CLEANUP_LUA, ABSOLUTE_HYBRID_CLEAR_LUA, ABSOLUTE_HYBRID_COMMIT_STATE_LUA,
+            ABSOLUTE_HYBRID_DELETE_LUA, ABSOLUTE_HYBRID_READ_STATE_LUA,
+            ABSOLUTE_HYBRID_SET_RATE_LIMIT_LUA, ABSOLUTE_SET_IF_LUA, absolute_lua_script,
         },
     },
 };
@@ -16,17 +18,19 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct AbsoluteHybridCommit {
     pub key: RedisKey,
-    pub window_limit: u64,
+    pub window_limit: f64,
     pub count: u64,
+    pub state_revision: StateRevision,
 }
 
 #[derive(Debug)]
 pub(crate) struct AbsoluteHybridRedisProxyReadStateResult {
     pub key: RedisKey,
     pub current_total_count: u64,
-    pub window_limit: Option<u64>,
+    pub window_limit: Option<f64>,
     pub oldest_bucket_ttl: Option<u64>,
     pub oldest_bucket_count: Option<u64>,
+    pub state_revision: StateRevision,
 }
 
 pub(crate) struct AbsoluteHybridRedisProxyOptions {
@@ -43,6 +47,9 @@ pub(crate) struct AbsoluteHybridRedisProxy {
     commit_state_script: Script,
     set_if_script: Script,
     cleanup_script: Script,
+    set_rate_limit_script: Script,
+    delete_script: Script,
+    clear_script: Script,
     connection_manager: ConnectionManager,
     read_chunk_size: usize,
     window_size: WindowSize,
@@ -65,6 +72,9 @@ impl AbsoluteHybridRedisProxy {
             commit_state_script: absolute_lua_script(ABSOLUTE_HYBRID_COMMIT_STATE_LUA),
             set_if_script: absolute_lua_script(ABSOLUTE_SET_IF_LUA),
             cleanup_script: absolute_lua_script(ABSOLUTE_CLEANUP_LUA),
+            set_rate_limit_script: absolute_lua_script(ABSOLUTE_HYBRID_SET_RATE_LIMIT_LUA),
+            delete_script: absolute_lua_script(ABSOLUTE_HYBRID_DELETE_LUA),
+            clear_script: absolute_lua_script(ABSOLUTE_HYBRID_CLEAR_LUA),
             connection_manager,
             read_chunk_size: 100,
             window_size_ms: window_size.as_milliseconds(),
@@ -79,13 +89,15 @@ impl AbsoluteHybridRedisProxy {
     ) -> Result<AbsoluteHybridRedisProxyReadStateResult, TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let res: (String, u64, i64, i64, i64) = self
+        let res: (String, u64, String, i64, i64, u64, u64) = self
             .read_state_script
             .key(self.key_generator.get_hash_key(key))
             .key(self.key_generator.get_active_keys(key))
             .key(self.key_generator.get_window_limit_key(key))
             .key(self.key_generator.get_total_count_key(key))
             .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_state_revision_key())
+            .key(self.key_generator.get_key_state_revisions_key())
             .arg(key.as_str())
             .arg(self.window_size_ms)
             .invoke_async(&mut connection_manager)
@@ -113,11 +125,15 @@ impl AbsoluteHybridRedisProxy {
                     .key(self.key_generator.get_window_limit_key(&commit.key))
                     .key(self.key_generator.get_total_count_key(&commit.key))
                     .key(self.key_generator.get_active_entities_key())
+                    .key(self.key_generator.get_state_revision_key())
+                    .key(self.key_generator.get_key_state_revisions_key())
                     .arg(commit.key.as_str())
                     .arg(self.window_size.as_seconds())
                     .arg(commit.window_limit)
                     .arg(self.bucket_size.as_milliseconds())
-                    .arg(commit.count),
+                    .arg(commit.count)
+                    .arg(commit.state_revision.namespace)
+                    .arg(commit.state_revision.key),
             );
         }
 
@@ -142,7 +158,9 @@ impl AbsoluteHybridRedisProxy {
             let pipe = self.build_read_pipeline(chunk, false);
 
             let results = match pipe
-                .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
+                .query_async::<Vec<(String, u64, String, i64, i64, u64, u64)>>(
+                    &mut connection_manager,
+                )
                 .await
             {
                 Ok(results) => results,
@@ -155,7 +173,9 @@ impl AbsoluteHybridRedisProxy {
                     let pipe = self.build_read_pipeline(chunk, true);
 
                     match pipe
-                        .query_async::<Vec<(String, u64, i64, i64, i64)>>(&mut connection_manager)
+                        .query_async::<Vec<(String, u64, String, i64, i64, u64, u64)>>(
+                            &mut connection_manager,
+                        )
                         .await
                     {
                         Ok(results) => results,
@@ -191,6 +211,8 @@ impl AbsoluteHybridRedisProxy {
                     .key(self.key_generator.get_window_limit_key(key))
                     .key(self.key_generator.get_total_count_key(key))
                     .key(self.key_generator.get_active_entities_key())
+                    .key(self.key_generator.get_state_revision_key())
+                    .key(self.key_generator.get_key_state_revisions_key())
                     .arg(key.as_str())
                     .arg(self.window_size_ms),
             );
@@ -212,7 +234,7 @@ impl AbsoluteHybridRedisProxy {
     pub(crate) async fn set_if(
         &self,
         key: &RedisKey,
-        window_limit: u64,
+        window_limit: f64,
         comparator: RateLimitComparator,
         count: u64,
         mode: HistoryUpdateMode,
@@ -242,6 +264,97 @@ impl AbsoluteHybridRedisProxy {
 
         Ok((new_total, old_total, changed != 0))
     } // end method set_if
+
+    pub(crate) async fn set_rate_limit(
+        &self,
+        key: &RedisKey,
+        window_limit: f64,
+    ) -> Result<Option<(f64, bool)>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let (status, previous, changed): (String, String, u8) = self
+            .set_rate_limit_script
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_key_state_revisions_key())
+            .arg(key.as_str())
+            .arg(self.window_size.as_seconds())
+            .arg(window_limit)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        match status.as_str() {
+            "missing" => Ok(None),
+            "found" => previous
+                .parse::<f64>()
+                .map(|previous| Some((previous, changed == 1)))
+                .map_err(|_| {
+                    TrypemaError::CustomError(
+                        "invalid stored absolute hybrid window limit".to_string(),
+                    )
+                }),
+            "invalid" => Err(TrypemaError::CustomError(
+                "invalid stored absolute hybrid window limit".to_string(),
+            )),
+            _ => Err(TrypemaError::UnexpectedRedisScriptResult {
+                operation: "absolute_hybrid.set_rate_limit",
+                key: key.to_string(),
+                result: status,
+            }),
+        }
+    }
+
+    pub(crate) async fn delete(
+        &self,
+        key: &RedisKey,
+        pending_count: u64,
+        cached_committed_count: u64,
+        state_revision: StateRevision,
+        local_existed: bool,
+    ) -> Result<Option<u64>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let (existed, total_count): (u8, u64) = self
+            .delete_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_key_state_revisions_key())
+            .key(self.key_generator.get_state_revision_key())
+            .arg(key.as_str())
+            .arg(self.window_size.as_seconds())
+            .arg(pending_count)
+            .arg(cached_committed_count)
+            .arg(state_revision.namespace)
+            .arg(state_revision.key)
+            .arg(u8::from(local_existed))
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok((existed == 1).then_some(total_count))
+    }
+
+    pub(crate) async fn clear(&self) -> Result<(), TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let _: () = self
+            .clear_script
+            .key(self.key_generator.get_active_entities_key())
+            .key(self.key_generator.get_state_revision_key())
+            .key(self.key_generator.get_key_state_revisions_key())
+            .arg(self.key_generator.prefix.to_string())
+            .arg(self.key_generator.rate_type.to_string())
+            .arg(self.key_generator.hash_key_suffix.to_string())
+            .arg(self.key_generator.active_keys_key_suffix.to_string())
+            .arg(self.key_generator.window_limit_key_suffix.to_string())
+            .arg(self.key_generator.total_count_key_suffix.to_string())
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok(())
+    }
 
     /// Evict expired buckets and update the total count.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
@@ -300,17 +413,34 @@ impl RedisProxyCommitter<AbsoluteHybridCommit> for AbsoluteHybridRedisProxy {
 }
 
 fn map_redis_read_result_to_state(
-    (entity, total_count, window_limit, oldest_ttl, oldest_count): (String, u64, i64, i64, i64),
+    (
+        entity,
+        total_count,
+        window_limit,
+        oldest_ttl,
+        oldest_count,
+        state_revision,
+        key_state_revision,
+    ): (String, u64, String, i64, i64, u64, u64),
 ) -> AbsoluteHybridRedisProxyReadStateResult {
     fn map_negative_to_none(value: i64) -> Option<u64> {
         if value < 0 { None } else { Some(value as u64) }
     }
 
+    let window_limit = window_limit
+        .parse::<f64>()
+        .ok()
+        .filter(|window_limit| *window_limit >= 0.0);
+
     AbsoluteHybridRedisProxyReadStateResult {
         key: RedisKey::from(entity),
         current_total_count: total_count,
-        window_limit: map_negative_to_none(window_limit),
+        window_limit,
         oldest_bucket_ttl: map_negative_to_none(oldest_ttl),
         oldest_bucket_count: map_negative_to_none(oldest_count),
+        state_revision: StateRevision {
+            namespace: state_revision,
+            key: key_state_revision,
+        },
     }
 }

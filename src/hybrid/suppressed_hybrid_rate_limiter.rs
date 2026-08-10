@@ -8,7 +8,7 @@ use std::{
 };
 
 use dashmap::{DashMap, mapref::entry::Entry, mapref::one::Ref};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{RwLock, mpsc, watch};
 
 use crate::{
     ConditionalSetOutcome, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
@@ -19,7 +19,7 @@ use crate::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
         SuppressedHybridCommit, SuppressedHybridPendingState, SuppressedHybridRedisProxy,
         SuppressedHybridRedisProxyOptions, SuppressedHybridRedisProxyReadStateResult,
-        common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal},
+        common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal, StateRevision},
         hybrid_rate_limiter_provider::HybridRateLimiterConfig,
     },
     redis::{RedisKey, mutex_lock, spawn_task},
@@ -36,6 +36,7 @@ enum SuppressedRedisLimitingState {
         count: AtomicU64,
         declined_count: Mutex<u64>,
         last_modified: Mutex<Instant>,
+        state_revision: Mutex<StateRevision>,
     },
     Undefined,
     Suppressing {
@@ -47,6 +48,7 @@ enum SuppressedRedisLimitingState {
         starting_declined_count: Mutex<u64>,
         count: AtomicU64,
         declined_count: AtomicU64,
+        state_revision: Mutex<StateRevision>,
     },
 }
 
@@ -92,6 +94,7 @@ pub struct SuppressedHybridRateLimiter {
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
     reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>, RandomState>,
+    maintenance_lock: Arc<RwLock<()>>,
     #[cfg(test)]
     set_if_test_hook: Mutex<Option<Arc<SuppressedHybridSetIfTestHook>>>,
 }
@@ -116,6 +119,7 @@ impl SuppressedHybridRateLimiter {
         });
 
         let is_active_watch = watch::Sender::new(0u64);
+        let maintenance_lock = Arc::new(RwLock::new(()));
 
         let sync_interval = Duration::from_millis(options.sync_interval.as_milliseconds());
 
@@ -126,6 +130,7 @@ impl SuppressedHybridRateLimiter {
             limiter_sender: tx,
             redis_proxy: Box::new(redis_proxy.clone()),
             is_active_watch: is_active_watch.subscribe(),
+            maintenance_lock: Arc::clone(&maintenance_lock),
         });
 
         let limiter = Self {
@@ -139,6 +144,7 @@ impl SuppressedHybridRateLimiter {
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
             reset_locks: DashMap::default(),
+            maintenance_lock,
             #[cfg(test)]
             set_if_test_hook: Mutex::new(None),
         };
@@ -428,6 +434,33 @@ impl SuppressedHybridRateLimiter {
 
         let read_state_result = self.redis_proxy.read_state(key).await?;
 
+        let revision_mismatch = match self.limiting_state.get(key) {
+            Some(state) => match state.deref() {
+                SuppressedRedisLimitingState::Accepting { state_revision, .. } => {
+                    *mutex_lock(state_revision, "accepting.state_revision")?
+                        != read_state_result.state_revision
+                }
+                SuppressedRedisLimitingState::Suppressing { state_revision, .. } => {
+                    *mutex_lock(state_revision, "suppressing.state_revision")?
+                        != read_state_result.state_revision
+                }
+                SuppressedRedisLimitingState::Undefined => false,
+            },
+            None => false,
+        };
+
+        if revision_mismatch {
+            let state = self
+                .resolve_redis_state_and_commit(read_state_result)
+                .await?;
+            self.limiting_state.remove(key);
+            return Ok(SuppressedRateLimitSnapshot {
+                total: state.current_total_count,
+                total_declined: state.current_declined_count,
+                suppression_factor: state.suppression_factor,
+            });
+        }
+
         let mut total = read_state_result.current_total_count;
         let mut total_declined = read_state_result.current_total_declined;
         let mut suppression_factor = read_state_result.suppression_factor;
@@ -463,6 +496,138 @@ impl SuppressedHybridRateLimiter {
             suppression_factor,
         })
     } // end method get
+
+    /// Change the stored rate limit for an existing key without changing its history.
+    ///
+    /// This instance's pending counts and declines are committed first. A changed limit clears
+    /// cached suppression and advances the key's state revision so other hybrid instances ignore
+    /// stale cached state on their next Redis interaction. Their pending deltas still apply as
+    /// fresh usage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for Redis failures or an invalid legacy stored limit.
+    pub async fn set_rate_limit(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+    ) -> Result<Option<RateLimit>, TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        let lock = self.get_or_create_reset_lock(key);
+        let _reset_guard = lock.lock().await;
+
+        let committed_pending = self.flush_local_pending_for_lifecycle(key).await?;
+        RedisCommitter::barrier(&self.commiter_sender).await?;
+
+        let _maintenance_guard = self.maintenance_lock.write().await;
+        let hard_window_limit = self.window_size.as_seconds() as f64
+            * rate_limit.as_per_second()
+            * self.hard_limit_factor.as_multiplier();
+        let result = self
+            .redis_proxy
+            .set_rate_limit(key, hard_window_limit)
+            .await?;
+
+        match result {
+            Some((_, changed)) if changed || committed_pending => {
+                self.limiting_state.remove(key);
+            }
+            None => {
+                self.limiting_state.remove(key);
+            }
+            Some(_) => {}
+        }
+
+        result
+            .map(|(previous_hard_window_limit, _)| {
+                RateLimit::from_stored_window_limit(
+                    previous_hard_window_limit,
+                    self.window_size,
+                    self.hard_limit_factor.as_multiplier(),
+                )
+            })
+            .transpose()
+    } // end method set_rate_limit
+
+    /// Delete all committed and caller-local state for `key`.
+    ///
+    /// Returns live accepted usage (`total - total_declined`) at deletion, including this
+    /// instance's pending counts, or `None` when no committed or caller-local state existed.
+    ///
+    /// Other instances discard stale cached state on their next Redis interaction. Pending
+    /// increments already accepted there may recreate the key as fresh usage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queued commits cannot drain or Redis cannot delete the state. Local
+    /// state is restored when deletion fails.
+    pub async fn delete(&self, key: &RedisKey) -> Result<Option<u64>, TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        let lock = self.get_or_create_reset_lock(key);
+        let _reset_guard = lock.lock().await;
+        let local_state = self.limiting_state.remove(key).map(|(_, state)| state);
+        let (pending_count, pending_declined_count, local_existed) = match local_state.as_ref() {
+            Some(SuppressedRedisLimitingState::Accepting { count, .. }) => {
+                (count.load(Ordering::Acquire), 0, true)
+            }
+            Some(SuppressedRedisLimitingState::Suppressing {
+                count,
+                declined_count,
+                ..
+            }) => (
+                count.load(Ordering::Acquire),
+                declined_count.load(Ordering::Acquire),
+                true,
+            ),
+            Some(SuppressedRedisLimitingState::Undefined) | None => (0, 0, false),
+        };
+
+        if let Err(err) = RedisCommitter::barrier(&self.commiter_sender).await {
+            if let Some(state) = local_state {
+                self.store_local_state(key, state);
+            }
+            return Err(err);
+        }
+
+        let _maintenance_guard = self.maintenance_lock.write().await;
+        match self
+            .redis_proxy
+            .delete(key, pending_count, pending_declined_count, local_existed)
+            .await
+        {
+            Ok(deleted_accepted_count) => {
+                self.limiting_state.remove(key);
+                Ok(deleted_accepted_count)
+            }
+            Err(err) => {
+                if let Some(state) = local_state {
+                    self.store_local_state(key, state);
+                }
+                Err(err)
+            }
+        }
+    } // end method delete
+
+    /// Delete every key tracked by this hybrid suppressed limiter's prefix and strategy.
+    ///
+    /// The namespace state revision invalidates other instances when they next interact with
+    /// Redis. Concurrent or remote pending increments may recreate keys after this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queued commits cannot drain or Redis cannot complete the clear.
+    pub async fn clear(&self) -> Result<(), TrypemaError> {
+        self.send_epoch_change_if_needed();
+        RedisCommitter::barrier(&self.commiter_sender).await?;
+
+        let _maintenance_guard = self.maintenance_lock.write().await;
+        self.redis_proxy.clear().await?;
+        self.limiting_state.clear();
+
+        Ok(())
+    } // end method clear
 
     /// Conditionally replace the window total for `key` (atomic on Redis).
     ///

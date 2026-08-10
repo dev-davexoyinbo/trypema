@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::redis::tick;
 use crate::runtime::{TaskHandle, sleep, spawn_task_handle};
@@ -20,10 +20,12 @@ pub(crate) struct RedisCommitterOptions<T> {
     pub limiter_sender: mpsc::Sender<RedisRateLimiterSignal>,
     pub is_active_watch: watch::Receiver<u64>,
     pub redis_proxy: Box<dyn RedisProxyCommitter<T> + Send + Sync>,
+    pub maintenance_lock: Arc<RwLock<()>>,
 }
 
 pub(crate) enum AbsoluteHybridCommitterSignal<T> {
     Commit(T),
+    Barrier(oneshot::Sender<Result<(), TrypemaError>>),
 }
 
 impl<T> From<T> for AbsoluteHybridCommitterSignal<T> {
@@ -55,6 +57,7 @@ impl RedisCommitter {
             max_batch_size,
             limiter_sender,
             redis_proxy,
+            maintenance_lock,
             mut is_active_watch,
         } = options;
 
@@ -96,17 +99,45 @@ impl RedisCommitter {
             tick(&mut flush_interval).await;
 
             loop {
-                if !is_active.load(Ordering::Acquire) {
-                    if is_active_watch.changed().await.is_err() {
-                        break;
+                let pending_signal = if !is_active.load(Ordering::Acquire) {
+                    futures::select! {
+                        changed = is_active_watch.changed().fuse() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            None
+                        }
+                        signal = rx.recv().fuse() => {
+                            let Some(signal) = signal else {
+                                break;
+                            };
+                            Some(signal)
+                        }
                     }
+                } else {
+                    None
+                };
 
-                    is_active.store(true, Ordering::Release);
-                }
+                is_active.store(true, Ordering::Release);
 
-                {
+                if let Some(signal) = pending_signal {
+                    match signal {
+                        AbsoluteHybridCommitterSignal::Commit(commit) => batch.push(commit),
+                        AbsoluteHybridCommitterSignal::Barrier(sender) => {
+                            let _maintenance_guard = maintenance_lock.read().await;
+                            let result = Self::flush_to_redis(
+                                redis_proxy.as_ref(),
+                                &mut batch,
+                                max_batch_size,
+                            )
+                            .await;
+                            let _ = sender.send(result);
+                        }
+                    }
+                } else {
                     futures::select! {
                         _ = tick(&mut flush_interval).fuse() => {
+                            let _maintenance_guard = maintenance_lock.read().await;
                             if let Err(err) =
                                 Self::flush_to_redis(
                                     redis_proxy.as_ref(),
@@ -125,18 +156,41 @@ impl RedisCommitter {
                             }
                         }
                         commit = rx.recv().fuse() => {
-                            let Some(AbsoluteHybridCommitterSignal::Commit(commit)) = commit else {
+                            let Some(signal) = commit else {
                                 break;
                             };
 
-                            batch.push(commit);
+                            match signal {
+                                AbsoluteHybridCommitterSignal::Commit(commit) => batch.push(commit),
+                                AbsoluteHybridCommitterSignal::Barrier(sender) => {
+                                    let _maintenance_guard = maintenance_lock.read().await;
+                                    let result = Self::flush_to_redis(
+                                        redis_proxy.as_ref(),
+                                        &mut batch,
+                                        max_batch_size,
+                                    ).await;
+                                    let _ = sender.send(result);
+                                }
+                            }
                         }
 
                     }
                 }
 
-                while let Ok(AbsoluteHybridCommitterSignal::Commit(commit)) = rx.try_recv() {
-                    batch.push(commit);
+                while let Ok(signal) = rx.try_recv() {
+                    match signal {
+                        AbsoluteHybridCommitterSignal::Commit(commit) => batch.push(commit),
+                        AbsoluteHybridCommitterSignal::Barrier(sender) => {
+                            let _maintenance_guard = maintenance_lock.read().await;
+                            let result = Self::flush_to_redis(
+                                redis_proxy.as_ref(),
+                                &mut batch,
+                                max_batch_size,
+                            )
+                            .await;
+                            let _ = sender.send(result);
+                        }
+                    }
                 }
             }
 
@@ -145,6 +199,7 @@ impl RedisCommitter {
 
             drop(is_active_cancel_task);
 
+            let _maintenance_guard = maintenance_lock.read().await;
             if let Err(err) =
                 Self::flush_to_redis(redis_proxy.as_ref(), &mut batch, max_batch_size).await
             {
@@ -154,6 +209,21 @@ impl RedisCommitter {
 
         tx
     } // end method run
+
+    pub(crate) async fn barrier<T>(
+        sender: &mpsc::Sender<AbsoluteHybridCommitterSignal<T>>,
+    ) -> Result<(), TrypemaError> {
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(AbsoluteHybridCommitterSignal::Barrier(tx))
+            .await
+            .map_err(|err| {
+                TrypemaError::CustomError(format!("Failed to send committer barrier: {err:?}"))
+            })?;
+        rx.await.map_err(|err| {
+            TrypemaError::CustomError(format!("Failed to receive committer barrier: {err:?}"))
+        })?
+    }
 
     async fn flush_to_redis<T>(
         redis_proxy: &(dyn RedisProxyCommitter<T> + Send + Sync),

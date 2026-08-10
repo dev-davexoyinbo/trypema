@@ -8,8 +8,9 @@ use crate::{
         RedisKey, RedisKeyGenerator,
         redis_rate_limiter_provider::RedisRateLimiterConfig,
         scripts::{
-            ABSOLUTE_CLEANUP_LUA, ABSOLUTE_GET_TOTAL_LUA, ABSOLUTE_INC_LUA,
-            ABSOLUTE_IS_ALLOWED_LUA, ABSOLUTE_SET_IF_LUA, absolute_lua_script,
+            ABSOLUTE_CLEANUP_LUA, ABSOLUTE_DELETE_LUA, ABSOLUTE_GET_TOTAL_LUA, ABSOLUTE_INC_LUA,
+            ABSOLUTE_IS_ALLOWED_LUA, ABSOLUTE_SET_IF_LUA, ABSOLUTE_SET_RATE_LIMIT_LUA,
+            absolute_lua_script,
         },
     },
 };
@@ -54,6 +55,8 @@ pub struct AbsoluteRedisRateLimiter {
     is_allowed_script: Script,
     get_total_script: Script,
     set_if_script: Script,
+    set_rate_limit_script: Script,
+    delete_script: Script,
     cleanup_script: Script,
 }
 
@@ -70,6 +73,8 @@ impl AbsoluteRedisRateLimiter {
             is_allowed_script: absolute_lua_script(ABSOLUTE_IS_ALLOWED_LUA),
             get_total_script: absolute_lua_script(ABSOLUTE_GET_TOTAL_LUA),
             set_if_script: absolute_lua_script(ABSOLUTE_SET_IF_LUA),
+            set_rate_limit_script: absolute_lua_script(ABSOLUTE_SET_RATE_LIMIT_LUA),
+            delete_script: absolute_lua_script(ABSOLUTE_DELETE_LUA),
             cleanup_script: absolute_lua_script(ABSOLUTE_CLEANUP_LUA),
         }
     } // end method with_rate_type
@@ -242,6 +247,87 @@ impl AbsoluteRedisRateLimiter {
 
         Ok(total)
     } // end method get
+
+    /// Change the stored rate limit for an existing key without changing its history.
+    ///
+    /// Returns the previous effective rate limit, or `None` when no stored limit exists. An
+    /// equivalent effective limit performs no writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for Redis failures or an invalid legacy stored limit.
+    pub async fn set_rate_limit(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+    ) -> Result<Option<RateLimit>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+        let window_limit = self.window_size.as_seconds() as f64 * rate_limit.as_per_second();
+
+        let (status, previous, _changed): (String, String, u8) = self
+            .set_rate_limit_script
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .arg(key.to_string())
+            .arg(self.window_size.as_seconds())
+            .arg(window_limit)
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        match status.as_str() {
+            "missing" => Ok(None),
+            "found" => {
+                let previous_window_limit = previous.parse::<f64>().map_err(|_| {
+                    TrypemaError::CustomError("invalid stored absolute window limit".to_string())
+                })?;
+                RateLimit::from_stored_window_limit(previous_window_limit, self.window_size, 1.0)
+                    .map(Some)
+            }
+            "invalid" => Err(TrypemaError::CustomError(
+                "invalid stored absolute window limit".to_string(),
+            )),
+            _ => Err(TrypemaError::UnexpectedRedisScriptResult {
+                operation: "absolute.set_rate_limit",
+                key: key.to_string(),
+                result: status,
+            }),
+        }
+    } // end method set_rate_limit
+
+    /// Delete all Redis state for `key` in this absolute limiter.
+    ///
+    /// Returns the key's live total before deletion, or `None` when no per-key state existed.
+    /// Membership-only cleanup does not count as an existing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Redis cannot complete the atomic deletion.
+    pub async fn delete(&self, key: &RedisKey) -> Result<Option<u64>, TrypemaError> {
+        let mut connection_manager = self.connection_manager.clone();
+
+        let (existed, total_count): (u8, u64) = self
+            .delete_script
+            .key(self.key_generator.get_hash_key(key))
+            .key(self.key_generator.get_active_keys(key))
+            .key(self.key_generator.get_window_limit_key(key))
+            .key(self.key_generator.get_total_count_key(key))
+            .key(self.key_generator.get_active_entities_key())
+            .arg(key.to_string())
+            .arg(self.window_size.as_seconds())
+            .invoke_async(&mut connection_manager)
+            .await?;
+
+        Ok((existed == 1).then_some(total_count))
+    } // end method delete
+
+    /// Delete every key tracked by this absolute limiter's prefix and strategy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Redis cannot complete the atomic clear.
+    pub async fn clear(&self) -> Result<(), TrypemaError> {
+        self.cleanup(0).await
+    } // end method clear
 
     async fn set_if_with_history_mode(
         &self,

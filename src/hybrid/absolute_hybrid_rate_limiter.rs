@@ -8,7 +8,7 @@ use std::{
 };
 
 use dashmap::{DashMap, mapref::entry::Entry, mapref::one::Ref};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{RwLock, mpsc, watch};
 
 use crate::{
     ConditionalSetOutcome, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
@@ -20,7 +20,7 @@ use crate::{
             AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyOptions,
             AbsoluteHybridRedisProxyReadStateResult,
         },
-        common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal},
+        common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal, StateRevision},
         hybrid_rate_limiter_provider::HybridRateLimiterConfig,
     },
     redis::{RedisKey, mutex_lock, spawn_task},
@@ -32,7 +32,7 @@ mod helpers;
 #[derive(Debug)]
 enum AbsoluteRedisLimitingState {
     Accepting {
-        window_limit: Mutex<u64>,
+        window_limit: Mutex<f64>,
         accept_limit: Mutex<u64>,
         starting_count: Mutex<u64>,
         count: AtomicU64,
@@ -40,6 +40,7 @@ enum AbsoluteRedisLimitingState {
         oldest_bucket_ttl: Mutex<Option<u64>>,
         oldest_bucket_count: Mutex<Option<u64>>,
         last_modified: Mutex<Instant>,
+        state_revision: Mutex<StateRevision>,
     },
     Undefined,
     Rejecting {
@@ -48,6 +49,7 @@ enum AbsoluteRedisLimitingState {
         count_after_release: Mutex<u64>,
         committed_count: u64,
         committed_at: Instant,
+        state_revision: Mutex<StateRevision>,
     },
 }
 
@@ -97,6 +99,7 @@ pub struct AbsoluteHybridRateLimiter {
     epoch: AtomicU64,
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
+    maintenance_lock: Arc<RwLock<()>>,
 }
 
 impl AbsoluteHybridRateLimiter {
@@ -113,6 +116,7 @@ impl AbsoluteHybridRateLimiter {
         });
 
         let is_active_watch = watch::Sender::new(0u64);
+        let maintenance_lock = Arc::new(RwLock::new(()));
 
         let commiter_sender = RedisCommitter::run(RedisCommitterOptions {
             sync_interval: Duration::from_millis(options.sync_interval.as_milliseconds()),
@@ -121,6 +125,7 @@ impl AbsoluteHybridRateLimiter {
             limiter_sender: tx,
             redis_proxy: Box::new(redis_proxy.clone()),
             is_active_watch: is_active_watch.subscribe(),
+            maintenance_lock: Arc::clone(&maintenance_lock),
         });
 
         let limiter = Self {
@@ -132,6 +137,7 @@ impl AbsoluteHybridRateLimiter {
             epoch: AtomicU64::new(0),
             last_commited_epoch: AtomicU64::new(0),
             is_active_watch,
+            maintenance_lock,
         };
 
         let limiter = Arc::new(limiter);
@@ -411,6 +417,29 @@ impl AbsoluteHybridRateLimiter {
 
         let read_state_result = self.redis_proxy.read_state(key).await?;
 
+        let revision_mismatch = match self.limiting_state.get(key) {
+            Some(state) => match state.deref() {
+                AbsoluteRedisLimitingState::Accepting { state_revision, .. } => {
+                    *mutex_lock(state_revision, "accepting.state_revision")?
+                        != read_state_result.state_revision
+                }
+                AbsoluteRedisLimitingState::Rejecting { state_revision, .. } => {
+                    *mutex_lock(state_revision, "rejecting.state_revision")?
+                        != read_state_result.state_revision
+                }
+                AbsoluteRedisLimitingState::Undefined => false,
+            },
+            None => false,
+        };
+
+        if revision_mismatch {
+            let state = self
+                .resolve_redis_state_and_commit(read_state_result)
+                .await?;
+            self.limiting_state.remove(key);
+            return Ok(state.current_total);
+        }
+
         let mut total_count = read_state_result.current_total_count;
 
         if let Some(state) = self.limiting_state.get(key) {
@@ -434,6 +463,165 @@ impl AbsoluteHybridRateLimiter {
 
         Ok(total_count)
     } // end method get
+
+    /// Change the stored rate limit for an existing key without changing its history.
+    ///
+    /// This instance's pending increments are committed first. A changed limit invalidates local
+    /// cached admission state and advances the key's state revision so other hybrid instances
+    /// ignore stale cached totals and limits on their next Redis interaction. Pending increments
+    /// from those instances still apply as fresh usage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for Redis failures or an invalid legacy stored limit.
+    pub async fn set_rate_limit(
+        &self,
+        key: &RedisKey,
+        rate_limit: &RateLimit,
+    ) -> Result<Option<RateLimit>, TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        let lock = self.get_or_create_reset_lock(key);
+        let _reset_guard = lock.lock().await;
+
+        let committed_pending = self.flush_local_pending_for_lifecycle(key).await?;
+        RedisCommitter::barrier(&self.commiter_sender).await?;
+
+        let _maintenance_guard = self.maintenance_lock.write().await;
+        let window_limit = self.window_size.as_seconds() as f64 * rate_limit.as_per_second();
+        let result = self.redis_proxy.set_rate_limit(key, window_limit).await?;
+
+        match result {
+            Some((_, changed)) if changed || committed_pending => {
+                self.limiting_state.remove(key);
+            }
+            None => {
+                self.limiting_state.remove(key);
+            }
+            Some(_) => {}
+        }
+
+        result
+            .map(|(previous_window_limit, _)| {
+                RateLimit::from_stored_window_limit(previous_window_limit, self.window_size, 1.0)
+            })
+            .transpose()
+    } // end method set_rate_limit
+
+    /// Delete all committed and caller-local state for `key`.
+    ///
+    /// Returns the live total at deletion, including this instance's pending increments, or
+    /// `None` when no committed or caller-local state existed.
+    ///
+    /// Other instances discard stale cached state on their next Redis interaction. Pending
+    /// increments already accepted there may recreate the key as fresh usage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queued commits cannot drain or Redis cannot delete the state. Local
+    /// state is restored when deletion fails.
+    pub async fn delete(&self, key: &RedisKey) -> Result<Option<u64>, TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        let lock = self.get_or_create_reset_lock(key);
+        let _reset_guard = lock.lock().await;
+        let local_state = self.limiting_state.remove(key).map(|(_, state)| state);
+        let local_values = match local_state.as_ref() {
+            Some(AbsoluteRedisLimitingState::Accepting {
+                count,
+                state_revision,
+                ..
+            }) => mutex_lock(state_revision, "accepting.state_revision")
+                .map(|state_revision| (count.load(Ordering::Acquire), 0, *state_revision, true)),
+            Some(AbsoluteRedisLimitingState::Rejecting {
+                committed_count,
+                committed_at,
+                state_revision,
+                ..
+            }) => mutex_lock(state_revision, "rejecting.state_revision").map(|state_revision| {
+                let cached_committed_count = if committed_at.elapsed()
+                    < Duration::from_secs(self.window_size.as_seconds())
+                {
+                    *committed_count
+                } else {
+                    0
+                };
+                (0, cached_committed_count, *state_revision, true)
+            }),
+            Some(AbsoluteRedisLimitingState::Undefined) | None => {
+                Ok((0, 0, StateRevision::default(), false))
+            }
+        };
+        let (pending_count, cached_committed_count, state_revision, local_existed) =
+            match local_values {
+                Ok(local_values) => local_values,
+                Err(err) => {
+                    if let Some(state) = local_state {
+                        self.store_absolute_local_state(key, state);
+                    }
+                    return Err(err);
+                }
+            };
+
+        if let Err(err) = RedisCommitter::barrier(&self.commiter_sender).await {
+            if let Some(state) = local_state {
+                self.store_absolute_local_state(key, state);
+            }
+            return Err(err);
+        }
+
+        let _maintenance_guard = self.maintenance_lock.write().await;
+        match self
+            .redis_proxy
+            .delete(
+                key,
+                pending_count,
+                cached_committed_count,
+                state_revision,
+                local_existed,
+            )
+            .await
+        {
+            Ok(deleted_total) => {
+                self.limiting_state.remove(key);
+                Ok(deleted_total)
+            }
+            Err(err) => {
+                if let Some(state) = local_state {
+                    self.store_absolute_local_state(key, state);
+                }
+                Err(err)
+            }
+        }
+    } // end method delete
+
+    /// Delete every key tracked by this hybrid absolute limiter's prefix and strategy.
+    ///
+    /// The namespace state revision invalidates other instances when they next interact with
+    /// Redis. Concurrent or remote pending increments may recreate keys after this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queued commits cannot drain or Redis cannot complete the clear.
+    pub async fn clear(&self) -> Result<(), TrypemaError> {
+        self.send_epoch_change_if_needed();
+        RedisCommitter::barrier(&self.commiter_sender).await?;
+
+        let _maintenance_guard = self.maintenance_lock.write().await;
+        self.redis_proxy.clear().await?;
+        self.limiting_state.clear();
+
+        Ok(())
+    } // end method clear
+
+    fn store_absolute_local_state(&self, key: &RedisKey, state: AbsoluteRedisLimitingState) {
+        match self.limiting_state.entry(key.clone()) {
+            Entry::Occupied(mut entry) => *entry.get_mut() = state,
+            Entry::Vacant(entry) => {
+                entry.insert(state);
+            }
+        }
+    } // end fn store_absolute_local_state
 
     /// Conditionally replace the window total for `key` (atomic on Redis).
     ///
@@ -615,19 +803,23 @@ impl AbsoluteHybridRateLimiter {
         let lock = self.get_or_create_reset_lock(key);
         let _guard = lock.lock().await;
 
-        let pending_count = self
-            .limiting_state
-            .get(key)
-            .and_then(|state| match state.deref() {
-                AbsoluteRedisLimitingState::Accepting { count, .. } => {
-                    Some(count.load(Ordering::Acquire))
-                }
-                _ => None,
-            })
-            .unwrap_or(0);
+        let (pending_count, state_revision) = match self.limiting_state.get(key) {
+            Some(state) => match state.deref() {
+                AbsoluteRedisLimitingState::Accepting {
+                    count,
+                    state_revision,
+                    ..
+                } => (
+                    count.load(Ordering::Acquire),
+                    *mutex_lock(state_revision, "accepting.state_revision")?,
+                ),
+                AbsoluteRedisLimitingState::Undefined
+                | AbsoluteRedisLimitingState::Rejecting { .. } => (0, StateRevision::default()),
+            },
+            None => (0, StateRevision::default()),
+        };
 
-        let window_limit =
-            ((self.window_size.as_seconds() as f64) * rate_limit.as_per_second()) as u64;
+        let window_limit = self.window_size.as_seconds() as f64 * rate_limit.as_per_second();
 
         let (new_total, old_total, changed) = self
             .redis_proxy
@@ -649,6 +841,7 @@ impl AbsoluteHybridRateLimiter {
                     key: key.clone(),
                     window_limit,
                     count: extra_count,
+                    state_revision,
                 };
 
                 self.send_commit(commit).await?;

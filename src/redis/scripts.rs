@@ -341,6 +341,69 @@ pub(crate) const ABSOLUTE_CLEANUP_LUA: &str = r#"
     )
 "#;
 
+pub(crate) const ABSOLUTE_SET_RATE_LIMIT_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local window_limit_key = KEYS[1]
+    local active_entities_key = KEYS[2]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local window_limit = tonumber(ARGV[3])
+
+    local previous = redis.call("GET", window_limit_key)
+    if previous == false then
+        return {"missing", "", 0}
+    end
+
+    local previous_window_limit = tonumber(previous)
+    local previous_rate_limit = previous_window_limit and previous_window_limit / window_size_seconds
+    if previous_window_limit == nil or previous_window_limit <= 0 or previous_window_limit ~= previous_window_limit
+        or previous_rate_limit <= 0 or previous_rate_limit ~= previous_rate_limit then
+        return {"invalid", previous, 0}
+    end
+
+    if previous_window_limit == window_limit then
+        return {"found", previous, 0}
+    end
+
+    redis.call("SET", window_limit_key, window_limit, "EX", window_size_seconds)
+    redis.call("ZADD", active_entities_key, timestamp_ms, entity)
+
+    return {"found", previous, 1}
+"#;
+
+pub(crate) const ABSOLUTE_DELETE_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local hash_key = KEYS[1]
+    local active_keys = KEYS[2]
+    local window_limit_key = KEYS[3]
+    local total_count_key = KEYS[4]
+    local active_entities_key = KEYS[5]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local existed = redis.call("EXISTS", hash_key, active_keys, window_limit_key, total_count_key) > 0
+    local total_count = cleanup_expired_absolute(
+        hash_key,
+        active_keys,
+        total_count_key,
+        timestamp_ms,
+        window_size_seconds * 1000,
+        true
+    )
+
+    if total_count < 0 then
+        total_count = 0
+    end
+
+    redis.call("DEL", hash_key, active_keys, window_limit_key, total_count_key)
+    redis.call("ZREM", active_entities_key, entity)
+
+    return {existed and 1 or 0, total_count}
+"#;
+
 /// Read an absolute sliding window's live total, evicting expired buckets first.
 ///
 /// Existing entities are marked active so cleanup tracking stays consistent; unknown reads
@@ -538,12 +601,28 @@ pub(crate) const ABSOLUTE_HYBRID_COMMIT_STATE_LUA: &str = r#"
     local window_limit_key = KEYS[3]
     local total_count_key = KEYS[4]
     local active_entities_key = KEYS[5]
+    local state_revision_key = KEYS[6]
+    local key_state_revisions_key = KEYS[7]
 
     local entity = ARGV[1]
     local window_size_seconds = tonumber(ARGV[2])
     local window_limit = tonumber(ARGV[3])
     local rate_group_size_ms = tonumber(ARGV[4])
     local count = tonumber(ARGV[5])
+    local caller_state_revision = tonumber(ARGV[6]) or 0
+    local caller_key_state_revision = tonumber(ARGV[7]) or 0
+
+    local state_revision = tonumber(redis.call("GET", state_revision_key)) or 0
+    local key_state_revision = tonumber(redis.call("HGET", key_state_revisions_key, entity)) or 0
+    local revisions_match = caller_state_revision == state_revision
+        and caller_key_state_revision == key_state_revision
+
+    local stored_window_limit = tonumber(redis.call("GET", window_limit_key))
+    if stored_window_limit ~= nil then
+        window_limit = stored_window_limit
+    elseif not revisions_match then
+        window_limit = tonumber(ARGV[3])
+    end
 
 
     cleanup_expired_absolute(
@@ -585,11 +664,15 @@ pub(crate) const ABSOLUTE_HYBRID_READ_STATE_LUA: &str = r#"
     local window_limit_key = KEYS[3]
     local total_count_key = KEYS[4]
     local active_entities_key = KEYS[5]
+    local state_revision_key = KEYS[6]
+    local key_state_revisions_key = KEYS[7]
 
     local entity = ARGV[1]
     local window_size_ms = tonumber(ARGV[2])
 
     local window_limit = tonumber(redis.call("GET", window_limit_key))
+    local state_revision = tonumber(redis.call("GET", state_revision_key)) or 0
+    local key_state_revision = tonumber(redis.call("HGET", key_state_revisions_key, entity)) or 0
     local total_count = cleanup_expired_absolute(
         hash_key,
         active_keys,
@@ -610,7 +693,116 @@ pub(crate) const ABSOLUTE_HYBRID_READ_STATE_LUA: &str = r#"
         redis.call("ZADD", active_entities_key, timestamp_ms, entity)
     end
 
-    return {entity, total_count, window_limit or -1, oldest_ttl or -1, oldest_count or -1}
+    return {
+        entity,
+        total_count,
+        tostring(window_limit or -1),
+        oldest_ttl or -1,
+        oldest_count or -1,
+        state_revision,
+        key_state_revision
+    }
+"#;
+
+pub(crate) const ABSOLUTE_HYBRID_SET_RATE_LIMIT_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local window_limit_key = KEYS[1]
+    local active_entities_key = KEYS[2]
+    local key_state_revisions_key = KEYS[3]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local window_limit = tonumber(ARGV[3])
+
+    local previous = redis.call("GET", window_limit_key)
+    if previous == false then
+        return {"missing", "", 0}
+    end
+
+    local previous_window_limit = tonumber(previous)
+    local previous_rate_limit = previous_window_limit and previous_window_limit / window_size_seconds
+    if previous_window_limit == nil or previous_window_limit <= 0 or previous_window_limit ~= previous_window_limit
+        or previous_rate_limit <= 0 or previous_rate_limit ~= previous_rate_limit then
+        return {"invalid", previous, 0}
+    end
+
+    if previous_window_limit == window_limit then
+        return {"found", previous, 0}
+    end
+
+    redis.call("SET", window_limit_key, window_limit, "EX", window_size_seconds)
+    redis.call("ZADD", active_entities_key, timestamp_ms, entity)
+    redis.call("HINCRBY", key_state_revisions_key, entity, 1)
+
+    return {"found", previous, 1}
+"#;
+
+pub(crate) const ABSOLUTE_HYBRID_DELETE_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local hash_key = KEYS[1]
+    local active_keys = KEYS[2]
+    local window_limit_key = KEYS[3]
+    local total_count_key = KEYS[4]
+    local active_entities_key = KEYS[5]
+    local key_state_revisions_key = KEYS[6]
+    local state_revision_key = KEYS[7]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local pending_count = tonumber(ARGV[3])
+    local cached_committed_count = tonumber(ARGV[4])
+    local caller_state_revision = tonumber(ARGV[5]) or 0
+    local caller_key_state_revision = tonumber(ARGV[6]) or 0
+    local local_existed = tonumber(ARGV[7]) == 1
+    local existed = redis.call("EXISTS", hash_key, active_keys, window_limit_key, total_count_key) > 0
+    local state_revision = tonumber(redis.call("GET", state_revision_key)) or 0
+    local key_state_revision = tonumber(redis.call("HGET", key_state_revisions_key, entity)) or 0
+    local revisions_match = caller_state_revision == state_revision
+        and caller_key_state_revision == key_state_revision
+    local total_count = cleanup_expired_absolute(
+        hash_key,
+        active_keys,
+        total_count_key,
+        timestamp_ms,
+        window_size_seconds * 1000,
+        true
+    )
+
+    if total_count < 0 then
+        total_count = 0
+    end
+    total_count = total_count + pending_count
+    if revisions_match then
+        total_count = math.max(total_count, cached_committed_count)
+    end
+
+    redis.call("DEL", hash_key, active_keys, window_limit_key, total_count_key)
+    redis.call("ZREM", active_entities_key, entity)
+    redis.call("HINCRBY", key_state_revisions_key, entity, 1)
+
+    return {(existed or local_existed) and 1 or 0, total_count}
+"#;
+
+pub(crate) const ABSOLUTE_HYBRID_CLEAR_LUA: &str = r#"
+    local active_entities_key = KEYS[1]
+    local state_revision_key = KEYS[2]
+    local key_state_revisions_key = KEYS[3]
+
+    local prefix = ARGV[1]
+    local rate_type = ARGV[2]
+    local suffixes = {ARGV[3], ARGV[4], ARGV[5], ARGV[6]}
+    local entities = redis.call("ZRANGE", active_entities_key, 0, -1)
+
+    for i = 1, #entities do
+        for j = 1, #suffixes do
+            redis.call("DEL", prefix .. ":" .. entities[i] .. ":" .. rate_type .. ":" .. suffixes[j])
+        end
+    end
+
+    redis.call("DEL", active_entities_key, key_state_revisions_key)
+    redis.call("INCR", state_revision_key)
 "#;
 
 // Suppressed rate-limiter scripts.
@@ -641,6 +833,97 @@ pub(crate) const SUPPRESSED_CLEANUP_LUA: &str = r#"
         stale_after_ms,
         suffixes
     )
+"#;
+
+pub(crate) const SUPPRESSED_SET_RATE_LIMIT_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local window_limit_key = KEYS[1]
+    local active_entities_key = KEYS[2]
+    local suppression_factor_key = KEYS[3]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local hard_window_limit = tonumber(ARGV[3])
+    local hard_limit_factor = tonumber(ARGV[4])
+
+    local previous = redis.call("GET", window_limit_key)
+    if previous == false then
+        return {"missing", "", 0}
+    end
+
+    local previous_hard_window_limit = tonumber(previous)
+    local previous_rate_limit = previous_hard_window_limit
+        and previous_hard_window_limit / window_size_seconds / hard_limit_factor
+    if previous_hard_window_limit == nil or previous_hard_window_limit <= 0
+        or previous_hard_window_limit ~= previous_hard_window_limit
+        or previous_rate_limit <= 0 or previous_rate_limit ~= previous_rate_limit then
+        return {"invalid", previous, 0}
+    end
+
+    if previous_hard_window_limit == hard_window_limit then
+        return {"found", previous, 0}
+    end
+
+    redis.call("SET", window_limit_key, hard_window_limit, "EX", window_size_seconds)
+    redis.call("DEL", suppression_factor_key)
+    redis.call("ZADD", active_entities_key, timestamp_ms, entity)
+
+    return {"found", previous, 1}
+"#;
+
+pub(crate) const SUPPRESSED_DELETE_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local hash_key = KEYS[1]
+    local hash_declined_key = KEYS[2]
+    local active_keys = KEYS[3]
+    local window_limit_key = KEYS[4]
+    local total_count_key = KEYS[5]
+    local total_declined_key = KEYS[6]
+    local suppression_factor_key = KEYS[7]
+    local active_entities_key = KEYS[8]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local existed = redis.call(
+        "EXISTS",
+        hash_key,
+        hash_declined_key,
+        active_keys,
+        window_limit_key,
+        total_count_key,
+        total_declined_key,
+        suppression_factor_key
+    ) > 0
+
+    cleanup_expired_suppressed(
+        hash_key,
+        hash_declined_key,
+        active_keys,
+        total_count_key,
+        total_declined_key,
+        timestamp_ms,
+        window_size_seconds * 1000,
+        true
+    )
+    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+    local total_declined = tonumber(redis.call("GET", total_declined_key)) or 0
+    local accepted_count = math.max(total_count - total_declined, 0)
+
+    redis.call(
+        "DEL",
+        hash_key,
+        hash_declined_key,
+        active_keys,
+        window_limit_key,
+        total_count_key,
+        total_declined_key,
+        suppression_factor_key
+    )
+    redis.call("ZREM", active_entities_key, entity)
+
+    return {existed and 1 or 0, accepted_count}
 "#;
 
 pub(crate) const SUPPRESSED_INC_LUA: &str = r#"
@@ -1053,6 +1336,8 @@ pub(crate) const SUPPRESSED_HYBRID_COMMIT_STATE_LUA: &str = r#"
     local suppression_factor_key = KEYS[6]
     local total_declined_key = KEYS[7]
     local hash_declined_key = KEYS[8]
+    local state_revision_key = KEYS[9]
+    local key_state_revisions_key = KEYS[10]
 
     local entity = ARGV[1]
     local window_size_seconds = tonumber(ARGV[2])
@@ -1062,8 +1347,18 @@ pub(crate) const SUPPRESSED_HYBRID_COMMIT_STATE_LUA: &str = r#"
     local hard_limit_factor = tonumber(ARGV[6])
     local count = tonumber(ARGV[7])
     local declined_count = tonumber(ARGV[8])
+    local caller_state_revision = tonumber(ARGV[9]) or 0
+    local caller_key_state_revision = tonumber(ARGV[10]) or 0
+
+    local state_revision = tonumber(redis.call("GET", state_revision_key)) or 0
+    local key_state_revision = tonumber(redis.call("HGET", key_state_revisions_key, entity)) or 0
+    local revisions_match = caller_state_revision == state_revision
+        and caller_key_state_revision == key_state_revision
 
     local hard_window_limit = tonumber(redis.call("GET", window_limit_key)) or hard_window_limit_to_consider
+    if not revisions_match and redis.call("EXISTS", window_limit_key) == 0 then
+        hard_window_limit = hard_window_limit_to_consider
+    end
 
     redis.call("ZADD", active_entities_key, timestamp_ms, entity)
 
@@ -1117,6 +1412,8 @@ pub(crate) const SUPPRESSED_HYBRID_READ_STATE_LUA: &str = r#"
     local suppression_factor_key = KEYS[6]
     local total_declined_key = KEYS[7]
     local hash_declined_key = KEYS[8]
+    local state_revision_key = KEYS[9]
+    local key_state_revisions_key = KEYS[10]
 
     local entity = ARGV[1]
     local window_size_seconds = tonumber(ARGV[2])
@@ -1124,6 +1421,8 @@ pub(crate) const SUPPRESSED_HYBRID_READ_STATE_LUA: &str = r#"
     local hard_limit_factor = tonumber(ARGV[4])
 
     local hard_window_limit = tonumber(redis.call("GET", window_limit_key))
+    local state_revision = tonumber(redis.call("GET", state_revision_key)) or 0
+    local key_state_revision = tonumber(redis.call("HGET", key_state_revisions_key, entity)) or 0
 
     local evicted = cleanup_expired_suppressed(
         hash_key,
@@ -1163,7 +1462,135 @@ pub(crate) const SUPPRESSED_HYBRID_READ_STATE_LUA: &str = r#"
         redis.call("ZADD", active_entities_key, timestamp_ms, entity)
     end
 
-    return {entity, tostring(suppression_factor), total_count, total_declined, tostring(hard_window_limit or -1), suppression_factor_ttl_ms }
+    return {
+        entity,
+        tostring(suppression_factor),
+        total_count,
+        total_declined,
+        tostring(hard_window_limit or -1),
+        suppression_factor_ttl_ms,
+        state_revision,
+        key_state_revision
+    }
+"#;
+
+pub(crate) const SUPPRESSED_HYBRID_SET_RATE_LIMIT_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local window_limit_key = KEYS[1]
+    local active_entities_key = KEYS[2]
+    local suppression_factor_key = KEYS[3]
+    local key_state_revisions_key = KEYS[4]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local hard_window_limit = tonumber(ARGV[3])
+    local hard_limit_factor = tonumber(ARGV[4])
+
+    local previous = redis.call("GET", window_limit_key)
+    if previous == false then
+        return {"missing", "", 0}
+    end
+
+    local previous_hard_window_limit = tonumber(previous)
+    local previous_rate_limit = previous_hard_window_limit
+        and previous_hard_window_limit / window_size_seconds / hard_limit_factor
+    if previous_hard_window_limit == nil or previous_hard_window_limit <= 0
+        or previous_hard_window_limit ~= previous_hard_window_limit
+        or previous_rate_limit <= 0 or previous_rate_limit ~= previous_rate_limit then
+        return {"invalid", previous, 0}
+    end
+
+    if previous_hard_window_limit == hard_window_limit then
+        return {"found", previous, 0}
+    end
+
+    redis.call("SET", window_limit_key, hard_window_limit, "EX", window_size_seconds)
+    redis.call("DEL", suppression_factor_key)
+    redis.call("ZADD", active_entities_key, timestamp_ms, entity)
+    redis.call("HINCRBY", key_state_revisions_key, entity, 1)
+
+    return {"found", previous, 1}
+"#;
+
+pub(crate) const SUPPRESSED_HYBRID_DELETE_LUA: &str = r#"
+    local timestamp_ms = now_ms()
+
+    local hash_key = KEYS[1]
+    local hash_declined_key = KEYS[2]
+    local active_keys = KEYS[3]
+    local window_limit_key = KEYS[4]
+    local total_count_key = KEYS[5]
+    local total_declined_key = KEYS[6]
+    local suppression_factor_key = KEYS[7]
+    local active_entities_key = KEYS[8]
+    local key_state_revisions_key = KEYS[9]
+
+    local entity = ARGV[1]
+    local window_size_seconds = tonumber(ARGV[2])
+    local pending_count = tonumber(ARGV[3])
+    local pending_declined_count = tonumber(ARGV[4])
+    local local_existed = tonumber(ARGV[5]) == 1
+    local existed = redis.call(
+        "EXISTS",
+        hash_key,
+        hash_declined_key,
+        active_keys,
+        window_limit_key,
+        total_count_key,
+        total_declined_key,
+        suppression_factor_key
+    ) > 0
+
+    cleanup_expired_suppressed(
+        hash_key,
+        hash_declined_key,
+        active_keys,
+        total_count_key,
+        total_declined_key,
+        timestamp_ms,
+        window_size_seconds * 1000,
+        true
+    )
+    local total_count = tonumber(redis.call("GET", total_count_key)) or 0
+    local total_declined = tonumber(redis.call("GET", total_declined_key)) or 0
+    local accepted_count = math.max(total_count - total_declined, 0)
+        + math.max(pending_count - pending_declined_count, 0)
+
+    redis.call(
+        "DEL",
+        hash_key,
+        hash_declined_key,
+        active_keys,
+        window_limit_key,
+        total_count_key,
+        total_declined_key,
+        suppression_factor_key
+    )
+    redis.call("ZREM", active_entities_key, entity)
+    redis.call("HINCRBY", key_state_revisions_key, entity, 1)
+
+    return {(existed or local_existed) and 1 or 0, accepted_count}
+"#;
+
+pub(crate) const SUPPRESSED_HYBRID_CLEAR_LUA: &str = r#"
+    local active_entities_key = KEYS[1]
+    local state_revision_key = KEYS[2]
+    local key_state_revisions_key = KEYS[3]
+
+    local prefix = ARGV[1]
+    local rate_type = ARGV[2]
+    local suffixes = {ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7], ARGV[8], ARGV[9]}
+    local entities = redis.call("ZRANGE", active_entities_key, 0, -1)
+
+    for i = 1, #entities do
+        for j = 1, #suffixes do
+            redis.call("DEL", prefix .. ":" .. entities[i] .. ":" .. rate_type .. ":" .. suffixes[j])
+        end
+    end
+
+    redis.call("DEL", active_entities_key, key_state_revisions_key)
+    redis.call("INCR", state_revision_key)
 "#;
 
 /// Build a script with the common helper prelude.
