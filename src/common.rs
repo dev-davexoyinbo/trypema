@@ -412,6 +412,18 @@ impl RateLimit {
             Ok(Self(value))
         }
     }
+
+    pub(crate) fn from_stored_window_limit(
+        window_limit: f64,
+        window_size: WindowSize,
+        factor: f64,
+    ) -> Result<Self, TrypemaError> {
+        if window_limit == f64::MAX || window_limit == f64::INFINITY {
+            return Ok(Self::max());
+        }
+
+        Self::from_per_second(window_limit / window_size.as_seconds() as f64 / factor)
+    }
 }
 
 /// Sliding window size stored in seconds.

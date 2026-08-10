@@ -85,6 +85,14 @@ feature configuration.
   same key do not redefine that stored limit.
 - A matched conditional set recomputes and redefines the stored window limit from the supplied
   rate limit.
+- `set_rate_limit` changes only an existing key's stored limit, preserves history and totals, and
+  returns the previous effective per-second rate. Missing stored-rate state remains absent.
+- Equivalent rate-only updates perform no TTL, cache, activity-metadata, or revision writes.
+- `delete` removes one strategy key and returns its live pre-delete usage: absolute returns the
+  live total, while suppressed returns accepted usage (`total - total_declined`). Existing
+  zero-usage or cache-only state returns `Some(0)`; missing state and membership-only Redis ghosts
+  return `None`.
+- `clear` removes only the called strategy under its prefix and remains idempotent.
 - Increments within `bucket_size` of the newest bucket are coalesced into that bucket.
 - A bucket remains live while its age is within the configured window. Expiration and boundary
   comparisons must stay consistent across all operations.
@@ -497,6 +505,18 @@ rules:
 - Gather candidates before awaiting; never hold DashMap guards across Redis awaits.
 - Keep Redis and local invalidation ordering explicit and test failure paths.
 - Test both a pending snapshot and an increment that races after that snapshot.
+
+Hybrid lifecycle mutations additionally preserve these rules:
+
+- Changed rate updates and deletes advance the per-key state revision. Clear advances the
+  namespace state revision and clears per-key revisions.
+- Existing Redis reads and commits carry both revisions. A mismatch discards stale cached
+  totals, limits, and suppression state while applying pending deltas as fresh usage.
+- Drain caller-local queued commits before lifecycle mutations. Destructive mutations coordinate
+  with background commits through the maintenance lock without adding locks to the `inc` fast path.
+- Delete and clear preserve caller-local state when Redis fails. Concurrent or remote pending
+  increments may recreate deleted or cleared keys after the mutation.
+- Do not clear per-key reset-lock maps while locks or waiters may still reference them.
 
 ## 8. Test Construction Rules
 

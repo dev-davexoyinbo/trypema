@@ -110,6 +110,22 @@ update through this path.
 history. [`HistoryPreservation::PreserveOldest`] does the reverse. Matched zero targets remove
 the key; every matched update replaces its sticky window capacity.
 
+## Managing existing keys
+
+All six limiter variants expose `set_rate_limit`, `delete`, and `clear`. `set_rate_limit` changes
+only an existing key's sticky capacity and returns its previous effective [`RateLimit`]. It
+preserves live buckets, timestamps, totals, and declined usage. A missing key returns `None`; an
+equivalent effective rate performs no TTL, cache, activity-metadata, or hybrid-revision writes.
+A changed suppressed rate invalidates its cached suppression factor.
+
+`delete` removes one key and returns its live pre-delete usage in `Some`: the live total for
+absolute limiters and accepted usage (`total - total_declined`) for suppressed limiters. Existing
+zero-usage or cache-only state returns `Some(0)`; missing state returns `None`. `clear` removes all
+keys belonging to only the called strategy and configured prefix. Local methods are synchronous;
+Redis and hybrid methods are asynchronous and return [`Result`](std::result::Result). Hybrid state
+revisions prevent stale cached totals and limits from undoing these mutations on later Redis
+interaction. Concurrent or remote pending increments may still recreate keys afterward.
+
 [`RateLimitDecision`] is exhaustive, so callers can match all three variants without a wildcard.
 The fields of its `Rejected` and `Suppressed` variants remain non-exhaustive, so match those
 variants with `{ .. }`:

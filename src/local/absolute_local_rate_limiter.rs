@@ -565,6 +565,50 @@ impl AbsoluteLocalRateLimiter {
         self.live_total(key)
     } // end method get
 
+    /// Change the stored rate limit for an existing key without changing its history.
+    ///
+    /// Returns the previous effective rate limit, or `None` when the key does not exist. An
+    /// equivalent effective limit is a no-op. Later calls to [`Self::inc`] keep using the new
+    /// stored limit.
+    pub fn set_rate_limit(&self, key: &str, rate_limit: &RateLimit) -> Option<RateLimit> {
+        let series = self.series.get(key)?;
+        let previous_rate_limit =
+            RateLimit::from_stored_window_limit(series.window_limit, self.window_size, 1.0)
+                .expect("locally stored window limit must represent a valid rate limit");
+        let window_limit = rate_limit.as_per_second() * self.window_size.as_seconds() as f64;
+
+        if series.window_limit == window_limit {
+            return Some(previous_rate_limit);
+        }
+
+        drop(series);
+
+        let mut series = self.series.get_mut(key)?;
+        let previous_rate_limit =
+            RateLimit::from_stored_window_limit(series.window_limit, self.window_size, 1.0)
+                .expect("locally stored window limit must represent a valid rate limit");
+
+        if series.window_limit != window_limit {
+            series.window_limit = window_limit;
+        }
+
+        Some(previous_rate_limit)
+    } // end method set_rate_limit
+
+    /// Delete all rate-limit state for `key`.
+    ///
+    /// Returns the key's live total before deletion, or `None` when it did not exist. A later
+    /// increment starts with fresh history and the rate supplied to that increment.
+    pub fn delete(&self, key: &str) -> Option<u64> {
+        let (_, mut series) = self.series.remove(key)?;
+        Some(Self::evict_expired(&mut series, self.window_duration))
+    } // end method delete
+
+    /// Delete all keys stored by this absolute limiter.
+    pub fn clear(&self) {
+        self.series.clear();
+    } // end method clear
+
     /// Conditionally replace the window total for `key`.
     ///
     /// When `comparator` matches the key's current window total, the
