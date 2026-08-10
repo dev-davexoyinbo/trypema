@@ -300,20 +300,21 @@ impl SuppressedLocalRateLimiter {
             } else {
                 random_bool(1f64 - suppression_factor)
             };
+        }
 
+        // Keep aggregate and bucket writes on the same series. A concurrent delete can remove
+        // this entry while the structural path switches from shared to exclusive access.
+        if let Some(latest_bucket) = series.buckets.back()
+            && latest_bucket.timestamp.elapsed().as_millis()
+                <= self.bucket_size.as_milliseconds() as u128
+        {
             if !should_allow {
                 series
                     .total_declined_count
                     .fetch_add(count, Ordering::AcqRel);
             }
-        }
 
-        series.total_count.fetch_add(count, Ordering::AcqRel);
-
-        if let Some(latest_bucket) = series.buckets.back()
-            && latest_bucket.timestamp.elapsed().as_millis()
-                <= self.bucket_size.as_milliseconds() as u128
-        {
+            series.total_count.fetch_add(count, Ordering::AcqRel);
             latest_bucket.count.fetch_add(count, Ordering::AcqRel);
 
             if !should_allow {
@@ -332,7 +333,18 @@ impl SuppressedLocalRateLimiter {
             };
 
             match self.series.entry(key.to_string()) {
-                Entry::Occupied(mut entry) => entry.get_mut().buckets.push_back(bucket),
+                Entry::Occupied(mut entry) => {
+                    let series = entry.get_mut();
+
+                    if !should_allow {
+                        series
+                            .total_declined_count
+                            .fetch_add(count, Ordering::AcqRel);
+                    }
+
+                    series.total_count.fetch_add(count, Ordering::AcqRel);
+                    series.buckets.push_back(bucket);
+                }
                 Entry::Vacant(entry) => {
                     let mut series = RateLimitSeries::new(hard_window_limit);
 
