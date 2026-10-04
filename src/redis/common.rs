@@ -1,4 +1,4 @@
-use std::{fmt, hash::Hash, sync::Mutex};
+use std::{borrow::Borrow, fmt, hash::Hash, sync::Mutex};
 
 use dashmap::{DashMap, mapref::one::RefMut, try_result::TryResult};
 
@@ -65,6 +65,19 @@ impl RedisKey {
     pub fn new_or_panic(value: String) -> Self {
         Self::try_from(value).unwrap()
     }
+
+    /// Borrow this key as a [`RedisKeyRef`], without validating it again.
+    pub fn as_key_ref(&self) -> RedisKeyRef<'_> {
+        RedisKeyRef(&self.0)
+    }
+}
+
+/// Lets maps keyed by `RedisKey` be searched with a plain `&str`. A `RedisKey` hashes and
+/// compares exactly like its string, as `Borrow` requires.
+impl Borrow<str> for RedisKey {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Display for RedisKey {
@@ -77,21 +90,9 @@ impl TryFrom<String> for RedisKey {
     type Error = TrypemaError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        if value.is_empty() {
-            Err(TrypemaError::InvalidRedisKey(
-                "Redis key must not be empty".to_string(),
-            ))
-        } else if value.len() > 255 {
-            Err(TrypemaError::InvalidRedisKey(
-                "Redis key must not be longer than 255 characters".to_string(),
-            ))
-        } else if value.contains(":") {
-            Err(TrypemaError::InvalidRedisKey(
-                "Redis key must not contain colons".to_string(),
-            ))
-        } else {
-            Ok(Self(value))
-        }
+        validate_redis_key(&value)?;
+
+        Ok(Self(value))
     }
 }
 
@@ -102,6 +103,71 @@ impl TryFrom<&str> for RedisKey {
         Self::try_from(value.to_string())
     }
 }
+
+/// A validated, borrowed Redis key: the same rules as [`RedisKey`], without allocating.
+///
+/// Hot paths that only look up existing state, such as the hybrid limiters' `try_inc`, take this
+/// form so callers can validate a key they already hold as `&str` without copying it.
+///
+/// # Examples
+///
+/// ```
+/// use trypema::redis::{RedisKey, RedisKeyRef};
+///
+/// let key = RedisKeyRef::try_from("user_123").unwrap();
+/// assert_eq!(key.as_str(), "user_123");
+///
+/// // The same rules as RedisKey:
+/// assert!(RedisKeyRef::try_from("user:123").is_err());
+///
+/// // An owned key borrows without validating again:
+/// let owned = RedisKey::try_from("user_123").unwrap();
+/// assert_eq!(owned.as_key_ref(), key);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RedisKeyRef<'a>(&'a str);
+
+impl<'a> RedisKeyRef<'a> {
+    /// Return key as string slice.
+    pub fn as_str(&self) -> &'a str {
+        self.0
+    }
+}
+
+impl fmt::Display for RedisKeyRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl<'a> TryFrom<&'a str> for RedisKeyRef<'a> {
+    type Error = TrypemaError;
+
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+        validate_redis_key(value)?;
+
+        Ok(Self(value))
+    }
+}
+
+/// The rules every [`RedisKey`] and [`RedisKeyRef`] satisfies.
+fn validate_redis_key(value: &str) -> Result<(), TrypemaError> {
+    if value.is_empty() {
+        Err(TrypemaError::InvalidRedisKey(
+            "Redis key must not be empty".to_string(),
+        ))
+    } else if value.len() > 255 {
+        Err(TrypemaError::InvalidRedisKey(
+            "Redis key must not be longer than 255 characters".to_string(),
+        ))
+    } else if value.contains(":") {
+        Err(TrypemaError::InvalidRedisKey(
+            "Redis key must not contain colons".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+} // end fn validate_redis_key
 
 #[derive(Clone, Debug)]
 pub(crate) struct RedisKeyGenerator {

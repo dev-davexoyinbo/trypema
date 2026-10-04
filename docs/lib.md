@@ -91,8 +91,14 @@ let provider = HybridRateLimiterProvider::builder(connection)
 # }
 ```
 
-Redis and hybrid operations accept `&RedisKey`; local operations accept `&str`. Redis keys are
-validated and never silently sanitized.
+Hybrid limiters also expose a synchronous `try_inc(key, count)`, taking a `RedisKeyRef`: a
+borrowed key validated by the same rules as `RedisKey`, built from a `&str` without allocating
+(or from an owned key with `as_key_ref()`). It decides from this instance's local state without
+awaiting and returns `Ok(None)`, recording nothing, when the decision needs Redis; call `inc` then.
+Hot paths can use it to skip async machinery on most requests.
+
+Redis and hybrid operations accept `&RedisKey` (`try_inc` its borrowed form, `RedisKeyRef`);
+local operations accept `&str`. Redis keys are validated and never silently sanitized.
 
 ## Decisions and conditional updates
 

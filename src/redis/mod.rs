@@ -10,7 +10,7 @@ mod suppressed_redis_rate_limiter;
 pub use suppressed_redis_rate_limiter::SuppressedRedisRateLimiter;
 
 pub(crate) mod common;
-pub use common::RedisKey;
+pub use common::{RedisKey, RedisKeyRef};
 pub(crate) use common::{RedisKeyGenerator, mutex_lock};
 
 pub(crate) mod scripts;

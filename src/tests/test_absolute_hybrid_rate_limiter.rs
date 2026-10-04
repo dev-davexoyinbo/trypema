@@ -2155,3 +2155,124 @@ fn multi_instance_threaded_lifecycle_cutovers_fence_stale_state() {
         }
     });
 }
+
+#[test]
+fn hybrid_absolute_try_inc_decides_only_from_local_state() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 10, 1_000, 1_000, unique_prefix()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
+        let window_limit = window_capacity(10, &rate_limit);
+
+        assert!(
+            rl.absolute().try_inc(k.as_key_ref(), 1).unwrap().is_none(),
+            "a key without local state needs Redis"
+        );
+
+        assert_allowed(
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            "first inc refreshes from Redis",
+        );
+
+        for i in 1..window_limit {
+            let decision = rl.absolute().try_inc(k.as_key_ref(), 1).unwrap();
+            assert_allowed(
+                decision.expect("accepting state decides locally"),
+                &format!("try_inc {i}"),
+            );
+        }
+
+        assert!(
+            rl.absolute().try_inc(k.as_key_ref(), 1).unwrap().is_none(),
+            "exhausted local capacity needs a Redis commit"
+        );
+        assert_rejected(
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            "inc after local exhaustion",
+        );
+
+        let decision = rl.absolute().try_inc(k.as_key_ref(), 1).unwrap();
+        assert_rejected(
+            decision.expect("rejection cache decides locally"),
+            "try_inc while rejecting",
+        );
+        assert_eq!(
+            rl.absolute().get(&k).await.unwrap(),
+            window_limit,
+            "deferred and rejected calls record nothing"
+        );
+    });
+}
+
+#[test]
+fn hybrid_absolute_try_inc_needs_redis_after_delete_clear_and_rejection_expiry() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 1, 1_000, 1_000, unique_prefix()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let window_limit = window_capacity(1, &rate_limit);
+
+        for i in 0..window_limit {
+            assert_allowed(
+                rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+                &format!("setup inc {i}"),
+            );
+        }
+        assert_rejected(
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            "inc after exhaustion",
+        );
+        assert!(matches!(
+            rl.absolute().try_inc(k.as_key_ref(), 1).unwrap(),
+            Some(RateLimitDecision::Rejected { .. })
+        ));
+
+        assert_eq!(rl.absolute().delete(&k).await.unwrap(), Some(window_limit));
+        assert!(
+            rl.absolute().try_inc(k.as_key_ref(), 1).unwrap().is_none(),
+            "delete drops the cached rejection"
+        );
+
+        assert_allowed(
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            "inc after delete",
+        );
+        assert!(matches!(
+            rl.absolute().try_inc(k.as_key_ref(), 1).unwrap(),
+            Some(RateLimitDecision::Allowed)
+        ));
+
+        rl.absolute().clear().await.unwrap();
+        assert!(
+            rl.absolute().try_inc(k.as_key_ref(), 1).unwrap().is_none(),
+            "clear drops local state"
+        );
+
+        for i in 0..window_limit {
+            assert_allowed(
+                rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+                &format!("refill inc {i}"),
+            );
+        }
+        let RateLimitDecision::Rejected { retry_after, .. } =
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap()
+        else {
+            panic!("expected a rejection after refilling the window");
+        };
+
+        runtime::async_sleep(retry_after + Duration::from_millis(100)).await;
+
+        assert!(
+            rl.absolute().try_inc(k.as_key_ref(), 1).unwrap().is_none(),
+            "an expired rejection cache needs a Redis refresh"
+        );
+        assert_allowed(
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            "inc after the window passed",
+        );
+    });
+}

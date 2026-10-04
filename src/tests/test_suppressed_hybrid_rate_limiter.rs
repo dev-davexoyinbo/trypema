@@ -2693,3 +2693,149 @@ fn set_if_preserve_history_includes_suppressed_pending_and_noop_keeps_it() {
         assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 10);
     });
 }
+
+#[test]
+fn hybrid_suppressed_try_inc_decides_only_from_local_state() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl =
+            build_limiter_with_prefix(&url, 10, 1_000, 1.0, 1_000, 1_000, unique_prefix()).await;
+        let k = key("k");
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
+        let hard_window_limit = window_capacity(10, &rate_limit);
+
+        assert!(
+            rl.suppressed()
+                .try_inc(k.as_key_ref(), 1)
+                .unwrap()
+                .is_none(),
+            "a key without local state needs Redis"
+        );
+
+        assert!(matches!(
+            rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+
+        // The increment that would land exactly on the hard limit is coordinated through Redis.
+        for i in 1..hard_window_limit - 1 {
+            let decision = rl.suppressed().try_inc(k.as_key_ref(), 1).unwrap();
+            assert!(
+                matches!(decision, Some(RateLimitDecision::Allowed)),
+                "try_inc {i}: {decision:?}"
+            );
+        }
+
+        assert!(
+            rl.suppressed()
+                .try_inc(k.as_key_ref(), 1)
+                .unwrap()
+                .is_none(),
+            "reaching the hard limit needs Redis"
+        );
+        assert!(matches!(
+            rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+
+        let decision = rl.suppressed().try_inc(k.as_key_ref(), 1).unwrap();
+        assert!(
+            matches!(
+                decision,
+                Some(RateLimitDecision::Suppressed {
+                    is_allowed: false,
+                    ..
+                })
+            ),
+            "full suppression is cached locally: {decision:?}"
+        );
+
+        let snapshot = rl.suppressed().get(&k).await.unwrap();
+        assert_eq!(snapshot.total, hard_window_limit + 1);
+        assert_eq!(snapshot.total_declined, 1);
+    });
+}
+
+#[test]
+fn hybrid_suppressed_try_inc_needs_redis_after_delete_clear_and_suppression_expiry() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let suppression_factor_cache_period = 100_u64;
+        let rl = build_limiter_with_prefix(
+            &url,
+            1,
+            1_000,
+            2.0,
+            suppression_factor_cache_period,
+            1_000,
+            unique_prefix(),
+        )
+        .await;
+        let k = key("k");
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let soft_window_limit = window_capacity(1, &rate_limit);
+
+        assert!(matches!(
+            rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert!(matches!(
+            rl.suppressed().try_inc(k.as_key_ref(), 1).unwrap(),
+            Some(RateLimitDecision::Allowed)
+        ));
+
+        assert_eq!(rl.suppressed().delete(&k).await.unwrap(), Some(2));
+        assert!(
+            rl.suppressed()
+                .try_inc(k.as_key_ref(), 1)
+                .unwrap()
+                .is_none(),
+            "delete drops local state"
+        );
+
+        assert!(matches!(
+            rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        rl.suppressed().clear().await.unwrap();
+        assert!(
+            rl.suppressed()
+                .try_inc(k.as_key_ref(), 1)
+                .unwrap()
+                .is_none(),
+            "clear drops local state"
+        );
+
+        // Past the soft limit the key suppresses from a cached factor until the cache expires.
+        for i in 0..soft_window_limit {
+            let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
+            assert!(
+                matches!(decision, RateLimitDecision::Allowed),
+                "setup inc {i}: {decision:?}"
+            );
+        }
+        let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
+        assert!(
+            matches!(decision, RateLimitDecision::Suppressed { .. }),
+            "inc past the soft limit: {decision:?}"
+        );
+
+        let decision = rl.suppressed().try_inc(k.as_key_ref(), 1).unwrap();
+        assert!(
+            matches!(decision, Some(RateLimitDecision::Suppressed { .. })),
+            "cached suppression decides locally: {decision:?}"
+        );
+
+        runtime::async_sleep(Duration::from_millis(suppression_factor_cache_period + 50)).await;
+
+        assert!(
+            rl.suppressed()
+                .try_inc(k.as_key_ref(), 1)
+                .unwrap()
+                .is_none(),
+            "an expired suppression factor needs a Redis refresh"
+        );
+    });
+}

@@ -23,7 +23,7 @@ use crate::{
         common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal, StateRevision},
         hybrid_rate_limiter_provider::HybridRateLimiterConfig,
     },
-    redis::{RedisKey, mutex_lock, spawn_task},
+    redis::{RedisKey, RedisKeyRef, mutex_lock, spawn_task},
     runtime,
 };
 
@@ -274,6 +274,52 @@ impl AbsoluteHybridRateLimiter {
 
         Ok(decision)
     } // end method inc
+
+    /// Run [`inc`](Self::inc) only when it can be decided from local state, without awaiting.
+    ///
+    /// Returns `Ok(None)` when the decision needs Redis: the key has no local state yet, its
+    /// rejection cache expired, or its local capacity is exhausted. Nothing is recorded then;
+    /// call [`inc`](Self::inc), which performs the same check before coordinating with Redis.
+    /// Callers on a hot path can use this to skip the async machinery on most requests.
+    ///
+    /// `key` is a [`RedisKeyRef`]: validated by the same rules as [`RedisKey`], but borrowed, so a
+    /// hot path holding the key as `&str` validates it without allocating.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(Allowed))` — under limit, increment recorded locally
+    /// - `Ok(Some(Rejected { .. }))` — over limit, served from the local rejection cache
+    /// - `Ok(None)` — Redis is needed; call [`inc`](Self::inc)
+    /// - `Err(TrypemaError)` — local state is unusable
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
+    /// use trypema::RateLimit;
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
+    ///
+    /// let decision = match rl.absolute().try_inc(key.as_key_ref(), 1).unwrap() {
+    ///     Some(decision) => decision,
+    ///     None => rl.absolute().inc(&key, &rate, 1).await.unwrap(),
+    /// };
+    /// # let _ = decision;
+    /// # }
+    /// ```
+    pub fn try_inc(
+        &self,
+        key: RedisKeyRef<'_>,
+        count: u64,
+    ) -> Result<Option<RateLimitDecision>, TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        self.try_inc_from_local_state(key.as_str(), count)
+    } // end method try_inc
 
     /// Check if `key` is currently under its rate limit (read-only).
     ///

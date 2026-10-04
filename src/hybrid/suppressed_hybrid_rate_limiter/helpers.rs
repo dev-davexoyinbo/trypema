@@ -718,6 +718,23 @@ impl SuppressedHybridRateLimiter {
             .await
     } // end fn inc_with_rng
 
+    /// The local-state half of [`inc_with_rng`](Self::inc_with_rng) for a key with local state.
+    /// `None` means the key has no local state or needs a Redis refresh or commit.
+    pub(super) fn try_inc_with_rng(
+        &self,
+        key: &str,
+        increment: u64,
+        random_bool: &mut impl FnMut(f64) -> bool,
+    ) -> Result<Option<RateLimitDecision>, TrypemaError> {
+        self.send_epoch_change_if_needed();
+
+        let Some(state) = self.limiting_state.get(key) else {
+            return Ok(None);
+        };
+
+        self.evaluate_local_state_and_increment(state.deref(), increment, increment, random_bool)
+    } // end fn try_inc_with_rng
+
     pub(super) fn snapshot_pending_state(&self, key: &RedisKey) -> SuppressedHybridPendingState {
         self.limiting_state
             .get(key)

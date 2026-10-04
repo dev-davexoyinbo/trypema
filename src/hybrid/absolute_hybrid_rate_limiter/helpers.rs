@@ -550,6 +550,24 @@ impl AbsoluteHybridRateLimiter {
             .await
     } // end method is_allowed_with_count_increment
 
+    /// The local-state half of [`inc`](Self::inc) for a key with local state. `None` means the
+    /// key has no local state or needs a Redis refresh or commit.
+    pub(super) fn try_inc_from_local_state(
+        &self,
+        key: &str,
+        count: u64,
+    ) -> Result<Option<RateLimitDecision>, TrypemaError> {
+        let Some(state) = self.limiting_state.get(key) else {
+            return Ok(None);
+        };
+
+        match self.evaluate_local_state(state.key(), state.value(), count, count)? {
+            LocalAdmission::Allowed => Ok(Some(RateLimitDecision::Allowed)),
+            LocalAdmission::Rejected(decision) => Ok(Some(decision)),
+            LocalAdmission::Refresh | LocalAdmission::Exhausted(_) => Ok(None),
+        }
+    } // end fn try_inc_from_local_state
+
     async fn coordinate_local_transition(
         &self,
         key: &RedisKey,

@@ -351,6 +351,47 @@ fn redis_key_try_from_str_preserves_valid_input_without_sanitizing() {
     assert!(RedisKey::try_from("user:123").is_err());
 }
 
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn redis_key_ref_validates_exactly_like_redis_key() {
+    use crate::redis::{RedisKey, RedisKeyRef};
+
+    let longest = "k".repeat(255);
+    for valid in ["user_123", "a", longest.as_str()] {
+        let key = RedisKeyRef::try_from(valid).unwrap();
+        assert_eq!(key.as_str(), valid);
+        assert_eq!(RedisKey::try_from(valid).unwrap().as_key_ref(), key);
+    }
+
+    let too_long = "k".repeat(256);
+    for invalid in ["", "a:b", "user:", too_long.as_str()] {
+        let borrowed = RedisKeyRef::try_from(invalid).unwrap_err().to_string();
+        let owned = RedisKey::try_from(invalid).unwrap_err().to_string();
+        assert_eq!(borrowed, owned, "{invalid:?}");
+    }
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn redis_key_borrows_as_its_str_for_map_lookups() {
+    use std::{
+        borrow::Borrow,
+        collections::HashMap,
+        hash::{BuildHasher, RandomState},
+    };
+
+    use crate::redis::RedisKey;
+
+    let key = RedisKey::try_from("user_123").unwrap();
+    let hasher = RandomState::new();
+    assert_eq!(Borrow::<str>::borrow(&key), "user_123");
+    assert_eq!(hasher.hash_one(&key), hasher.hash_one("user_123"));
+
+    let map = HashMap::from([(key, 1)]);
+    assert_eq!(map.get("user_123"), Some(&1));
+    assert_eq!(map.get("user_124"), None);
+}
+
 #[test]
 fn rate_limit_comparator_matches_uses_embedded_operand_and_always_matches() {
     // (comparator, current, expected)

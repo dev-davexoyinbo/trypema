@@ -68,8 +68,9 @@ shared-to-exclusive lock regressions visible as contended-throughput changes. Th
 cases consume the complete `SuppressedRateLimitSnapshot`, including both counters and the factor.
 All six suites compare conditional-set guard misses with matched replacement,
 `PreserveNewest`, and `PreserveOldest` history adjustments. Each hybrid suite also benchmarks
-every strategy-specific public operation: `inc`, reads, admission checks where applicable, and
-both conditional-set forms. Both hybrid strategies measure the local `get_estimate` fast path,
+every strategy-specific public operation: `inc`, the synchronous `try_inc` local path, reads,
+admission checks where applicable, and both conditional-set forms. Both hybrid strategies
+measure the local `get_estimate` fast path,
 its Redis-refresh path, and Redis-synchronized `get` reads separately.
 
 Run one bench directly:

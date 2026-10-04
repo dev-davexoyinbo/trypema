@@ -45,6 +45,15 @@ mod enabled {
             });
         });
 
+        group.bench_function("try_inc/hot_key", |b| {
+            b.iter(|| {
+                black_box(
+                    rl.suppressed()
+                        .try_inc(black_box(hot_key.as_key_ref()), black_box(1)),
+                )
+            });
+        });
+
         group.bench_function("get/redis_synchronized", |b| {
             b.iter(|| {
                 black_box(runtime::block_on(&rt, async {

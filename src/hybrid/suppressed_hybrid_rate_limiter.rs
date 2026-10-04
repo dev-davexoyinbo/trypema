@@ -22,7 +22,7 @@ use crate::{
         common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal, StateRevision},
         hybrid_rate_limiter_provider::HybridRateLimiterConfig,
     },
-    redis::{RedisKey, mutex_lock, spawn_task},
+    redis::{RedisKey, RedisKeyRef, mutex_lock, spawn_task},
     runtime,
 };
 
@@ -806,6 +806,53 @@ impl SuppressedHybridRateLimiter {
 
         Ok(decision)
     } // end method inc
+
+    /// Run [`inc`](Self::inc) only when it can be decided from local state, without awaiting.
+    ///
+    /// Returns `Ok(None)` when the decision needs Redis: the key has no local state yet, its
+    /// suppression state expired, or its local capacity is exhausted. Nothing is recorded then;
+    /// call [`inc`](Self::inc), which performs the same check before coordinating with Redis.
+    /// Callers on a hot path can use this to skip the async machinery on most requests.
+    ///
+    /// `key` is a [`RedisKeyRef`]: validated by the same rules as [`RedisKey`], but borrowed, so a
+    /// hot path holding the key as `&str` validates it without allocating.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(Allowed))` — within soft capacity, increment recorded locally
+    /// - `Ok(Some(Suppressed { is_allowed, suppression_factor }))` — probabilistic admission
+    ///   from the locally cached suppression factor; check `is_allowed`
+    /// - `Ok(None)` — Redis is needed; call [`inc`](Self::inc)
+    /// - `Err(TrypemaError)` — local state is unusable
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
+    /// use trypema::RateLimit;
+    /// use trypema::redis::RedisKey;
+    ///
+    /// let key = RedisKey::try_from("user_123").unwrap();
+    /// let rate = RateLimit::per_second(10.0).unwrap();
+    ///
+    /// let decision = match rl.suppressed().try_inc(key.as_key_ref(), 1).unwrap() {
+    ///     Some(decision) => decision,
+    ///     None => rl.suppressed().inc(&key, &rate, 1).await.unwrap(),
+    /// };
+    /// # let _ = decision;
+    /// # }
+    /// ```
+    pub fn try_inc(
+        &self,
+        key: RedisKeyRef<'_>,
+        count: u64,
+    ) -> Result<Option<RateLimitDecision>, TrypemaError> {
+        let mut rng = |p: f64| rand::random_bool(p);
+
+        self.try_inc_with_rng(key.as_str(), count, &mut rng)
+    } // end method try_inc
 
     /// Remove stale Redis state and local state stale since its suppression cache expired.
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
