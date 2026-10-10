@@ -360,21 +360,30 @@ impl AbsoluteHybridRedisProxy {
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
-        let _: () = self
-            .cleanup_script
-            .key(self.key_generator.prefix.to_string())
-            .key(self.key_generator.rate_type.to_string())
-            .key(self.key_generator.get_active_entities_key())
-            .arg(stale_after_ms)
-            .arg(self.key_generator.hash_key_suffix.to_string())
-            .arg(self.key_generator.window_limit_key_suffix.to_string())
-            .arg(self.key_generator.total_count_key_suffix.to_string())
-            .arg(self.key_generator.active_keys_key_suffix.to_string())
-            .arg(self.key_generator.suppression_factor_key_suffix.to_string())
-            .invoke_async(&mut connection_manager)
-            .await?;
+        // One script call removes a limited number of stale keys. The first call sets the
+        // cutoff of the pass, so that new activity cannot make the pass longer.
+        let mut cutoff_ms = 0u64;
 
-        Ok(())
+        loop {
+            cutoff_ms = self
+                .cleanup_script
+                .key(self.key_generator.prefix.to_string())
+                .key(self.key_generator.rate_type.to_string())
+                .key(self.key_generator.get_active_entities_key())
+                .arg(stale_after_ms)
+                .arg(self.key_generator.hash_key_suffix.to_string())
+                .arg(self.key_generator.window_limit_key_suffix.to_string())
+                .arg(self.key_generator.total_count_key_suffix.to_string())
+                .arg(self.key_generator.active_keys_key_suffix.to_string())
+                .arg(self.key_generator.suppression_factor_key_suffix.to_string())
+                .arg(cutoff_ms)
+                .invoke_async(&mut connection_manager)
+                .await?;
+
+            if cutoff_ms == 0 {
+                return Ok(());
+            }
+        }
     }
 }
 
