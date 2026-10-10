@@ -25,6 +25,25 @@ const COMMON_LUA_HELPERS: &str = r#"
         return total
     end
 
+    -- Redis Lua cannot unpack a long list, so a command gets its members in slices.
+    local slice_size = 1000
+
+    local function call_in_slices(command, key, members)
+        for first = 1, #members, slice_size do
+            local last = math.min(first + slice_size - 1, #members)
+            redis.call(command, key, unpack(members, first, last))
+        end
+    end
+
+    local function hmget_sum(hash_key, fields)
+        local total = 0
+        for first = 1, #fields, slice_size do
+            local last = math.min(first + slice_size - 1, #fields)
+            total = total + sum_values(redis.call("HMGET", hash_key, unpack(fields, first, last)))
+        end
+        return total
+    end
+
     local function comparator_matches(value, comparator_op, comparator_operand)
         if comparator_op == "nil" then
             return true
@@ -75,34 +94,46 @@ const COMMON_LUA_HELPERS: &str = r#"
         return retry_after_ms, count
     end
 
-    local function cleanup_stale_entities(prefix, rate_type, active_entities_key, timestamp_ms, stale_after_ms, suffixes)
+    -- Removes at most `batch_size` entities that have no activity after the cutoff.
+    -- The first call of a cleanup pass gives `cutoff_ms` = 0. Then the cutoff is the Redis time
+    -- minus `stale_after_ms`. Returns the cutoff when more of these entities can remain, and 0
+    -- when none remain. The caller gives that cutoff to the next call, so new activity cannot
+    -- make the pass longer.
+    local function cleanup_stale_entities(prefix, rate_type, active_entities_key, stale_after_ms, cutoff_ms, suffixes)
+        local batch_size = 500
+
+        if cutoff_ms == 0 then
+            cutoff_ms = now_ms() - stale_after_ms
+        end
+
         local stale_entities = redis.call(
             "ZRANGE",
             active_entities_key,
             "-inf",
-            timestamp_ms - stale_after_ms,
-            "BYSCORE"
+            cutoff_ms,
+            "BYSCORE",
+            "LIMIT",
+            0,
+            batch_size
         )
 
         if #stale_entities == 0 then
-            return
+            return 0
         end
-
-        local remove_keys = {}
 
         for i = 1, #stale_entities do
-            local entity = stale_entities[i]
+            local remove_keys = {}
 
             for j = 1, #suffixes do
-                table.insert(
-                    remove_keys,
-                    prefix .. ":" .. entity .. ":" .. rate_type .. ":" .. suffixes[j]
-                )
+                remove_keys[j] = prefix .. ":" .. stale_entities[i] .. ":" .. rate_type .. ":" .. suffixes[j]
             end
+
+            redis.call("DEL", unpack(remove_keys))
         end
 
-        redis.call("DEL", unpack(remove_keys))
         redis.call("ZREM", active_entities_key, unpack(stale_entities))
+
+        return #stale_entities == batch_size and cutoff_ms or 0
     end
 "#;
 
@@ -116,10 +147,9 @@ const ABSOLUTE_LUA_HELPERS: &str = r#"
             return total_count, false
         end
 
-        local expired_counts = redis.call("HMGET", hash_key, unpack(expired_keys))
-        local expired_sum = sum_values(expired_counts)
-        redis.call("HDEL", hash_key, unpack(expired_keys))
-        redis.call("ZREM", active_keys, unpack(expired_keys))
+        local expired_sum = hmget_sum(hash_key, expired_keys)
+        call_in_slices("HDEL", hash_key, expired_keys)
+        call_in_slices("ZREM", active_keys, expired_keys)
 
         if expired_sum > 0 or not delete_empty_total then
             total_count = redis.call("DECRBY", total_count_key, expired_sum)
@@ -141,14 +171,12 @@ const SUPPRESSED_LUA_HELPERS: &str = r#"
             return false
         end
 
-        local expired_counts = redis.call("HMGET", hash_key, unpack(expired_keys))
-        local expired_declines = redis.call("HMGET", hash_declined_key, unpack(expired_keys))
-        local expired_count_sum = sum_values(expired_counts)
-        local expired_declined_sum = sum_values(expired_declines)
+        local expired_count_sum = hmget_sum(hash_key, expired_keys)
+        local expired_declined_sum = hmget_sum(hash_declined_key, expired_keys)
 
-        redis.call("HDEL", hash_key, unpack(expired_keys))
-        redis.call("HDEL", hash_declined_key, unpack(expired_keys))
-        redis.call("ZREM", active_keys, unpack(expired_keys))
+        call_in_slices("HDEL", hash_key, expired_keys)
+        call_in_slices("HDEL", hash_declined_key, expired_keys)
+        call_in_slices("ZREM", active_keys, expired_keys)
 
         if expired_count_sum > 0 or not delete_empty_totals then
             local remaining_total = redis.call("DECRBY", total_count_key, expired_count_sum)
@@ -190,10 +218,7 @@ const SUPPRESSED_LUA_HELPERS: &str = r#"
             "BYSCORE",
             "REV"
         )
-        local total_in_last_second = 0
-        if #active_keys_in_1s > 0 then
-            total_in_last_second = sum_values(redis.call("HMGET", hash_key, unpack(active_keys_in_1s)))
-        end
+        local total_in_last_second = hmget_sum(hash_key, active_keys_in_1s)
 
         local average_rate_in_window = total_count / window_size_seconds
         local perceived_rate_limit = math.max(average_rate_in_window, total_in_last_second)
@@ -315,8 +340,6 @@ pub(crate) const ABSOLUTE_IS_ALLOWED_LUA: &str = r#"
 "#;
 
 pub(crate) const ABSOLUTE_CLEANUP_LUA: &str = r#"
-    local timestamp_ms = now_ms()
-
     local prefix = KEYS[1]
     local rate_type = KEYS[2]
     local active_entities_key = KEYS[3]
@@ -327,16 +350,17 @@ pub(crate) const ABSOLUTE_CLEANUP_LUA: &str = r#"
     local total_count_suffix = ARGV[4]
     local active_keys_suffix = ARGV[5]
     local suppression_factor_key_suffix = ARGV[6]
+    local cutoff_ms = tonumber(ARGV[7]) or 0
 
 
     local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix}
 
-    cleanup_stale_entities(
+    return cleanup_stale_entities(
         prefix,
         rate_type,
         active_entities_key,
-        timestamp_ms,
         stale_after_ms,
+        cutoff_ms,
         suffixes
     )
 "#;
@@ -469,12 +493,7 @@ pub(crate) const ABSOLUTE_SET_IF_LUA: &str = r#"
     local pending_count = tonumber(ARGV[8]) or 0
 
     local expired_keys = expired_bucket_keys(active_keys, timestamp_ms, window_size_seconds * 1000)
-    local expired_sum = 0
-
-    if #expired_keys > 0 then
-        local expired_counts = redis.call("HMGET", hash_key, unpack(expired_keys))
-        expired_sum = sum_values(expired_counts)
-    end
+    local expired_sum = hmget_sum(hash_key, expired_keys)
 
     local redis_total = (tonumber(redis.call("GET", total_count_key)) or 0) - expired_sum
 
@@ -527,10 +546,8 @@ pub(crate) const ABSOLUTE_SET_IF_LUA: &str = r#"
             redis.call("ZADD", active_keys, timestamp_ms, field)
         end
     else
-        if #expired_keys > 0 then
-            redis.call("HDEL", hash_key, unpack(expired_keys))
-            redis.call("ZREM", active_keys, unpack(expired_keys))
-        end
+        call_in_slices("HDEL", hash_key, expired_keys)
+        call_in_slices("ZREM", active_keys, expired_keys)
 
         if pending_count > 0 then
             local pending_field = tostring(timestamp_ms)
@@ -808,8 +825,6 @@ pub(crate) const ABSOLUTE_HYBRID_CLEAR_LUA: &str = r#"
 // Suppressed rate-limiter scripts.
 
 pub(crate) const SUPPRESSED_CLEANUP_LUA: &str = r#"
-    local timestamp_ms = now_ms()
-
     local prefix = KEYS[1]
     local rate_type = KEYS[2]
     local active_entities_key = KEYS[3]
@@ -822,15 +837,16 @@ pub(crate) const SUPPRESSED_CLEANUP_LUA: &str = r#"
     local suppression_factor_key_suffix = ARGV[6]
     local total_declined_suffix = ARGV[7]
     local hash_declined_suffix = ARGV[8]
+    local cutoff_ms = tonumber(ARGV[9]) or 0
 
 
     local suffixes = {hash_suffix, window_limit_suffix, total_count_suffix, active_keys_suffix, suppression_factor_key_suffix, total_declined_suffix, hash_declined_suffix}
-    cleanup_stale_entities(
+    return cleanup_stale_entities(
         prefix,
         rate_type,
         active_entities_key,
-        timestamp_ms,
         stale_after_ms,
+        cutoff_ms,
         suffixes
     )
 "#;
@@ -1187,14 +1203,8 @@ pub(crate) const SUPPRESSED_SET_IF_LUA: &str = r#"
     local pending_declined = tonumber(ARGV[9]) or 0
 
     local expired_keys = expired_bucket_keys(active_keys, timestamp_ms, window_size_seconds * 1000)
-    local expired_sum = 0
-    local expired_declined = 0
-    if #expired_keys > 0 then
-        local expired_counts = redis.call("HMGET", hash_key, unpack(expired_keys))
-        local expired_declines = redis.call("HMGET", hash_declined_key, unpack(expired_keys))
-        expired_sum = sum_values(expired_counts)
-        expired_declined = sum_values(expired_declines)
-    end
+    local expired_sum = hmget_sum(hash_key, expired_keys)
+    local expired_declined = hmget_sum(hash_declined_key, expired_keys)
 
     local redis_total = (tonumber(redis.call("GET", total_count_key)) or 0) - expired_sum
     if redis_total < 0 then redis_total = 0 end
@@ -1245,11 +1255,9 @@ pub(crate) const SUPPRESSED_SET_IF_LUA: &str = r#"
             redis.call("ZADD", active_keys, timestamp_ms, field)
         end
     else
-        if #expired_keys > 0 then
-            redis.call("HDEL", hash_key, unpack(expired_keys))
-            redis.call("HDEL", hash_declined_key, unpack(expired_keys))
-            redis.call("ZREM", active_keys, unpack(expired_keys))
-        end
+        call_in_slices("HDEL", hash_key, expired_keys)
+        call_in_slices("HDEL", hash_declined_key, expired_keys)
+        call_in_slices("ZREM", active_keys, expired_keys)
 
         if pending_count > 0 then
             local pending_field = tostring(timestamp_ms)
