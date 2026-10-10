@@ -259,7 +259,14 @@ impl HybridRateLimiterProvider {
     }
 
     pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        self.absolute.cleanup(stale_after_ms).await?;
-        self.suppressed.cleanup(stale_after_ms).await
+        // The two strategies are independent. A failure of one must not stop the other.
+        let absolute = self.absolute.cleanup(stale_after_ms).await;
+        let suppressed = self.suppressed.cleanup(stale_after_ms).await;
+
+        if let (Err(_), Err(error)) = (&absolute, &suppressed) {
+            tracing::warn!(?error, "Suppressed cleanup also failed");
+        }
+
+        absolute.and(suppressed)
     }
 }

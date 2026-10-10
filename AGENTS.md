@@ -93,6 +93,14 @@ feature configuration.
   zero-usage or cache-only state returns `Some(0)`; missing state and membership-only Redis ghosts
   return `None`.
 - `clear` removes only the called strategy under its prefix and remains idempotent.
+- Redis stale-state cleanup removes stale entities in script calls of limited size, and it repeats
+  the call until none remain. The first call sets the cutoff time of the pass. One cleanup pass,
+  and thus the Redis `clear`, removes all entities that were stale at that time. Activity during
+  the pass can keep or recreate a key.
+- A provider cleanup pass runs the absolute cleanup and the suppressed cleanup. A failure of one
+  does not stop the other. The pass returns the first error.
+- A hybrid strategy removes stale local state only after its Redis cleanup succeeds. When Redis
+  fails, local state stays.
 - Increments within `bucket_size` of the newest bucket are coalesced into that bucket.
 - A bucket remains live while its age is within the configured window. Expiration and boundary
   comparisons must stay consistent across all operations.
@@ -459,6 +467,9 @@ Lua requirements:
   individual script bodies.
 - Reuse the shared expiry, grouping, comparator, history-mode, and cleanup helpers instead of
   copying those state-transition fragments into individual bodies.
+- Do not give `unpack` a list that has no size limit. Redis Lua refuses approximately 8,000
+  values or more, and the script fails. Use `call_in_slices` and `hmget_sum`, or put a `LIMIT` on
+  the read.
 - Use Redis server time, not client time, for bucket scores and TTL-sensitive behavior.
 - Compute expired contributions and the logical live total before deciding whether the comparator
   matches.
@@ -833,6 +844,7 @@ Before handing work back, confirm all applicable items:
 - Reusing a cached suppression factor after the history that produced it was evicted.
 - Losing hybrid increments that arrive after a conditional-set snapshot.
 - Holding DashMap guards across Redis awaits.
+- Giving Lua `unpack` a list with no size limit, such as all expired buckets or all stale entities.
 - Adding Redis feature gates throughout local benchmark code.
 - Measuring thread creation in hot-key contention benchmarks.
 - Giving each worker the full Criterion iteration count.
