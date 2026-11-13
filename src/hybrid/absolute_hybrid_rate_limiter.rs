@@ -20,7 +20,7 @@ use crate::{
             AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyOptions,
             AbsoluteHybridRedisProxyReadStateResult,
         },
-        common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal, StateRevision},
+        common::{CallMode, EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal, StateRevision},
         hybrid_rate_limiter_provider::HybridRateLimiterConfig,
     },
     redis::{RedisKey, RedisKeyRef, mutex_lock, spawn_task},
@@ -36,19 +36,27 @@ enum AbsoluteRedisLimitingState {
         accept_limit: Mutex<u64>,
         starting_count: Mutex<u64>,
         count: AtomicU64,
-        time_instant: Mutex<Instant>,
+        // A refresh updates an existing `Accepting` state in place under a shared map guard,
+        // so this needs interior mutability. Suppressed `Accepting` is replaced whole instead.
+        last_synced: Mutex<Instant>,
         oldest_bucket_ttl: Mutex<Option<u64>>,
         oldest_bucket_count: Mutex<Option<u64>>,
         last_modified: Mutex<Instant>,
         state_revision: Mutex<StateRevision>,
     },
     Undefined,
+    Absent {
+        last_synced: Instant,
+    },
     Rejecting {
         time_instant: Mutex<Instant>,
         ttl_ms: Mutex<u64>,
         count_after_release: Mutex<u64>,
         committed_count: u64,
         committed_at: Instant,
+        // The time of the Redis read behind this rejection. It anchors the allowed lag when
+        // `allowed_lag_applies_to_rejections` is set.
+        last_synced: Mutex<Instant>,
         state_revision: Mutex<StateRevision>,
     },
 }
@@ -62,18 +70,22 @@ enum AbsoluteRedisLimitingState {
 ///
 /// # State Machine
 ///
-/// Each key transitions through three states:
+/// Each key transitions through four states:
 ///
-/// - **`Undefined`** — No local state exists. The first `inc()` call reads Redis to
-///   initialise local state, then transitions to `Accepting` or `Rejecting`.
+/// - **`Undefined`** — No local state exists. The first call reads Redis to
+///   initialise local state, then transitions to `Accepting`, `Rejecting`, or `Absent`.
 ///
 /// - **`Accepting`** — Serving from a local counter. Each `inc()` is a fast atomic
 ///   increment with no Redis I/O. When the local counter exceeds the available capacity,
-///   it commits the count to Redis and transitions based on the result.
+///   it commits the count to Redis and transitions based on the result. A read-only call
+///   reads Redis again when the state is older than the allowed lag.
 ///
 /// - **`Rejecting`** — A rejection cache based on the oldest bucket's TTL. All calls
-///   return `Rejected` until the TTL expires, at which point the state resets to
-///   `Undefined` for a fresh Redis read.
+///   return `Rejected` until the TTL expires, at which point the next call reads Redis again.
+///
+/// - **`Absent`** — Redis has no stored limit for the key, and the call gave no rate. A
+///   read-only call answers `Allowed` from this state until the allowed lag passes. An `inc()`
+///   reads Redis, as for `Undefined`.
 ///
 /// # Thundering Herd Prevention
 ///
@@ -84,11 +96,26 @@ enum AbsoluteRedisLimitingState {
 /// # When to Use
 ///
 /// Use this over the pure Redis provider when per-request Redis latency is unacceptable.
-/// The trade-off is that admission decisions may lag behind the true Redis state by up
-/// to `sync_interval`.
+/// The trade-off has these bounds:
+///
+/// - Increments from this instance reach Redis within `sync_interval`.
+/// - A read-only call (`is_allowed`, `get_estimate`) answers from `Accepting` or `Absent` state
+///   only while that state is younger than `allowed_lag`.
+/// - A `Rejecting` state answers from its cache until its retry TTL ends, which can be up to one
+///   window. With `allowed_lag_applies_to_rejections(true)` on the builder, a read-only answer
+///   from `Rejecting` state is also at most `allowed_lag` old. The age counts from the Redis read
+///   behind the rejection; a rejection that this instance derives from its own local count
+///   keeps the time of the Redis read behind that count. `inc()` keeps the retry TTL rule.
+///
+/// A read-only call records no activity. A key in `Accepting` state that is only checked
+/// becomes stale, and cleanup removes it. A key in `Rejecting` state that is checked after its
+/// retry TTL (or, with the setting, after the allowed lag) gets a new rejection cache from Redis
+/// each time, so cleanup keeps it while it is checked.
 #[derive(Debug)]
 pub struct AbsoluteHybridRateLimiter {
     window_size: WindowSize,
+    pub(crate) allowed_lag: Duration,
+    pub(crate) allowed_lag_applies_to_rejections: bool,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
     limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState, RandomState>,
@@ -130,6 +157,8 @@ impl AbsoluteHybridRateLimiter {
 
         let limiter = Self {
             window_size: options.provider.window_size,
+            allowed_lag: Duration::from_millis(options.allowed_lag.as_milliseconds()),
+            allowed_lag_applies_to_rejections: options.allowed_lag_applies_to_rejections,
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::default(),
@@ -231,6 +260,10 @@ impl AbsoluteHybridRateLimiter {
     /// single atomic increment with no Redis I/O. When local capacity is exhausted,
     /// it flushes to Redis and refreshes local state.
     ///
+    /// When the key is at its limit with nothing pending, the rejection comes from local state
+    /// and writes nothing to Redis. It does not extend the TTL of the stored limit or the
+    /// key's activity time in Redis.
+    ///
     /// # Arguments
     ///
     /// - `key`: Validated [`RedisKey`] identifying the rate-limited resource
@@ -269,7 +302,13 @@ impl AbsoluteHybridRateLimiter {
         self.send_epoch_change_if_needed();
 
         let decision = self
-            .is_allowed_with_count_increment(key, count, count, Some(rate_limit))
+            .is_allowed_with_count_increment(
+                key,
+                count,
+                count,
+                Some(rate_limit),
+                CallMode::Recording,
+            )
             .await?;
 
         Ok(decision)
@@ -324,7 +363,22 @@ impl AbsoluteHybridRateLimiter {
     /// Check if `key` is currently under its rate limit (read-only).
     ///
     /// Performs an admission check **without** recording an increment. On the fast-path
-    /// (key in `Accepting` state), this is served from local state with no Redis I/O.
+    /// (key in `Accepting` state), this is served from local state with no Redis I/O. When
+    /// that state is older than the allowed lag, the call reads Redis again first. A rejection
+    /// is served from the local rejection cache until its retry TTL ends (up to one window);
+    /// the next check after that reads Redis again. With the builder setting
+    /// `allowed_lag_applies_to_rejections(true)`, the check also reads Redis again once the
+    /// Redis read behind the rejection is older than the allowed lag.
+    ///
+    /// The check records no activity. A key in `Accepting` state that is only checked becomes
+    /// stale, and cleanup removes it. A rejected key that is checked after its cache ends gets a
+    /// new rejection cache each time, so cleanup keeps it while it is checked.
+    ///
+    /// A key with no stored limit is allowed and no Redis key is created. This instance keeps a
+    /// small local entry for the key that answers later checks until the allowed lag passes. Only
+    /// the cleanup loop removes that entry. When cleanup is disabled, start it with
+    /// [`HybridRateLimiterProvider::start_cleanup_loop`](crate::hybrid::HybridRateLimiterProvider::start_cleanup_loop),
+    /// or the entries of unknown keys stay in memory.
     ///
     /// Useful for previewing whether a request would be allowed before doing expensive work.
     ///
@@ -353,16 +407,26 @@ impl AbsoluteHybridRateLimiter {
     pub async fn is_allowed(&self, key: &RedisKey) -> Result<RateLimitDecision, TrypemaError> {
         self.send_epoch_change_if_needed();
 
-        self.is_allowed_with_count_increment(key, 1, 0, None).await
+        self.is_allowed_with_count_increment(key, 1, 0, None, CallMode::ReadOnly)
+            .await
     } // end method is_allowed
 
     /// Infer the current window total for `key` from this instance's limiting state.
     ///
     /// This follows the same state-refresh path as [`Self::is_allowed`], without checking or
-    /// recording an increment. An initialized, usable state stays on the local fast path. An
-    /// undefined state or expired rejection cache is refreshed from Redis first, then the total
-    /// is inferred from the updated state. The result can still lag later commits from other
-    /// instances and Redis-side expiration. Use [`Self::get`] when every read must consult Redis.
+    /// recording an increment. An `Accepting` state younger than the allowed lag stays on the
+    /// local fast path; so does a live rejection cache, until its retry TTL ends (up to one
+    /// window), or, with `allowed_lag_applies_to_rejections(true)`, until the Redis read behind it
+    /// is older than the allowed lag. An undefined state, an `Accepting` state older than the allowed lag, or an
+    /// expired rejection cache is refreshed from Redis first, then the total is inferred from the
+    /// updated state. Use [`Self::get`] when every read must consult Redis.
+    ///
+    /// The call records no activity, with the same cleanup rules as [`Self::is_allowed`].
+    /// A key with no stored limit is allowed and no Redis key is created. This instance keeps a
+    /// small local entry for the key that answers later reads until the allowed lag passes. Only
+    /// the cleanup loop removes that entry. When cleanup is disabled, start it with
+    /// [`HybridRateLimiterProvider::start_cleanup_loop`](crate::hybrid::HybridRateLimiterProvider::start_cleanup_loop),
+    /// or the entries of unknown keys stay in memory.
     ///
     /// # Errors
     ///
@@ -394,7 +458,7 @@ impl AbsoluteHybridRateLimiter {
     pub async fn get_estimate(&self, key: &RedisKey) -> Result<u64, TrypemaError> {
         self.send_epoch_change_if_needed();
 
-        self.is_allowed_with_count_increment(key, 0, 0, None)
+        self.is_allowed_with_count_increment(key, 0, 0, None, CallMode::ReadOnly)
             .await?;
 
         let Some(state) = self.limiting_state.get(key) else {
@@ -419,6 +483,7 @@ impl AbsoluteHybridRateLimiter {
                 Ok(*committed_count)
             }
             AbsoluteRedisLimitingState::Undefined
+            | AbsoluteRedisLimitingState::Absent { .. }
             | AbsoluteRedisLimitingState::Rejecting { .. } => Ok(0),
         }
     } // end method get_estimate
@@ -473,7 +538,8 @@ impl AbsoluteHybridRateLimiter {
                     *mutex_lock(state_revision, "rejecting.state_revision")?
                         != read_state_result.state_revision
                 }
-                AbsoluteRedisLimitingState::Undefined => false,
+                AbsoluteRedisLimitingState::Undefined
+                | AbsoluteRedisLimitingState::Absent { .. } => false,
             },
             None => false,
         };
@@ -503,6 +569,7 @@ impl AbsoluteHybridRateLimiter {
                     total_count = total_count.max(*committed_count);
                 }
                 AbsoluteRedisLimitingState::Undefined
+                | AbsoluteRedisLimitingState::Absent { .. }
                 | AbsoluteRedisLimitingState::Rejecting { .. } => {}
             }
         }
@@ -594,9 +661,10 @@ impl AbsoluteHybridRateLimiter {
                 };
                 (0, cached_committed_count, *state_revision, true)
             }),
-            Some(AbsoluteRedisLimitingState::Undefined) | None => {
-                Ok((0, 0, StateRevision::default(), false))
-            }
+            Some(
+                AbsoluteRedisLimitingState::Undefined | AbsoluteRedisLimitingState::Absent { .. },
+            )
+            | None => Ok((0, 0, StateRevision::default(), false)),
         };
         let (pending_count, cached_committed_count, state_revision, local_existed) =
             match local_values {
@@ -796,9 +864,18 @@ impl AbsoluteHybridRateLimiter {
         self.limiting_state.len()
     }
 
-    fn should_cleanup_local_state(state: &AbsoluteRedisLimitingState, stale_after_ms: u64) -> bool {
+    fn should_cleanup_local_state(
+        &self,
+        state: &AbsoluteRedisLimitingState,
+        stale_after_ms: u64,
+    ) -> bool {
         match state {
             AbsoluteRedisLimitingState::Undefined => true,
+            // An absent entry only holds the time of its last Redis read. Once the allowed lag
+            // passes, the next call reads Redis anyway, so the entry carries no information.
+            AbsoluteRedisLimitingState::Absent { last_synced } => {
+                last_synced.elapsed() >= self.allowed_lag
+            }
             AbsoluteRedisLimitingState::Accepting { last_modified, .. } => {
                 let last_modified = match last_modified.lock() {
                     Ok(last_modified) => last_modified,
@@ -860,6 +937,7 @@ impl AbsoluteHybridRateLimiter {
                     *mutex_lock(state_revision, "accepting.state_revision")?,
                 ),
                 AbsoluteRedisLimitingState::Undefined
+                | AbsoluteRedisLimitingState::Absent { .. }
                 | AbsoluteRedisLimitingState::Rejecting { .. } => (0, StateRevision::default()),
             },
             None => (0, StateRevision::default()),
@@ -913,7 +991,7 @@ impl AbsoluteHybridRateLimiter {
         let candidates = self
             .limiting_state
             .iter()
-            .filter(|state| Self::should_cleanup_local_state(state.value(), stale_after_ms))
+            .filter(|state| self.should_cleanup_local_state(state.value(), stale_after_ms))
             .map(|state| state.key().clone())
             .collect::<Vec<_>>();
 
@@ -922,7 +1000,7 @@ impl AbsoluteHybridRateLimiter {
             let _guard = lock.lock().await;
 
             let should_remove = self.limiting_state.get(&key).is_some_and(|state| {
-                Self::should_cleanup_local_state(state.value(), stale_after_ms)
+                self.should_cleanup_local_state(state.value(), stale_after_ms)
             });
 
             if !should_remove {
@@ -931,7 +1009,7 @@ impl AbsoluteHybridRateLimiter {
 
             match self.limiting_state.entry(key) {
                 Entry::Occupied(entry)
-                    if Self::should_cleanup_local_state(entry.get(), stale_after_ms) =>
+                    if self.should_cleanup_local_state(entry.get(), stale_after_ms) =>
                 {
                     entry.remove();
                 }
@@ -1034,7 +1112,7 @@ impl AbsoluteHybridRateLimiter {
 
         for result in read_state_results {
             if let Err(err) = self
-                .reset_single_state_from_read_result(result, 0, 0, None)
+                .reset_single_state_from_read_result(result, 0, 0, None, CallMode::Recording)
                 .await
             {
                 tracing::error!(error = ?err, "Failed to reset state from redis read result");

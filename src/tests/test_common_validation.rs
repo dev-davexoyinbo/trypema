@@ -6,7 +6,7 @@ use crate::{
 };
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-use crate::hybrid::SyncInterval;
+use crate::hybrid::{AllowedLag, SyncInterval};
 
 type RateConstructor = fn(f64) -> Result<RateLimit, TrypemaError>;
 type PanicRateConstructor = fn(f64) -> RateLimit;
@@ -309,6 +309,49 @@ fn sync_interval_getters_convert_from_milliseconds() {
     assert_eq!(SyncInterval::milliseconds_or_panic(1_500).as_seconds(), 1.5);
     assert_eq!(SyncInterval::seconds_or_panic(90).as_minutes(), 1.5);
     assert_eq!(SyncInterval::minutes_or_panic(90).as_hours(), 1.5);
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn allowed_lag_helpers_store_milliseconds() {
+    type Constructor = fn(u64) -> Result<AllowedLag, TrypemaError>;
+    type PanicConstructor = fn(u64) -> AllowedLag;
+
+    let cases: [(Constructor, PanicConstructor, u64, u64); 4] = [
+        (
+            AllowedLag::milliseconds,
+            AllowedLag::milliseconds_or_panic,
+            1,
+            1,
+        ),
+        (AllowedLag::seconds, AllowedLag::seconds_or_panic, 1, 1_000),
+        (AllowedLag::minutes, AllowedLag::minutes_or_panic, 1, 60_000),
+        (AllowedLag::hours, AllowedLag::hours_or_panic, 1, 3_600_000),
+    ];
+
+    for (constructor, panic_constructor, value, expected) in cases {
+        assert_eq!(constructor(value).unwrap().as_milliseconds(), expected);
+        assert_eq!(panic_constructor(value).as_milliseconds(), expected);
+        assert!(std::panic::catch_unwind(|| panic_constructor(0)).is_err());
+    }
+
+    assert_eq!(AllowedLag::default().as_milliseconds(), 1_000);
+    assert!(matches!(
+        AllowedLag::milliseconds(0),
+        Err(TrypemaError::InvalidAllowedLag(_))
+    ));
+    assert!(matches!(
+        AllowedLag::seconds(u64::MAX),
+        Err(TrypemaError::InvalidAllowedLag(_))
+    ));
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn allowed_lag_getters_convert_from_milliseconds() {
+    assert_eq!(AllowedLag::milliseconds_or_panic(1_500).as_seconds(), 1.5);
+    assert_eq!(AllowedLag::seconds_or_panic(90).as_minutes(), 1.5);
+    assert_eq!(AllowedLag::minutes_or_panic(90).as_hours(), 1.5);
 }
 
 #[test]

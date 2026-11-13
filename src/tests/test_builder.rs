@@ -271,3 +271,48 @@ fn redis_and_hybrid_builders_support_shared_and_specific_methods() {
         assert_eq!((outcome.previous_total, outcome.current_total), (0, 0));
     });
 }
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn hybrid_builder_passes_allowed_lag_to_both_strategies() {
+    use crate::hybrid::{AllowedLag, HybridRateLimiterProvider};
+
+    super::runtime::block_on(async {
+        let connection_manager: crate::redis::ConnectionManager =
+            super::common::connection_manager().await;
+
+        let default_lag = HybridRateLimiterProvider::builder(connection_manager.clone())
+            .prefix(super::common::unique_prefix())
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        assert_eq!(default_lag.absolute().allowed_lag, Duration::from_secs(1));
+        assert_eq!(default_lag.suppressed().allowed_lag, Duration::from_secs(1));
+        assert!(!default_lag.absolute().allowed_lag_applies_to_rejections);
+
+        let custom_lag = HybridRateLimiterProvider::builder(connection_manager)
+            .prefix(super::common::unique_prefix())
+            .allowed_lag(AllowedLag::milliseconds_or_panic(250))
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        assert_eq!(
+            custom_lag.absolute().allowed_lag,
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            custom_lag.suppressed().allowed_lag,
+            Duration::from_millis(250)
+        );
+        assert!(!custom_lag.absolute().allowed_lag_applies_to_rejections);
+
+        let rejection_lag =
+            HybridRateLimiterProvider::builder(super::common::connection_manager().await)
+                .prefix(super::common::unique_prefix())
+                .allowed_lag_applies_to_rejections(true)
+                .disable_cleanup()
+                .build()
+                .unwrap();
+        assert!(rejection_lag.absolute().allowed_lag_applies_to_rejections);
+    });
+}

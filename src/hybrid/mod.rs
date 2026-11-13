@@ -7,7 +7,7 @@ pub(crate) use redis_commiter::{
 };
 
 mod common;
-pub use common::SyncInterval;
+pub use common::{AllowedLag, SyncInterval};
 
 mod hybrid_rate_limiter_provider;
 pub use hybrid_rate_limiter_provider::{HybridRateLimiterBuilder, HybridRateLimiterProvider};

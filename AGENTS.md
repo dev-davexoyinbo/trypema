@@ -140,8 +140,8 @@ Naming and initialization are part of this contract:
   between shared, mutable, entry, and downgraded guards rather than introducing
   `rate_limit_series`, `series_guard`, or `series_entry`.
 - Name `RateLimitDecision` values `decision`; reserve `is_*` and `should_*` locals for booleans.
-- Keep the public `WindowSize`, `BucketSize`, `SuppressionFactorCachePeriod`, and `SyncInterval`
-  types with their unit-neutral configuration field names. Raw internal time values retain unit
+- Keep the public `WindowSize`, `BucketSize`, `SuppressionFactorCachePeriod`, `SyncInterval`,
+  and `AllowedLag` types with their unit-neutral configuration field names. Raw internal time values retain unit
   suffixes. Internal state for a concrete bucket uses `_bucket_`, such as `oldest_bucket_ttl` and
   `oldest_bucket_count`.
 
@@ -169,7 +169,8 @@ For `get`:
 
 For `is_allowed`:
 
-- Unknown keys are allowed without insertion.
+- Unknown keys are allowed. Local and Redis providers insert no state. The hybrid provider
+  creates no Redis key and keeps a local `Absent` entry (see the hybrid rules below).
 - Fresh under-limit checks stay on the shared fast path.
 - Expiration maintenance is lazy and may require exclusive access.
 - Rejected decisions expose best-effort metadata:
@@ -184,11 +185,48 @@ For `is_allowed`:
 For `get_suppression_factor`:
 
 - Unknown keys return `0.0` without creating per-entity data, a suppression-cache key, or active
-  entity membership.
+  entity membership. The hybrid provider keeps a local `Absent` entry for the key.
 - Expiration that removes history affecting a cached factor must invalidate that cache before the
   factor is reused or recomputed.
 - When the soft and hard limits are identical, reaching that boundary means full suppression;
   local, Redis, and freshly initialized hybrid state must all report `1.0` consistently.
+
+For hybrid read-only calls (absolute `is_allowed` and `get_estimate`, suppressed
+`get_suppression_factor` and `get_estimate`). Internally they pass `CallMode::ReadOnly`; `inc`,
+`try_inc`, and the flush refresh pass `CallMode::Recording`, also with a count of `0`:
+
+- A read-only call records no activity. It does not write `last_modified`, also not when it
+  refreshes an existing `Accepting` state from Redis. Only a new `Accepting` state sets it. A key
+  in `Accepting` state that is only checked therefore becomes stale.
+- `Rejecting` and `Suppressing` state answer from their caches until the retry TTL (up to one
+  window) or the cache period ends; by default `allowed_lag` does not apply to them. A refresh
+  after that stores a new cache time, so a checked key in these states is not removed by cleanup
+  while it is checked.
+- The hybrid builder setting `allowed_lag_applies_to_rejections` (default `false`) applies
+  `allowed_lag` to read-only calls on absolute `Rejecting` state. `Rejecting` keeps the time of
+  the Redis read behind it (`last_synced`): a Redis-derived rejection sets it to the read time,
+  and a rejection derived from local data (the `Exhausted` path) takes the `last_synced` of the
+  `Accepting` state it comes from. A read-only call on `Rejecting` older than `allowed_lag` reads
+  Redis again under the reset lock; a refresh that still rejects sets a new `last_synced`, so the
+  next call inside the lag answers from the cache. `committed_count` and `committed_at` keep
+  their rules. `inc` and `try_inc` keep the retry TTL rule. `Suppressing` does not use the
+  setting.
+- `Accepting` state keeps the time of its last Redis read (`last_synced`). A read-only call on
+  `Accepting` state older than `allowed_lag` reads Redis again under the per-key reset lock. It
+  re-checks the state after it takes the lock, so concurrent calls share one Redis read. The
+  refresh commits the pending local count first, so pending counts stay exact.
+- A key with no stored limit, read without a rate, keeps a local `Absent { last_synced }` entry
+  and creates no Redis key. A read-only call answers from it until `allowed_lag` passes. An `inc`
+  on it reads Redis, as on `Undefined`. Flush ignores it, `get` treats it as no local state,
+  `get_estimate` reports zero for it, and cleanup removes it once it is older than `allowed_lag`.
+  Cleanup is the only removal path; with cleanup disabled, the entries stay until the caller
+  starts the cleanup loop.
+- `inc` and `try_inc` do not use `allowed_lag` and treat `Absent` as `Undefined`, also with a
+  count of `0`. Their pending count reaches Redis at the next flush. The flush refresh writes
+  `last_modified`.
+- An absolute `Exhausted` transition with nothing pending writes nothing to Redis, for `inc` and
+  read-only calls. It moves to `Rejecting` from local data. It does not extend the
+  window-limit TTL or the activity score in Redis and writes no empty bucket.
 
 ### 3.3 Increment behavior
 
