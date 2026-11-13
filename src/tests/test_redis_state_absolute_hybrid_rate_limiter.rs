@@ -17,18 +17,24 @@
 //! **Important:** because the hybrid limiter batches writes, tests must wait for the
 //! background committer to flush (`wait_for_hybrid_sync`) before inspecting Redis state.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use redis::AsyncCommands;
 
-use super::common::{key, key_gen, redis_url, unique_prefix, wait_for_hybrid_sync};
+use super::common::{
+    assert_inside_allowed_lag, key, key_gen, redis_url, sleep_past_allowed_lag, unique_prefix,
+    wait_for_hybrid_sync,
+};
 use super::runtime;
 
 use crate::common::RateType;
 use crate::{
     BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
     RateLimiterBuilder, WindowSize,
-    hybrid::{HybridRateLimiterProvider, SyncInterval},
+    hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
     redis::{RedisKey, RedisRateLimiterProvider},
 };
 
@@ -51,6 +57,28 @@ async fn build_limiter(
         .window_size(WindowSize::seconds(window_size).unwrap())
         .bucket_size(BucketSize::milliseconds(bucket_size).unwrap())
         .sync_interval(SyncInterval::milliseconds(sync_interval).unwrap())
+        .cleanup_enabled(false)
+        .build()
+        .unwrap()
+}
+
+async fn build_limiter_with_allowed_lag(
+    url: &str,
+    window_size: u64,
+    bucket_size: u64,
+    allowed_lag: u64,
+    prefix: RedisKey,
+) -> std::sync::Arc<HybridRateLimiterProvider> {
+    let client = redis::Client::open(url).unwrap();
+    let cm = client.get_connection_manager().await.unwrap();
+
+    // A long sync interval keeps the background flush out of the observed interval.
+    HybridRateLimiterProvider::builder(cm)
+        .prefix(prefix)
+        .window_size(WindowSize::seconds(window_size).unwrap())
+        .bucket_size(BucketSize::milliseconds(bucket_size).unwrap())
+        .sync_interval(SyncInterval::milliseconds(2_000).unwrap())
+        .allowed_lag(AllowedLag::milliseconds(allowed_lag).unwrap())
         .cleanup_enabled(false)
         .build()
         .unwrap()
@@ -1421,7 +1449,9 @@ fn redis_state_hybrid_absolute_get_keeps_unknown_entity_absent() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let rl = build_limiter(&url, 6, 1000, 25, prefix.clone()).await;
+        let allowed_lag_ms = 3_000_u64;
+        let rl =
+            build_limiter_with_allowed_lag(&url, 6, 1000, allowed_lag_ms, prefix.clone()).await;
         let k = key("k");
         let rate = RateLimit::per_second(10f64).unwrap();
         let key_generator = key_gen(&prefix, RateType::HybridAbsolute);
@@ -1452,7 +1482,9 @@ fn redis_state_hybrid_absolute_get_keeps_unknown_entity_absent() {
             .await
             .unwrap();
 
+        let synced_before = Instant::now();
         assert_eq!(rl.absolute().get_estimate(&k).await.unwrap(), 3);
+        let synced_after = Instant::now();
         let score: Option<f64> = conn
             .zscore(key_generator.get_active_entities_key(), k.as_str())
             .await
@@ -1467,13 +1499,14 @@ fn redis_state_hybrid_absolute_get_keeps_unknown_entity_absent() {
             .await
             .unwrap();
         assert_eq!(rl.absolute().get_estimate(&k).await.unwrap(), 3);
+        assert_inside_allowed_lag(synced_before, allowed_lag_ms);
         let score: Option<f64> = conn
             .zscore(key_generator.get_active_entities_key(), k.as_str())
             .await
             .unwrap();
         assert!(
             score.is_none(),
-            "local inference fast path must not read or mutate Redis"
+            "local inference fast path inside the allowed lag must not read or mutate Redis"
         );
 
         assert_eq!(rl.absolute().get(&k).await.unwrap(), 3);
@@ -1482,5 +1515,264 @@ fn redis_state_hybrid_absolute_get_keeps_unknown_entity_absent() {
             .await
             .unwrap();
         assert!(score.is_some(), "known get must refresh active membership");
+
+        let _: u64 = conn
+            .zrem(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        sleep_past_allowed_lag(synced_after, allowed_lag_ms).await;
+        assert_eq!(rl.absolute().get_estimate(&k).await.unwrap(), 3);
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(
+            score.is_some(),
+            "local state older than the allowed lag must be read from Redis again"
+        );
+    });
+}
+
+#[test]
+fn redis_state_hybrid_absolute_unknown_key_check_is_local_until_allowed_lag_passes() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let allowed_lag_ms = 3_000_u64;
+        let reader =
+            build_limiter_with_allowed_lag(&url, 6, 1000, allowed_lag_ms, prefix.clone()).await;
+        let writer =
+            build_limiter_with_allowed_lag(&url, 6, 1000, allowed_lag_ms, prefix.clone()).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(10f64).unwrap();
+        let key_generator = key_gen(&prefix, RateType::HybridAbsolute);
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let synced_before = Instant::now();
+        assert_allowed(
+            reader.absolute().is_allowed(&k).await.unwrap(),
+            "unknown key check",
+        );
+        let synced_after = Instant::now();
+        for entity_key in key_generator.get_all_entity_keys(&k) {
+            let exists: bool = conn.exists(&entity_key).await.unwrap();
+            assert!(!exists, "unknown check created {entity_key}");
+        }
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(score.is_none(), "unknown check created active membership");
+        assert_eq!(reader.absolute().local_state_count(), 1);
+
+        assert_eq!(
+            writer
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Always, 60)
+                .await
+                .unwrap(),
+            (60, 0)
+        );
+        // A Redis read of an existing entity restores this membership.
+        let _: u64 = conn
+            .zrem(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+
+        assert_allowed(
+            reader.absolute().is_allowed(&k).await.unwrap(),
+            "unknown key check inside the allowed lag",
+        );
+        assert_inside_allowed_lag(synced_before, allowed_lag_ms);
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(
+            score.is_none(),
+            "a check inside the allowed lag must not read Redis"
+        );
+
+        sleep_past_allowed_lag(synced_after, allowed_lag_ms).await;
+        assert!(
+            matches!(
+                reader.absolute().is_allowed(&k).await.unwrap(),
+                RateLimitDecision::Rejected { .. }
+            ),
+            "a check after the allowed lag must see the full window"
+        );
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(
+            score.is_some(),
+            "a check after the allowed lag must read Redis"
+        );
+    });
+}
+
+#[test]
+fn redis_state_hybrid_absolute_check_at_limit_with_nothing_pending_writes_nothing() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        // Short buckets make a commit after the sleep below write a new bucket field.
+        let bucket_size_ms = 10_u64;
+        let reader =
+            build_limiter_with_allowed_lag(&url, 6, bucket_size_ms, 10_000, prefix.clone()).await;
+        let writer =
+            build_limiter_with_allowed_lag(&url, 6, bucket_size_ms, 10_000, prefix.clone()).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(10f64).unwrap();
+        let key_generator = key_gen(&prefix, RateType::HybridAbsolute);
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            writer
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Always, 60)
+                .await
+                .unwrap(),
+            (60, 0)
+        );
+        assert_eq!(reader.absolute().get_estimate(&k).await.unwrap(), 60);
+
+        let hash_key = redis_key(&prefix, &k, "h");
+        let active_keys = redis_key(&prefix, &k, "a");
+        let window_limit_key = redis_key(&prefix, &k, "w");
+        let total_count_key = redis_key(&prefix, &k, "t");
+        let hash_before: HashMap<String, u64> = conn.hgetall(&hash_key).await.unwrap();
+        let active_before: Vec<(String, f64)> =
+            conn.zrange_withscores(&active_keys, 0, -1).await.unwrap();
+        let total_before: Option<u64> = conn.get(&total_count_key).await.unwrap();
+        let ttl_before_ms: i64 = conn.pttl(&window_limit_key).await.unwrap();
+        let score_before: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert_eq!(total_before, Some(60));
+        assert!(score_before.is_some());
+
+        runtime::async_sleep(Duration::from_millis(bucket_size_ms * 5)).await;
+        assert!(
+            matches!(
+                reader.absolute().is_allowed(&k).await.unwrap(),
+                RateLimitDecision::Rejected { .. }
+            ),
+            "a check at the limit must reject"
+        );
+        assert!(matches!(
+            reader.absolute().is_allowed(&k).await.unwrap(),
+            RateLimitDecision::Rejected { .. }
+        ));
+
+        let hash_after: HashMap<String, u64> = conn.hgetall(&hash_key).await.unwrap();
+        let active_after: Vec<(String, f64)> =
+            conn.zrange_withscores(&active_keys, 0, -1).await.unwrap();
+        let total_after: Option<u64> = conn.get(&total_count_key).await.unwrap();
+        let ttl_after_ms: i64 = conn.pttl(&window_limit_key).await.unwrap();
+        let score_after: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert_eq!(hash_after, hash_before, "no bucket may be written");
+        assert_eq!(active_after, active_before, "no bucket may be ordered");
+        assert_eq!(total_after, total_before);
+        assert!(
+            ttl_after_ms > 0 && ttl_after_ms < ttl_before_ms,
+            "the window-limit TTL must not be refreshed: before {ttl_before_ms}, after {ttl_after_ms}"
+        );
+        assert_eq!(score_after, score_before, "activity must not be refreshed");
+    });
+}
+
+#[test]
+fn redis_state_hybrid_absolute_rejection_lag_refresh_that_still_rejects_answers_from_cache() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let allowed_lag_ms = 3_000_u64;
+        let build = |prefix: RedisKey| {
+            let url = url.clone();
+            async move {
+                let cm = redis::Client::open(url.as_str())
+                    .unwrap()
+                    .get_connection_manager()
+                    .await
+                    .unwrap();
+
+                // The 30-second window keeps the retry TTL far beyond the allowed lag.
+                HybridRateLimiterProvider::builder(cm)
+                    .prefix(prefix)
+                    .window_size(WindowSize::seconds(30).unwrap())
+                    .bucket_size(BucketSize::milliseconds(1_000).unwrap())
+                    .sync_interval(SyncInterval::milliseconds(2_000).unwrap())
+                    .allowed_lag(AllowedLag::milliseconds(allowed_lag_ms).unwrap())
+                    .allowed_lag_applies_to_rejections(true)
+                    .cleanup_enabled(false)
+                    .build()
+                    .unwrap()
+            }
+        };
+        let reader = build(prefix.clone()).await;
+        let writer = build(prefix.clone()).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(1f64).unwrap();
+        let active_entities_key =
+            key_gen(&prefix, RateType::HybridAbsolute).get_active_entities_key();
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let is_rejected =
+            |decision: RateLimitDecision| matches!(decision, RateLimitDecision::Rejected { .. });
+
+        assert_eq!(
+            writer
+                .absolute()
+                .set_if(&k, &rate, RateLimitComparator::Always, 30)
+                .await
+                .unwrap(),
+            (30, 0)
+        );
+        assert!(is_rejected(reader.absolute().is_allowed(&k).await.unwrap()));
+        let synced_after = Instant::now();
+
+        // A Redis read of an existing entity restores this membership.
+        sleep_past_allowed_lag(synced_after, allowed_lag_ms).await;
+        let _: u64 = conn.zrem(&active_entities_key, k.as_str()).await.unwrap();
+        let synced_before = Instant::now();
+        assert!(
+            is_rejected(reader.absolute().is_allowed(&k).await.unwrap()),
+            "a key still over the limit stays rejected after the refresh"
+        );
+        let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(
+            score.is_some(),
+            "a check after the allowed lag must read Redis"
+        );
+
+        let _: u64 = conn.zrem(&active_entities_key, k.as_str()).await.unwrap();
+        let decision = reader.absolute().is_allowed(&k).await.unwrap();
+        assert_inside_allowed_lag(synced_before, allowed_lag_ms);
+        assert!(is_rejected(decision));
+        let score: Option<f64> = conn.zscore(&active_entities_key, k.as_str()).await.unwrap();
+        assert!(
+            score.is_none(),
+            "a check inside the allowed lag after a refresh must answer from the cache"
+        );
     });
 }

@@ -7,6 +7,7 @@ struct AcceptingTransition {
     retry_after_ms: u128,
     remaining_after_waiting: u64,
     committed_total: u64,
+    last_synced: Instant,
 }
 
 #[derive(Debug)]
@@ -34,15 +35,34 @@ impl AbsoluteHybridRateLimiter {
         state: &AbsoluteRedisLimitingState,
         check_count: u64,
         increment: u64,
+        mode: CallMode,
     ) -> Result<LocalAdmission, TrypemaError> {
         match state {
             AbsoluteRedisLimitingState::Undefined => Ok(LocalAdmission::Refresh),
+            AbsoluteRedisLimitingState::Absent { last_synced } => {
+                if mode == CallMode::ReadOnly && last_synced.elapsed() < self.allowed_lag {
+                    return Ok(LocalAdmission::Allowed);
+                }
+
+                Ok(LocalAdmission::Refresh)
+            }
             AbsoluteRedisLimitingState::Rejecting {
                 time_instant,
                 ttl_ms,
                 count_after_release,
+                last_synced,
                 ..
             } => {
+                // With the setting on, a read-only call also bounds the rejection cache by the
+                // allowed lag. A recording call keeps the retry TTL rule and reads no clock here.
+                if mode == CallMode::ReadOnly
+                    && self.allowed_lag_applies_to_rejections
+                    && mutex_lock(last_synced, "rejecting.last_synced")?.elapsed()
+                        >= self.allowed_lag
+                {
+                    return Ok(LocalAdmission::Refresh);
+                }
+
                 let elapsed_ms = mutex_lock(time_instant, "rejecting.time_instant")?
                     .elapsed()
                     .as_millis();
@@ -66,27 +86,37 @@ impl AbsoluteHybridRateLimiter {
                 accept_limit,
                 starting_count,
                 count,
-                time_instant,
+                last_synced,
                 oldest_bucket_ttl,
                 oldest_bucket_count,
                 last_modified,
                 state_revision,
             } => {
+                // A read-only call records no activity and answers only from local state that
+                // is younger than the allowed lag. The recording fast path reads no clock here.
+                if mode == CallMode::ReadOnly
+                    && mutex_lock(last_synced, "accepting.last_synced")?.elapsed()
+                        >= self.allowed_lag
+                {
+                    return Ok(LocalAdmission::Refresh);
+                }
+
                 let local_count = count.load(Ordering::Acquire);
                 let accept_limit = *mutex_lock(accept_limit, "accepting.accept_limit")?;
 
                 if check_count <= accept_limit.saturating_sub(local_count) {
-                    *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
-                    count.fetch_add(increment, Ordering::AcqRel);
+                    if mode == CallMode::Recording {
+                        *mutex_lock(last_modified, "accepting.last_modified")? = Instant::now();
+                        count.fetch_add(increment, Ordering::AcqRel);
+                    }
 
                     return Ok(LocalAdmission::Allowed);
                 }
 
                 let starting_count = *mutex_lock(starting_count, "accepting.starting_count")?;
                 let committed_total = starting_count.saturating_add(local_count);
-                let elapsed_ms = mutex_lock(time_instant, "accepting.time_instant")?
-                    .elapsed()
-                    .as_millis();
+                let last_synced = *mutex_lock(last_synced, "accepting.last_synced")?;
+                let elapsed_ms = last_synced.elapsed().as_millis();
                 let retry_after_ms =
                     match *mutex_lock(oldest_bucket_ttl, "accepting.oldest_bucket_ttl")? {
                         Some(oldest_bucket_ttl) => {
@@ -117,6 +147,7 @@ impl AbsoluteHybridRateLimiter {
                     retry_after_ms,
                     remaining_after_waiting,
                     committed_total,
+                    last_synced,
                 }))
             }
         }
@@ -183,6 +214,7 @@ impl AbsoluteHybridRateLimiter {
                     Some((commit, previous_accept_limit))
                 }
                 AbsoluteRedisLimitingState::Undefined
+                | AbsoluteRedisLimitingState::Absent { .. }
                 | AbsoluteRedisLimitingState::Rejecting { .. } => None,
             },
             Entry::Vacant(_) => None,
@@ -224,7 +256,7 @@ impl AbsoluteHybridRateLimiter {
         let state = self.get_or_create_limiting_state(&key);
 
         match state.deref() {
-            AbsoluteRedisLimitingState::Undefined => {
+            AbsoluteRedisLimitingState::Undefined | AbsoluteRedisLimitingState::Absent { .. } => {
                 drop(state);
             }
             AbsoluteRedisLimitingState::Rejecting {
@@ -273,6 +305,7 @@ impl AbsoluteHybridRateLimiter {
                             ))
                         }
                         AbsoluteRedisLimitingState::Undefined
+                        | AbsoluteRedisLimitingState::Absent { .. }
                         | AbsoluteRedisLimitingState::Rejecting { .. } => None,
                     },
                     Entry::Vacant(_) => None,
@@ -320,21 +353,17 @@ impl AbsoluteHybridRateLimiter {
         })
     }
 
-    fn reset_to_undefined(&self, key: &RedisKey) {
-        let state = self.get_or_create_limiting_state(key);
-
-        if matches!(state.deref(), AbsoluteRedisLimitingState::Undefined) {
-            return;
-        }
-
-        drop(state);
+    fn store_absent_state(&self, key: &RedisKey) {
+        let absent = AbsoluteRedisLimitingState::Absent {
+            last_synced: Instant::now(),
+        };
 
         match self.limiting_state.entry(key.clone()) {
             Entry::Occupied(mut entry) => {
-                *entry.get_mut() = AbsoluteRedisLimitingState::Undefined;
+                *entry.get_mut() = absent;
             }
             Entry::Vacant(entry) => {
-                entry.insert(AbsoluteRedisLimitingState::Undefined);
+                entry.insert(absent);
             }
         }
     }
@@ -344,6 +373,7 @@ impl AbsoluteHybridRateLimiter {
         state: &ResolvedRedisState,
         retry_after_ms: u64,
         remaining_after_waiting: u64,
+        synced_at: Instant,
     ) -> Result<(), TrypemaError> {
         let time_instant = Instant::now();
         let current = self.get_or_create_limiting_state(&state.key);
@@ -352,6 +382,7 @@ impl AbsoluteHybridRateLimiter {
             time_instant: current_time_instant,
             ttl_ms,
             count_after_release,
+            last_synced,
             state_revision: current_state_revision,
             ..
         } = current.deref()
@@ -360,6 +391,7 @@ impl AbsoluteHybridRateLimiter {
             // must keep the time of the actual local commit; refreshing it here
             // would keep an expired committed count alive indefinitely.
             *mutex_lock(current_time_instant, "rejecting.time_instant")? = time_instant;
+            *mutex_lock(last_synced, "rejecting.last_synced")? = synced_at;
             *mutex_lock(ttl_ms, "rejecting.ttl_ms")? = retry_after_ms;
             *mutex_lock(count_after_release, "rejecting.count_after_release")? =
                 remaining_after_waiting;
@@ -375,6 +407,7 @@ impl AbsoluteHybridRateLimiter {
             count_after_release: Mutex::new(remaining_after_waiting),
             committed_count: state.current_total,
             committed_at: time_instant,
+            last_synced: Mutex::new(synced_at),
             state_revision: Mutex::new(state.state_revision),
         };
 
@@ -395,8 +428,9 @@ impl AbsoluteHybridRateLimiter {
         state: &ResolvedRedisState,
         window_limit: f64,
         increment: u64,
+        mode: CallMode,
     ) -> Result<(), TrypemaError> {
-        let time_instant = Instant::now();
+        let synced_at = Instant::now();
         let accept_limit = (window_limit as u64).saturating_sub(state.current_total);
         let current = self.get_or_create_limiting_state(&state.key);
 
@@ -405,7 +439,7 @@ impl AbsoluteHybridRateLimiter {
             accept_limit: current_accept_limit,
             starting_count,
             count,
-            time_instant: current_time_instant,
+            last_synced,
             oldest_bucket_ttl,
             oldest_bucket_count,
             last_modified,
@@ -416,8 +450,11 @@ impl AbsoluteHybridRateLimiter {
             // Any pending local count was committed before this refresh. Keep it in the
             // inferred baseline instead of falling back to the pre-commit Redis total.
             *mutex_lock(starting_count, "accepting.starting_count")? = state.current_total;
-            *mutex_lock(current_time_instant, "accepting.time_instant")? = time_instant;
-            *mutex_lock(last_modified, "accepting.last_modified")? = time_instant;
+            *mutex_lock(last_synced, "accepting.last_synced")? = synced_at;
+            // A read-only refresh is not activity; it must not keep the key alive.
+            if mode == CallMode::Recording {
+                *mutex_lock(last_modified, "accepting.last_modified")? = synced_at;
+            }
             *mutex_lock(oldest_bucket_ttl, "accepting.oldest_bucket_ttl")? =
                 state.oldest_bucket_ttl;
             *mutex_lock(oldest_bucket_count, "accepting.oldest_bucket_count")? =
@@ -435,10 +472,10 @@ impl AbsoluteHybridRateLimiter {
             accept_limit: Mutex::new(accept_limit),
             starting_count: Mutex::new(state.current_total),
             count: AtomicU64::new(increment),
-            time_instant: Mutex::new(time_instant),
+            last_synced: Mutex::new(synced_at),
             oldest_bucket_ttl: Mutex::new(state.oldest_bucket_ttl),
             oldest_bucket_count: Mutex::new(state.oldest_bucket_count),
-            last_modified: Mutex::new(time_instant),
+            last_modified: Mutex::new(synced_at),
             state_revision: Mutex::new(state.state_revision),
         };
 
@@ -460,6 +497,7 @@ impl AbsoluteHybridRateLimiter {
         check_count: u64,
         increment: u64,
         rate_limit: Option<&RateLimit>,
+        mode: CallMode,
     ) -> Result<RateLimitDecision, TrypemaError> {
         let read_state_result =
             self.redis_proxy.read_state(key).await.map_err(|err| {
@@ -471,6 +509,7 @@ impl AbsoluteHybridRateLimiter {
             check_count,
             increment,
             rate_limit,
+            mode,
         )
         .await
     }
@@ -481,6 +520,7 @@ impl AbsoluteHybridRateLimiter {
         check_count: u64,
         increment: u64,
         rate_limit: Option<&RateLimit>,
+        mode: CallMode,
     ) -> Result<RateLimitDecision, TrypemaError> {
         let state = self
             .resolve_redis_state_and_commit(read_state_result)
@@ -490,7 +530,7 @@ impl AbsoluteHybridRateLimiter {
             Some(window_limit) => window_limit,
             None => {
                 let Some(rate_limit) = rate_limit else {
-                    self.reset_to_undefined(&state.key);
+                    self.store_absent_state(&state.key);
 
                     return Ok(RateLimitDecision::Allowed);
                 };
@@ -503,7 +543,12 @@ impl AbsoluteHybridRateLimiter {
             let retry_after_ms = state.oldest_bucket_ttl.unwrap_or(0);
             let remaining_after_waiting = state.oldest_bucket_count.unwrap_or(0);
 
-            self.store_rejecting_state(&state, retry_after_ms, remaining_after_waiting)?;
+            self.store_rejecting_state(
+                &state,
+                retry_after_ms,
+                remaining_after_waiting,
+                Instant::now(),
+            )?;
 
             return Ok(RateLimitDecision::Rejected {
                 window_size: self.window_size,
@@ -512,7 +557,7 @@ impl AbsoluteHybridRateLimiter {
             });
         }
 
-        self.store_accepting_state(&state, window_limit, increment)?;
+        self.store_accepting_state(&state, window_limit, increment, mode)?;
 
         Ok(RateLimitDecision::Allowed)
     }
@@ -535,10 +580,11 @@ impl AbsoluteHybridRateLimiter {
         check_count: u64,
         increment: u64,
         rate_limit: Option<&RateLimit>,
+        mode: CallMode,
     ) -> Result<RateLimitDecision, TrypemaError> {
         let state = self.get_or_create_limiting_state(key);
 
-        match self.evaluate_local_state(key, state.deref(), check_count, increment)? {
+        match self.evaluate_local_state(key, state.deref(), check_count, increment, mode)? {
             LocalAdmission::Allowed => return Ok(RateLimitDecision::Allowed),
             LocalAdmission::Rejected(decision) => return Ok(decision),
             LocalAdmission::Refresh | LocalAdmission::Exhausted(_) => {}
@@ -546,7 +592,7 @@ impl AbsoluteHybridRateLimiter {
 
         drop(state);
 
-        self.coordinate_local_transition(key, check_count, increment, rate_limit)
+        self.coordinate_local_transition(key, check_count, increment, rate_limit, mode)
             .await
     } // end method is_allowed_with_count_increment
 
@@ -561,7 +607,13 @@ impl AbsoluteHybridRateLimiter {
             return Ok(None);
         };
 
-        match self.evaluate_local_state(state.key(), state.value(), count, count)? {
+        match self.evaluate_local_state(
+            state.key(),
+            state.value(),
+            count,
+            count,
+            CallMode::Recording,
+        )? {
             LocalAdmission::Allowed => Ok(Some(RateLimitDecision::Allowed)),
             LocalAdmission::Rejected(decision) => Ok(Some(decision)),
             LocalAdmission::Refresh | LocalAdmission::Exhausted(_) => Ok(None),
@@ -574,19 +626,20 @@ impl AbsoluteHybridRateLimiter {
         check_count: u64,
         increment: u64,
         rate_limit: Option<&RateLimit>,
+        mode: CallMode,
     ) -> Result<RateLimitDecision, TrypemaError> {
         let reset_lock = self.get_or_create_reset_lock(key);
         let _reset_guard = reset_lock.lock().await;
 
         let state = self.get_or_create_limiting_state(key);
 
-        match self.evaluate_local_state(key, state.deref(), check_count, increment)? {
+        match self.evaluate_local_state(key, state.deref(), check_count, increment, mode)? {
             LocalAdmission::Allowed => return Ok(RateLimitDecision::Allowed),
             LocalAdmission::Rejected(decision) => return Ok(decision),
             LocalAdmission::Refresh => {
                 drop(state);
                 return self
-                    .read_redis_and_reset_state(key, check_count, increment, rate_limit)
+                    .read_redis_and_reset_state(key, check_count, increment, rate_limit, mode)
                     .await;
             }
             LocalAdmission::Exhausted(_) => drop(state),
@@ -595,7 +648,7 @@ impl AbsoluteHybridRateLimiter {
         let transition = match self.limiting_state.entry(key.clone()) {
             Entry::Occupied(mut entry) => {
                 let admission =
-                    self.evaluate_local_state(key, entry.get(), check_count, increment)?;
+                    self.evaluate_local_state(key, entry.get(), check_count, increment, mode)?;
                 match admission {
                     LocalAdmission::Allowed => return Ok(RateLimitDecision::Allowed),
                     LocalAdmission::Rejected(decision) => return Ok(decision),
@@ -624,18 +677,22 @@ impl AbsoluteHybridRateLimiter {
 
         let Some(transition) = transition else {
             return self
-                .read_redis_and_reset_state(key, check_count, increment, rate_limit)
+                .read_redis_and_reset_state(key, check_count, increment, rate_limit, mode)
                 .await;
         };
 
-        let _maintenance_guard = self.maintenance_lock.read().await;
-        if let Err(err) = self
-            .redis_proxy
-            .batch_commit_state(std::slice::from_ref(&transition.commit))
-            .await
-        {
-            self.restore_accepting_state(&transition.commit, transition.previous_accept_limit)?;
-            return Err(err);
+        // With nothing pending, the local data already decides the rejection. A commit of 0
+        // would still refresh Redis TTLs and activity metadata.
+        if transition.commit.count > 0 {
+            let _maintenance_guard = self.maintenance_lock.read().await;
+            if let Err(err) = self
+                .redis_proxy
+                .batch_commit_state(std::slice::from_ref(&transition.commit))
+                .await
+            {
+                self.restore_accepting_state(&transition.commit, transition.previous_accept_limit)?;
+                return Err(err);
+            }
         }
 
         let state = ResolvedRedisState {
@@ -647,10 +704,13 @@ impl AbsoluteHybridRateLimiter {
             state_revision: transition.commit.state_revision,
         };
 
+        // The rejection comes from local data, so it is as old as the Redis read behind that
+        // data. A commit writes Redis but does not read what other instances changed.
         self.store_rejecting_state(
             &state,
             transition.retry_after_ms as u64,
             transition.remaining_after_waiting,
+            transition.last_synced,
         )?;
 
         Ok(RateLimitDecision::Rejected {
