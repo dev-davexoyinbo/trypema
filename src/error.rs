@@ -195,6 +195,13 @@ pub enum TrypemaError {
     #[error("invalid sync interval: {0}")]
     InvalidSyncInterval(String),
 
+    /// Hybrid allowed lag is invalid.
+    ///
+    /// The lag must be greater than 0 milliseconds and fit in the internal `u64` millisecond
+    /// representation.
+    #[error("invalid allowed lag: {0}")]
+    InvalidAllowedLag(String),
+
     /// Stale-state cleanup timing is invalid.
     #[error("invalid cleanup configuration: {0}")]
     InvalidCleanupConfiguration(String),

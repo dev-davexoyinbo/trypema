@@ -12,7 +12,7 @@ use crate::{
     BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, TrypemaError,
     WindowSize,
     builder::{CleanupConfig, ProviderConfig},
-    hybrid::{AbsoluteHybridRateLimiter, SuppressedHybridRateLimiter, SyncInterval},
+    hybrid::{AbsoluteHybridRateLimiter, AllowedLag, SuppressedHybridRateLimiter, SyncInterval},
     redis::RedisKey,
     runtime::{new_interval, spawn_task, tick},
 };
@@ -23,6 +23,8 @@ pub(crate) struct HybridRateLimiterConfig {
     pub prefix: Option<RedisKey>,
     pub provider: ProviderConfig,
     pub sync_interval: SyncInterval,
+    pub allowed_lag: AllowedLag,
+    pub allowed_lag_applies_to_rejections: bool,
 }
 
 /// Builder for [`HybridRateLimiterProvider`].
@@ -32,6 +34,8 @@ pub struct HybridRateLimiterBuilder {
     prefix: Option<RedisKey>,
     provider: ProviderConfig,
     sync_interval: SyncInterval,
+    allowed_lag: AllowedLag,
+    allowed_lag_applies_to_rejections: bool,
     cleanup: CleanupConfig,
 }
 
@@ -42,6 +46,8 @@ impl HybridRateLimiterBuilder {
             prefix: None,
             provider: ProviderConfig::default(),
             sync_interval: SyncInterval::default(),
+            allowed_lag: AllowedLag::default(),
+            allowed_lag_applies_to_rejections: false,
             cleanup: CleanupConfig::default(),
         }
     }
@@ -55,6 +61,51 @@ impl HybridRateLimiterBuilder {
     /// Set background Redis synchronization interval.
     pub fn sync_interval(mut self, value: SyncInterval) -> Self {
         self.sync_interval = value;
+        self
+    }
+
+    /// Set the maximum age of local state that answers a read-only call.
+    ///
+    /// A read-only call on local state older than this lag reads Redis again. See
+    /// [`AllowedLag`] for the calls it applies to.
+    pub fn allowed_lag(mut self, value: AllowedLag) -> Self {
+        self.allowed_lag = value;
+        self
+    }
+
+    /// Apply the allowed lag to the rejection cache of the absolute strategy.
+    ///
+    /// Default `false`: a rejected key answers `is_allowed` and `get_estimate` from its local
+    /// rejection cache until the retry TTL ends, which can be up to one window. A limit that
+    /// another instance deletes or raises in Redis stays invisible for that time.
+    ///
+    /// With `true`, `is_allowed` and `get_estimate` on a rejected key read Redis again once the
+    /// Redis read behind the rejection is older than the allowed lag. Concurrent calls share one
+    /// Redis read, and a refresh that still rejects answers later calls from the cache until the
+    /// lag passes again. `inc` and `try_inc` keep the retry TTL rule. A checked rejected key is
+    /// refreshed more often, and each refresh that still rejects starts a new cache time, so
+    /// cleanup keeps it while it is checked, as with `false`.
+    ///
+    /// The suppressed strategy does not use this setting. Its suppression cache is bounded by
+    /// the suppression-factor cache period.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use trypema::{RateLimiterBuilder, hybrid::{AllowedLag, HybridRateLimiterProvider}};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// let provider = HybridRateLimiterProvider::builder(connection_manager)
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .allowed_lag(AllowedLag::seconds_or_panic(1))
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .allowed_lag_applies_to_rejections(true)
+    ///     .build()
+    ///     .unwrap();
+    /// # let _ = provider;
+    /// # }
+    /// ```
+    pub fn allowed_lag_applies_to_rejections(mut self, value: bool) -> Self {
+        self.allowed_lag_applies_to_rejections = value;
         self
     }
 }
@@ -106,6 +157,8 @@ impl RateLimiterBuilder for HybridRateLimiterBuilder {
             prefix: self.prefix,
             provider: provider_config,
             sync_interval: self.sync_interval,
+            allowed_lag: self.allowed_lag,
+            allowed_lag_applies_to_rejections: self.allowed_lag_applies_to_rejections,
         };
 
         let provider = Arc::new(HybridRateLimiterProvider::new(config, cleanup));
@@ -127,7 +180,11 @@ impl RateLimiterBuilder for HybridRateLimiterBuilder {
 /// [`AbsoluteHybridRateLimiter`] and [`SuppressedHybridRateLimiter`] as strategies.
 ///
 /// Compared with the Redis provider, hybrid admission avoids steady-state per-request Redis I/O
-/// and batches commits. Decisions can lag shared Redis state by the synchronization interval.
+/// and batches commits. Increments from this instance reach Redis within the synchronization
+/// interval. A read-only call answers from `Accepting` or absent-key state only while that state
+/// is younger than the allowed lag. A cached rejection answers until its retry TTL ends (up to
+/// one window), or with `allowed_lag_applies_to_rejections(true)` also only within the allowed
+/// lag for read-only calls. A cached suppression state answers until its cache period ends.
 ///
 /// # Strategies
 ///
