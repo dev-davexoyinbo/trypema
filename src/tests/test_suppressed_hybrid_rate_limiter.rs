@@ -2,16 +2,17 @@ use std::{
     env,
     sync::{Arc, Barrier, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use super::common::{assert_inside_allowed_lag, sleep_past_allowed_lag};
 use super::runtime;
 
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, RateLimiterBuilder, SuppressedRateLimitSnapshot,
     SuppressionFactorCachePeriod, WindowSize,
-    hybrid::{HybridRateLimiterProvider, SyncInterval},
+    hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
     redis::{RedisKey, RedisRateLimiterProvider},
 };
 
@@ -575,6 +576,29 @@ async fn build_limiter_with_prefix(
             SuppressionFactorCachePeriod::milliseconds(suppression_factor_cache_period).unwrap(),
         )
         .sync_interval(SyncInterval::milliseconds(sync_interval).unwrap())
+        .cleanup_enabled(false)
+        .build()
+        .unwrap()
+}
+
+async fn build_limiter_with_allowed_lag(
+    url: &str,
+    window_size: u64,
+    allowed_lag: u64,
+    prefix: RedisKey,
+) -> std::sync::Arc<HybridRateLimiterProvider> {
+    let client = redis::Client::open(url).unwrap();
+    let cm = client.get_connection_manager().await.unwrap();
+
+    // A long sync interval keeps the background flush out of the observed interval.
+    HybridRateLimiterProvider::builder(cm)
+        .prefix(prefix)
+        .window_size(WindowSize::seconds(window_size).unwrap())
+        .bucket_size(BucketSize::milliseconds(1_000).unwrap())
+        .hard_limit_factor(HardLimitFactor::try_from(1.0).unwrap())
+        .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds(100).unwrap())
+        .sync_interval(SyncInterval::milliseconds(2_000).unwrap())
+        .allowed_lag(AllowedLag::milliseconds(allowed_lag).unwrap())
         .cleanup_enabled(false)
         .build()
         .unwrap()
@@ -2161,9 +2185,9 @@ fn get_estimate_refreshes_once_then_uses_local_snapshot() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let writer =
-            build_limiter_with_prefix(&url, 6, 1_000, 1.5, 100, 2_000, prefix.clone()).await;
-        let reader = build_limiter_with_prefix(&url, 6, 1_000, 1.5, 100, 2_000, prefix).await;
+        let allowed_lag_ms = 3_000_u64;
+        let writer = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix.clone()).await;
+        let reader = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix).await;
         let k = key("k");
         let rate = RateLimit::per_second(100f64).unwrap();
 
@@ -2175,7 +2199,9 @@ fn get_estimate_refreshes_once_then_uses_local_snapshot() {
                 .unwrap(),
             (5, 0)
         );
+        let synced_before = Instant::now();
         assert_eq!(reader.suppressed().get_estimate(&k).await.unwrap().total, 5);
+        let synced_after = Instant::now();
 
         assert_eq!(
             writer
@@ -2186,12 +2212,20 @@ fn get_estimate_refreshes_once_then_uses_local_snapshot() {
             (9, 5)
         );
 
+        let estimate = reader.suppressed().get_estimate(&k).await.unwrap();
+        assert_inside_allowed_lag(synced_before, allowed_lag_ms);
         assert_eq!(
-            reader.suppressed().get_estimate(&k).await.unwrap().total,
-            5,
-            "usable local state must stay on the inference fast path"
+            estimate.total, 5,
+            "local state inside the allowed lag must stay on the inference fast path"
         );
         assert_eq!(reader.suppressed().get(&k).await.unwrap().total, 9);
+
+        sleep_past_allowed_lag(synced_after, allowed_lag_ms).await;
+        assert_eq!(
+            reader.suppressed().get_estimate(&k).await.unwrap().total,
+            9,
+            "local state older than the allowed lag must be read from Redis again"
+        );
     });
 }
 
@@ -2836,6 +2870,473 @@ fn hybrid_suppressed_try_inc_needs_redis_after_delete_clear_and_suppression_expi
                 .unwrap()
                 .is_none(),
             "an expired suppression factor needs a Redis refresh"
+        );
+    });
+}
+
+#[test]
+fn get_suppression_factor_answers_from_local_state_until_allowed_lag_passes() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let allowed_lag_ms = 3_000_u64;
+        let writer = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix.clone()).await;
+        let reader = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(10f64).unwrap();
+        let hard_window_limit = window_capacity(6, &rate);
+
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, 10)
+                .await
+                .unwrap(),
+            (10, 0)
+        );
+        let synced_before = Instant::now();
+        assert_eq!(
+            reader
+                .suppressed()
+                .get_suppression_factor(&k)
+                .await
+                .unwrap(),
+            0.0
+        );
+        let synced_after = Instant::now();
+
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, hard_window_limit)
+                .await
+                .unwrap(),
+            (hard_window_limit, 10)
+        );
+
+        let suppression_factor = reader
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+        assert_inside_allowed_lag(synced_before, allowed_lag_ms);
+        assert_eq!(suppression_factor, 0.0, "reader inside the allowed lag");
+
+        sleep_past_allowed_lag(synced_after, allowed_lag_ms).await;
+        assert_eq!(
+            reader
+                .suppressed()
+                .get_suppression_factor(&k)
+                .await
+                .unwrap(),
+            1.0,
+            "reader after the allowed lag"
+        );
+    });
+}
+
+#[test]
+fn get_estimate_answers_from_local_state_until_allowed_lag_passes() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let allowed_lag_ms = 3_000_u64;
+        let writer = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix.clone()).await;
+        let reader = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(10f64).unwrap();
+        let hard_window_limit = window_capacity(6, &rate);
+
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, 10)
+                .await
+                .unwrap(),
+            (10, 0)
+        );
+        let synced_before = Instant::now();
+        assert_eq!(
+            reader.suppressed().get_estimate(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: 10,
+                total_declined: 0,
+                suppression_factor: 0.0,
+            }
+        );
+        let synced_after = Instant::now();
+
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, hard_window_limit)
+                .await
+                .unwrap(),
+            (hard_window_limit, 10)
+        );
+
+        let estimate = reader.suppressed().get_estimate(&k).await.unwrap();
+        assert_inside_allowed_lag(synced_before, allowed_lag_ms);
+        assert_eq!(estimate.total, 10, "reader inside the allowed lag");
+
+        sleep_past_allowed_lag(synced_after, allowed_lag_ms).await;
+        assert_eq!(
+            reader.suppressed().get_estimate(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: hard_window_limit,
+                total_declined: 0,
+                suppression_factor: 1.0,
+            },
+            "reader after the allowed lag"
+        );
+    });
+}
+
+#[test]
+fn allowed_lag_refresh_keeps_pending_counts_exact() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let allowed_lag_ms = 200_u64;
+        let writer = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix.clone()).await;
+        let reader = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(100f64).unwrap();
+
+        assert!(matches!(
+            reader.suppressed().inc(&k, &rate, 4).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, 7)
+                .await
+                .unwrap(),
+            (7, 0)
+        );
+
+        runtime::async_sleep(Duration::from_millis(allowed_lag_ms + 100)).await;
+        assert_eq!(
+            reader.suppressed().get_estimate(&k).await.unwrap().total,
+            11,
+            "the refresh commits the pending count on top of the Redis total"
+        );
+        assert_eq!(reader.suppressed().get(&k).await.unwrap().total, 11);
+        assert_eq!(writer.suppressed().get(&k).await.unwrap().total, 11);
+    });
+}
+
+#[test]
+fn checked_only_key_is_removed_by_cleanup_after_stale_after() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let stale_after_ms = 1_000_u64;
+        let writer = build_limiter_with_allowed_lag(&url, 6, 200, prefix.clone()).await;
+        let reader = build_limiter_with_allowed_lag(&url, 6, 200, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(100f64).unwrap();
+
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, 3)
+                .await
+                .unwrap(),
+            (3, 0)
+        );
+
+        // The reads span several allowed lags, so they also refresh the state from Redis.
+        for _ in 0..12 {
+            assert_eq!(
+                reader
+                    .suppressed()
+                    .get_suppression_factor(&k)
+                    .await
+                    .unwrap(),
+                0.0
+            );
+            assert_eq!(reader.suppressed().get_estimate(&k).await.unwrap().total, 3);
+            runtime::async_sleep(Duration::from_millis(100)).await;
+        }
+
+        reader.suppressed().cleanup(stale_after_ms).await.unwrap();
+        assert_eq!(
+            reader.suppressed().local_state_count(),
+            0,
+            "reads and their Redis refreshes must not count as activity"
+        );
+    });
+}
+
+#[test]
+fn absent_entry_is_removed_by_cleanup_after_allowed_lag() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let allowed_lag_ms = 3_000_u64;
+        let rl = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, unique_prefix()).await;
+        let k = key("k");
+
+        let synced_before = Instant::now();
+        assert_eq!(
+            rl.suppressed().get_suppression_factor(&k).await.unwrap(),
+            0.0
+        );
+        let synced_after = Instant::now();
+        assert_eq!(
+            rl.suppressed().get_estimate(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot::default()
+        );
+        assert_eq!(rl.suppressed().local_state_count(), 1);
+
+        rl.suppressed().cleanup(60_000).await.unwrap();
+        assert_inside_allowed_lag(synced_before, allowed_lag_ms);
+        assert_eq!(
+            rl.suppressed().local_state_count(),
+            1,
+            "an absent entry inside the allowed lag answers later reads"
+        );
+
+        sleep_past_allowed_lag(synced_after, allowed_lag_ms).await;
+        rl.suppressed().cleanup(60_000).await.unwrap();
+        assert_eq!(rl.suppressed().local_state_count(), 0);
+    });
+}
+
+#[test]
+fn inc_on_absent_key_reads_redis_and_decides() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        // A long lag keeps the absent entry fresh, so only `inc` can trigger the Redis read.
+        let writer = build_limiter_with_allowed_lag(&url, 6, 10_000, prefix.clone()).await;
+        let reader = build_limiter_with_allowed_lag(&url, 6, 10_000, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(10f64).unwrap();
+        let hard_window_limit = window_capacity(6, &rate);
+
+        assert_eq!(
+            reader
+                .suppressed()
+                .get_suppression_factor(&k)
+                .await
+                .unwrap(),
+            0.0
+        );
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, hard_window_limit)
+                .await
+                .unwrap(),
+            (hard_window_limit, 0)
+        );
+        assert_eq!(
+            reader
+                .suppressed()
+                .get_suppression_factor(&k)
+                .await
+                .unwrap(),
+            0.0,
+            "fresh absent entry answers a read"
+        );
+
+        assert!(matches!(
+            reader.suppressed().inc(&k, &rate, 1).await.unwrap(),
+            RateLimitDecision::Suppressed {
+                is_allowed: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            reader.suppressed().get(&k).await.unwrap(),
+            SuppressedRateLimitSnapshot {
+                total: hard_window_limit + 1,
+                total_declined: 1,
+                suppression_factor: 1.0,
+            }
+        );
+    });
+}
+
+#[test]
+fn concurrent_reads_after_allowed_lag_commit_pending_count_once() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let allowed_lag_ms = 200_u64;
+        let writer = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix.clone()).await;
+        let reader = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(100f64).unwrap();
+
+        let synced_before = Instant::now();
+        assert!(matches!(
+            reader.suppressed().inc(&k, &rate, 5).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, 20)
+                .await
+                .unwrap(),
+            (20, 0)
+        );
+
+        sleep_past_allowed_lag(synced_before, allowed_lag_ms).await;
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let reader = Arc::clone(&reader);
+            let k = k.clone();
+            handles.push(runtime::spawn(async move {
+                reader.suppressed().get_estimate(&k).await.unwrap().total
+            }));
+        }
+
+        for handle in handles {
+            assert_eq!(runtime::join(handle).await, 25);
+        }
+
+        assert_eq!(
+            writer.suppressed().get(&k).await.unwrap().total,
+            25,
+            "the pending count must be committed exactly once"
+        );
+    });
+}
+
+#[test]
+fn read_only_refresh_after_suppression_cache_period_follows_redis() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let cache_period_ms = 2_000_u64;
+        let writer =
+            build_limiter_with_prefix(&url, 6, 1_000, 1.0, cache_period_ms, 2_000, prefix.clone())
+                .await;
+        let reader =
+            build_limiter_with_prefix(&url, 6, 1_000, 1.0, cache_period_ms, 2_000, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(10f64).unwrap();
+        let hard_window_limit = window_capacity(6, &rate);
+
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, hard_window_limit)
+                .await
+                .unwrap(),
+            (hard_window_limit, 0)
+        );
+        let cached_before = Instant::now();
+        assert_eq!(
+            reader
+                .suppressed()
+                .get_suppression_factor(&k)
+                .await
+                .unwrap(),
+            1.0
+        );
+        let cached_after = Instant::now();
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, 10)
+                .await
+                .unwrap(),
+            (10, hard_window_limit)
+        );
+
+        // Past the default one-second allowed lag, but inside the cache period.
+        runtime::async_sleep(Duration::from_millis(1_200)).await;
+        let suppression_factor = reader
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+        let elapsed = cached_before.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(cache_period_ms),
+            "test setup took {elapsed:?}; the suppression cache check cannot be made"
+        );
+        assert_eq!(
+            suppression_factor, 1.0,
+            "a suppression state is served from its cache, not bound by the allowed lag"
+        );
+
+        let wait = Duration::from_millis(cache_period_ms + 200);
+        let elapsed = cached_after.elapsed();
+        if elapsed < wait {
+            runtime::async_sleep(wait - elapsed).await;
+        }
+        assert_eq!(
+            reader
+                .suppressed()
+                .get_suppression_factor(&k)
+                .await
+                .unwrap(),
+            0.0,
+            "a read after the cache period reads Redis"
+        );
+        assert_eq!(
+            reader.suppressed().get_estimate(&k).await.unwrap().total,
+            10
+        );
+    });
+}
+
+#[test]
+fn zero_count_inc_and_try_inc_on_absent_key_take_the_undefined_path() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        // A long lag keeps the absent entry fresh for read-only calls.
+        let writer = build_limiter_with_allowed_lag(&url, 6, 60_000, prefix.clone()).await;
+        let reader = build_limiter_with_allowed_lag(&url, 6, 60_000, prefix).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(10f64).unwrap();
+
+        assert_eq!(
+            reader
+                .suppressed()
+                .get_suppression_factor(&k)
+                .await
+                .unwrap(),
+            0.0
+        );
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, 7)
+                .await
+                .unwrap(),
+            (7, 0)
+        );
+
+        assert_eq!(
+            reader.suppressed().try_inc(k.as_key_ref(), 0).unwrap(),
+            None,
+            "try_inc with a count of 0 needs Redis for a key with no usable local state"
+        );
+        assert!(matches!(
+            reader.suppressed().inc(&k, &rate, 0).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(
+            reader.suppressed().get_estimate(&k).await.unwrap().total,
+            7,
+            "inc with a count of 0 must read Redis and store its total"
         );
     });
 }

@@ -20,18 +20,24 @@
 //! **Important:** because the hybrid limiter batches writes, tests must wait for the
 //! background committer to flush (`wait_for_hybrid_sync`) before inspecting Redis state.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use redis::AsyncCommands;
 
-use super::common::{key, key_gen, redis_url, unique_prefix, wait_for_hybrid_sync};
+use super::common::{
+    assert_inside_allowed_lag, key, key_gen, redis_url, sleep_past_allowed_lag, unique_prefix,
+    wait_for_hybrid_sync,
+};
 use super::runtime;
 
 use crate::common::RateType;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, RateLimiterBuilder, SuppressionFactorCachePeriod, WindowSize,
-    hybrid::{HybridRateLimiterProvider, SyncInterval},
+    hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
     redis::RedisKey,
 };
 
@@ -1713,5 +1719,124 @@ fn redis_state_hybrid_suppressed_get_keeps_unknown_entity_absent() {
             .await
             .unwrap();
         assert!(score.is_some(), "known get must refresh active membership");
+    });
+}
+
+#[test]
+fn redis_state_hybrid_suppressed_unknown_key_read_is_local_until_allowed_lag_passes() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let prefix = unique_prefix();
+        let allowed_lag_ms = 3_000_u64;
+        let build = |prefix: RedisKey| {
+            let url = url.clone();
+            async move {
+                let cm = redis::Client::open(url.as_str())
+                    .unwrap()
+                    .get_connection_manager()
+                    .await
+                    .unwrap();
+
+                // A long sync interval keeps the background flush out of the observed interval.
+                HybridRateLimiterProvider::builder(cm)
+                    .prefix(prefix)
+                    .window_size(WindowSize::seconds(6).unwrap())
+                    .bucket_size(BucketSize::milliseconds(1_000).unwrap())
+                    .hard_limit_factor(HardLimitFactor::try_from(1.0).unwrap())
+                    .suppression_factor_cache_period(
+                        SuppressionFactorCachePeriod::milliseconds(100).unwrap(),
+                    )
+                    .sync_interval(SyncInterval::milliseconds(2_000).unwrap())
+                    .allowed_lag(AllowedLag::milliseconds(allowed_lag_ms).unwrap())
+                    .cleanup_enabled(false)
+                    .build()
+                    .unwrap()
+            }
+        };
+        let reader = build(prefix.clone()).await;
+        let writer = build(prefix.clone()).await;
+        let k = key("k");
+        let rate = RateLimit::per_second(10f64).unwrap();
+        let key_generator = key_gen(&prefix, RateType::HybridSuppressed);
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        let synced_before = Instant::now();
+        assert_eq!(
+            reader
+                .suppressed()
+                .get_suppression_factor(&k)
+                .await
+                .unwrap(),
+            0.0
+        );
+        let synced_after = Instant::now();
+        assert_eq!(reader.suppressed().get_estimate(&k).await.unwrap().total, 0);
+        for entity_key in key_generator.get_all_entity_keys(&k) {
+            let exists: bool = conn.exists(&entity_key).await.unwrap();
+            assert!(!exists, "unknown read created {entity_key}");
+        }
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(score.is_none(), "unknown read created active membership");
+        assert_eq!(reader.suppressed().local_state_count(), 1);
+
+        assert_eq!(
+            writer
+                .suppressed()
+                .set_if(&k, &rate, RateLimitComparator::Always, 60)
+                .await
+                .unwrap(),
+            (60, 0)
+        );
+        // A Redis read of an existing entity restores this membership.
+        let _: u64 = conn
+            .zrem(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+
+        let suppression_factor = reader
+            .suppressed()
+            .get_suppression_factor(&k)
+            .await
+            .unwrap();
+        assert_inside_allowed_lag(synced_before, allowed_lag_ms);
+        assert_eq!(
+            suppression_factor, 0.0,
+            "unknown key read inside the allowed lag"
+        );
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(
+            score.is_none(),
+            "a read inside the allowed lag must not read Redis"
+        );
+
+        sleep_past_allowed_lag(synced_after, allowed_lag_ms).await;
+        assert_eq!(
+            reader
+                .suppressed()
+                .get_suppression_factor(&k)
+                .await
+                .unwrap(),
+            1.0,
+            "a read after the allowed lag must see the full window"
+        );
+        let score: Option<f64> = conn
+            .zscore(key_generator.get_active_entities_key(), k.as_str())
+            .await
+            .unwrap();
+        assert!(
+            score.is_some(),
+            "a read after the allowed lag must read Redis"
+        );
     });
 }

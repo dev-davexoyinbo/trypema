@@ -19,7 +19,7 @@ use crate::{
         AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
         SuppressedHybridCommit, SuppressedHybridPendingState, SuppressedHybridRedisProxy,
         SuppressedHybridRedisProxyOptions, SuppressedHybridRedisProxyReadStateResult,
-        common::{EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal, StateRevision},
+        common::{CallMode, EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal, StateRevision},
         hybrid_rate_limiter_provider::HybridRateLimiterConfig,
     },
     redis::{RedisKey, RedisKeyRef, mutex_lock, spawn_task},
@@ -36,9 +36,13 @@ enum SuppressedRedisLimitingState {
         count: AtomicU64,
         declined_count: Mutex<u64>,
         last_modified: Mutex<Instant>,
+        last_synced: Instant,
         state_revision: Mutex<StateRevision>,
     },
     Undefined,
+    Absent {
+        last_synced: Instant,
+    },
     Suppressing {
         time_instant: Mutex<Instant>,
         hard_window_limit: Mutex<f64>,
@@ -67,17 +71,32 @@ pub(crate) struct SuppressedHybridSetIfTestHook {
 ///
 /// # State Machine
 ///
-/// Each key transitions through three states:
+/// Each key transitions through four states:
 ///
 /// - **`Undefined`** — No local state exists. The first call reads Redis to initialise.
 ///
 /// - **`Accepting`** — Below capacity. All requests are allowed from local state with
 ///   no Redis I/O. When the local counter exceeds the soft capacity, it commits to Redis
-///   and transitions based on the result.
+///   and transitions based on the result. A read-only call reads Redis again when the state
+///   is older than the allowed lag.
+///
+/// - **`Absent`** — Redis has no stored hard limit for the key, and the call gave no rate.
+///   A read-only call answers `0.0` from this state until the allowed lag passes. An `inc()`
+///   reads Redis, as for `Undefined`.
 ///
 /// - **`Suppressing`** — At or above capacity. Probabilistic admission based on the
 ///   suppression factor from the last Redis read. Continues until the local state is
 ///   flushed and refreshed from Redis.
+///
+/// Increments from this instance reach Redis within `sync_interval`. A read-only call
+/// (`get_suppression_factor`, `get_estimate`) answers from `Accepting` or `Absent` state only
+/// while that state is younger than `allowed_lag`. A `Suppressing` state answers from its cache
+/// until the suppression-factor cache period ends.
+///
+/// A read-only call records no activity. A key in `Accepting` state that is only read becomes
+/// stale, and cleanup removes it. A key in `Suppressing` state that is read after its cache
+/// period gets a new suppression state from Redis each time, so cleanup keeps it while it is
+/// read.
 ///
 /// # Thundering Herd Prevention
 ///
@@ -85,6 +104,7 @@ pub(crate) struct SuppressedHybridSetIfTestHook {
 #[derive(Debug)]
 pub struct SuppressedHybridRateLimiter {
     window_size: WindowSize,
+    pub(crate) allowed_lag: Duration,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<SuppressedHybridCommit>>,
     redis_proxy: SuppressedHybridRedisProxy,
     limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState, RandomState>,
@@ -135,6 +155,7 @@ impl SuppressedHybridRateLimiter {
 
         let limiter = Self {
             window_size,
+            allowed_lag: Duration::from_millis(options.allowed_lag.as_milliseconds()),
             commiter_sender,
             redis_proxy,
             limiting_state: DashMap::default(),
@@ -239,13 +260,23 @@ impl SuppressedHybridRateLimiter {
     /// - `0.0 < sf < 1.0` — partial suppression (at capacity)
     /// - `1.0` — full suppression (cached at the hard boundary or on a forecast above it)
     ///
-    /// On the fast-path (key in `Suppressing` state with a fresh cached factor), this is
-    /// served entirely from local state with no Redis I/O. Otherwise, it performs a Redis
-    /// read to refresh the state. Unknown keys remain absent, and Redis history eviction
+    /// On the fast-path (key in `Suppressing` state with a fresh cached factor, or in
+    /// `Accepting` state younger than the allowed lag), this is served entirely from local
+    /// state with no Redis I/O. Otherwise, it performs a Redis read to refresh the state.
+    /// Concurrent calls for the same key share one Redis read. Redis history eviction
     /// invalidates a factor cached from the expired history.
     ///
-    /// This method is read-only with respect to request counts. It is useful for metrics
-    /// and observability dashboards.
+    /// An unknown key creates no Redis state. This instance keeps a small local entry for the
+    /// key that answers `0.0` until the allowed lag passes. Only the cleanup loop removes that
+    /// entry. When cleanup is disabled, start it with
+    /// [`HybridRateLimiterProvider::start_cleanup_loop`](crate::hybrid::HybridRateLimiterProvider::start_cleanup_loop),
+    /// or the entries of unknown keys stay in memory.
+    ///
+    /// This method is read-only with respect to request counts and records no activity. A key in
+    /// `Accepting` state that is only read becomes stale, and cleanup removes it. A key in
+    /// `Suppressing` state that is read after its cache period gets a new suppression state from
+    /// Redis each time, so cleanup keeps it while it is read.
+    /// It is useful for metrics and observability dashboards.
     ///
     /// # Examples
     ///
@@ -264,7 +295,7 @@ impl SuppressedHybridRateLimiter {
         self.send_epoch_change_if_needed();
 
         if let Some(state) = self.limiting_state.get(key)
-            && let Some(suppression_factor) = self.local_suppression_factor(state.deref())?
+            && let Some(suppression_factor) = self.fresh_local_suppression_factor(state.deref())?
         {
             return Ok(suppression_factor);
         }
@@ -272,8 +303,9 @@ impl SuppressedHybridRateLimiter {
         let lock = self.get_or_create_reset_lock(key);
         let _guard = lock.lock().await;
 
+        // Another call may have refreshed the state while this one waited for the lock.
         if let Some(state) = self.limiting_state.get(key)
-            && let Some(suppression_factor) = self.local_suppression_factor(state.deref())?
+            && let Some(suppression_factor) = self.fresh_local_suppression_factor(state.deref())?
         {
             return Ok(suppression_factor);
         }
@@ -281,7 +313,14 @@ impl SuppressedHybridRateLimiter {
         let mut rng = |p: f64| rand::random_bool(p);
         let read_state_result = self.redis_proxy.read_state(key).await?;
         let decision = self
-            .reset_single_state_from_read_result(read_state_result, 0, 0, None, &mut rng)
+            .reset_single_state_from_read_result(
+                read_state_result,
+                0,
+                0,
+                None,
+                &mut rng,
+                CallMode::ReadOnly,
+            )
             .await?;
 
         if let Some(state) = self.limiting_state.get(key)
@@ -353,9 +392,13 @@ impl SuppressedHybridRateLimiter {
 
     /// Infer current window state from this instance's local limiting state.
     ///
-    /// An initialized state stays on local fast path. Undefined or expired suppression state is
-    /// refreshed from Redis first. Result can lag commits from other instances and Redis-side
-    /// expiration; use [`Self::get`] when every read must consult Redis.
+    /// An `Accepting` state younger than the allowed lag stays on local fast path; so does a
+    /// `Suppressing` state until its cache period ends. Undefined state, `Accepting` state older
+    /// than the allowed lag, or expired suppression state is refreshed from Redis first. Use
+    /// [`Self::get`] when every read must consult Redis.
+    ///
+    /// The call records no activity, with the same cleanup rules as
+    /// [`Self::get_suppression_factor`]. For an unknown key it keeps the same local entry.
     ///
     /// # Errors
     ///
@@ -444,7 +487,8 @@ impl SuppressedHybridRateLimiter {
                     *mutex_lock(state_revision, "suppressing.state_revision")?
                         != read_state_result.state_revision
                 }
-                SuppressedRedisLimitingState::Undefined => false,
+                SuppressedRedisLimitingState::Undefined
+                | SuppressedRedisLimitingState::Absent { .. } => false,
             },
             None => false,
         };
@@ -486,7 +530,8 @@ impl SuppressedHybridRateLimiter {
                         .saturating_add(declined_count.load(Ordering::Acquire))
                         .min(total);
                 }
-                SuppressedRedisLimitingState::Undefined => {}
+                SuppressedRedisLimitingState::Undefined
+                | SuppressedRedisLimitingState::Absent { .. } => {}
             }
         }
 
@@ -581,7 +626,11 @@ impl SuppressedHybridRateLimiter {
                 declined_count.load(Ordering::Acquire),
                 true,
             ),
-            Some(SuppressedRedisLimitingState::Undefined) | None => (0, 0, false),
+            Some(
+                SuppressedRedisLimitingState::Undefined
+                | SuppressedRedisLimitingState::Absent { .. },
+            )
+            | None => (0, 0, false),
         };
 
         if let Err(err) = RedisCommitter::barrier(&self.commiter_sender).await {
@@ -861,7 +910,7 @@ impl SuppressedHybridRateLimiter {
         let candidates = self
             .limiting_state
             .iter()
-            .filter(|state| Self::should_cleanup_local_state(state.value(), stale_after_ms))
+            .filter(|state| self.should_cleanup_local_state(state.value(), stale_after_ms))
             .map(|state| state.key().clone())
             .collect::<Vec<_>>();
 
@@ -870,7 +919,7 @@ impl SuppressedHybridRateLimiter {
             let _guard = lock.lock().await;
 
             let should_remove = self.limiting_state.get(&key).is_some_and(|state| {
-                Self::should_cleanup_local_state(state.value(), stale_after_ms)
+                self.should_cleanup_local_state(state.value(), stale_after_ms)
             });
 
             if !should_remove {
@@ -879,7 +928,7 @@ impl SuppressedHybridRateLimiter {
 
             match self.limiting_state.entry(key) {
                 Entry::Occupied(entry)
-                    if Self::should_cleanup_local_state(entry.get(), stale_after_ms) =>
+                    if self.should_cleanup_local_state(entry.get(), stale_after_ms) =>
                 {
                     entry.remove();
                 }
@@ -918,7 +967,14 @@ impl SuppressedHybridRateLimiter {
 
         for result in read_state_results {
             if let Err(err) = self
-                .reset_single_state_from_read_result(result, 0, 0, None, &mut rng)
+                .reset_single_state_from_read_result(
+                    result,
+                    0,
+                    0,
+                    None,
+                    &mut rng,
+                    CallMode::Recording,
+                )
                 .await
             {
                 tracing::error!(error = ?err, "Failed to reset state from redis read result");

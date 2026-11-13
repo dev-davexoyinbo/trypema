@@ -8,6 +8,7 @@ struct FrozenLocalState {
     hard_window_limit: Option<f64>,
     suppression_factor_ttl_ms: Option<u64>,
     state_revision: Option<StateRevision>,
+    accepting_last_modified: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -19,6 +20,7 @@ pub(super) struct ResolvedRedisState {
     pub(super) suppression_factor_ttl_ms: Option<u64>,
     pub(super) hard_window_limit: Option<f64>,
     pub(super) state_revision: StateRevision,
+    pub(super) accepting_last_modified: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -52,7 +54,8 @@ impl SuppressedHybridRateLimiter {
         random_bool: &mut impl FnMut(f64) -> bool,
     ) -> Result<Option<RateLimitDecision>, TrypemaError> {
         match state {
-            SuppressedRedisLimitingState::Undefined => Ok(None),
+            SuppressedRedisLimitingState::Undefined
+            | SuppressedRedisLimitingState::Absent { .. } => Ok(None),
             SuppressedRedisLimitingState::Accepting {
                 hard_window_limit,
                 starting_count,
@@ -282,9 +285,31 @@ impl SuppressedHybridRateLimiter {
                 Ok(Some(suppression_factor))
             }
 
-            SuppressedRedisLimitingState::Undefined => Ok(None),
+            SuppressedRedisLimitingState::Undefined
+            | SuppressedRedisLimitingState::Absent { .. } => Ok(None),
         }
     } // end fn local_suppression_factor
+
+    /// The local factor for a read-only call. `Accepting` and `Absent` state answer only while
+    /// they are younger than the allowed lag; `None` sends the call to Redis.
+    pub(super) fn fresh_local_suppression_factor(
+        &self,
+        state: &SuppressedRedisLimitingState,
+    ) -> Result<Option<f64>, TrypemaError> {
+        match state {
+            SuppressedRedisLimitingState::Accepting { last_synced, .. }
+                if last_synced.elapsed() >= self.allowed_lag =>
+            {
+                Ok(None)
+            }
+            SuppressedRedisLimitingState::Absent { last_synced } => {
+                Ok((last_synced.elapsed() < self.allowed_lag).then_some(0f64))
+            }
+            SuppressedRedisLimitingState::Accepting { .. }
+            | SuppressedRedisLimitingState::Suppressing { .. }
+            | SuppressedRedisLimitingState::Undefined => self.local_suppression_factor(state),
+        }
+    } // end fn fresh_local_suppression_factor
 
     pub(super) fn local_snapshot(
         &self,
@@ -328,7 +353,8 @@ impl SuppressedHybridRateLimiter {
 
                 (total, total_declined)
             }
-            SuppressedRedisLimitingState::Undefined => return Ok(None),
+            SuppressedRedisLimitingState::Undefined
+            | SuppressedRedisLimitingState::Absent { .. } => return Ok(None),
         };
 
         Ok(Some(SuppressedRateLimitSnapshot {
@@ -351,6 +377,7 @@ impl SuppressedHybridRateLimiter {
             Some(SuppressedRedisLimitingState::Accepting {
                 hard_window_limit,
                 count,
+                last_modified,
                 state_revision,
                 ..
             }) => Ok((
@@ -362,6 +389,7 @@ impl SuppressedHybridRateLimiter {
                 )?),
                 None,
                 Some(*mutex_lock(state_revision, "accepting.state_revision")?),
+                Some(*mutex_lock(last_modified, "accepting.last_modified")?),
             )),
             Some(SuppressedRedisLimitingState::Suppressing {
                 hard_window_limit,
@@ -382,8 +410,13 @@ impl SuppressedHybridRateLimiter {
                     "suppressing.suppression_factor_ttl_ms",
                 )?),
                 Some(*mutex_lock(state_revision, "suppressing.state_revision")?),
+                None,
             )),
-            Some(SuppressedRedisLimitingState::Undefined) | None => Ok((0, 0, None, None, None)),
+            Some(
+                SuppressedRedisLimitingState::Undefined
+                | SuppressedRedisLimitingState::Absent { .. },
+            )
+            | None => Ok((0, 0, None, None, None, None)),
         };
 
         let (
@@ -392,6 +425,7 @@ impl SuppressedHybridRateLimiter {
             hard_window_limit,
             suppression_factor_ttl_ms,
             state_revision,
+            accepting_last_modified,
         ) = match local_values {
             Ok(values) => values,
             Err(err) => {
@@ -410,6 +444,7 @@ impl SuppressedHybridRateLimiter {
             hard_window_limit,
             suppression_factor_ttl_ms,
             state_revision,
+            accepting_last_modified,
         })
     } // end fn freeze_local_state
 
@@ -434,7 +469,8 @@ impl SuppressedHybridRateLimiter {
             | SuppressedRedisLimitingState::Suppressing { count, .. } => {
                 count.load(Ordering::Acquire) > 0
             }
-            SuppressedRedisLimitingState::Undefined => false,
+            SuppressedRedisLimitingState::Undefined
+            | SuppressedRedisLimitingState::Absent { .. } => false,
         };
         drop(state);
 
@@ -550,6 +586,7 @@ impl SuppressedHybridRateLimiter {
             suppression_factor_ttl_ms,
             hard_window_limit,
             state_revision,
+            accepting_last_modified: frozen.accepting_last_modified,
         })
     } // end fn resolve_redis_state_and_commit
 
@@ -560,6 +597,7 @@ impl SuppressedHybridRateLimiter {
         increment: u64,
         rate_limit: Option<&RateLimit>,
         random_bool: &mut impl FnMut(f64) -> bool,
+        mode: CallMode,
     ) -> Result<RateLimitDecision, TrypemaError> {
         let state = self
             .resolve_redis_state_and_commit(read_state_result)
@@ -569,9 +607,12 @@ impl SuppressedHybridRateLimiter {
             Some(hard_window_limit) => hard_window_limit,
             None => {
                 let Some(rate_limit) = rate_limit else {
-                    self.limiting_state.remove_if(&state.key, |_, state| {
-                        matches!(state, SuppressedRedisLimitingState::Undefined)
-                    });
+                    self.store_local_state(
+                        &state.key,
+                        SuppressedRedisLimitingState::Absent {
+                            last_synced: Instant::now(),
+                        },
+                    );
 
                     return Ok(RateLimitDecision::Allowed);
                 };
@@ -640,11 +681,19 @@ impl SuppressedHybridRateLimiter {
             };
         }
 
+        let synced_at = Instant::now();
+        // A read-only refresh is not activity; it keeps the time of the last recorded one.
+        let last_modified = match (mode, state.accepting_last_modified) {
+            (CallMode::ReadOnly, Some(last_modified)) => last_modified,
+            (CallMode::ReadOnly, None) | (CallMode::Recording, _) => synced_at,
+        };
+
         self.store_local_state(
             &state.key,
             SuppressedRedisLimitingState::Accepting {
                 hard_window_limit: Mutex::new(hard_window_limit),
-                last_modified: Mutex::new(Instant::now()),
+                last_modified: Mutex::new(last_modified),
+                last_synced: synced_at,
                 starting_count: Mutex::new(state.current_total_count),
                 declined_count: Mutex::new(state.current_declined_count),
                 count: AtomicU64::new(increment),
@@ -688,6 +737,7 @@ impl SuppressedHybridRateLimiter {
             increment,
             rate_limit,
             random_bool,
+            CallMode::Recording,
         )
         .await
     } // end fn coordinate_local_transition
@@ -763,7 +813,8 @@ impl SuppressedHybridRateLimiter {
                             .map(|value| *value)
                             .unwrap_or_default(),
                     },
-                    SuppressedRedisLimitingState::Undefined => {
+                    SuppressedRedisLimitingState::Undefined
+                    | SuppressedRedisLimitingState::Absent { .. } => {
                         SuppressedHybridPendingState::default()
                     }
                 }
@@ -787,7 +838,8 @@ impl SuppressedHybridRateLimiter {
                 declined_count,
                 ..
             } => (count.into_inner(), declined_count.into_inner()),
-            SuppressedRedisLimitingState::Undefined => return Ok(()),
+            SuppressedRedisLimitingState::Undefined
+            | SuppressedRedisLimitingState::Absent { .. } => return Ok(()),
         };
 
         let extra_count = actual_count.saturating_sub(pending_state.pending_count);
@@ -849,11 +901,17 @@ impl SuppressedHybridRateLimiter {
     }
 
     pub(super) fn should_cleanup_local_state(
+        &self,
         state: &SuppressedRedisLimitingState,
         stale_after_ms: u64,
     ) -> bool {
         match state {
             SuppressedRedisLimitingState::Undefined => true,
+            // An absent entry only holds the time of its last Redis read. Once the allowed lag
+            // passes, the next call reads Redis anyway, so the entry carries no information.
+            SuppressedRedisLimitingState::Absent { last_synced } => {
+                last_synced.elapsed() >= self.allowed_lag
+            }
             SuppressedRedisLimitingState::Accepting { last_modified, .. } => {
                 let last_modified = match last_modified.lock() {
                     Ok(last_modified) => last_modified,
@@ -895,7 +953,8 @@ impl SuppressedHybridRateLimiter {
         state: &SuppressedRedisLimitingState,
     ) -> Result<bool, TrypemaError> {
         let elapsed_ms = match state {
-            SuppressedRedisLimitingState::Undefined => return Ok(false),
+            SuppressedRedisLimitingState::Undefined
+            | SuppressedRedisLimitingState::Absent { .. } => return Ok(false),
             SuppressedRedisLimitingState::Accepting { last_modified, .. } => {
                 mutex_lock(last_modified, "accepting.last_modified")?
                     .elapsed()
@@ -921,7 +980,8 @@ impl SuppressedHybridRateLimiter {
                 declined_count,
                 ..
             } => count.load(Ordering::Acquire) > 0 || declined_count.load(Ordering::Acquire) > 0,
-            SuppressedRedisLimitingState::Undefined => false,
+            SuppressedRedisLimitingState::Undefined
+            | SuppressedRedisLimitingState::Absent { .. } => false,
         }
     } // end fn has_pending_counts
 
