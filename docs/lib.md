@@ -41,8 +41,8 @@ Configuration types expose unit-named constructors and explicit getters:
   `as_*` getters; minute-and-larger getters return `f64`.
 - [`BucketSize`]: `milliseconds`, `seconds`, `minutes`, `hours`, `days`, `weeks`, and `months`.
 - [`SuppressionFactorCachePeriod`]: `milliseconds`, `seconds`, `minutes`, `hours`, and `days`.
-- `hybrid::SyncInterval`: `milliseconds`, `seconds`, `minutes`, and `hours`, with matching
-  `as_*` getters; second-and-larger getters return `f64`.
+- `hybrid::SyncInterval` and `hybrid::AllowedLag`: `milliseconds`, `seconds`, `minutes`, and
+  `hours`, with matching `as_*` getters; second-and-larger getters return `f64`.
 
 Provider builders require `bucket_size` to be less than or equal to `window_size`; equality is
 valid. This relationship is checked by `build()`, regardless of setter order.
@@ -75,16 +75,27 @@ let provider = RedisRateLimiterProvider::builder(connection)
 # }
 ```
 
-The hybrid builder additionally exposes `sync_interval`. Its synchronization worker is always
-started and is independent of optional stale-state cleanup.
+The hybrid builder additionally exposes `sync_interval` and `allowed_lag`. Its synchronization
+worker is always started and is independent of optional stale-state cleanup. `sync_interval`
+(default 10 ms) sets how often local increments reach Redis. `allowed_lag` (default 1 second) sets
+the maximum age of the local state that answers a read-only call: `is_allowed` and `get_estimate`
+on the absolute limiter, `get_suppression_factor` and `get_estimate` on the suppressed limiter.
+Older accepting or absent-key state is read from Redis again first; concurrent calls for one key
+share that read.
 
 ```no_run
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 # async fn example(connection: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
-use trypema::{RateLimiterBuilder, hybrid::{HybridRateLimiterProvider, SyncInterval}};
+use trypema::{
+    RateLimiterBuilder,
+    hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
+};
 
 let provider = HybridRateLimiterProvider::builder(connection)
+    // Optional: only available with 'redis-tokio' or 'redis-smol'
     .sync_interval(SyncInterval::milliseconds_or_panic(10))
+    // Optional: only available with 'redis-tokio' or 'redis-smol'
+    .allowed_lag(AllowedLag::milliseconds_or_panic(500))
     .build()?;
 # let _ = provider;
 # Ok(())
@@ -161,6 +172,25 @@ Absolute `get` methods return the live total as `u64`. Suppressed `get` methods 
 suppression factor. Unknown keys return zero-valued results without creating state. Reads may
 perform lazy expiration maintenance. Hybrid reads include this instance's pending local counts;
 `get_estimate` may use initialized local state instead of consulting Redis.
+
+Increments from a hybrid instance reach Redis within `sync_interval`. Hybrid read-only calls
+answer from accepting state, or from the local entry of a key with no stored limit, only while
+that state is younger than `allowed_lag`. A cached rejection answers until its retry TTL ends (up
+to one window), and a cached suppression state until its cache period ends. The hybrid builder
+setting `allowed_lag_applies_to_rejections(true)` (default `false`) bounds read-only answers from
+an absolute rejection cache by `allowed_lag` as well, so a limit that another instance deletes or
+raises becomes visible within that lag. `inc` and `try_inc` keep the retry TTL rule, and the
+suppressed strategy does not use this setting.
+
+Hybrid read-only calls record no activity. A key in accepting state that is only checked becomes
+stale, and cleanup removes it. A key with a cached rejection or suppression state that is checked
+after the cache ends gets a new cache from Redis each time, so cleanup keeps it while it is
+checked.
+
+A hybrid check of a key with no stored limit is allowed and creates no Redis key. The instance
+keeps a small local entry that answers later checks until `allowed_lag` passes. Only the cleanup
+loop removes that entry. With cleanup disabled, start the loop with `start_cleanup_loop()`, or the
+entries of unknown keys stay in memory.
 
 ## Name and Biblical Inspiration
 
