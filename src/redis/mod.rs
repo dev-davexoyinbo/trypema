@@ -4,10 +4,12 @@ mod redis_rate_limiter_provider;
 pub use redis_rate_limiter_provider::{RedisRateLimiterBuilder, RedisRateLimiterProvider};
 
 mod absolute_redis_rate_limiter;
-pub use absolute_redis_rate_limiter::AbsoluteRedisRateLimiter;
+pub use absolute_redis_rate_limiter::{AbsoluteRedisRateLimiter, AbsoluteRedisRateLimiterBuilder};
 
 mod suppressed_redis_rate_limiter;
-pub use suppressed_redis_rate_limiter::SuppressedRedisRateLimiter;
+pub use suppressed_redis_rate_limiter::{
+    SuppressedRedisRateLimiter, SuppressedRedisRateLimiterBuilder,
+};
 
 pub(crate) mod common;
 pub use common::{RedisKey, RedisKeyRef};

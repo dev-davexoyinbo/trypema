@@ -9,7 +9,9 @@ use dashmap::DashMap;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, WindowSize,
-    builder::ProviderConfig, common::RandomState, local::SuppressedLocalRateLimiter,
+    builder::{CleanupConfig, ProviderConfig},
+    common::RandomState,
+    local::SuppressedLocalRateLimiter,
     local::suppressed_local_rate_limiter::RateLimitSeries,
 };
 
@@ -263,12 +265,15 @@ fn limiter(
     bucket_size: u64,
     hard_limit_factor: f64,
 ) -> SuppressedLocalRateLimiter {
-    SuppressedLocalRateLimiter::new(ProviderConfig {
-        window_size: WindowSize::seconds(window_size).unwrap(),
-        bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-        hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-        suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-    })
+    SuppressedLocalRateLimiter::new(
+        ProviderConfig {
+            window_size: WindowSize::seconds(window_size).unwrap(),
+            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
+            hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+        },
+        CleanupConfig::default(),
+    )
 }
 
 fn limiter_with_cache_ms(
@@ -277,15 +282,18 @@ fn limiter_with_cache_ms(
     hard_limit_factor: f64,
     suppression_factor_cache_period: u64,
 ) -> SuppressedLocalRateLimiter {
-    SuppressedLocalRateLimiter::new(ProviderConfig {
-        window_size: WindowSize::seconds(window_size).unwrap(),
-        bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-        hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
-        suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
-            suppression_factor_cache_period,
-        )
-        .unwrap(),
-    })
+    SuppressedLocalRateLimiter::new(
+        ProviderConfig {
+            window_size: WindowSize::seconds(window_size).unwrap(),
+            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
+            hard_limit_factor: HardLimitFactor::try_from(hard_limit_factor).unwrap(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::milliseconds(
+                suppression_factor_cache_period,
+            )
+            .unwrap(),
+        },
+        CleanupConfig::default(),
+    )
 }
 
 /// Push `key` to the soft window capacity so that subsequent `inc_with_rng` calls

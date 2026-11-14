@@ -8,7 +8,10 @@ use crate::common::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, SuppressionFactorCachePeriod, WindowSize,
 };
-use crate::{builder::ProviderConfig, local::AbsoluteLocalRateLimiter};
+use crate::{
+    builder::{CleanupConfig, ProviderConfig},
+    local::AbsoluteLocalRateLimiter,
+};
 
 fn window_limit(window_size: u64, rate_limit: &RateLimit) -> f64 {
     window_size as f64 * rate_limit.as_per_second()
@@ -42,12 +45,15 @@ fn record_decision(
 }
 
 fn limiter(window_size: u64, bucket_size: u64) -> AbsoluteLocalRateLimiter {
-    AbsoluteLocalRateLimiter::new(ProviderConfig {
-        window_size: WindowSize::seconds(window_size).unwrap(),
-        bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
-        hard_limit_factor: HardLimitFactor::default(),
-        suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
-    })
+    AbsoluteLocalRateLimiter::new(
+        ProviderConfig {
+            window_size: WindowSize::seconds(window_size).unwrap(),
+            bucket_size: BucketSize::milliseconds(bucket_size).unwrap(),
+            hard_limit_factor: HardLimitFactor::default(),
+            suppression_factor_cache_period: SuppressionFactorCachePeriod::default(),
+        },
+        CleanupConfig::default(),
+    )
 }
 
 fn assert_retry_after_between(retry_after: Duration, min_ms: u128, max_ms: u128) {

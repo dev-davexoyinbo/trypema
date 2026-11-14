@@ -8,14 +8,20 @@ use std::{
 };
 
 use dashmap::{DashMap, mapref::entry::Entry, mapref::one::Ref};
+use redis::aio::ConnectionManager;
 use tokio::sync::{RwLock, mpsc, watch};
 
 use crate::{
-    ConditionalSetOutcome, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
+    BucketSize, ConditionalSetOutcome, HardLimitFactor, HistoryPreservation, RateLimit,
+    RateLimitComparator, RateLimitDecision, RateLimiterBuilder, SuppressionFactorCachePeriod,
     TrypemaError, WindowSize,
+    builder::CleanupConfig,
+    cleanup_loop::CleanupLoop,
     common::{HistoryUpdateMode, RandomState, duration_from_milliseconds},
     hybrid::{
-        AbsoluteHybridCommitterSignal, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
+        AbsoluteHybridCommitterSignal, AllowedLag, HybridRateLimiterBuilder,
+        HybridRateLimiterProvider, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
+        SyncInterval,
         absolute_hybrid_redis_proxy::{
             AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyOptions,
             AbsoluteHybridRedisProxyReadStateResult,
@@ -60,6 +66,130 @@ enum AbsoluteRedisLimitingState {
         state_revision: Mutex<StateRevision>,
     },
 }
+
+/// Builder for [`AbsoluteHybridRateLimiter`].
+///
+/// Builds the absolute strategy alone, without the suppressed strategy of a
+/// [`HybridRateLimiterProvider`]: one local state map, one Redis committer, and no workers of
+/// the suppressed strategy. The settings and their defaults are those of
+/// [`HybridRateLimiterBuilder`](super::HybridRateLimiterBuilder). A limiter built with prefix
+/// `P` reads and writes the same Redis keys as `HybridRateLimiterProvider` with prefix `P`, so
+/// both can share state.
+///
+/// `hard_limit_factor` and `suppression_factor_cache_period` have no effect on the absolute
+/// strategy. The builder accepts them because [`RateLimiterBuilder`] is shared.
+///
+/// `build()` starts the synchronization worker, and also the stale-state cleanup loop unless
+/// cleanup is disabled. Both end after the last `Arc` of the limiter drops.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+/// use std::time::Duration;
+/// use trypema::{
+///     RateLimit, RateLimiterBuilder, WindowSize,
+///     hybrid::{AllowedLag, AbsoluteHybridRateLimiter, SyncInterval},
+///     redis::RedisKey,
+/// };
+///
+/// let limiter = AbsoluteHybridRateLimiter::builder(connection_manager)
+///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+///     .prefix(RedisKey::try_from("my-service")?)
+///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+///     .sync_interval(SyncInterval::milliseconds_or_panic(10))
+///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+///     .allowed_lag(AllowedLag::milliseconds_or_panic(500))
+///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+///     .allowed_lag_applies_to_rejections(true)
+///     // Optional: sliding-window duration
+///     .window_size(WindowSize::seconds_or_panic(60))
+///     // Optional: inactivity duration before cleanup removes a key
+///     .stale_after(Duration::from_secs(300))
+///     .build()?;
+///
+/// let key = RedisKey::try_from("user-123")?;
+/// let rate = RateLimit::per_second_or_panic(10.0);
+/// let decision = limiter.inc(&key, &rate, 1).await?;
+/// # let _ = decision;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct AbsoluteHybridRateLimiterBuilder(HybridRateLimiterBuilder);
+
+impl AbsoluteHybridRateLimiterBuilder {
+    /// Set prefix used for Redis keys.
+    pub fn prefix(self, value: RedisKey) -> Self {
+        Self(self.0.prefix(value))
+    }
+
+    /// Set background Redis synchronization interval.
+    pub fn sync_interval(self, value: SyncInterval) -> Self {
+        Self(self.0.sync_interval(value))
+    }
+
+    /// Set the maximum age of local state that answers a read-only call.
+    ///
+    /// A read-only call on local state older than this lag reads Redis again. See
+    /// [`AllowedLag`] for the calls it applies to.
+    pub fn allowed_lag(self, value: AllowedLag) -> Self {
+        Self(self.0.allowed_lag(value))
+    }
+
+    /// Apply the allowed lag to the rejection cache of this limiter.
+    ///
+    /// Default `false`. See
+    /// [`HybridRateLimiterBuilder::allowed_lag_applies_to_rejections`](super::HybridRateLimiterBuilder::allowed_lag_applies_to_rejections)
+    /// for the behavior; it is the same for a limiter built here.
+    pub fn allowed_lag_applies_to_rejections(self, value: bool) -> Self {
+        Self(self.0.allowed_lag_applies_to_rejections(value))
+    }
+} // end impl
+
+impl RateLimiterBuilder for AbsoluteHybridRateLimiterBuilder {
+    type Provider = AbsoluteHybridRateLimiter;
+
+    fn window_size(self, value: WindowSize) -> Self {
+        Self(self.0.window_size(value))
+    }
+
+    fn bucket_size(self, value: BucketSize) -> Self {
+        Self(self.0.bucket_size(value))
+    }
+
+    fn hard_limit_factor(self, value: HardLimitFactor) -> Self {
+        Self(self.0.hard_limit_factor(value))
+    }
+
+    fn suppression_factor_cache_period(self, value: SuppressionFactorCachePeriod) -> Self {
+        Self(self.0.suppression_factor_cache_period(value))
+    }
+
+    fn stale_after(self, value: Duration) -> Self {
+        Self(self.0.stale_after(value))
+    }
+
+    fn cleanup_interval(self, value: Duration) -> Self {
+        Self(self.0.cleanup_interval(value))
+    }
+
+    fn cleanup_enabled(self, enabled: bool) -> Self {
+        Self(self.0.cleanup_enabled(enabled))
+    }
+
+    fn build(self) -> Result<Arc<Self::Provider>, TrypemaError> {
+        let (config, cleanup) = self.0.validate()?;
+
+        let limiter = AbsoluteHybridRateLimiter::new(config, cleanup);
+
+        if cleanup.enabled {
+            limiter.start_cleanup_loop();
+        }
+
+        Ok(limiter)
+    }
+} // end impl
 
 /// Sliding-window allow/reject limiter with a local fast path and periodic Redis sync.
 ///
@@ -127,10 +257,11 @@ pub struct AbsoluteHybridRateLimiter {
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
     maintenance_lock: Arc<RwLock<()>>,
+    cleanup_loop: CleanupLoop,
 }
 
 impl AbsoluteHybridRateLimiter {
-    pub(crate) fn new(options: HybridRateLimiterConfig) -> Arc<Self> {
+    pub(crate) fn new(options: HybridRateLimiterConfig, cleanup: CleanupConfig) -> Arc<Self> {
         let prefix = options.prefix.unwrap_or_else(RedisKey::default_prefix);
 
         let (tx, rx) = mpsc::channel::<RedisRateLimiterSignal>(1);
@@ -167,6 +298,7 @@ impl AbsoluteHybridRateLimiter {
             last_commited_epoch: AtomicU64::new(0),
             is_active_watch,
             maintenance_lock,
+            cleanup_loop: CleanupLoop::new(cleanup),
         };
 
         let limiter = Arc::new(limiter);
@@ -176,6 +308,45 @@ impl AbsoluteHybridRateLimiter {
 
         limiter
     } // end method with_rate_type
+
+    /// Create a builder for a limiter that runs the absolute strategy alone.
+    ///
+    /// See [`AbsoluteHybridRateLimiterBuilder`] for the settings and the cleanup lifecycle.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
+    /// use trypema::{RateLimiterBuilder, hybrid::AbsoluteHybridRateLimiter};
+    ///
+    /// let limiter = AbsoluteHybridRateLimiter::builder(connection_manager)
+    ///     .disable_cleanup()
+    ///     .build()
+    ///     .unwrap();
+    /// # let _ = limiter;
+    /// # }
+    /// ```
+    pub fn builder(connection_manager: ConnectionManager) -> AbsoluteHybridRateLimiterBuilder {
+        AbsoluteHybridRateLimiterBuilder(HybridRateLimiterProvider::builder(connection_manager))
+    } // end method builder
+
+    /// Start stale-state cleanup. Calling while already running is no-op.
+    ///
+    /// Only a limiter from [`builder`](Self::builder) is held in an `Arc` that callers can use
+    /// here. The cleanup loop of a provider cleans the limiters that the provider owns.
+    pub fn start_cleanup_loop(self: &Arc<Self>) {
+        CleanupLoop::start_task(
+            self,
+            |limiter| &limiter.cleanup_loop,
+            |limiter, stale_after_ms| async move { limiter.cleanup(stale_after_ms).await },
+            "Hybrid absolute cleanup failed, will retry",
+        );
+    } // end method start_cleanup_loop
+
+    /// Stop stale-state cleanup. Calling while stopped is no-op.
+    pub fn stop_cleanup_loop(&self) {
+        self.cleanup_loop.stop();
+    } // end method stop_cleanup_loop
 
     fn epoch_change_task(self: &Arc<Self>) {
         self.epoch.fetch_add(1, Ordering::AcqRel);

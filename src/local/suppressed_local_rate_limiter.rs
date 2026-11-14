@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -8,12 +11,14 @@ use dashmap::{DashMap, mapref::entry::Entry};
 
 use crate::{
     BucketSize, ConditionalSetOutcome, HistoryPreservation, RateLimitComparator, RateLimitDecision,
-    SuppressedRateLimitSnapshot,
-    builder::ProviderConfig,
+    RateLimiterBuilder, SuppressedRateLimitSnapshot, TrypemaError,
+    builder::{CleanupConfig, ProviderConfig},
+    cleanup_loop::CleanupLoop,
     common::{
         Bucket, HardLimitFactor, HistoryUpdateMode, RandomState, RateLimit,
         SuppressionFactorCachePeriod, WindowSize,
     },
+    local::LocalRateLimiterBuilder,
 };
 
 #[derive(Debug)]
@@ -34,6 +39,84 @@ impl RateLimitSeries {
         }
     }
 }
+
+/// Builder for [`SuppressedLocalRateLimiter`].
+///
+/// Builds the suppressed strategy alone, without the absolute strategy of a
+/// [`LocalRateLimiterProvider`](super::LocalRateLimiterProvider). The settings and their
+/// defaults are those of [`LocalRateLimiterBuilder`].
+///
+/// `build()` starts the stale-state cleanup loop of the limiter unless cleanup is disabled. The
+/// loop ends after the last `Arc` of the limiter drops.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use trypema::{
+///     HardLimitFactor, RateLimit, RateLimitDecision, RateLimiterBuilder, WindowSize,
+///     local::SuppressedLocalRateLimiter,
+/// };
+///
+/// let limiter = SuppressedLocalRateLimiter::builder()
+///     // Optional: sliding-window duration
+///     .window_size(WindowSize::seconds_or_panic(60))
+///     // Optional: hard cutoff multiplier
+///     .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
+///     // Optional: inactivity duration before cleanup removes a key
+///     .stale_after(Duration::from_secs(300))
+///     .build()
+///     .unwrap();
+///
+/// let rate = RateLimit::per_second_or_panic(10.0);
+/// assert!(matches!(limiter.inc("user-123", &rate, 1), RateLimitDecision::Allowed));
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SuppressedLocalRateLimiterBuilder(LocalRateLimiterBuilder);
+
+impl RateLimiterBuilder for SuppressedLocalRateLimiterBuilder {
+    type Provider = SuppressedLocalRateLimiter;
+
+    fn window_size(self, value: WindowSize) -> Self {
+        Self(self.0.window_size(value))
+    }
+
+    fn bucket_size(self, value: BucketSize) -> Self {
+        Self(self.0.bucket_size(value))
+    }
+
+    fn hard_limit_factor(self, value: HardLimitFactor) -> Self {
+        Self(self.0.hard_limit_factor(value))
+    }
+
+    fn suppression_factor_cache_period(self, value: SuppressionFactorCachePeriod) -> Self {
+        Self(self.0.suppression_factor_cache_period(value))
+    }
+
+    fn stale_after(self, value: Duration) -> Self {
+        Self(self.0.stale_after(value))
+    }
+
+    fn cleanup_interval(self, value: Duration) -> Self {
+        Self(self.0.cleanup_interval(value))
+    }
+
+    fn cleanup_enabled(self, enabled: bool) -> Self {
+        Self(self.0.cleanup_enabled(enabled))
+    }
+
+    fn build(self) -> Result<Arc<Self::Provider>, TrypemaError> {
+        let (config, cleanup) = self.0.validate()?;
+
+        let limiter = Arc::new(SuppressedLocalRateLimiter::new(config, cleanup));
+
+        if cleanup.enabled {
+            limiter.start_cleanup_loop();
+        }
+
+        Ok(limiter)
+    }
+} // end impl
 
 /// Probabilistic in-process rate limiter for graceful degradation.
 ///
@@ -140,10 +223,11 @@ pub struct SuppressedLocalRateLimiter {
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_period: SuppressionFactorCachePeriod,
     pub(crate) suppression_factors: DashMap<String, (Instant, f64), RandomState>,
+    cleanup_loop: CleanupLoop,
 }
 
 impl SuppressedLocalRateLimiter {
-    pub(crate) fn new(options: ProviderConfig) -> Self {
+    pub(crate) fn new(options: ProviderConfig, cleanup: CleanupConfig) -> Self {
         Self {
             hard_limit_factor: options.hard_limit_factor,
             window_size_ms: options.window_size.as_milliseconds(),
@@ -153,8 +237,41 @@ impl SuppressedLocalRateLimiter {
             bucket_size: options.bucket_size,
             series: DashMap::default(),
             suppression_factors: DashMap::default(),
+            cleanup_loop: CleanupLoop::new(cleanup),
         }
     } // end constructor
+
+    /// Create a builder for a limiter that runs the suppressed strategy alone.
+    ///
+    /// See [`SuppressedLocalRateLimiterBuilder`] for the settings and the cleanup lifecycle.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trypema::{RateLimiterBuilder, local::SuppressedLocalRateLimiter};
+    ///
+    /// let limiter = SuppressedLocalRateLimiter::builder()
+    ///     .disable_cleanup()
+    ///     .build()
+    ///     .unwrap();
+    /// # let _ = limiter;
+    /// ```
+    pub fn builder() -> SuppressedLocalRateLimiterBuilder {
+        SuppressedLocalRateLimiterBuilder::default()
+    } // end method builder
+
+    /// Start stale-state cleanup. Calling while already running is no-op.
+    ///
+    /// Only a limiter from [`builder`](Self::builder) is held in an `Arc` that callers can use
+    /// here. The cleanup loop of a provider cleans the limiters that the provider owns.
+    pub fn start_cleanup_loop(self: &Arc<Self>) {
+        CleanupLoop::start_thread(self, |limiter| &limiter.cleanup_loop, Self::cleanup);
+    } // end method start_cleanup_loop
+
+    /// Stop stale-state cleanup. Calling while stopped is no-op.
+    pub fn stop_cleanup_loop(&self) {
+        self.cleanup_loop.stop();
+    } // end method stop_cleanup_loop
 
     /// Check admission and record the increment for `key` using probabilistic suppression.
     ///

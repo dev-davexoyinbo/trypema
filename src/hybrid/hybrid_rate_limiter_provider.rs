@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use redis::aio::ConnectionManager;
 
@@ -12,9 +6,9 @@ use crate::{
     BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, TrypemaError,
     WindowSize,
     builder::{CleanupConfig, ProviderConfig},
+    cleanup_loop::CleanupLoop,
     hybrid::{AbsoluteHybridRateLimiter, AllowedLag, SuppressedHybridRateLimiter, SyncInterval},
     redis::RedisKey,
-    runtime::{new_interval, spawn_task, tick},
 };
 
 #[derive(Clone, Debug)]
@@ -108,6 +102,22 @@ impl HybridRateLimiterBuilder {
         self.allowed_lag_applies_to_rejections = value;
         self
     }
+
+    pub(crate) fn validate(self) -> Result<(HybridRateLimiterConfig, CleanupConfig), TrypemaError> {
+        let provider_config = self.provider.validate()?;
+        let cleanup = self.cleanup.validate()?;
+
+        let config = HybridRateLimiterConfig {
+            connection_manager: self.connection_manager,
+            prefix: self.prefix,
+            provider: provider_config,
+            sync_interval: self.sync_interval,
+            allowed_lag: self.allowed_lag,
+            allowed_lag_applies_to_rejections: self.allowed_lag_applies_to_rejections,
+        };
+
+        Ok((config, cleanup))
+    }
 }
 
 impl RateLimiterBuilder for HybridRateLimiterBuilder {
@@ -149,17 +159,7 @@ impl RateLimiterBuilder for HybridRateLimiterBuilder {
     }
 
     fn build(self) -> Result<Arc<Self::Provider>, TrypemaError> {
-        let provider_config = self.provider.validate()?;
-        let cleanup = self.cleanup.validate()?;
-
-        let config = HybridRateLimiterConfig {
-            connection_manager: self.connection_manager,
-            prefix: self.prefix,
-            provider: provider_config,
-            sync_interval: self.sync_interval,
-            allowed_lag: self.allowed_lag,
-            allowed_lag_applies_to_rejections: self.allowed_lag_applies_to_rejections,
-        };
+        let (config, cleanup) = self.validate()?;
 
         let provider = Arc::new(HybridRateLimiterProvider::new(config, cleanup));
 
@@ -199,9 +199,7 @@ impl RateLimiterBuilder for HybridRateLimiterBuilder {
 pub struct HybridRateLimiterProvider {
     absolute: Arc<AbsoluteHybridRateLimiter>,
     suppressed: Arc<SuppressedHybridRateLimiter>,
-    cleanup: CleanupConfig,
-    is_cleanup_loop_running: AtomicBool,
-    cleanup_generation: AtomicU64,
+    cleanup_loop: CleanupLoop,
 }
 
 impl HybridRateLimiterProvider {
@@ -212,57 +210,25 @@ impl HybridRateLimiterProvider {
 
     pub(crate) fn new(options: HybridRateLimiterConfig, cleanup: CleanupConfig) -> Self {
         Self {
-            absolute: AbsoluteHybridRateLimiter::new(options.clone()),
-            suppressed: SuppressedHybridRateLimiter::new(options),
-            cleanup,
-            is_cleanup_loop_running: AtomicBool::new(false),
-            cleanup_generation: AtomicU64::new(0),
+            absolute: AbsoluteHybridRateLimiter::new(options.clone(), cleanup),
+            suppressed: SuppressedHybridRateLimiter::new(options, cleanup),
+            cleanup_loop: CleanupLoop::new(cleanup),
         }
     }
 
     /// Start stale-state cleanup. Calling while already running is no-op.
     pub fn start_cleanup_loop(self: &Arc<Self>) {
-        if self.is_cleanup_loop_running.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        let generation = self
-            .cleanup_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-
-        let provider = Arc::downgrade(self);
-        let cleanup_interval = self.cleanup.interval;
-
-        spawn_task(async move {
-            let mut interval = new_interval(cleanup_interval);
-            // Tokio intervals tick immediately; Smol intervals wait for the configured duration.
-            #[cfg(feature = "redis-tokio")]
-            tick(&mut interval).await;
-
-            loop {
-                tick(&mut interval).await;
-                let Some(provider) = provider.upgrade() else {
-                    break;
-                };
-
-                if !provider.is_cleanup_loop_running.load(Ordering::Acquire)
-                    || provider.cleanup_generation.load(Ordering::Acquire) != generation
-                {
-                    break;
-                }
-
-                if let Err(error) = provider.cleanup(provider.cleanup.stale_after_ms()).await {
-                    tracing::warn!(?error, "Hybrid cleanup failed, will retry");
-                }
-            }
-        });
+        CleanupLoop::start_task(
+            self,
+            |provider| &provider.cleanup_loop,
+            |provider, stale_after_ms| async move { provider.cleanup(stale_after_ms).await },
+            "Hybrid cleanup failed, will retry",
+        );
     }
 
     /// Stop stale-state cleanup. Calling while stopped is no-op.
     pub fn stop_cleanup_loop(&self) {
-        self.cleanup_generation.fetch_add(1, Ordering::AcqRel);
-        self.is_cleanup_loop_running.store(false, Ordering::Release);
+        self.cleanup_loop.stop();
     }
 
     /// Access the absolute allow/reject strategy.

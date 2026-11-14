@@ -1,15 +1,17 @@
-//! Shared provider-builder API and configuration.
+//! Shared builder API and configuration for providers and limiters.
 
 use std::{sync::Arc, time::Duration};
 
 use crate::{BucketSize, HardLimitFactor, SuppressionFactorCachePeriod, TrypemaError, WindowSize};
 
-/// Shared configuration API implemented by every rate-limiter provider builder.
+/// Shared configuration API implemented by every provider builder and limiter builder.
 ///
-/// Provider-specific settings, such as Redis prefixes and hybrid synchronization intervals,
+/// A provider builder, such as `LocalRateLimiterProvider::builder()`, builds both strategies. A
+/// limiter builder, such as `AbsoluteLocalRateLimiter::builder()`, builds one strategy only.
+/// Backend-specific settings, such as Redis prefixes and hybrid synchronization intervals,
 /// remain inherent methods on their concrete builders.
 pub trait RateLimiterBuilder: Sized {
-    /// Provider produced by this builder.
+    /// Provider or limiter produced by this builder.
     type Provider;
 
     /// Set sliding-window duration.
@@ -33,12 +35,12 @@ pub trait RateLimiterBuilder: Sized {
     /// Set interval between stale-state cleanup passes.
     fn cleanup_interval(self, value: Duration) -> Self;
 
-    /// Disable automatic cleanup startup when provider is built.
+    /// Disable automatic cleanup startup when the provider or limiter is built.
     fn disable_cleanup(self) -> Self {
         self.cleanup_enabled(false)
     }
 
-    /// Enable automatic cleanup startup when provider is built.
+    /// Enable automatic cleanup startup when the provider or limiter is built.
     fn enable_cleanup(self) -> Self {
         self.cleanup_enabled(true)
     }
@@ -49,7 +51,7 @@ pub trait RateLimiterBuilder: Sized {
     /// [`disable_cleanup`](Self::disable_cleanup) when value is known statically.
     fn cleanup_enabled(self, enabled: bool) -> Self;
 
-    /// Build provider and start cleanup when enabled.
+    /// Build the provider or limiter and start cleanup when enabled.
     ///
     /// Returns [`TrypemaError::InvalidBucketSize`] when the configured bucket size exceeds the
     /// configured window size.
