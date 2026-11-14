@@ -561,12 +561,15 @@ Explain the provider-specific builder forms explicitly:
 - Local: `LocalRateLimiterProvider::builder()`.
 - Redis: `RedisRateLimiterProvider::builder(connection_manager)`.
 - Hybrid: `HybridRateLimiterProvider::builder(connection_manager)`.
+- One strategy: `<Limiter>::builder()` for the two local limiters and
+  `<Limiter>::builder(connection_manager)` for the four Redis and hybrid limiters, such as
+  `AbsoluteHybridRateLimiter::builder(connection_manager)`.
 
 Document the cleanup lifecycle:
 
 - The shared `RateLimiterBuilder::build()` starts cleanup automatically.
 - `cleanup_enabled(false)` disables automatic cleanup startup.
-- Provider `start_cleanup_loop()` and `stop_cleanup_loop()` methods are idempotent.
+- Provider and limiter `start_cleanup_loop()` and `stop_cleanup_loop()` methods are idempotent.
 
 In builder examples, put a short comment before optional chained setters. Use `Optional: ...` for
 general setters and `Optional: only available with 'redis-tokio' or 'redis-smol'` for Redis-only

@@ -102,6 +102,74 @@ Redis and hybrid operations accept `&RedisKey` (`try_inc` its borrowed form, `Re
 Local operations accept `&str`. Invalid Redis keys are rejected; keys are never silently
 sanitized.
 
+## Building one strategy directly
+
+A provider builds both strategies. When an application uses only one strategy, build that
+limiter directly. Each of the six limiters has a `builder()` that returns its own builder, for
+example `AbsoluteLocalRateLimiter::builder()` or
+`AbsoluteHybridRateLimiter::builder(connection_manager)`. The limiter builder implements
+the `RateLimiterBuilder` trait and has the same backend settings as the provider builder.
+`allowed_lag_applies_to_rejections` is only on the absolute hybrid builder. `build()` returns an
+`Arc` of the limiter. It does not create the state, Lua scripts, or background workers of the
+other strategy.
+
+A limiter built with prefix `P` uses the same Redis keys as the provider with prefix `P`, so the
+two share state. `build()` starts the stale-state cleanup loop of the limiter unless cleanup is
+disabled. The limiter has idempotent `start_cleanup_loop()` and `stop_cleanup_loop()` methods.
+Its cleanup loop and the hybrid synchronization worker end after the last `Arc` drops. The
+absolute builders accept `hard_limit_factor` and `suppression_factor_cache_period` because the
+trait is shared, but these settings have no effect on the absolute strategy.
+
+```rust
+use std::time::Duration;
+use trypema::{
+    BucketSize, RateLimit, RateLimitDecision, RateLimiterBuilder, WindowSize,
+    local::AbsoluteLocalRateLimiter,
+};
+
+let limiter = AbsoluteLocalRateLimiter::builder()
+    .window_size(WindowSize::minutes_or_panic(1))
+    .bucket_size(BucketSize::milliseconds_or_panic(10))
+    .stale_after(Duration::from_secs(300))
+    .build()
+    .unwrap();
+
+let rate = RateLimit::per_second_or_panic(10.0);
+assert!(matches!(limiter.inc("user-123", &rate, 1), RateLimitDecision::Allowed));
+```
+
+The Redis and hybrid limiter builders take the connection manager, as the provider builders do:
+
+```rust,ignore
+use trypema::{RateLimiterBuilder, WindowSize};
+use trypema::redis::{AbsoluteRedisRateLimiter, RedisKey};
+
+let limiter = AbsoluteRedisRateLimiter::builder(connection)
+    .prefix(RedisKey::try_from("my-service")?)
+    .window_size(WindowSize::minutes_or_panic(1))
+    .build()?;
+```
+
+```rust,ignore
+use std::time::Duration;
+use trypema::{
+    BucketSize, RateLimiterBuilder, WindowSize,
+    hybrid::{AbsoluteHybridRateLimiter, SyncInterval},
+    redis::RedisKey,
+};
+
+let limiter = AbsoluteHybridRateLimiter::builder(connection)
+    .prefix(RedisKey::try_from("ip-ban")?)
+    .window_size(WindowSize::minutes_or_panic(1))
+    .bucket_size(BucketSize::milliseconds_or_panic(100))
+    .stale_after(Duration::from_secs(600))
+    // Optional: only available with 'redis-tokio' or 'redis-smol'
+    .sync_interval(SyncInterval::milliseconds_or_panic(10))
+    // Optional: only available with 'redis-tokio' or 'redis-smol'
+    .allowed_lag_applies_to_rejections(true)
+    .build()?;
+```
+
 ## Semantic time values
 
 The public API uses validated, unit-aware values:
@@ -115,8 +183,9 @@ The public API uses validated, unit-aware values:
 | `hybrid::SyncInterval` | `milliseconds`, `seconds`, `minutes`, `hours` |
 | `hybrid::AllowedLag` | `milliseconds`, `seconds`, `minutes`, `hours` |
 
-Provider builders require `bucket_size` to be less than or equal to `window_size`; equality is
-valid. The relationship is checked by `build()`, regardless of setter order.
+Provider and limiter builders require `bucket_size` to be less than or equal to
+`window_size`; equality is valid. The relationship is checked by `build()`, regardless of
+setter order.
 
 One month is defined as 30 days. Every constructor has an `_or_panic` counterpart. `RateLimit`
 provides matching `as_per_second()`, `as_per_minute()`, `as_per_hour()`, `as_per_day()`,
