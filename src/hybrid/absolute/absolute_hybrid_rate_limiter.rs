@@ -21,7 +21,7 @@ use crate::{
     hybrid::{
         AbsoluteHybridCommitterSignal, HybridBackend, RedisCommitter, RedisCommitterOptions,
         RedisProxyCommitter,
-        absolute_hybrid_redis_proxy::{
+        absolute::{
             AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyOptions,
             AbsoluteHybridRedisProxyReadStateResult,
         },

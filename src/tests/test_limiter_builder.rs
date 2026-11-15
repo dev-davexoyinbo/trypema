@@ -2,6 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use super::wait::wait_until;
 use crate::{
     BucketSize, HardLimitFactor, RateLimit, RateLimitDecision, RateLimiterBuilder, TrypemaError,
     WindowSize,
@@ -24,6 +25,7 @@ fn absolute_local_builder_defaults_build() {
         RateLimitDecision::Allowed
     ));
     assert_eq!(limiter.series().get("key").unwrap().window_limit, 10.0);
+    // The cleanup loop holds only a `Weak` until its first pass, one 30 s default interval later.
     assert_eq!(Arc::strong_count(&limiter), 1);
 }
 
@@ -136,9 +138,14 @@ fn absolute_local_builder_cleanup_enabled_and_disabled() {
         disabled.inc("key", &rate, 1),
         RateLimitDecision::Allowed
     ));
-    std::thread::sleep(Duration::from_millis(150));
+    wait_until(
+        || enabled.series().is_empty(),
+        "the enabled loop must remove the stale key",
+    );
+    // The disabled key is as stale as the removed one. A loop at the 20 ms interval would remove
+    // it in this window of five intervals.
+    std::thread::sleep(Duration::from_millis(100));
 
-    assert_eq!(enabled.series().len(), 0);
     assert_eq!(disabled.series().len(), 1);
 }
 
@@ -164,9 +171,14 @@ fn suppressed_local_builder_cleanup_enabled_and_disabled() {
         disabled.inc("key", &rate, 1),
         RateLimitDecision::Allowed
     ));
-    std::thread::sleep(Duration::from_millis(150));
+    wait_until(
+        || enabled.series().is_empty(),
+        "the enabled loop must remove the stale key",
+    );
+    // The disabled key is as stale as the removed one. A loop at the 20 ms interval would remove
+    // it in this window of five intervals.
+    std::thread::sleep(Duration::from_millis(100));
 
-    assert_eq!(enabled.series().len(), 0);
     assert_eq!(disabled.series().len(), 1);
 }
 
@@ -186,8 +198,10 @@ fn local_limiter_cleanup_can_be_started_stopped_and_restarted() {
     ));
     limiter.start_cleanup_loop();
     limiter.start_cleanup_loop();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(limiter.series().len(), 0);
+    wait_until(
+        || limiter.series().is_empty(),
+        "the started loop must remove the stale key",
+    );
 
     assert!(matches!(
         limiter.inc("key", &rate, 1),
@@ -195,14 +209,18 @@ fn local_limiter_cleanup_can_be_started_stopped_and_restarted() {
     ));
     limiter.stop_cleanup_loop();
     limiter.stop_cleanup_loop();
+    // The key turns stale after 40 ms. A loop still running at the 20 ms interval would remove it
+    // in this window.
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(limiter.series().len(), 1);
 
     limiter.start_cleanup_loop();
     limiter.stop_cleanup_loop();
     limiter.start_cleanup_loop();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(limiter.series().len(), 0);
+    wait_until(
+        || limiter.series().is_empty(),
+        "the restarted loop must remove the stale key",
+    );
 }
 
 #[test]
@@ -220,9 +238,10 @@ fn provider_limiter_stop_does_not_stop_provider_cleanup() {
         provider.absolute().inc("key", &rate, 1),
         RateLimitDecision::Allowed
     ));
-    std::thread::sleep(Duration::from_millis(150));
-
-    assert_eq!(provider.absolute().series().len(), 0);
+    wait_until(
+        || provider.absolute().series().is_empty(),
+        "the provider loop must remove the stale key of its limiter",
+    );
 }
 
 #[test]
@@ -234,10 +253,12 @@ fn dropping_last_local_limiter_arc_frees_limiter_with_cleanup_running() {
     let weak = Arc::downgrade(&limiter);
 
     drop(limiter);
-    // The loop holds a strong reference only during a cleanup pass.
-    std::thread::sleep(Duration::from_millis(60));
 
-    assert!(weak.upgrade().is_none());
+    // The loop holds a strong reference only during a cleanup pass.
+    wait_until(
+        || weak.strong_count() == 0,
+        "the cleanup loop must not keep the dropped limiter alive",
+    );
 }
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -252,6 +273,7 @@ mod redis_backed {
             unique_prefix, wait_for_hybrid_sync,
         },
         runtime,
+        wait::wait_until_async,
     };
     use super::invalid_bucket_size;
     use crate::{
@@ -312,6 +334,8 @@ mod redis_backed {
                     .build()
                     .unwrap();
 
+            // The cleanup task holds only a `Weak` until its first pass, one 30 s default
+            // interval later.
             assert_eq!(Arc::strong_count(&limiter), 1);
         });
     }
@@ -361,6 +385,8 @@ mod redis_backed {
                     .build()
                     .unwrap();
 
+            // The cleanup task holds only a `Weak` until its first pass, one 30 s default
+            // interval later.
             assert_eq!(Arc::strong_count(&limiter), 1);
         });
     }
@@ -476,7 +502,20 @@ mod redis_backed {
                 cases.push((enabled, prefix, absolute, suppressed));
             }
 
-            runtime::async_sleep(Duration::from_millis(220)).await;
+            let enabled_prefix = &cases[0].1;
+            wait_until_async(
+                async || {
+                    let mut connection = connection.clone();
+                    !total_exists(&mut connection, enabled_prefix, RateType::Absolute, &k).await
+                        && !total_exists(&mut connection, enabled_prefix, RateType::Suppressed, &k)
+                            .await
+                },
+                "the enabled loops must remove the stale keys",
+            )
+            .await;
+            // The disabled keys are as stale as the removed ones. Loops at the 40 ms interval
+            // would remove them in this window of five intervals.
+            runtime::async_sleep(Duration::from_millis(200)).await;
 
             for (enabled, prefix, _absolute, _suppressed) in &cases {
                 for rate_type in [RateType::Absolute, RateType::Suppressed] {
@@ -511,12 +550,20 @@ mod redis_backed {
             limiter.inc(&started, &rate, 1).await.unwrap();
             limiter.start_cleanup_loop();
             limiter.start_cleanup_loop();
-            runtime::async_sleep(Duration::from_millis(220)).await;
-            assert!(!total_exists(&mut connection, &prefix, RateType::Absolute, &started).await);
+            wait_until_async(
+                async || {
+                    let mut connection = connection.clone();
+                    !total_exists(&mut connection, &prefix, RateType::Absolute, &started).await
+                },
+                "the started loop must remove the stale key",
+            )
+            .await;
 
             limiter.stop_cleanup_loop();
             limiter.stop_cleanup_loop();
             limiter.inc(&stopped, &rate, 1).await.unwrap();
+            // The key turns stale after 100 ms. A loop still running at the 40 ms interval would
+            // remove it in this window.
             runtime::async_sleep(Duration::from_millis(220)).await;
             assert!(total_exists(&mut connection, &prefix, RateType::Absolute, &stopped).await);
         });
@@ -563,6 +610,9 @@ mod redis_backed {
                     .build()
                     .unwrap();
 
+            // Every worker holds only a `Weak` until its first wake: the epoch task after 15 s,
+            // the cleanup task after the 30 s default interval, and the flush listener at the
+            // first flush, which waits for an increment.
             assert_eq!(Arc::strong_count(&limiter), 1);
             assert_eq!(limiter.allowed_lag, Duration::from_secs(1));
             assert!(!limiter.allowed_lag_applies_to_rejections);
@@ -605,11 +655,15 @@ mod redis_backed {
                 "a 1 s sync interval must not flush after 150 ms"
             );
 
-            wait_for_hybrid_sync(1_000).await;
-            assert_eq!(
-                window_limit(&mut connection, &prefix, RateType::HybridAbsolute, &k).await,
-                Some(20.0)
-            );
+            wait_until_async(
+                async || {
+                    let mut connection = connection.clone();
+                    window_limit(&mut connection, &prefix, RateType::HybridAbsolute, &k).await
+                        == Some(20.0)
+                },
+                "the 1 s sync interval must flush the window limit",
+            )
+            .await;
             assert_eq!(
                 bucket_count(&mut connection, &prefix, RateType::HybridAbsolute, &k).await,
                 1
@@ -625,6 +679,9 @@ mod redis_backed {
                     .build()
                     .unwrap();
 
+            // Every worker holds only a `Weak` until its first wake: the epoch task after 15 s,
+            // the cleanup task after the 30 s default interval, and the flush listener at the
+            // first flush, which waits for an increment.
             assert_eq!(Arc::strong_count(&limiter), 1);
             assert_eq!(limiter.allowed_lag, Duration::from_secs(1));
         });
@@ -665,11 +722,15 @@ mod redis_backed {
                 "a 1 s sync interval must not flush after 150 ms"
             );
 
-            wait_for_hybrid_sync(1_000).await;
-            assert_eq!(
-                window_limit(&mut connection, &prefix, RateType::HybridSuppressed, &k).await,
-                Some(30.0)
-            );
+            wait_until_async(
+                async || {
+                    let mut connection = connection.clone();
+                    window_limit(&mut connection, &prefix, RateType::HybridSuppressed, &k).await
+                        == Some(30.0)
+                },
+                "the 1 s sync interval must flush the window limit",
+            )
+            .await;
             assert_eq!(
                 bucket_count(&mut connection, &prefix, RateType::HybridSuppressed, &k).await,
                 1
@@ -762,22 +823,28 @@ mod redis_backed {
                 limiter.inc(&k, &rate, 3).await.unwrap(),
                 RateLimitDecision::Allowed
             ));
-            wait_for_hybrid_sync(5).await;
-            assert_eq!(provider.absolute().get(&k).await.unwrap(), 3);
+            wait_until_async(
+                async || provider.absolute().get(&k).await.unwrap() == 3,
+                "the provider must read the limiter's flushed increment",
+            )
+            .await;
 
             assert!(matches!(
                 provider.absolute().inc(&k, &rate, 2).await.unwrap(),
                 RateLimitDecision::Allowed
             ));
-            wait_for_hybrid_sync(5).await;
-            assert_eq!(limiter.get(&k).await.unwrap(), 5);
+            wait_until_async(
+                async || limiter.get(&k).await.unwrap() == 5,
+                "the limiter must read the provider's flushed increment",
+            )
+            .await;
         });
     }
 
     #[test]
     fn absolute_hybrid_limiter_inc_flushes_to_redis() {
         runtime::block_on(async {
-            let mut connection = connection_manager().await;
+            let connection = connection_manager().await;
             let prefix = unique_prefix();
             let limiter: Arc<AbsoluteHybridRateLimiter> =
                 RateLimiterBuilder::hybrid(connection.clone())
@@ -793,13 +860,18 @@ mod redis_backed {
                 limiter.inc(&k, &rate, 2).await.unwrap(),
                 RateLimitDecision::Allowed
             ));
-            wait_for_hybrid_sync(5).await;
-
-            let total: Option<u64> = connection
-                .get(key_gen(&prefix, RateType::HybridAbsolute).get_total_count_key(&k))
-                .await
-                .unwrap();
-            assert_eq!(total, Some(2));
+            wait_until_async(
+                async || {
+                    let total: Option<u64> = connection
+                        .clone()
+                        .get(key_gen(&prefix, RateType::HybridAbsolute).get_total_count_key(&k))
+                        .await
+                        .unwrap();
+                    total == Some(2)
+                },
+                "the sync interval must flush the increment to Redis",
+            )
+            .await;
         });
     }
 
@@ -880,10 +952,13 @@ mod redis_backed {
             let weak = Arc::downgrade(&limiter);
 
             drop(limiter);
-            // Workers hold a strong reference only while they run one pass.
-            runtime::async_sleep(Duration::from_millis(100)).await;
 
-            assert_eq!(weak.strong_count(), 0);
+            // Workers hold a strong reference only while they run one pass or flush.
+            wait_until_async(
+                async || weak.strong_count() == 0,
+                "the workers must not keep the dropped limiter alive",
+            )
+            .await;
         });
     }
 

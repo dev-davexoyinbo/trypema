@@ -1,27 +1,42 @@
 use std::time::Duration;
 
-use crate::{RateLimit, WindowSize, local::LocalRateLimiterProvider};
+use super::wait::wait_until;
+use crate::{
+    BucketSize, RateLimit, RateLimitDecision, WindowSize, local::LocalRateLimiterProvider,
+};
 
 #[test]
 fn local_cleanup_removes_stale_entries_and_keeps_active_entries() {
+    // Cleanup judges a key by its newest bucket. The 10 ms bucket keeps that bucket of the
+    // active key close to its last increment, far inside the 200 ms `stale_after`.
     let provider = LocalRateLimiterProvider::builder()
-        .window_size(WindowSize::seconds_or_panic(1))
-        .stale_after(Duration::from_millis(100))
-        .cleanup_interval(Duration::from_millis(40))
+        .window_size(WindowSize::seconds_or_panic(60))
+        .bucket_size(BucketSize::milliseconds_or_panic(10))
+        .stale_after(Duration::from_millis(200))
+        .cleanup_interval(Duration::from_millis(20))
         .build()
         .unwrap();
-    let rate = RateLimit::per_second_or_panic(100.0);
+    let rate = RateLimit::per_second_or_panic(1_000.0);
 
-    provider.absolute().inc("stale", &rate, 1);
-    provider.absolute().inc("active", &rate, 1);
-    for _ in 0..4 {
-        std::thread::sleep(Duration::from_millis(40));
-        provider.absolute().inc("active", &rate, 1);
-    }
-    std::thread::sleep(Duration::from_millis(60));
+    assert!(matches!(
+        provider.absolute().inc("stale", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    let mut active_count = 0;
+    wait_until(
+        || {
+            assert!(matches!(
+                provider.absolute().inc("active", &rate, 1),
+                RateLimitDecision::Allowed
+            ));
+            active_count += 1;
+            provider.absolute().series().get("stale").is_none()
+        },
+        "the loop must remove the stale entry",
+    );
 
-    assert!(provider.absolute().series().get("stale").is_none());
-    assert!(provider.absolute().series().get("active").is_some());
+    // A pass that removed the active entry would lose its earlier increments.
+    assert_eq!(provider.absolute().get("active"), active_count);
 }
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -29,6 +44,7 @@ fn local_cleanup_removes_stale_entries_and_keeps_active_entries() {
 fn redis_and_hybrid_cleanup_start_by_default() {
     use redis::AsyncCommands;
 
+    use super::wait::wait_until_async;
     use crate::{
         BucketSize,
         common::RateType,
@@ -39,17 +55,22 @@ fn redis_and_hybrid_cleanup_start_by_default() {
     super::runtime::block_on(async {
         let connection_manager = super::common::connection_manager().await;
         let rate = RateLimit::per_second_or_panic(100.0);
+        let cleanup_interval = Duration::from_millis(500);
+        let started = std::time::Instant::now();
 
         let redis_prefix = super::common::unique_prefix();
         let redis = RedisRateLimiterProvider::builder(connection_manager.clone())
             .prefix(redis_prefix.clone())
             .window_size(WindowSize::seconds_or_panic(60))
             .stale_after(Duration::from_millis(50))
-            .cleanup_interval(Duration::from_millis(200))
+            .cleanup_interval(cleanup_interval)
             .build()
             .unwrap();
         let redis_key = super::common::key("redis_cleanup");
-        redis.absolute().inc(&redis_key, &rate, 1).await.unwrap();
+        assert!(matches!(
+            redis.absolute().inc(&redis_key, &rate, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
 
         let hybrid_prefix = super::common::unique_prefix();
         let hybrid = HybridRateLimiterProvider::builder(connection_manager.clone())
@@ -58,31 +79,49 @@ fn redis_and_hybrid_cleanup_start_by_default() {
             .bucket_size(BucketSize::milliseconds_or_panic(5))
             .sync_interval(SyncInterval::milliseconds_or_panic(5))
             .stale_after(Duration::from_millis(50))
-            .cleanup_interval(Duration::from_millis(200))
+            .cleanup_interval(cleanup_interval)
             .build()
             .unwrap();
         let hybrid_key = super::common::key("hybrid_cleanup");
-        hybrid.absolute().inc(&hybrid_key, &rate, 1).await.unwrap();
+        assert!(matches!(
+            hybrid.absolute().inc(&hybrid_key, &rate, 1).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
 
-        // This is after one cleanup interval but before two; Smol must not discard its first tick.
-        super::runtime::async_sleep(Duration::from_millis(325)).await;
+        wait_until_async(
+            async || {
+                for (prefix, rate_type, key) in [
+                    (&redis_prefix, RateType::Absolute, &redis_key),
+                    (&hybrid_prefix, RateType::HybridAbsolute, &hybrid_key),
+                ] {
+                    let key_generator = super::common::key_gen(prefix, rate_type);
+                    let mut connection = connection_manager.clone();
+                    for entity_key in key_generator.get_all_entity_keys(key) {
+                        let exists: bool = connection.exists(entity_key).await.unwrap();
+                        if exists {
+                            return false;
+                        }
+                    }
+                    let score: Option<f64> = connection
+                        .zscore(key_generator.get_active_entities_key(), key.as_str())
+                        .await
+                        .unwrap();
+                    if score.is_some() {
+                        return false;
+                    }
+                }
+                true
+            },
+            "default cleanup must remove the stale state and active membership",
+        )
+        .await;
 
-        for (prefix, rate_type, key) in [
-            (&redis_prefix, RateType::Absolute, &redis_key),
-            (&hybrid_prefix, RateType::HybridAbsolute, &hybrid_key),
-        ] {
-            let key_generator = super::common::key_gen(prefix, rate_type);
-            let mut connection = connection_manager.clone();
-            for entity_key in key_generator.get_all_entity_keys(key) {
-                let exists: bool = connection.exists(entity_key).await.unwrap();
-                assert!(!exists, "default cleanup left stale state for {key:?}");
-            }
-            let score: Option<f64> = connection
-                .zscore(key_generator.get_active_entities_key(), key.as_str())
-                .await
-                .unwrap();
-            assert!(score.is_none(), "default cleanup left active membership");
-        }
+        // A second pass cannot run before two intervals. Smol must not discard its first tick.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < cleanup_interval * 2,
+            "the stale state was removed after {elapsed:?}, not by the first pass"
+        );
     });
 }
 
@@ -91,12 +130,26 @@ fn redis_and_hybrid_cleanup_start_by_default() {
 fn redis_and_hybrid_cleanup_support_opt_out_stop_and_restart() {
     use redis::AsyncCommands;
 
+    use super::wait::wait_until_async;
     use crate::{
         BucketSize,
         common::RateType,
         hybrid::{HybridRateLimiterProvider, SyncInterval},
-        redis::RedisRateLimiterProvider,
+        redis::{ConnectionManager, RedisKey, RedisRateLimiterProvider},
     };
+
+    async fn total_exists(
+        connection_manager: &ConnectionManager,
+        prefix: &RedisKey,
+        rate_type: RateType,
+        key: &RedisKey,
+    ) -> bool {
+        connection_manager
+            .clone()
+            .exists(super::common::key_gen(prefix, rate_type).get_total_count_key(key))
+            .await
+            .unwrap()
+    }
 
     super::runtime::block_on(async {
         let connection_manager = super::common::connection_manager().await;
@@ -128,37 +181,32 @@ fn redis_and_hybrid_cleanup_support_opt_out_stop_and_restart() {
         let hybrid_key = super::common::key("hybrid_lifecycle");
         hybrid.absolute().inc(&hybrid_key, &rate, 1).await.unwrap();
 
+        // The keys turn stale after 100 ms. Loops at the 40 ms interval would remove them in this
+        // window.
         super::runtime::async_sleep(Duration::from_millis(220)).await;
         for (prefix, rate_type, key) in [
             (&redis_prefix, RateType::Absolute, &redis_key),
             (&hybrid_prefix, RateType::HybridAbsolute, &hybrid_key),
         ] {
-            let key_generator = super::common::key_gen(prefix, rate_type);
-            let mut connection = connection_manager.clone();
-            let exists: bool = connection
-                .exists(key_generator.get_total_count_key(key))
-                .await
-                .unwrap();
-            assert!(exists, "cleanup opt-out lost state for {key:?}");
+            assert!(
+                total_exists(&connection_manager, prefix, rate_type, key).await,
+                "cleanup opt-out lost state for {key:?}"
+            );
         }
 
         redis.start_cleanup_loop();
         redis.start_cleanup_loop();
         hybrid.start_cleanup_loop();
         hybrid.start_cleanup_loop();
-        super::runtime::async_sleep(Duration::from_millis(220)).await;
-
         for (prefix, rate_type, key) in [
             (&redis_prefix, RateType::Absolute, &redis_key),
             (&hybrid_prefix, RateType::HybridAbsolute, &hybrid_key),
         ] {
-            let key_generator = super::common::key_gen(prefix, rate_type);
-            let mut connection = connection_manager.clone();
-            let exists: bool = connection
-                .exists(key_generator.get_total_count_key(key))
-                .await
-                .unwrap();
-            assert!(!exists, "started cleanup retained stale state for {key:?}");
+            wait_until_async(
+                async || !total_exists(&connection_manager, prefix, rate_type, key).await,
+                &format!("started cleanup must remove the stale state for {key:?}"),
+            )
+            .await;
         }
 
         redis.stop_cleanup_loop();
@@ -170,19 +218,18 @@ fn redis_and_hybrid_cleanup_support_opt_out_stop_and_restart() {
         let hybrid_key = super::common::key("hybrid_stopped");
         redis.absolute().inc(&redis_key, &rate, 1).await.unwrap();
         hybrid.absolute().inc(&hybrid_key, &rate, 1).await.unwrap();
+        // The keys turn stale after 100 ms. Loops still running at the 40 ms interval would
+        // remove them in this window.
         super::runtime::async_sleep(Duration::from_millis(220)).await;
 
         for (prefix, rate_type, key) in [
             (&redis_prefix, RateType::Absolute, &redis_key),
             (&hybrid_prefix, RateType::HybridAbsolute, &hybrid_key),
         ] {
-            let key_generator = super::common::key_gen(prefix, rate_type);
-            let mut connection = connection_manager.clone();
-            let exists: bool = connection
-                .exists(key_generator.get_total_count_key(key))
-                .await
-                .unwrap();
-            assert!(exists, "stopped cleanup removed state for {key:?}");
+            assert!(
+                total_exists(&connection_manager, prefix, rate_type, key).await,
+                "stopped cleanup removed state for {key:?}"
+            );
         }
 
         redis.start_cleanup_loop();
@@ -191,22 +238,15 @@ fn redis_and_hybrid_cleanup_support_opt_out_stop_and_restart() {
         hybrid.start_cleanup_loop();
         hybrid.stop_cleanup_loop();
         hybrid.start_cleanup_loop();
-        super::runtime::async_sleep(Duration::from_millis(220)).await;
-
         for (prefix, rate_type, key) in [
             (&redis_prefix, RateType::Absolute, &redis_key),
             (&hybrid_prefix, RateType::HybridAbsolute, &hybrid_key),
         ] {
-            let key_generator = super::common::key_gen(prefix, rate_type);
-            let mut connection = connection_manager.clone();
-            let exists: bool = connection
-                .exists(key_generator.get_total_count_key(key))
-                .await
-                .unwrap();
-            assert!(
-                !exists,
-                "restarted cleanup retained stale state for {key:?}"
-            );
+            wait_until_async(
+                async || !total_exists(&connection_manager, prefix, rate_type, key).await,
+                &format!("restarted cleanup must remove the stale state for {key:?}"),
+            )
+            .await;
         }
     });
 }
@@ -220,16 +260,15 @@ mod loop_lifecycle {
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
-        time::{Duration, Instant},
+        time::Duration,
     };
 
-    use crate::{builder::CleanupConfig, cleanup_loop::CleanupLoop};
+    use crate::{builder::CleanupConfig, cleanup_loop::CleanupLoop, tests::wait::wait_until};
 
     pub(super) const INTERVAL: Duration = Duration::from_millis(20);
     /// Interval for the restart tests: long enough that a stop and a start run before the first
     /// loop wakes.
     pub(super) const LONG_INTERVAL: Duration = Duration::from_millis(200);
-    pub(super) const BOUND: Duration = Duration::from_secs(3);
 
     pub(super) struct Owner {
         pub(super) cleanup_loop: CleanupLoop,
@@ -299,15 +338,6 @@ mod loop_lifecycle {
             |owner| &owner.cleanup_loop,
             thread_cleanup(probe.0, probe.1),
         );
-    }
-
-    /// Wait until `condition` holds, or fail with `message` after `BOUND`.
-    pub(super) fn wait_until(mut condition: impl FnMut() -> bool, message: &str) {
-        let deadline = Instant::now() + BOUND;
-        while !condition() {
-            assert!(Instant::now() < deadline, "{message} within {BOUND:?}");
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
 
     #[test]
@@ -385,11 +415,14 @@ mod loop_lifecycle {
                 Arc,
                 atomic::{AtomicUsize, Ordering},
             },
-            time::Instant,
         };
 
-        use super::{BOUND, INTERVAL, LONG_INTERVAL, LoopEnd, Owner, Probe, owner};
-        use crate::{TrypemaError, cleanup_loop::CleanupLoop, tests::runtime};
+        use super::{INTERVAL, LONG_INTERVAL, LoopEnd, Owner, Probe, owner};
+        use crate::{
+            TrypemaError,
+            cleanup_loop::CleanupLoop,
+            tests::{runtime, wait::wait_until_async},
+        };
 
         fn task_cleanup(
             calls: Arc<AtomicUsize>,
@@ -412,15 +445,6 @@ mod loop_lifecycle {
             );
         }
 
-        /// Wait on the runtime until `condition` holds, or fail with `message` after `BOUND`.
-        async fn wait_until(mut condition: impl FnMut() -> bool, message: &str) {
-            let deadline = Instant::now() + BOUND;
-            while !condition() {
-                assert!(Instant::now() < deadline, "{message} within {BOUND:?}");
-                runtime::async_sleep(std::time::Duration::from_millis(5)).await;
-            }
-        }
-
         fn on_runtime(test: impl Future<Output = ()>) {
             runtime::block_on(test);
         }
@@ -431,12 +455,12 @@ mod loop_lifecycle {
                 let owner = owner(INTERVAL);
                 let (probe, calls, loop_end) = Probe::new();
                 start_task(&owner, (calls, loop_end));
-                wait_until(|| probe.calls() >= 1, "the started loop must run").await;
+                wait_until_async(async || probe.calls() >= 1, "the started loop must run").await;
 
                 drop(owner);
 
-                wait_until(
-                    || probe.has_ended(),
+                wait_until_async(
+                    async || probe.has_ended(),
                     "the loop must end after the owner drops",
                 )
                 .await;
@@ -452,11 +476,11 @@ mod loop_lifecycle {
                 let owner = owner(INTERVAL);
                 let (probe, calls, loop_end) = Probe::new();
                 start_task(&owner, (calls, loop_end));
-                wait_until(|| probe.calls() >= 1, "the started loop must run").await;
+                wait_until_async(async || probe.calls() >= 1, "the started loop must run").await;
 
                 owner.cleanup_loop.stop();
 
-                wait_until(|| probe.has_ended(), "the loop must end after stop").await;
+                wait_until_async(async || probe.has_ended(), "the loop must end after stop").await;
                 let calls_at_end = probe.calls();
                 runtime::async_sleep(INTERVAL * 5).await;
                 assert_eq!(probe.calls(), calls_at_end);
@@ -481,19 +505,19 @@ mod loop_lifecycle {
                     third.has_ended(),
                     "a start while a loop runs must not start a second loop"
                 );
-                wait_until(
-                    || first.has_ended(),
+                wait_until_async(
+                    async || first.has_ended(),
                     "the stopped loop must end at its wake",
                 )
                 .await;
-                wait_until(|| second.calls() >= 3, "the restarted loop must run").await;
+                wait_until_async(async || second.calls() >= 3, "the restarted loop must run").await;
                 assert_eq!(first.calls(), 0, "the stopped loop must not run a pass");
                 assert_eq!(third.calls(), 0);
                 assert!(!second.has_ended(), "the restarted loop must keep running");
 
                 drop(owner);
-                wait_until(
-                    || second.has_ended(),
+                wait_until_async(
+                    async || second.has_ended(),
                     "the loop must end after the owner drops",
                 )
                 .await;

@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
+use super::wait::wait_until;
 use crate::{
     BucketSize, HardLimitFactor, RateLimit, RateLimitComparator, RateLimitDecision,
     RateLimiterBuilder, SuppressionFactorCachePeriod, TrypemaError, WindowSize,
@@ -220,13 +221,17 @@ fn cleanup_can_be_disabled_started_stopped_and_restarted() {
         provider.absolute().inc("key", &rate, 1),
         RateLimitDecision::Allowed
     ));
+    // The key turns stale after 40 ms. A loop at the 20 ms interval would remove it in this
+    // window.
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(provider.absolute().series().len(), 1);
 
     provider.start_cleanup_loop();
     provider.start_cleanup_loop();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(provider.absolute().series().len(), 0);
+    wait_until(
+        || provider.absolute().series().is_empty(),
+        "the started loop must remove the stale key",
+    );
 
     assert!(matches!(
         provider.absolute().inc("key", &rate, 1),
@@ -234,14 +239,18 @@ fn cleanup_can_be_disabled_started_stopped_and_restarted() {
     ));
     provider.stop_cleanup_loop();
     provider.stop_cleanup_loop();
+    // The key turns stale after 40 ms. A loop still running at the 20 ms interval would remove it
+    // in this window.
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(provider.absolute().series().len(), 1);
 
     provider.start_cleanup_loop();
     provider.stop_cleanup_loop();
     provider.start_cleanup_loop();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(provider.absolute().series().len(), 0);
+    wait_until(
+        || provider.absolute().series().is_empty(),
+        "the restarted loop must remove the stale key",
+    );
 }
 
 #[test]
@@ -259,8 +268,10 @@ fn cleanup_convenience_methods_follow_builder_order() {
         provider.absolute().inc("key", &rate, 1),
         RateLimitDecision::Allowed
     ));
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(provider.absolute().series().len(), 0);
+    wait_until(
+        || provider.absolute().series().is_empty(),
+        "the enabled loop must remove the stale key",
+    );
 }
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -499,6 +510,8 @@ fn redis_and_hybrid_shortcuts_build_their_own_type_without_annotation() {
         let _: &Arc<AbsoluteHybridRateLimiter> = &absolute_hybrid;
         let _: &Arc<SuppressedHybridRateLimiter> = &suppressed_hybrid;
         assert_eq!(Arc::strong_count(&redis), 1);
+        // The epoch task holds only a `Weak` until its first wake 15 s after the build, and the
+        // flush listener until the first flush, which waits for an increment.
         assert_eq!(Arc::strong_count(&absolute_hybrid), 1);
     });
 }

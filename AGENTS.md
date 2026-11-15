@@ -44,14 +44,14 @@ Trypema has two rate-limiting strategies across three providers:
 | --- | --- | --- | --- |
 | Local | `src/local/absolute_local_rate_limiter.rs` | `src/local/suppressed_local_rate_limiter.rs` | Always compiled |
 | Redis | `src/redis/absolute_redis_rate_limiter.rs` | `src/redis/suppressed_redis_rate_limiter.rs` | Requires one Redis runtime feature |
-| Hybrid | `src/hybrid/absolute_hybrid_rate_limiter.rs` | `src/hybrid/suppressed_hybrid_rate_limiter.rs` | Requires one Redis runtime feature |
+| Hybrid | `src/hybrid/absolute/absolute_hybrid_rate_limiter.rs` | `src/hybrid/suppressed/suppressed_hybrid_rate_limiter.rs` | Requires one Redis runtime feature |
 
 Supporting areas:
 
 - Shared public types and comparator/history enums: `src/common.rs`
 - Redis Lua scripts: `src/redis/scripts.rs`
 - Shared Redis types and Rust helpers: `src/redis/common.rs`
-- Hybrid Redis proxies and commit coordination: `src/hybrid/`
+- Hybrid Redis proxies and commit coordination: `src/hybrid/`. Each strategy's limiter and Redis proxy are in `src/hybrid/absolute/` and `src/hybrid/suppressed/`; the provider, the committer and the shared types are in `src/hybrid/`.
 - Unit/integration tests: `src/tests/`
 - Criterion benchmarks: `benches/`
 - Stress harness: `stress/`
