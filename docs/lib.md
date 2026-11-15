@@ -7,29 +7,43 @@ the local, Redis, or hybrid workers they actually use.
 ## Local provider
 
 ```
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use trypema::{
     BucketSize, RateLimit, RateLimitDecision, RateLimiterBuilder, WindowSize,
     local::LocalRateLimiterProvider,
 };
 
-let provider = LocalRateLimiterProvider::builder()
+let provider: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
     .window_size(WindowSize::minutes_or_panic(1))
     .bucket_size(BucketSize::milliseconds_or_panic(10))
     .cleanup_interval(Duration::from_secs(30))
-    .build()
-    .unwrap();
+    .build()?;
 
 let rate = RateLimit::per_second_or_panic(10.0);
 let decision = provider.absolute().inc("user-123", &rate, 1);
 assert!(matches!(decision, RateLimitDecision::Allowed));
+# Ok::<(), trypema::TrypemaError>(())
 ```
 
-Every concrete builder implements [`RateLimiterBuilder`]. Shared methods configure windowing,
-suppression, and stale-state cleanup. `build()` returns an `Arc` and starts cleanup by default;
-use `disable_cleanup()` to opt out and `enable_cleanup()` to opt back in while configuring the
-builder. A provider's idempotent `start_cleanup_loop()` and `stop_cleanup_loop()` methods control
-cleanup after construction.
+[`RateLimiterBuilder`] builds every provider and limiter. Start from the backend:
+`RateLimiterBuilder::local()`, `RateLimiterBuilder::redis(connection_manager)`, or
+`RateLimiterBuilder::hybrid(connection_manager)`. The Redis and hybrid constructors are only
+available with `redis-tokio` or `redis-smol`. The type that the caller expects from `build()`
+selects the target: the provider of the backend or one of its two limiters. Without an
+annotation, name the target with a turbofish, such as `build::<LocalRateLimiterProvider>()`. A
+target of another backend, such as a hybrid limiter from `RateLimiterBuilder::local()`, does not
+compile.
+
+Each provider and limiter also has a `builder()` shortcut, such as
+`LocalRateLimiterProvider::builder()` or
+`AbsoluteHybridRateLimiter::builder(connection_manager)`. The Redis and hybrid shortcuts are
+only available with `redis-tokio` or `redis-smol`. A shortcut returns the same builder with the
+target fixed to its type, so its `build()` needs no annotation.
+
+Shared methods configure windowing, suppression, and stale-state cleanup. `build()` returns an
+`Arc` and starts cleanup by default; use `disable_cleanup()` to opt out and `enable_cleanup()` to
+opt back in while configuring the builder. The idempotent `start_cleanup_loop()` and
+`stop_cleanup_loop()` methods of a provider or limiter control cleanup after construction.
 
 ## Time values
 
@@ -44,7 +58,7 @@ Configuration types expose unit-named constructors and explicit getters:
 - `hybrid::SyncInterval` and `hybrid::AllowedLag`: `milliseconds`, `seconds`, `minutes`, and
   `hours`, with matching `as_*` getters; second-and-larger getters return `f64`.
 
-Provider and limiter builders require `bucket_size` to be less than or equal to
+`RateLimiterBuilder` requires `bucket_size` to be less than or equal to
 `window_size`; equality is valid. This relationship is checked by `build()`, regardless of
 setter order.
 
@@ -60,13 +74,15 @@ required. Construct the provider directly from the public `redis::ConnectionMana
 ```no_run
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+use std::sync::Arc;
 use trypema::{BucketSize, RateLimiterBuilder, WindowSize};
 use trypema::redis::{RedisKey, RedisRateLimiterProvider};
 
 let connection = redis::Client::open("redis://127.0.0.1/")?
     .get_connection_manager()
     .await?;
-let provider = RedisRateLimiterProvider::builder(connection)
+let provider: Arc<RedisRateLimiterProvider> = RateLimiterBuilder::redis(connection)
+    // Optional: only available with 'redis-tokio' or 'redis-smol'
     .prefix(RedisKey::try_from("my-service")?)
     .window_size(WindowSize::minutes_or_panic(1))
     .bucket_size(BucketSize::milliseconds_or_panic(10))
@@ -86,13 +102,14 @@ share that read.
 
 ```no_run
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
-# async fn example(connection: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+# async fn example(connection: trypema::redis::ConnectionManager) -> Result<(), Box<dyn std::error::Error>> {
+use std::sync::Arc;
 use trypema::{
     RateLimiterBuilder,
     hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
 };
 
-let provider = HybridRateLimiterProvider::builder(connection)
+let provider: Arc<HybridRateLimiterProvider> = RateLimiterBuilder::hybrid(connection)
     // Optional: only available with 'redis-tokio' or 'redis-smol'
     .sync_interval(SyncInterval::milliseconds_or_panic(10))
     // Optional: only available with 'redis-tokio' or 'redis-smol'
@@ -115,48 +132,48 @@ local operations accept `&str`. Redis keys are validated and never silently sani
 ## Building one strategy directly
 
 A provider builds both strategies. When an application uses only one strategy, build that
-limiter directly. Each of the six limiters has a `builder()` that returns its own builder, for
-example `AbsoluteLocalRateLimiter::builder()` or
-`AbsoluteHybridRateLimiter::builder(connection_manager)`. The limiter builder implements
-[`RateLimiterBuilder`] and has the same backend settings as the provider builder.
-`allowed_lag_applies_to_rejections` is only on the absolute hybrid builder. `build()` returns an
+limiter directly: annotate the result of `build()` with the limiter type. `build()` returns an
 `Arc` of the limiter. It does not create the state, Lua scripts, or background workers of the
 other strategy.
 
 A limiter built with prefix `P` uses the same Redis keys as the provider with prefix `P`, so the
 two share state. `build()` starts the stale-state cleanup loop of the limiter unless cleanup is
 disabled. The limiter has idempotent `start_cleanup_loop()` and `stop_cleanup_loop()` methods.
-Its cleanup loop and the hybrid synchronization worker end after the last `Arc` drops. The
-absolute builders accept `hard_limit_factor` and `suppression_factor_cache_period` because the
-trait is shared, but these settings have no effect on the absolute strategy.
+After the last `Arc` drops, the hybrid synchronization worker ends at once and the cleanup
+loop ends within one cleanup interval. The builder of a backend accepts every setting of that
+backend for every target. The absolute limiters do not use
+`hard_limit_factor` and `suppression_factor_cache_period`, and the suppressed hybrid limiter does
+not use `allowed_lag_applies_to_rejections`.
 
 ```
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use trypema::{
     BucketSize, RateLimit, RateLimitDecision, RateLimiterBuilder, WindowSize,
     local::AbsoluteLocalRateLimiter,
 };
 
-let limiter = AbsoluteLocalRateLimiter::builder()
+let limiter: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
     .window_size(WindowSize::minutes_or_panic(1))
     .bucket_size(BucketSize::milliseconds_or_panic(10))
     .stale_after(Duration::from_secs(300))
-    .build()
-    .unwrap();
+    .build()?;
 
 let rate = RateLimit::per_second_or_panic(10.0);
 assert!(matches!(limiter.inc("user-123", &rate, 1), RateLimitDecision::Allowed));
+# Ok::<(), trypema::TrypemaError>(())
 ```
 
-The Redis and hybrid limiter builders take the connection manager, as the provider builders do:
+The Redis and hybrid limiters take the connection manager, as their providers do:
 
 ```no_run
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 # async fn example(connection: trypema::redis::ConnectionManager) -> Result<(), Box<dyn std::error::Error>> {
+use std::sync::Arc;
 use trypema::{RateLimiterBuilder, WindowSize};
 use trypema::redis::{AbsoluteRedisRateLimiter, RedisKey};
 
-let limiter = AbsoluteRedisRateLimiter::builder(connection)
+let limiter: Arc<AbsoluteRedisRateLimiter> = RateLimiterBuilder::redis(connection)
+    // Optional: only available with 'redis-tokio' or 'redis-smol'
     .prefix(RedisKey::try_from("my-service")?)
     .window_size(WindowSize::minutes_or_panic(1))
     .build()?;
@@ -168,14 +185,15 @@ let limiter = AbsoluteRedisRateLimiter::builder(connection)
 ```no_run
 # #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 # async fn example(connection: trypema::redis::ConnectionManager) -> Result<(), Box<dyn std::error::Error>> {
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use trypema::{
     BucketSize, RateLimiterBuilder, WindowSize,
     hybrid::{AbsoluteHybridRateLimiter, SyncInterval},
     redis::RedisKey,
 };
 
-let limiter = AbsoluteHybridRateLimiter::builder(connection)
+let limiter: Arc<AbsoluteHybridRateLimiter> = RateLimiterBuilder::hybrid(connection)
+    // Optional: only available with 'redis-tokio' or 'redis-smol'
     .prefix(RedisKey::try_from("ip-ban")?)
     .window_size(WindowSize::minutes_or_panic(1))
     .bucket_size(BucketSize::milliseconds_or_panic(100))
@@ -188,6 +206,38 @@ let limiter = AbsoluteHybridRateLimiter::builder(connection)
 # let _ = limiter;
 # Ok(())
 # }
+```
+
+## Migrating from 2.x
+
+In 3.0, `RateLimiterBuilder` is a struct, not a trait. `RateLimiterBuilder<B, T>` takes the
+backend `B` and the target `T`. The backends are `local::LocalBackend`, `redis::RedisBackend`,
+and `hybrid::HybridBackend`; the last two are only available with `redis-tokio` or `redis-smol`.
+
+- Removed: `LocalRateLimiterBuilder`, `RedisRateLimiterBuilder`, and
+  `HybridRateLimiterBuilder`. Name the builder of a shortcut as
+  `RateLimiterBuilder<LocalBackend, LocalRateLimiterProvider>`, and the builder of a backend
+  constructor as `RateLimiterBuilder<LocalBackend>`.
+- Unchanged: shortcut chains such as
+  `HybridRateLimiterProvider::builder(connection).window_size(window).build()?` compile and
+  return the same `Arc`. `use trypema::RateLimiterBuilder;` compiles; when the code calls only
+  shortcuts, the import is unused.
+- A bound on the old trait, such as `fn build<B: RateLimiterBuilder>(builder: B) ->
+  Arc<B::Provider>`, becomes a bound on the sealed `RateLimiterTarget` trait:
+
+```
+use std::sync::Arc;
+use trypema::{RateLimiterBuilder, RateLimiterTarget, TrypemaError, WindowSize};
+
+fn build_with_window<T: RateLimiterTarget>(
+    builder: RateLimiterBuilder<T::Backend, T>,
+) -> Result<Arc<T>, TrypemaError> {
+    builder.window_size(WindowSize::seconds_or_panic(10)).build()
+}
+
+let provider = build_with_window(trypema::local::LocalRateLimiterProvider::builder())?;
+# let _ = provider;
+# Ok::<(), trypema::TrypemaError>(())
 ```
 
 ## Decisions and conditional updates
