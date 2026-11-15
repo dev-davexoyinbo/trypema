@@ -1,9 +1,12 @@
 use std::time::Duration;
 
 use crate::{
-    BucketSize, HardLimitFactor, RateLimit, RateLimitComparator, SuppressionFactorCachePeriod,
-    TrypemaError, WindowSize, common::duration_from_milliseconds,
+    BucketSize, HardLimitFactor, RateLimit, RateLimitComparator, RateLimitDecision,
+    SuppressionFactorCachePeriod, TrypemaError, WindowSize, common::duration_from_milliseconds,
 };
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+use crate::common::RateType;
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 use crate::hybrid::{AllowedLag, SyncInterval};
@@ -461,5 +464,47 @@ fn rate_limit_comparator_matches_uses_embedded_operand_and_always_matches() {
             expected,
             "comparator: {comparator:?}, current: {current}"
         );
+    }
+}
+
+#[test]
+fn rate_limit_decision_display_is_the_variant_name() {
+    let cases = [
+        (RateLimitDecision::Allowed, "Allowed"),
+        (
+            RateLimitDecision::Rejected {
+                window_size: WindowSize::seconds_or_panic(1),
+                retry_after: Duration::from_millis(250),
+                remaining_after_waiting: 3,
+            },
+            "Rejected",
+        ),
+        (
+            RateLimitDecision::Suppressed {
+                suppression_factor: 0.5,
+                is_allowed: true,
+            },
+            "Suppressed",
+        ),
+    ];
+
+    for (decision, expected) in cases {
+        assert_eq!(decision.to_string(), expected, "decision: {decision:?}");
+    }
+}
+
+/// The strings are part of Redis key names; a change orphans the keys written before it.
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn rate_type_display_is_the_redis_key_segment() {
+    let cases = [
+        (RateType::Absolute, "absolute"),
+        (RateType::Suppressed, "suppressed"),
+        (RateType::HybridAbsolute, "hybrid_absolute"),
+        (RateType::HybridSuppressed, "hybrid_suppressed"),
+    ];
+
+    for (rate_type, expected) in cases {
+        assert_eq!(rate_type.to_string(), expected, "rate type: {rate_type:?}");
     }
 }

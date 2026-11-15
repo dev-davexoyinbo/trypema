@@ -42,7 +42,6 @@ rand = "0.10.3"
 redis = { version = "1.7.1", optional = true, default-features = false, features = [
   "script",
 ] }
-strum = "0.28.0"
 strum_macros = "0.28.0"
 thiserror = "2.0.19"
 tracing = "0.1.44"

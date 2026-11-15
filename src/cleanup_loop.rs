@@ -62,7 +62,7 @@ impl CleanupLoop {
 
     /// Start a loop on its own thread that calls `cleanup` once per interval.
     ///
-    /// The thread keeps no strong reference to `owner` while it sleeps. It owns `cleanup` and
+    /// The thread holds a strong reference to `owner` only during a pass. It owns `cleanup` and
     /// drops it when the loop ends: at the first wake after the last `Arc` of `owner` drops or
     /// after [`stop`](Self::stop). It is dropped at once when a loop already runs.
     pub(crate) fn start_thread<T, F>(
@@ -73,20 +73,17 @@ impl CleanupLoop {
         T: Send + Sync + 'static,
         F: Fn(&T, u64) + Send + 'static,
     {
-        let Some(generation) = cleanup_loop(owner).begin() else {
+        let state = cleanup_loop(owner);
+        let Some(generation) = state.begin() else {
             return;
         };
 
+        let cleanup_interval = state.config.interval;
         let weak_owner = Arc::downgrade(owner);
 
         thread::spawn(move || {
             loop {
-                let Some(owner) = weak_owner.upgrade() else {
-                    break;
-                };
-                let interval = cleanup_loop(&owner).config.interval;
-                drop(owner);
-                thread::sleep(interval);
+                thread::sleep(cleanup_interval);
 
                 let Some(owner) = weak_owner.upgrade() else {
                     break;

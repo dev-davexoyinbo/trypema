@@ -1,7 +1,7 @@
 use std::{
     sync::{Arc, Barrier, atomic::Ordering, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::common::{
@@ -56,11 +56,14 @@ fn limiter(window_size: u64, bucket_size: u64) -> AbsoluteLocalRateLimiter {
     )
 }
 
-fn assert_retry_after_between(retry_after: Duration, min_ms: u128, max_ms: u128) {
+/// The oldest bucket is no older than `started`, so the hint is at least the window minus the
+/// time since `started`, however long the scheduler delayed the test.
+fn assert_retry_after_within_window(retry_after: Duration, window_ms: u128, started: Instant) {
+    let min_ms = window_ms.saturating_sub(started.elapsed().as_millis());
     let retry_after = retry_after.as_millis();
     assert!(
-        retry_after >= min_ms && retry_after <= max_ms,
-        "retry_after={retry_after}, expected {min_ms} <= retry_after <= {max_ms}"
+        retry_after >= min_ms && retry_after <= window_ms,
+        "retry_after={retry_after}, expected {min_ms} <= retry_after <= {window_ms}"
     );
 }
 
@@ -208,6 +211,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
     let key = "k";
     let rate_limit = RateLimit::per_second(5f64).unwrap();
 
+    let started = Instant::now();
     assert!(matches!(
         limiter.inc(key, &rate_limit, 1),
         RateLimitDecision::Allowed
@@ -230,7 +234,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting() {
 
     assert_eq!(window_size.as_seconds(), 1);
     assert_eq!(remaining_after_waiting, 1);
-    assert_retry_after_between(retry_after, 800, 1_000);
+    assert_retry_after_within_window(retry_after, 1_000, started);
 }
 
 #[test]
@@ -239,6 +243,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_6() {
     let key = "k";
     let rate_limit = RateLimit::per_second(1f64).unwrap();
 
+    let started = Instant::now();
     assert!(matches!(
         limiter.inc(key, &rate_limit, 2),
         RateLimitDecision::Allowed
@@ -261,7 +266,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_6() {
 
     assert_eq!(window_size.as_seconds(), 6);
     assert_eq!(remaining_after_waiting, 2);
-    assert_retry_after_between(retry_after, 5_000, 6_000);
+    assert_retry_after_within_window(retry_after, 6_000, started);
 }
 
 #[test]
@@ -270,6 +275,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
     let key = "k";
     let rate_limit = RateLimit::per_second(1f64).unwrap();
 
+    let started = Instant::now();
     assert!(matches!(
         limiter.inc(key, &rate_limit, 3),
         RateLimitDecision::Allowed
@@ -292,7 +298,7 @@ fn rejected_includes_retry_after_and_remaining_after_waiting_window_10() {
 
     assert_eq!(window_size.as_seconds(), 10);
     assert_eq!(remaining_after_waiting, 3);
-    assert_retry_after_between(retry_after, 9_000, 10_000);
+    assert_retry_after_within_window(retry_after, 10_000, started);
 
     let decision = limiter.inc(key, &rate_limit, 1);
     let RateLimitDecision::Rejected {
@@ -317,6 +323,7 @@ fn rejected_metadata_window_6_with_nonzero_grouping_separates_buckets() {
     let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     // Two buckets (sleep > group size). window_limit = 6 * 1 = 6
+    let started = Instant::now();
     assert!(matches!(
         limiter.inc(key, &rate_limit, 2),
         RateLimitDecision::Allowed
@@ -339,7 +346,7 @@ fn rejected_metadata_window_6_with_nonzero_grouping_separates_buckets() {
 
     assert_eq!(window_size.as_seconds(), 6);
     assert_eq!(remaining_after_waiting, 2);
-    assert_retry_after_between(retry_after, 5_000, 6_000);
+    assert_retry_after_within_window(retry_after, 6_000, started);
 }
 
 #[test]
@@ -349,6 +356,7 @@ fn rejected_metadata_window_10_with_nonzero_grouping_separates_buckets() {
     let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     // Two buckets (sleep > group size). window_limit = 10 * 1 = 10
+    let started = Instant::now();
     assert!(matches!(
         limiter.inc(key, &rate_limit, 3),
         RateLimitDecision::Allowed
@@ -371,16 +379,17 @@ fn rejected_metadata_window_10_with_nonzero_grouping_separates_buckets() {
 
     assert_eq!(window_size.as_seconds(), 10);
     assert_eq!(remaining_after_waiting, 3);
-    assert_retry_after_between(retry_after, 9_000, 10_000);
+    assert_retry_after_within_window(retry_after, 10_000, started);
 }
 
 #[test]
 fn rejected_metadata_window_6_with_nonzero_grouping_merges_within_group() {
-    let limiter = limiter(6, 200);
+    let limiter = limiter(6, 1_000);
     let key = "k";
     let rate_limit = RateLimit::per_second(1f64).unwrap();
 
-    // Same bucket (sleep < group size). window_limit = 6 * 1 = 6
+    // Same bucket (sleep < group size, with 900 ms to spare). window_limit = 6 * 1 = 6
+    let started = Instant::now();
     assert!(matches!(
         limiter.inc(key, &rate_limit, 3),
         RateLimitDecision::Allowed
@@ -402,16 +411,17 @@ fn rejected_metadata_window_6_with_nonzero_grouping_merges_within_group() {
     };
 
     assert_eq!(remaining_after_waiting, 6);
-    assert_retry_after_between(retry_after, 5_000, 6_000);
+    assert_retry_after_within_window(retry_after, 6_000, started);
 }
 
 #[test]
 fn rejected_metadata_window_10_with_nonzero_grouping_merges_within_group() {
-    let limiter = limiter(10, 200);
+    let limiter = limiter(10, 1_000);
     let key = "k";
     let rate_limit = RateLimit::per_second(1f64).unwrap();
 
-    // Same bucket (sleep < group size). window_limit = 10 * 1 = 10
+    // Same bucket (sleep < group size, with 900 ms to spare). window_limit = 10 * 1 = 10
+    let started = Instant::now();
     assert!(matches!(
         limiter.inc(key, &rate_limit, 5),
         RateLimitDecision::Allowed
@@ -433,7 +443,7 @@ fn rejected_metadata_window_10_with_nonzero_grouping_merges_within_group() {
     };
 
     assert_eq!(remaining_after_waiting, 10);
-    assert_retry_after_between(retry_after, 9_000, 10_000);
+    assert_retry_after_within_window(retry_after, 10_000, started);
 }
 
 #[test]
@@ -497,14 +507,14 @@ fn evicts_oldest_bucket_but_keeps_newer_bucket_window_2_with_grouping() {
         limiter.inc(key, &rate_limit, 1),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(1_800));
     assert!(matches!(
         limiter.inc(key, &rate_limit, 1),
         RateLimitDecision::Allowed
     ));
 
-    // The first bucket expires while the second remains inside the window.
-    thread::sleep(Duration::from_millis(1_800));
+    // The first bucket expires while the second, 300 ms old, has 1.7 s left in the window.
+    thread::sleep(Duration::from_millis(300));
 
     assert!(matches!(
         limiter.is_allowed(key),
@@ -527,7 +537,7 @@ fn evicts_oldest_bucket_but_keeps_newer_bucket_window_2_with_grouping() {
 
 #[test]
 fn rate_grouping_merges_within_group() {
-    let limiter = limiter(1, 50);
+    let limiter = limiter(1, 500);
     let key = "k";
     let rate_limit = RateLimit::per_second(6f64).unwrap();
 
@@ -600,9 +610,10 @@ fn rate_grouping_separates_beyond_group() {
 
 #[test]
 fn concurrent_inc_eventually_rejects_without_panicking() {
-    let limiter = Arc::new(limiter(1, 1000));
+    // A 10 s window keeps the accepted increments live however long the threads take to start.
+    let limiter = Arc::new(limiter(10, 1000));
     let key = "k";
-    let rate_limit = RateLimit::per_second(10f64).unwrap();
+    let rate_limit = RateLimit::per_second(1f64).unwrap();
 
     let threads: Vec<_> = (0..8)
         .map(|_| {
@@ -956,15 +967,15 @@ fn get_excludes_and_evicts_expired_buckets() {
         limiter.inc("k", &rate_limit, 5),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(800));
     assert!(matches!(
         limiter.inc("k", &rate_limit, 3),
         RateLimitDecision::Allowed
     ));
 
     // The first bucket for `k` and the only bucket for `k2` expire while the
-    // second bucket for `k` remains live.
-    thread::sleep(Duration::from_millis(850));
+    // second bucket for `k`, 250 ms old, has 750 ms left in the window.
+    thread::sleep(Duration::from_millis(250));
 
     assert_eq!(limiter.get("k"), 3, "expired bucket must be ignored");
     {
@@ -1074,12 +1085,13 @@ fn conditional_set_guard_miss_leaves_expired_history_untouched() {
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(800));
     assert!(matches!(
         limiter.inc("k", &rate, 5),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(850));
+    // The first bucket expires while the second, 250 ms old, has 750 ms left in the window.
+    thread::sleep(Duration::from_millis(250));
 
     assert_eq!(
         limiter.set_if("k", &rate, RateLimitComparator::Eq(99), 10),
@@ -1551,17 +1563,18 @@ fn set_if_preserve_history_prunes_expired_before_directional_reduction() {
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(800));
     assert!(matches!(
         limiter.inc("k", &rate, 5),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(100));
     assert!(matches!(
         limiter.inc("k", &rate, 6),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(700));
+    // The first bucket expires while the second, 250 ms old, has 750 ms left in the window.
+    thread::sleep(Duration::from_millis(150));
 
     assert_eq!(
         limiter.set_if_preserve_history(

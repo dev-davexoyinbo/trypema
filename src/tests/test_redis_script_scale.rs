@@ -8,8 +8,9 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use redis::AsyncCommands;
 
-use super::common::{connection_manager, key, key_gen, unique_prefix, wait_for_hybrid_sync};
+use super::common::{connection_manager, key, key_gen, unique_prefix};
 use super::runtime;
+use super::wait::wait_until_async;
 
 use crate::common::RateType;
 use crate::redis::common::RedisKeyGenerator;
@@ -26,8 +27,6 @@ const MANY_ENTITIES: usize = 2_000;
 
 /// More buckets than Redis Lua can pass to one command.
 const MANY_BUCKETS: usize = 8_200;
-
-const SYNC_INTERVAL_MS: u64 = 5;
 
 /// A limit that no test reaches.
 fn high_rate() -> RateLimit {
@@ -60,7 +59,7 @@ impl Providers {
         let hybrid = HybridRateLimiterProvider::builder(connection_manager().await)
             .prefix(prefix.clone())
             .window_size(WindowSize::seconds_or_panic(60))
-            .sync_interval(SyncInterval::milliseconds_or_panic(SYNC_INTERVAL_MS))
+            .sync_interval(SyncInterval::milliseconds_or_panic(5))
             .cleanup_enabled(false)
             .build()
             .unwrap();
@@ -96,6 +95,10 @@ impl Providers {
     fn key_generator(&self, rate_type: RateType) -> RedisKeyGenerator {
         key_gen(&self.prefix, rate_type)
     }
+}
+
+async fn entity_count(conn: &redis::aio::ConnectionManager, active_entities_key: &str) -> usize {
+    conn.clone().zcard(active_entities_key).await.unwrap()
 }
 
 fn numbered_keys(name: &str, count: usize) -> Vec<RedisKey> {
@@ -140,17 +143,22 @@ async fn cleanup_removes_many_stale_entities(rate_type: RateType) {
     for stale_key in &stale {
         providers.inc(rate_type, stale_key).await;
     }
-    wait_for_hybrid_sync(SYNC_INTERVAL_MS).await;
+
+    // A hybrid provider registers the entities when its committer flushes them.
+    wait_until_async(
+        async || entity_count(&conn, &active_entities_key).await == MANY_ENTITIES,
+        "the setup must register every stale entity",
+    )
+    .await;
+    // The stale entities are 1.5 s old at cleanup, 500 ms past the threshold, which leaves time
+    // for the refresh that follows a hybrid flush.
     runtime::async_sleep(Duration::from_millis(1_500)).await;
     providers.inc(rate_type, &active).await;
-    wait_for_hybrid_sync(SYNC_INTERVAL_MS).await;
-
-    let members_before: usize = conn.zcard(&active_entities_key).await.unwrap();
-    assert_eq!(
-        members_before,
-        MANY_ENTITIES + 1,
-        "the setup must register every entity"
-    );
+    wait_until_async(
+        async || entity_count(&conn, &active_entities_key).await == MANY_ENTITIES + 1,
+        "the setup must register the active entity",
+    )
+    .await;
 
     providers.cleanup(rate_type, 1_000).await.unwrap();
 
@@ -247,8 +255,17 @@ async fn cleanup_of_suppressed_runs_when_absolute_fails(
     let stale = key("stale");
 
     providers.inc(suppressed_type, &stale).await;
-    wait_for_hybrid_sync(SYNC_INTERVAL_MS).await;
-    runtime::async_sleep(Duration::from_millis(300)).await;
+
+    // A hybrid provider registers the entity when its committer flushes it.
+    let suppressed_entities_key = suppressed_generator.get_active_entities_key();
+    wait_until_async(
+        async || entity_count(&conn, &suppressed_entities_key).await == 1,
+        "the setup must register the stale entity",
+    )
+    .await;
+    // The entity is 600 ms old at cleanup, 500 ms past the threshold, which leaves time for the
+    // refresh that follows a hybrid flush.
+    runtime::async_sleep(Duration::from_millis(600)).await;
 
     // A string where the script expects a sorted set makes the absolute cleanup fail.
     let broken_key = providers

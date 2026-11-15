@@ -276,9 +276,10 @@ fn redis_state_inc_retains_the_first_window_limit() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let (rl, prefix) = build_limiter(&url, 1, 1000).await;
+        // A 10 s window keeps the stored limit alive while the raw reads run.
+        let (rl, prefix) = build_limiter(&url, 10, 1000).await;
         let k = key("k");
-        let initial_rate = RateLimit::per_second(2.5f64).unwrap();
+        let initial_rate = RateLimit::per_second(0.25f64).unwrap();
         let later_rate = RateLimit::per_second(100f64).unwrap();
 
         assert_allowed(
@@ -399,10 +400,11 @@ fn redis_state_rejected_inc_does_not_mutate_usage_or_limit_state() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let (rl, prefix) = build_limiter(&url, 1, 1000).await;
+        // capacity = 10s * 0.2/s = 2. The 10 s window keeps the filled bucket and the stored
+        // limit alive through all the raw reads.
+        let (rl, prefix) = build_limiter(&url, 10, 1000).await;
         let k = key("k");
-        // capacity = 1s * 2/s = 2
-        let rate_limit = RateLimit::per_second(2f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.2f64).unwrap();
 
         // Fill capacity.
         assert_allowed(
@@ -517,25 +519,25 @@ fn redis_state_is_allowed_evicts_expired_buckets() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let (rl, prefix) = build_limiter(&url, 1, 100).await;
+        // capacity = 2s * 1/s = 2.
+        let (rl, prefix) = build_limiter(&url, 2, 100).await;
         let k = key("k");
-        let rate_limit = RateLimit::per_second(2f64).unwrap();
-
-        assert_allowed(
-            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
-            "creating the oldest bucket",
-        );
-        runtime::async_sleep(Duration::from_millis(500)).await;
-        assert_allowed(
-            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
-            "creating the fresh bucket and refreshing the limit TTL",
-        );
-
+        let rate_limit = RateLimit::per_second(1f64).unwrap();
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
             .get_multiplexed_async_connection()
             .await
             .unwrap();
+
+        assert_allowed(
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            "creating the oldest bucket",
+        );
+        runtime::async_sleep(Duration::from_millis(1_000)).await;
+        assert_allowed(
+            rl.absolute().inc(&k, &rate_limit, 1).await.unwrap(),
+            "creating the fresh bucket and refreshing the limit TTL",
+        );
 
         let total_before: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
         assert_eq!(total_before, 2);
@@ -545,7 +547,9 @@ fn redis_state_is_allowed_evicts_expired_buckets() {
 
         // Only the first bucket expires. The second increment keeps the sticky-limit key alive,
         // so this call must execute the eviction path rather than return early for an unknown key.
-        runtime::async_sleep(Duration::from_millis(550)).await;
+        // The 2.1 s since the oldest bucket pass the 2 s window with a margin for a Redis clock
+        // that lags the host clock; the fresh bucket and the limit TTL have about 900 ms left.
+        runtime::async_sleep(Duration::from_millis(1_100)).await;
         let decision = rl.absolute().is_allowed(&k).await.unwrap();
         assert!(
             matches!(decision, RateLimitDecision::Allowed),
@@ -889,7 +893,7 @@ fn redis_state_absolute_set_if_no_match_leaves_buckets_and_total_untouched() {
             .await
             .unwrap();
 
-        runtime::async_sleep(Duration::from_millis(50)).await;
+        runtime::async_sleep(Duration::from_millis(100)).await;
 
         // Guard cannot match (17 is not > 1000); the different rate must be ignored.
         let rate_new = RateLimit::per_second(20f64).unwrap();
@@ -948,14 +952,16 @@ fn redis_state_absolute_set_if_handles_expired_history_only_after_a_match() {
                 "creating an oldest bucket",
             );
         }
-        runtime::async_sleep(Duration::from_millis(900)).await;
+        // The oldest buckets are 2.1 s old after both sleeps, past the 2 s window. The fresh
+        // buckets and limit TTLs are 600 ms old, so about 1.4 s is left for the checks below.
+        runtime::async_sleep(Duration::from_millis(1_500)).await;
         for k in [&miss_key, &match_key] {
             assert_allowed(
                 rl.absolute().inc(k, &rate, 6).await.unwrap(),
                 "creating a fresh bucket",
             );
         }
-        runtime::async_sleep(Duration::from_millis(1_200)).await;
+        runtime::async_sleep(Duration::from_millis(600)).await;
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -1053,7 +1059,9 @@ fn redis_state_absolute_preserves_requested_history_edge() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let (rl, prefix) = build_limiter(&url, 60, 1).await;
+        // A 100 ms pause starts a new 20 ms bucket, with a margin for a Redis clock that lags
+        // the host clock.
+        let (rl, prefix) = build_limiter(&url, 60, 20).await;
         let rate = RateLimit::per_second(100f64).unwrap();
 
         for (name, preservation, expected_reduced, expected_increased) in [
@@ -1075,12 +1083,12 @@ fn redis_state_absolute_preserves_requested_history_edge() {
                 rl.absolute().inc(&k, &rate, 4).await.unwrap(),
                 RateLimitDecision::Allowed
             ));
-            runtime::async_sleep(Duration::from_millis(3)).await;
+            runtime::async_sleep(Duration::from_millis(100)).await;
             assert!(matches!(
                 rl.absolute().inc(&k, &rate, 5).await.unwrap(),
                 RateLimitDecision::Allowed
             ));
-            runtime::async_sleep(Duration::from_millis(3)).await;
+            runtime::async_sleep(Duration::from_millis(100)).await;
             assert!(matches!(
                 rl.absolute().inc(&k, &rate, 6).await.unwrap(),
                 RateLimitDecision::Allowed
@@ -1344,10 +1352,12 @@ fn redis_state_absolute_cleanup_removes_only_stale_entities() {
             rl.absolute().inc(&active_key, &rate, 4).await.unwrap(),
             "seeding the active entity",
         );
-        runtime::async_sleep(Duration::from_millis(250)).await;
+        // The stale entity is 600 ms old at cleanup; the active one is one round trip old, and
+        // the 500 ms threshold leaves it a wide margin.
+        runtime::async_sleep(Duration::from_millis(600)).await;
         assert_eq!(rl.absolute().get(&active_key).await.unwrap(), 4);
 
-        rl.absolute().cleanup(100).await.unwrap();
+        rl.absolute().cleanup(500).await.unwrap();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()

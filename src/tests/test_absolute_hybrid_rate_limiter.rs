@@ -7,6 +7,7 @@ use std::{
 
 use super::common::{assert_inside_allowed_lag, sleep_past_allowed_lag};
 use super::runtime;
+use super::wait::wait_until_async;
 
 use crate::{
     BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, WindowSize,
@@ -136,12 +137,6 @@ async fn build_limiter_with_rejection_lag(
         .unwrap()
 }
 
-async fn wait_for_hybrid_sync(sync_interval: u64) {
-    // Wait past two interval boundaries so the assertion does not depend on where
-    // construction landed within the committer's current interval.
-    runtime::async_sleep(Duration::from_millis(sync_interval * 2 + 50)).await;
-}
-
 #[test]
 fn hybrid_allows_until_capacity_then_rejects() {
     let url = redis_url();
@@ -196,7 +191,8 @@ fn hybrid_absolute_pending_only_rejection_reports_window_ttl_and_full_released_c
         let prefix = unique_prefix();
         let window_size = 1_u64;
         let bucket_size = 1_000_u64;
-        let sync_interval = 25_u64;
+        // A background flush would commit part of the usage and refresh the bucket metadata.
+        let sync_interval = 2_000_u64;
 
         let rl =
             build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
@@ -325,7 +321,8 @@ fn hybrid_usage_is_committed_to_redis_on_flush_and_then_visible_to_others() {
 
         let window_size = 1_u64;
         let bucket_size = 1_000_u64;
-        let sync_interval = 25_u64;
+        // A background flush would commit the local usage before the other instance checks.
+        let sync_interval = 2_000_u64;
 
         let rl_a = build_limiter_with_prefix(
             &url,
@@ -384,7 +381,8 @@ fn hybrid_absolute_does_not_touch_redis_until_commit() {
 
         let window_size = 1_u64;
         let bucket_size = 1_000_u64;
-        let sync_interval = 25_u64;
+        // A background flush would commit the local usage before the other instance checks.
+        let sync_interval = 2_000_u64;
 
         let rl_a = build_limiter_with_prefix(
             &url,
@@ -566,20 +564,27 @@ fn hybrid_absolute_remaining_after_waiting_reflects_oldest_bucket_when_seeded_fr
             prefix.clone(),
         )
         .await;
+        // `get` on this limiter has no local state, so it returns the Redis total.
+        let rl =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
         assert_allowed(
             rl_seed.absolute().inc(&k, &rate_limit, 2).await.unwrap(),
             "oldest bucket setup increment",
         );
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_until_async(
+            async || rl.absolute().get(&k).await.unwrap() == 2,
+            "the flush must commit the first increment",
+        )
+        .await;
         assert_allowed(
             rl_seed.absolute().inc(&k, &rate_limit, 4).await.unwrap(),
             "newest bucket setup increment",
         );
-        wait_for_hybrid_sync(sync_interval).await;
-
-        // Create a hybrid limiter that will read the current Redis state.
-        let rl =
-            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
+        wait_until_async(
+            async || rl.absolute().get(&k).await.unwrap() == 6,
+            "the flush must commit the second increment",
+        )
+        .await;
 
         let d_prime = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
         assert!(
@@ -621,19 +626,30 @@ fn hybrid_absolute_remaining_after_waiting_is_capacity_released_by_oldest_bucket
             prefix.clone(),
         )
         .await;
+        // `get` on this limiter has no local state, so it returns the Redis total.
+        let observer =
+            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
         assert_allowed(
             seed.absolute().inc(&k, &rate_limit, 3).await.unwrap(),
             "oldest bucket setup increment",
         );
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_until_async(
+            async || observer.absolute().get(&k).await.unwrap() == 3,
+            "the flush must commit the oldest bucket",
+        )
+        .await;
+        // The second commit must land more than one bucket after the first.
+        runtime::async_sleep(Duration::from_millis(bucket_size * 2)).await;
         assert_allowed(
             seed.absolute().inc(&k, &rate_limit, 7).await.unwrap(),
             "newest bucket setup increment",
         );
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_until_async(
+            async || observer.absolute().get(&k).await.unwrap() == 10,
+            "the flush must commit the newest bucket",
+        )
+        .await;
 
-        let observer =
-            build_limiter_with_prefix(&url, window_size, bucket_size, sync_interval, prefix).await;
         let decision = observer.absolute().is_allowed(&k).await.unwrap();
         let RateLimitDecision::Rejected {
             remaining_after_waiting,
@@ -910,7 +926,8 @@ fn cleanup_keeps_rejecting_state_until_stale_horizon_after_retry_ttl_expiry() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let stale_after_ms = 300_u64;
+        // The first cleanup runs about 100 ms past the retry TTL, well inside this horizon.
+        let stale_after_ms = 600_u64;
         let window_size_ms = 1_000_u64;
         let rl = build_limiter_with_prefix(&url, 1, 1_000, 2_000, unique_prefix()).await;
         let k = key("k");
@@ -1025,7 +1042,7 @@ fn get_methods_keep_the_exact_total_during_background_sync() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let sync_interval = 500_u64;
+        let sync_interval = 1_000_u64;
         let rl = build_limiter_with_prefix(&url, 60, 1_000, sync_interval, unique_prefix()).await;
         let k = key("k");
         let rate = RateLimit::per_second(100f64).unwrap();
@@ -1037,7 +1054,8 @@ fn get_methods_keep_the_exact_total_during_background_sync() {
 
         // The first tick refreshes local state. Historically it only queued the
         // captured count, leaving a gap until the second tick wrote it to Redis.
-        runtime::async_sleep(Duration::from_millis(sync_interval + 100)).await;
+        // The checks must run between the two ticks, so they get wide margins to both.
+        runtime::async_sleep(Duration::from_millis(sync_interval + 300)).await;
         assert_eq!(rl.absolute().get_estimate(&k).await.unwrap(), 3);
         assert_eq!(rl.absolute().get(&k).await.unwrap(), 3);
     });
@@ -1416,7 +1434,8 @@ fn set_if_prime_then_inc_enforces_remaining_budget() {
 
     runtime::block_on(async {
         let window_size = 6_u64;
-        let rl = build_limiter_with_prefix(&url, window_size, 1000, 25, unique_prefix()).await;
+        // A background flush between the increments would refresh the oldest bucket count.
+        let rl = build_limiter_with_prefix(&url, window_size, 1000, 2_000, unique_prefix()).await;
 
         let k = key("k");
         let rate_limit = RateLimit::per_second(5f64).unwrap();
@@ -1557,8 +1576,8 @@ fn set_if_after_rejection_transition_has_no_stale_commit_to_land_later() {
         assert_eq!(rl.absolute().get(&k).await.unwrap(), 2);
 
         // A previously queued capacity commit must not arrive after the reset and
-        // raise the total again.
-        runtime::async_sleep(Duration::from_millis(sync_interval + 100)).await;
+        // raise the total again. The wait goes well past the first flush.
+        runtime::async_sleep(Duration::from_millis(sync_interval + 500)).await;
         assert_eq!(rl.absolute().get(&k).await.unwrap(), 2);
     });
 }
@@ -1716,12 +1735,14 @@ fn concurrent_increments_remain_exact_across_background_refreshes() {
             runtime::join(task).await;
         }
 
-        wait_for_hybrid_sync(sync_interval).await;
         let observer = build_limiter_with_prefix(&url, 60, 1_000, sync_interval, prefix).await;
-        assert_eq!(
-            observer.absolute().get(&k).await.unwrap(),
-            worker_count * increments_per_worker
-        );
+        wait_until_async(
+            async || {
+                observer.absolute().get(&k).await.unwrap() == worker_count * increments_per_worker
+            },
+            "the flushes must commit every increment",
+        )
+        .await;
     });
 }
 

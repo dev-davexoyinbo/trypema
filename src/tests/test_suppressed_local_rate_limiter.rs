@@ -260,6 +260,10 @@ fn threaded_lifecycle_cutovers_preserve_exact_snapshot() {
     }
 }
 
+/// Keeps a factor pinned with `test_set_suppression_factor` cached for the next call, however
+/// long the scheduler delays it. The default 100 ms period would let it expire and be recomputed.
+const PINNED_FACTOR_CACHE_MS: u64 = 60_000;
+
 fn limiter(
     window_size: u64,
     bucket_size: u64,
@@ -584,7 +588,7 @@ fn batch_crossing_hard_limit_is_fully_declined_without_consuming_accepted_capaci
 
 #[test]
 fn suppressed_inc_denied_returns_suppressed_and_does_not_increment_accepted() {
-    let limiter = limiter(1, 1000, 10f64);
+    let limiter = limiter_with_cache_ms(1, 1000, 10f64, PINNED_FACTOR_CACHE_MS);
     let key = "k";
     let rate_limit = RateLimit::per_second(5f64).unwrap();
 
@@ -632,7 +636,7 @@ fn suppressed_inc_denied_returns_suppressed_and_does_not_increment_accepted() {
 
 #[test]
 fn suppressed_inc_allowed_returns_suppressed_is_allowed_true_and_increments_accepted() {
-    let limiter = limiter(1, 1000, 10f64);
+    let limiter = limiter_with_cache_ms(1, 1000, 10f64, PINNED_FACTOR_CACHE_MS);
     let key = "k";
     let rate_limit = RateLimit::per_second(5f64).unwrap();
 
@@ -730,7 +734,7 @@ fn hard_limit_is_enforced_after_suppression_factor_cache_expires() {
     expected = "SuppressedLocalRateLimiter::get_suppression_factor: suppression factor > 1"
 )]
 fn suppression_factor_gt_one_panics() {
-    let limiter = limiter(1, 1000, 10f64);
+    let limiter = limiter_with_cache_ms(1, 1000, 10f64, PINNED_FACTOR_CACHE_MS);
     let key = "k";
     let rate_limit = RateLimit::per_second(5f64).unwrap();
 
@@ -745,7 +749,7 @@ fn suppression_factor_gt_one_panics() {
     expected = "SuppressedLocalRateLimiter::get_suppression_factor: negative suppression factor"
 )]
 fn suppression_factor_negative_panics() {
-    let limiter = limiter(1, 1000, 10f64);
+    let limiter = limiter_with_cache_ms(1, 1000, 10f64, PINNED_FACTOR_CACHE_MS);
     let key = "k";
     let rate_limit = RateLimit::per_second(5f64).unwrap();
 
@@ -784,10 +788,14 @@ fn suppression_factor_cache_is_recomputed_after_cache_window() {
 fn cleanup_removes_stale_suppression_factors_and_keeps_fresh() {
     let limiter = limiter(1, 1000, 10f64);
 
-    limiter.test_set_suppression_factor("stale", Instant::now() - Duration::from_millis(250), 0.5);
+    limiter.test_set_suppression_factor(
+        "stale",
+        Instant::now() - Duration::from_millis(2_000),
+        0.5,
+    );
     limiter.test_set_suppression_factor("fresh", Instant::now(), 0.25);
 
-    limiter.cleanup(100);
+    limiter.cleanup(1_000);
 
     assert!(
         limiter.test_get_suppression_factor("stale").is_none(),
@@ -827,12 +835,12 @@ fn cleanup_removes_stale_series_and_keeps_fresh_series() {
     let stale = limiter.inc("stale", &rate, 3);
     assert!(matches!(stale, RateLimitDecision::Allowed));
 
-    thread::sleep(Duration::from_millis(80));
+    thread::sleep(Duration::from_millis(600));
 
     let fresh = limiter.inc("fresh", &rate, 4);
     assert!(matches!(fresh, RateLimitDecision::Allowed));
 
-    limiter.cleanup(50);
+    limiter.cleanup(500);
 
     assert!(!limiter.series().contains_key("stale"));
     assert!(limiter.series().contains_key("fresh"));
@@ -851,7 +859,7 @@ fn cleanup_is_millisecond_granularity_for_suppression_factor() {
 
 #[test]
 fn suppression_factor_zero_returns_suppressed_allowed_and_rng_not_called() {
-    let limiter = limiter(1, 1000, 10f64);
+    let limiter = limiter_with_cache_ms(1, 1000, 10f64, PINNED_FACTOR_CACHE_MS);
     let key = "k";
     let rate_limit = RateLimit::per_second(5f64).unwrap();
 
@@ -873,7 +881,7 @@ fn suppression_factor_zero_returns_suppressed_allowed_and_rng_not_called() {
 
 #[test]
 fn suppression_factor_one_must_not_return_allowed() {
-    let limiter = limiter(1, 1000, 10f64);
+    let limiter = limiter_with_cache_ms(1, 1000, 10f64, PINNED_FACTOR_CACHE_MS);
     let key = "k";
     let rate_limit = RateLimit::per_second(5f64).unwrap();
 
@@ -896,7 +904,7 @@ fn suppression_factor_one_must_not_return_allowed() {
 
 #[test]
 fn suppression_rng_probability_is_one_minus_suppression_factor() {
-    let limiter = limiter(1, 1000, 10f64);
+    let limiter = limiter_with_cache_ms(1, 1000, 10f64, PINNED_FACTOR_CACHE_MS);
     let key = "k";
     let rate_limit = RateLimit::per_second(5f64).unwrap();
 
@@ -922,7 +930,7 @@ fn suppression_rng_probability_is_one_minus_suppression_factor() {
 
 #[test]
 fn suppression_property_values_do_not_panic_and_follow_basic_contract() {
-    let limiter = limiter(1, 1000, 10f64);
+    let limiter = limiter_with_cache_ms(1, 1000, 10f64, PINNED_FACTOR_CACHE_MS);
     let rate_limit = RateLimit::per_second(5f64).unwrap();
 
     // Sample values across the full inclusive range.
@@ -1014,7 +1022,8 @@ fn suppressed_is_deterministically_allowed_until_base_capacity_boundary() {
     //   hard_window_limit = 10 * 1 * 2 = 20
     let window_size = 10_u64;
     let hard_limit_factor = 2f64;
-    let limiter = limiter(window_size, 1000, hard_limit_factor);
+    let limiter =
+        limiter_with_cache_ms(window_size, 1000, hard_limit_factor, PINNED_FACTOR_CACHE_MS);
 
     let key = "k";
     let rate_limit = RateLimit::per_second(1f64).unwrap();
@@ -1157,7 +1166,9 @@ fn get_evicts_expired_buckets_and_updates_declined_total() {
         limiter.test_get_suppression_factor("k2"),
         Some((_, factor)) if (factor - 1.0).abs() < 1e-12
     ));
-    thread::sleep(Duration::from_millis(300));
+    // `k`'s first bucket must stay live for this decline and expire before `get`; 550 ms on
+    // each side leaves 450 ms to spare for both.
+    thread::sleep(Duration::from_millis(550));
     assert!(matches!(
         limiter.inc("k", &rate, 7),
         RateLimitDecision::Suppressed {
@@ -1165,7 +1176,7 @@ fn get_evicts_expired_buckets_and_updates_declined_total() {
             suppression_factor,
         } if (suppression_factor - 1.0).abs() < 1e-12
     ));
-    thread::sleep(Duration::from_millis(800));
+    thread::sleep(Duration::from_millis(550));
 
     assert_eq!(
         limiter.get("k"),
@@ -1520,14 +1531,14 @@ fn set_if_redefines_sticky_hard_window_limit() {
 
 #[test]
 fn set_if_preserve_history_scales_partial_declines_proportionally() {
-    let limiter = limiter(10, 50, 1.0);
+    let limiter = limiter(10, 500, 1.0);
     let rate = RateLimit::per_second(2f64).unwrap();
 
     assert!(matches!(
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(60));
+    thread::sleep(Duration::from_millis(550));
     assert!(matches!(
         limiter.inc("k", &rate, 16),
         RateLimitDecision::Allowed
@@ -1672,7 +1683,7 @@ fn set_if_preserve_history_keeps_exact_decline_ratio_for_large_counters() {
 
 #[test]
 fn set_if_preserve_oldest_keeps_oldest_suppressed_history() {
-    let limiter = limiter(10, 50, 1.0);
+    let limiter = limiter(10, 500, 1.0);
     let rate = RateLimit::per_second(2f64).unwrap();
 
     assert!(matches!(
@@ -1686,7 +1697,7 @@ fn set_if_preserve_oldest_keeps_oldest_suppressed_history() {
             suppression_factor,
         } if (suppression_factor - 1.0).abs() < 1e-12
     ));
-    thread::sleep(Duration::from_millis(60));
+    thread::sleep(Duration::from_millis(550));
     assert!(matches!(
         limiter.inc("k", &rate, 6),
         RateLimitDecision::Suppressed {
@@ -1841,13 +1852,14 @@ fn set_if_preserve_history_prunes_expired_buckets_before_matching_update() {
         let decision = limiter.inc(key, &rate, 4);
         assert!(matches!(decision, RateLimitDecision::Allowed));
     }
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(800));
     for key in ["newest", "oldest"] {
         let decision = limiter.inc(key, &rate, 5);
         assert!(matches!(decision, RateLimitDecision::Allowed));
         limiter.test_set_suppression_factor(key, Instant::now(), 0.25);
     }
-    thread::sleep(Duration::from_millis(800));
+    // The first buckets expire while the second, 250 ms old, have 750 ms left in the window.
+    thread::sleep(Duration::from_millis(250));
 
     for (key, preservation) in [
         ("newest", HistoryPreservation::PreserveNewest),
@@ -2090,12 +2102,14 @@ fn conditional_set_guard_miss_leaves_expired_history_untouched() {
         limiter.inc("k", &rate, 4),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(200));
+    // `inc` evicts expired buckets, so the first must stay live for the second `inc` and expire
+    // before the miss; 550 ms on each side leaves 450 ms to spare for both.
+    thread::sleep(Duration::from_millis(550));
     assert!(matches!(
         limiter.inc("k", &rate, 5),
         RateLimitDecision::Allowed
     ));
-    thread::sleep(Duration::from_millis(850));
+    thread::sleep(Duration::from_millis(550));
 
     let cached_at = Instant::now();
     limiter.test_set_suppression_factor("k", cached_at, 0.25);
