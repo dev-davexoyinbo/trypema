@@ -1,16 +1,16 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use redis::{Script, aio::ConnectionManager};
 
 use crate::{
     BucketSize, ConditionalSetOutcome, HardLimitFactor, HistoryPreservation, RateLimit,
-    RateLimitComparator, RateLimitDecision, RateLimiterBuilder, SuppressedRateLimitSnapshot,
-    TrypemaError, WindowSize,
-    builder::CleanupConfig,
+    RateLimitComparator, RateLimitDecision, RateLimiterBuilder, RateLimiterTarget,
+    SuppressedRateLimitSnapshot, TrypemaError, WindowSize,
+    builder::{CleanupConfig, sealed},
     cleanup_loop::CleanupLoop,
     common::{HistoryUpdateMode, RateType, SuppressionFactorCachePeriod},
     redis::{
-        RedisKey, RedisKeyGenerator, RedisRateLimiterBuilder, RedisRateLimiterProvider,
+        RedisBackend, RedisKey, RedisKeyGenerator,
         redis_rate_limiter_provider::RedisRateLimiterConfig,
         scripts::{
             SUPPRESSED_CLEANUP_LUA, SUPPRESSED_DELETE_LUA, SUPPRESSED_GET_FACTOR_LUA,
@@ -20,90 +20,15 @@ use crate::{
     },
 };
 
-/// Builder for [`SuppressedRedisRateLimiter`].
-///
-/// Builds the suppressed strategy alone, without the absolute strategy of a
-/// [`RedisRateLimiterProvider`]. The settings and their defaults are those of
-/// [`RedisRateLimiterBuilder`](super::RedisRateLimiterBuilder). A limiter built with prefix `P`
-/// reads and writes the same Redis keys as `RedisRateLimiterProvider` with prefix `P`, so both can
-/// share state.
-///
-/// `build()` starts the stale-state cleanup loop of the limiter unless cleanup is disabled. The
-/// loop ends after the last `Arc` of the limiter drops.
-///
-/// # Examples
-///
-/// ```no_run
-/// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
-/// use std::time::Duration;
-/// use trypema::{
-///     RateLimit, RateLimiterBuilder, WindowSize, HardLimitFactor,
-///     redis::{SuppressedRedisRateLimiter, RedisKey},
-/// };
-///
-/// let limiter = SuppressedRedisRateLimiter::builder(connection_manager)
-///     // Optional: only available with 'redis-tokio' or 'redis-smol'
-///     .prefix(RedisKey::try_from("my-service")?)
-///     // Optional: sliding-window duration
-///     .window_size(WindowSize::seconds_or_panic(60))
-///     // Optional: hard cutoff multiplier
-///     .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
-///     // Optional: inactivity duration before cleanup removes a key
-///     .stale_after(Duration::from_secs(300))
-///     .build()?;
-///
-/// let key = RedisKey::try_from("user-123")?;
-/// let rate = RateLimit::per_second_or_panic(10.0);
-/// let decision = limiter.inc(&key, &rate, 1).await?;
-/// # let _ = decision;
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone, Debug)]
-pub struct SuppressedRedisRateLimiterBuilder(RedisRateLimiterBuilder);
+impl sealed::Sealed for SuppressedRedisRateLimiter {}
 
-impl SuppressedRedisRateLimiterBuilder {
-    /// Set prefix used for Redis keys.
-    pub fn prefix(self, value: RedisKey) -> Self {
-        Self(self.0.prefix(value))
-    }
-} // end impl
+impl RateLimiterTarget for SuppressedRedisRateLimiter {
+    type Backend = RedisBackend;
 
-impl RateLimiterBuilder for SuppressedRedisRateLimiterBuilder {
-    type Provider = SuppressedRedisRateLimiter;
+    fn build_from(builder: RateLimiterBuilder<RedisBackend>) -> Result<Arc<Self>, TrypemaError> {
+        let (backend, config, cleanup) = builder.validate()?;
 
-    fn window_size(self, value: WindowSize) -> Self {
-        Self(self.0.window_size(value))
-    }
-
-    fn bucket_size(self, value: BucketSize) -> Self {
-        Self(self.0.bucket_size(value))
-    }
-
-    fn hard_limit_factor(self, value: HardLimitFactor) -> Self {
-        Self(self.0.hard_limit_factor(value))
-    }
-
-    fn suppression_factor_cache_period(self, value: SuppressionFactorCachePeriod) -> Self {
-        Self(self.0.suppression_factor_cache_period(value))
-    }
-
-    fn stale_after(self, value: Duration) -> Self {
-        Self(self.0.stale_after(value))
-    }
-
-    fn cleanup_interval(self, value: Duration) -> Self {
-        Self(self.0.cleanup_interval(value))
-    }
-
-    fn cleanup_enabled(self, enabled: bool) -> Self {
-        Self(self.0.cleanup_enabled(enabled))
-    }
-
-    fn build(self) -> Result<Arc<Self::Provider>, TrypemaError> {
-        let (config, cleanup) = self.0.validate()?;
-
-        let limiter = Arc::new(SuppressedRedisRateLimiter::new(config, cleanup));
+        let limiter = Arc::new(Self::new(backend.into_config(config), cleanup));
 
         if cleanup.enabled {
             limiter.start_cleanup_loop();
@@ -183,32 +108,54 @@ impl SuppressedRedisRateLimiter {
         }
     } // end constructor
 
-    /// Create a builder for a limiter that runs the suppressed strategy alone.
+    /// Create a builder whose `build()` returns a limiter that runs the suppressed strategy alone.
     ///
-    /// See [`SuppressedRedisRateLimiterBuilder`] for the settings and the cleanup lifecycle.
+    /// Same as [`RateLimiterBuilder::redis`] with the target fixed to this type. The limiter has no
+    /// absolute strategy. `build()` starts the stale-state cleanup loop of the limiter unless
+    /// cleanup is disabled. The loop ends after the last `Arc` of the limiter drops.
+    ///
+    /// A limiter built with prefix `P` reads and writes the same Redis keys as the suppressed
+    /// strategy of a provider with prefix `P`, so both can share state.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
-    /// use trypema::{RateLimiterBuilder, redis::SuppressedRedisRateLimiter};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use std::time::Duration;
+    /// use trypema::{
+    ///     RateLimit, WindowSize, HardLimitFactor,
+    ///     redis::{SuppressedRedisRateLimiter, RedisKey},
+    /// };
     ///
     /// let limiter = SuppressedRedisRateLimiter::builder(connection_manager)
-    ///     .disable_cleanup()
-    ///     .build()
-    ///     .unwrap();
-    /// # let _ = limiter;
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .prefix(RedisKey::try_from("my-service")?)
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(60))
+    ///     // Optional: hard cutoff multiplier
+    ///     .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
+    ///     // Optional: inactivity duration before cleanup removes a key
+    ///     .stale_after(Duration::from_secs(300))
+    ///     .build()?;
+    ///
+    /// let key = RedisKey::try_from("user-123")?;
+    /// let rate = RateLimit::per_second_or_panic(10.0);
+    /// let decision = limiter.inc(&key, &rate, 1).await?;
+    /// # let _ = decision;
+    /// # Ok(())
     /// # }
     /// ```
-    pub fn builder(connection_manager: ConnectionManager) -> SuppressedRedisRateLimiterBuilder {
-        SuppressedRedisRateLimiterBuilder(RedisRateLimiterProvider::builder(connection_manager))
+    pub fn builder(
+        connection_manager: ConnectionManager,
+    ) -> RateLimiterBuilder<RedisBackend, Self> {
+        RateLimiterBuilder::redis(connection_manager).with_target()
     } // end method builder
 
     /// Start stale-state cleanup. Calling while already running is no-op.
     ///
-    /// Only a limiter from [`builder`](Self::builder) is held in an `Arc` that callers can use
-    /// here. The cleanup loop of a provider cleans the limiters that the provider owns. A clone
-    /// of a limiter starts with its cleanup loop stopped.
+    /// Only a limiter built directly, with [`builder`](Self::builder) or `RateLimiterBuilder`, is
+    /// held in an `Arc` that callers can use here. The cleanup loop of a provider cleans the
+    /// limiters that the provider owns. A clone of a limiter starts with its cleanup loop stopped.
     pub fn start_cleanup_loop(self: &Arc<Self>) {
         CleanupLoop::start_task(
             self,
@@ -252,7 +199,7 @@ impl SuppressedRedisRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # use trypema::redis::RedisRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
@@ -373,7 +320,7 @@ impl SuppressedRedisRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # use trypema::redis::RedisRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::redis::RedisKey;
@@ -417,7 +364,7 @@ impl SuppressedRedisRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # use trypema::redis::RedisRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::RateLimit;
@@ -589,7 +536,7 @@ impl SuppressedRedisRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # use trypema::redis::RedisRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitComparator};

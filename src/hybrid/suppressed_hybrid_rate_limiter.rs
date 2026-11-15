@@ -13,17 +13,17 @@ use redis::aio::ConnectionManager;
 use tokio::sync::{RwLock, mpsc, watch};
 
 use crate::{
-    BucketSize, ConditionalSetOutcome, HardLimitFactor, HistoryPreservation, RateLimit,
-    RateLimitComparator, RateLimitDecision, RateLimiterBuilder, SuppressedRateLimitSnapshot,
+    ConditionalSetOutcome, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
+    RateLimitDecision, RateLimiterBuilder, RateLimiterTarget, SuppressedRateLimitSnapshot,
     SuppressionFactorCachePeriod, TrypemaError, WindowSize,
-    builder::CleanupConfig,
+    builder::{CleanupConfig, sealed},
     cleanup_loop::CleanupLoop,
     common::{HistoryUpdateMode, RandomState},
     hybrid::{
-        AbsoluteHybridCommitterSignal, AllowedLag, HybridRateLimiterBuilder,
-        HybridRateLimiterProvider, RedisCommitter, RedisCommitterOptions, RedisProxyCommitter,
-        SuppressedHybridCommit, SuppressedHybridPendingState, SuppressedHybridRedisProxy,
-        SuppressedHybridRedisProxyOptions, SuppressedHybridRedisProxyReadStateResult, SyncInterval,
+        AbsoluteHybridCommitterSignal, HybridBackend, RedisCommitter, RedisCommitterOptions,
+        RedisProxyCommitter, SuppressedHybridCommit, SuppressedHybridPendingState,
+        SuppressedHybridRedisProxy, SuppressedHybridRedisProxyOptions,
+        SuppressedHybridRedisProxyReadStateResult,
         common::{CallMode, EPOCH_CHANGE_INTERVAL, RedisRateLimiterSignal, StateRevision},
         hybrid_rate_limiter_provider::HybridRateLimiterConfig,
     },
@@ -68,110 +68,15 @@ pub(crate) struct SuppressedHybridSetIfTestHook {
     pub resume: tokio::sync::Notify,
 }
 
-/// Builder for [`SuppressedHybridRateLimiter`].
-///
-/// Builds the suppressed strategy alone, without the absolute strategy of a
-/// [`HybridRateLimiterProvider`]: one local state map, one Redis committer, and no workers of
-/// the absolute strategy. The settings and their defaults are those of
-/// [`HybridRateLimiterBuilder`](super::HybridRateLimiterBuilder). A limiter built with prefix
-/// `P` reads and writes the same Redis keys as `HybridRateLimiterProvider` with prefix `P`, so
-/// both can share state.
-///
-/// This builder has no `allowed_lag_applies_to_rejections` setting, because the suppressed
-/// strategy does not use it.
-///
-/// `build()` starts the synchronization worker, and also the stale-state cleanup loop unless
-/// cleanup is disabled. Both end after the last `Arc` of the limiter drops.
-///
-/// # Examples
-///
-/// ```no_run
-/// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
-/// use std::time::Duration;
-/// use trypema::{
-///     RateLimit, RateLimiterBuilder, WindowSize,
-///     hybrid::{AllowedLag, SuppressedHybridRateLimiter, SyncInterval},
-///     redis::RedisKey,
-/// };
-///
-/// let limiter = SuppressedHybridRateLimiter::builder(connection_manager)
-///     // Optional: only available with 'redis-tokio' or 'redis-smol'
-///     .prefix(RedisKey::try_from("my-service")?)
-///     // Optional: only available with 'redis-tokio' or 'redis-smol'
-///     .sync_interval(SyncInterval::milliseconds_or_panic(10))
-///     // Optional: only available with 'redis-tokio' or 'redis-smol'
-///     .allowed_lag(AllowedLag::milliseconds_or_panic(500))
-///     // Optional: sliding-window duration
-///     .window_size(WindowSize::seconds_or_panic(60))
-///     // Optional: inactivity duration before cleanup removes a key
-///     .stale_after(Duration::from_secs(300))
-///     .build()?;
-///
-/// let key = RedisKey::try_from("user-123")?;
-/// let rate = RateLimit::per_second_or_panic(10.0);
-/// let decision = limiter.inc(&key, &rate, 1).await?;
-/// # let _ = decision;
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone, Debug)]
-pub struct SuppressedHybridRateLimiterBuilder(HybridRateLimiterBuilder);
+impl sealed::Sealed for SuppressedHybridRateLimiter {}
 
-impl SuppressedHybridRateLimiterBuilder {
-    /// Set prefix used for Redis keys.
-    pub fn prefix(self, value: RedisKey) -> Self {
-        Self(self.0.prefix(value))
-    }
+impl RateLimiterTarget for SuppressedHybridRateLimiter {
+    type Backend = HybridBackend;
 
-    /// Set background Redis synchronization interval.
-    pub fn sync_interval(self, value: SyncInterval) -> Self {
-        Self(self.0.sync_interval(value))
-    }
+    fn build_from(builder: RateLimiterBuilder<HybridBackend>) -> Result<Arc<Self>, TrypemaError> {
+        let (backend, config, cleanup) = builder.validate()?;
 
-    /// Set the maximum age of local state that answers a read-only call.
-    ///
-    /// A read-only call on local state older than this lag reads Redis again. See
-    /// [`AllowedLag`] for the calls it applies to.
-    pub fn allowed_lag(self, value: AllowedLag) -> Self {
-        Self(self.0.allowed_lag(value))
-    }
-} // end impl
-
-impl RateLimiterBuilder for SuppressedHybridRateLimiterBuilder {
-    type Provider = SuppressedHybridRateLimiter;
-
-    fn window_size(self, value: WindowSize) -> Self {
-        Self(self.0.window_size(value))
-    }
-
-    fn bucket_size(self, value: BucketSize) -> Self {
-        Self(self.0.bucket_size(value))
-    }
-
-    fn hard_limit_factor(self, value: HardLimitFactor) -> Self {
-        Self(self.0.hard_limit_factor(value))
-    }
-
-    fn suppression_factor_cache_period(self, value: SuppressionFactorCachePeriod) -> Self {
-        Self(self.0.suppression_factor_cache_period(value))
-    }
-
-    fn stale_after(self, value: Duration) -> Self {
-        Self(self.0.stale_after(value))
-    }
-
-    fn cleanup_interval(self, value: Duration) -> Self {
-        Self(self.0.cleanup_interval(value))
-    }
-
-    fn cleanup_enabled(self, enabled: bool) -> Self {
-        Self(self.0.cleanup_enabled(enabled))
-    }
-
-    fn build(self) -> Result<Arc<Self::Provider>, TrypemaError> {
-        let (config, cleanup) = self.0.validate()?;
-
-        let limiter = SuppressedHybridRateLimiter::new(config, cleanup);
+        let limiter = Self::new(backend.into_config(config), cleanup);
 
         if cleanup.enabled {
             limiter.start_cleanup_loop();
@@ -298,31 +203,60 @@ impl SuppressedHybridRateLimiter {
         limiter
     } // end constructor
 
-    /// Create a builder for a limiter that runs the suppressed strategy alone.
+    /// Create a builder whose `build()` returns a limiter that runs the suppressed strategy alone.
     ///
-    /// See [`SuppressedHybridRateLimiterBuilder`] for the settings and the cleanup lifecycle.
+    /// Same as [`RateLimiterBuilder::hybrid`] with the target fixed to this type. The limiter has
+    /// no absolute strategy. `build()` starts the synchronization worker, and also the stale-state
+    /// cleanup loop of the limiter unless cleanup is disabled. Both end after the last `Arc` of the
+    /// limiter drops.
+    ///
+    /// The limiter does not use `allowed_lag_applies_to_rejections`.
+    ///
+    /// A limiter built with prefix `P` reads and writes the same Redis keys as the suppressed
+    /// strategy of a provider with prefix `P`, so both can share state.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
-    /// use trypema::{RateLimiterBuilder, hybrid::SuppressedHybridRateLimiter};
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use std::time::Duration;
+    /// use trypema::{
+    ///     RateLimit, WindowSize,
+    ///     hybrid::{AllowedLag, SuppressedHybridRateLimiter, SyncInterval},
+    ///     redis::RedisKey,
+    /// };
     ///
     /// let limiter = SuppressedHybridRateLimiter::builder(connection_manager)
-    ///     .disable_cleanup()
-    ///     .build()
-    ///     .unwrap();
-    /// # let _ = limiter;
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .prefix(RedisKey::try_from("my-service")?)
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .sync_interval(SyncInterval::milliseconds_or_panic(10))
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .allowed_lag(AllowedLag::milliseconds_or_panic(500))
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(60))
+    ///     // Optional: inactivity duration before cleanup removes a key
+    ///     .stale_after(Duration::from_secs(300))
+    ///     .build()?;
+    ///
+    /// let key = RedisKey::try_from("user-123")?;
+    /// let rate = RateLimit::per_second_or_panic(10.0);
+    /// let decision = limiter.inc(&key, &rate, 1).await?;
+    /// # let _ = decision;
+    /// # Ok(())
     /// # }
     /// ```
-    pub fn builder(connection_manager: ConnectionManager) -> SuppressedHybridRateLimiterBuilder {
-        SuppressedHybridRateLimiterBuilder(HybridRateLimiterProvider::builder(connection_manager))
+    pub fn builder(
+        connection_manager: ConnectionManager,
+    ) -> RateLimiterBuilder<HybridBackend, Self> {
+        RateLimiterBuilder::hybrid(connection_manager).with_target()
     } // end method builder
 
     /// Start stale-state cleanup. Calling while already running is no-op.
     ///
-    /// Only a limiter from [`builder`](Self::builder) is held in an `Arc` that callers can use
-    /// here. The cleanup loop of a provider cleans the limiters that the provider owns.
+    /// Only a limiter built directly, with [`builder`](Self::builder) or `RateLimiterBuilder`, is
+    /// held in an `Arc` that callers can use here. The cleanup loop of a provider cleans the
+    /// limiters that the provider owns.
     pub fn start_cleanup_loop(self: &Arc<Self>) {
         CleanupLoop::start_task(
             self,
@@ -384,6 +318,7 @@ impl SuppressedHybridRateLimiter {
                 let Some(limiter) = limiter.upgrade() else {
                     break;
                 };
+
                 limiter.epoch.fetch_add(1, Ordering::AcqRel);
             }
         });
@@ -454,7 +389,7 @@ impl SuppressedHybridRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # use trypema::hybrid::HybridRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::redis::RedisKey;
@@ -580,7 +515,7 @@ impl SuppressedHybridRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # use trypema::hybrid::HybridRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::RateLimit;
@@ -625,7 +560,7 @@ impl SuppressedHybridRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # use trypema::hybrid::HybridRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::RateLimit;
@@ -892,7 +827,7 @@ impl SuppressedHybridRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # use trypema::hybrid::HybridRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitComparator};
@@ -999,7 +934,7 @@ impl SuppressedHybridRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # use trypema::hybrid::HybridRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
@@ -1050,7 +985,7 @@ impl SuppressedHybridRateLimiter {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # use trypema::hybrid::HybridRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::RateLimit;

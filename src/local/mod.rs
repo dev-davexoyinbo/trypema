@@ -10,7 +10,7 @@
 //! # Examples
 //!
 //! ```
-//! use trypema::{RateLimit, RateLimiterBuilder, local::LocalRateLimiterProvider};
+//! use trypema::{RateLimit, local::LocalRateLimiterProvider};
 //!
 //! let rl = LocalRateLimiterProvider::builder()
 //!     .disable_cleanup()
@@ -26,12 +26,10 @@
 //! ```
 
 mod absolute_local_rate_limiter;
-pub use absolute_local_rate_limiter::{AbsoluteLocalRateLimiter, AbsoluteLocalRateLimiterBuilder};
+pub use absolute_local_rate_limiter::AbsoluteLocalRateLimiter;
 
 mod local_rate_limiter_provider;
-pub use local_rate_limiter_provider::{LocalRateLimiterBuilder, LocalRateLimiterProvider};
+pub use local_rate_limiter_provider::{LocalBackend, LocalRateLimiterProvider};
 
 pub(crate) mod suppressed_local_rate_limiter;
-pub use suppressed_local_rate_limiter::{
-    SuppressedLocalRateLimiter, SuppressedLocalRateLimiterBuilder,
-};
+pub use suppressed_local_rate_limiter::SuppressedLocalRateLimiter;

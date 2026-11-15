@@ -18,9 +18,9 @@ use crate::{
 
 /// Start and stop state of the stale-state cleanup loop of one owner.
 ///
-/// A loop holds only a `Weak` reference to its owner, so it ends after the last `Arc` drops. Each
-/// start takes a new generation and each stop advances it, so a loop from before a stop ends even
-/// when a later start runs before it wakes.
+/// A loop holds only a `Weak` reference to its owner, so it ends at its next wake after the last
+/// `Arc` drops. Each start takes a new generation and each stop advances it, so a loop from before
+/// a stop ends even when a later start runs before it wakes.
 #[derive(Debug)]
 pub(crate) struct CleanupLoop {
     config: CleanupConfig,
@@ -62,13 +62,16 @@ impl CleanupLoop {
 
     /// Start a loop on its own thread that calls `cleanup` once per interval.
     ///
-    /// The thread keeps no strong reference to `owner` while it sleeps.
-    pub(crate) fn start_thread<T>(
+    /// The thread keeps no strong reference to `owner` while it sleeps. It owns `cleanup` and
+    /// drops it when the loop ends: at the first wake after the last `Arc` of `owner` drops or
+    /// after [`stop`](Self::stop). It is dropped at once when a loop already runs.
+    pub(crate) fn start_thread<T, F>(
         owner: &Arc<T>,
         cleanup_loop: fn(&T) -> &CleanupLoop,
-        cleanup: fn(&T, u64),
+        cleanup: F,
     ) where
         T: Send + Sync + 'static,
+        F: Fn(&T, u64) + Send + 'static,
     {
         let Some(generation) = cleanup_loop(owner).begin() else {
             return;
@@ -99,7 +102,9 @@ impl CleanupLoop {
 
     /// Start a loop on the async runtime that awaits `cleanup` once per interval.
     ///
-    /// A failed pass logs `failure_message` and the loop tries again at the next interval.
+    /// A failed pass logs `failure_message` and the loop tries again at the next interval. The
+    /// task owns `cleanup` and drops it when the loop ends, as for
+    /// [`start_thread`](Self::start_thread).
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
     pub(crate) fn start_task<T, F, Fut>(
         owner: &Arc<T>,

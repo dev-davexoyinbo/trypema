@@ -1,11 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use redis::aio::ConnectionManager;
 
 use crate::{
-    BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, TrypemaError,
-    WindowSize,
-    builder::{CleanupConfig, ProviderConfig},
+    RateLimiterBuilder, RateLimiterTarget, TrypemaError,
+    builder::{CleanupConfig, ProviderConfig, sealed},
     cleanup_loop::CleanupLoop,
 };
 
@@ -19,95 +18,95 @@ pub(crate) struct RedisRateLimiterConfig {
     pub provider: ProviderConfig,
 }
 
-impl RedisRateLimiterConfig {
-    pub(crate) fn new(connection_manager: ConnectionManager, provider: ProviderConfig) -> Self {
-        Self {
-            connection_manager,
-            prefix: None,
-            provider,
-        }
-    }
-}
-
-/// Builder for [`RedisRateLimiterProvider`].
+/// Backend of a [`RateLimiterBuilder`] that builds Redis state.
+///
+/// Holds the connection manager and the key prefix. Create the builder with
+/// [`RateLimiterBuilder::redis`].
 #[derive(Clone, Debug)]
-pub struct RedisRateLimiterBuilder {
+pub struct RedisBackend {
     connection_manager: ConnectionManager,
     prefix: Option<RedisKey>,
-    provider: ProviderConfig,
-    cleanup: CleanupConfig,
 }
 
-impl RedisRateLimiterBuilder {
-    fn new(connection_manager: ConnectionManager) -> Self {
-        Self {
+impl RedisBackend {
+    pub(crate) fn into_config(self, provider: ProviderConfig) -> RedisRateLimiterConfig {
+        RedisRateLimiterConfig {
+            connection_manager: self.connection_manager,
+            prefix: self.prefix,
+            provider,
+        }
+    } // end fn into_config
+} // end impl
+
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+impl RateLimiterBuilder<RedisBackend> {
+    /// Create a builder for the Redis provider or one of its two limiters.
+    ///
+    /// The type that the caller expects from `build()` selects the target:
+    /// [`RedisRateLimiterProvider`], [`AbsoluteRedisRateLimiter`], or
+    /// [`SuppressedRedisRateLimiter`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use std::sync::Arc;
+    /// use trypema::{
+    ///     RateLimiterBuilder, WindowSize,
+    ///     redis::{AbsoluteRedisRateLimiter, RedisKey, RedisRateLimiterProvider},
+    /// };
+    ///
+    /// let provider: Arc<RedisRateLimiterProvider> =
+    ///     RateLimiterBuilder::redis(connection_manager.clone()).build()?;
+    ///
+    /// let limiter: Arc<AbsoluteRedisRateLimiter> = RateLimiterBuilder::redis(connection_manager)
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .prefix(RedisKey::try_from("my-service")?)
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(60))
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A target of another backend does not compile:
+    ///
+    /// ```compile_fail
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use std::sync::Arc;
+    /// use trypema::{RateLimiterBuilder, hybrid::AbsoluteHybridRateLimiter};
+    ///
+    /// let limiter: Arc<AbsoluteHybridRateLimiter> =
+    ///     RateLimiterBuilder::redis(connection_manager).build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn redis(connection_manager: ConnectionManager) -> Self {
+        Self::new(RedisBackend {
             connection_manager,
             prefix: None,
-            provider: ProviderConfig::default(),
-            cleanup: CleanupConfig::default(),
-        }
-    }
+        })
+    } // end constructor
+} // end impl
 
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+impl<T> RateLimiterBuilder<RedisBackend, T> {
     /// Set prefix used for Redis keys.
     pub fn prefix(mut self, value: RedisKey) -> Self {
-        self.prefix = Some(value);
+        self.backend.prefix = Some(value);
         self
-    }
+    } // end method prefix
+} // end impl
 
-    pub(crate) fn validate(self) -> Result<(RedisRateLimiterConfig, CleanupConfig), TrypemaError> {
-        let provider_config = self.provider.validate()?;
-        let cleanup = self.cleanup.validate()?;
+impl sealed::Sealed for RedisRateLimiterProvider {}
 
-        let mut config = RedisRateLimiterConfig::new(self.connection_manager, provider_config);
+impl RateLimiterTarget for RedisRateLimiterProvider {
+    type Backend = RedisBackend;
 
-        config.prefix = self.prefix;
+    fn build_from(builder: RateLimiterBuilder<RedisBackend>) -> Result<Arc<Self>, TrypemaError> {
+        let (backend, config, cleanup) = builder.validate()?;
 
-        Ok((config, cleanup))
-    }
-}
-
-impl RateLimiterBuilder for RedisRateLimiterBuilder {
-    type Provider = RedisRateLimiterProvider;
-
-    fn window_size(mut self, value: WindowSize) -> Self {
-        self.provider.window_size = value;
-        self
-    }
-
-    fn bucket_size(mut self, value: BucketSize) -> Self {
-        self.provider.bucket_size = value;
-        self
-    }
-
-    fn hard_limit_factor(mut self, value: HardLimitFactor) -> Self {
-        self.provider.hard_limit_factor = value;
-        self
-    }
-
-    fn suppression_factor_cache_period(mut self, value: SuppressionFactorCachePeriod) -> Self {
-        self.provider.suppression_factor_cache_period = value;
-        self
-    }
-
-    fn stale_after(mut self, value: Duration) -> Self {
-        self.cleanup.stale_after = value;
-        self
-    }
-
-    fn cleanup_interval(mut self, value: Duration) -> Self {
-        self.cleanup.interval = value;
-        self
-    }
-
-    fn cleanup_enabled(mut self, enabled: bool) -> Self {
-        self.cleanup.enabled = enabled;
-        self
-    }
-
-    fn build(self) -> Result<Arc<Self::Provider>, TrypemaError> {
-        let (config, cleanup) = self.validate()?;
-
-        let provider = Arc::new(RedisRateLimiterProvider::new(config, cleanup));
+        let provider = Arc::new(Self::new(backend.into_config(config), cleanup));
 
         if cleanup.enabled {
             provider.start_cleanup_loop();
@@ -115,7 +114,7 @@ impl RateLimiterBuilder for RedisRateLimiterBuilder {
 
         Ok(provider)
     }
-}
+} // end impl
 
 /// Provider for Redis-backed distributed rate limiting.
 ///
@@ -139,7 +138,7 @@ impl RateLimiterBuilder for RedisRateLimiterBuilder {
 /// # Examples
 ///
 /// ```no_run
-/// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+/// # use trypema::redis::RedisRateLimiterProvider;
 /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
 /// # let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
 /// use trypema::{RateLimit, RateLimitDecision};
@@ -162,9 +161,13 @@ pub struct RedisRateLimiterProvider {
 }
 
 impl RedisRateLimiterProvider {
-    /// Create builder using connection manager and default validated configuration.
-    pub fn builder(connection_manager: ConnectionManager) -> RedisRateLimiterBuilder {
-        RedisRateLimiterBuilder::new(connection_manager)
+    /// Create a builder whose `build()` returns this provider.
+    ///
+    /// Same as [`RateLimiterBuilder::redis`] with the target fixed to this type.
+    pub fn builder(
+        connection_manager: ConnectionManager,
+    ) -> RateLimiterBuilder<RedisBackend, Self> {
+        RateLimiterBuilder::redis(connection_manager).with_target()
     }
 
     pub(crate) fn new(options: RedisRateLimiterConfig, cleanup: CleanupConfig) -> Self {
@@ -200,7 +203,7 @@ impl RedisRateLimiterProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # use trypema::redis::RedisRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
@@ -228,7 +231,7 @@ impl RedisRateLimiterProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, redis::RedisRateLimiterProvider};
+    /// # use trypema::redis::RedisRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = RedisRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
