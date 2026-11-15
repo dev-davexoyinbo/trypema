@@ -10,7 +10,7 @@ mod common;
 pub use common::{AllowedLag, SyncInterval};
 
 mod hybrid_rate_limiter_provider;
-pub use hybrid_rate_limiter_provider::{HybridRateLimiterBuilder, HybridRateLimiterProvider};
+pub use hybrid_rate_limiter_provider::{HybridBackend, HybridRateLimiterProvider};
 
 mod suppressed_hybrid_rate_limiter;
 pub use suppressed_hybrid_rate_limiter::SuppressedHybridRateLimiter;

@@ -15,12 +15,12 @@
 /// The runtime handle used to drive async bench futures.
 ///
 /// - **tokio**: `tokio::runtime::Runtime` (multi-thread, 2 workers)
-/// - **smol**: `()` — `smol::block_on` requires no persistent handle
+/// - **smol**: an empty handle — `smol::block_on` requires no persistent runtime
 #[cfg(feature = "redis-tokio")]
 pub type Runtime = tokio::runtime::Runtime;
 
 #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-pub type Runtime = ();
+pub struct Runtime;
 
 /// Build the runtime handle once per bench binary.
 #[cfg(feature = "redis-tokio")]
@@ -33,7 +33,9 @@ pub fn build() -> Runtime {
 }
 
 #[cfg(all(feature = "redis-smol", not(feature = "redis-tokio")))]
-pub fn build() -> Runtime {}
+pub fn build() -> Runtime {
+    Runtime
+}
 
 /// Drive a future to completion on the given runtime handle.
 #[cfg(feature = "redis-tokio")]

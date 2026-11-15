@@ -1,20 +1,13 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::sync::Arc;
 
 use redis::aio::ConnectionManager;
 
 use crate::{
-    BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, TrypemaError,
-    WindowSize,
-    builder::{CleanupConfig, ProviderConfig},
+    RateLimiterBuilder, RateLimiterTarget, TrypemaError,
+    builder::{CleanupConfig, ProviderConfig, sealed},
+    cleanup_loop::CleanupLoop,
     hybrid::{AbsoluteHybridRateLimiter, AllowedLag, SuppressedHybridRateLimiter, SyncInterval},
     redis::RedisKey,
-    runtime::{new_interval, spawn_task, tick},
 };
 
 #[derive(Clone, Debug)]
@@ -27,51 +20,110 @@ pub(crate) struct HybridRateLimiterConfig {
     pub allowed_lag_applies_to_rejections: bool,
 }
 
-/// Builder for [`HybridRateLimiterProvider`].
+/// Backend of a [`RateLimiterBuilder`] that builds local state that synchronizes with Redis.
+///
+/// Holds the connection manager, the key prefix, the synchronization interval, and the allowed
+/// lag settings. Create the builder with [`RateLimiterBuilder::hybrid`].
 #[derive(Clone, Debug)]
-pub struct HybridRateLimiterBuilder {
+pub struct HybridBackend {
     connection_manager: ConnectionManager,
     prefix: Option<RedisKey>,
-    provider: ProviderConfig,
     sync_interval: SyncInterval,
     allowed_lag: AllowedLag,
     allowed_lag_applies_to_rejections: bool,
-    cleanup: CleanupConfig,
 }
 
-impl HybridRateLimiterBuilder {
-    fn new(connection_manager: ConnectionManager) -> Self {
-        Self {
+impl HybridBackend {
+    pub(crate) fn into_config(self, provider: ProviderConfig) -> HybridRateLimiterConfig {
+        HybridRateLimiterConfig {
+            connection_manager: self.connection_manager,
+            prefix: self.prefix,
+            provider,
+            sync_interval: self.sync_interval,
+            allowed_lag: self.allowed_lag,
+            allowed_lag_applies_to_rejections: self.allowed_lag_applies_to_rejections,
+        }
+    } // end fn into_config
+} // end impl
+
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+impl RateLimiterBuilder<HybridBackend> {
+    /// Create a builder for the hybrid provider or one of its two limiters.
+    ///
+    /// The type that the caller expects from `build()` selects the target:
+    /// [`HybridRateLimiterProvider`], [`AbsoluteHybridRateLimiter`], or
+    /// [`SuppressedHybridRateLimiter`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use std::sync::Arc;
+    /// use trypema::{
+    ///     RateLimiterBuilder, WindowSize,
+    ///     hybrid::{AbsoluteHybridRateLimiter, HybridRateLimiterProvider, SyncInterval},
+    ///     redis::RedisKey,
+    /// };
+    ///
+    /// let provider: Arc<HybridRateLimiterProvider> =
+    ///     RateLimiterBuilder::hybrid(connection_manager.clone()).build()?;
+    ///
+    /// let limiter: Arc<AbsoluteHybridRateLimiter> = RateLimiterBuilder::hybrid(connection_manager)
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .prefix(RedisKey::try_from("my-service")?)
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .sync_interval(SyncInterval::milliseconds_or_panic(10))
+    ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
+    ///     .allowed_lag_applies_to_rejections(true)
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(60))
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A target of another backend does not compile:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use trypema::{RateLimiterBuilder, hybrid::AbsoluteHybridRateLimiter};
+    ///
+    /// let limiter: Arc<AbsoluteHybridRateLimiter> = RateLimiterBuilder::local().build()?;
+    /// # Ok::<(), trypema::TrypemaError>(())
+    /// ```
+    pub fn hybrid(connection_manager: ConnectionManager) -> Self {
+        Self::new(HybridBackend {
             connection_manager,
             prefix: None,
-            provider: ProviderConfig::default(),
             sync_interval: SyncInterval::default(),
             allowed_lag: AllowedLag::default(),
             allowed_lag_applies_to_rejections: false,
-            cleanup: CleanupConfig::default(),
-        }
-    }
+        })
+    } // end constructor
+} // end impl
 
+#[cfg_attr(docsrs, doc(cfg(any(feature = "redis-tokio", feature = "redis-smol"))))]
+impl<T> RateLimiterBuilder<HybridBackend, T> {
     /// Set prefix used for Redis keys.
     pub fn prefix(mut self, value: RedisKey) -> Self {
-        self.prefix = Some(value);
+        self.backend.prefix = Some(value);
         self
-    }
+    } // end method prefix
 
     /// Set background Redis synchronization interval.
     pub fn sync_interval(mut self, value: SyncInterval) -> Self {
-        self.sync_interval = value;
+        self.backend.sync_interval = value;
         self
-    }
+    } // end method sync_interval
 
     /// Set the maximum age of local state that answers a read-only call.
     ///
     /// A read-only call on local state older than this lag reads Redis again. See
     /// [`AllowedLag`] for the calls it applies to.
     pub fn allowed_lag(mut self, value: AllowedLag) -> Self {
-        self.allowed_lag = value;
+        self.backend.allowed_lag = value;
         self
-    }
+    } // end method allowed_lag
 
     /// Apply the allowed lag to the rejection cache of the absolute strategy.
     ///
@@ -86,13 +138,13 @@ impl HybridRateLimiterBuilder {
     /// refreshed more often, and each refresh that still rejects starts a new cache time, so
     /// cleanup keeps it while it is checked, as with `false`.
     ///
-    /// The suppressed strategy does not use this setting. Its suppression cache is bounded by
-    /// the suppression-factor cache period.
+    /// The suppressed strategy, of a provider or a [`SuppressedHybridRateLimiter`], does not use
+    /// this setting. Its suppression cache is bounded by the suppression-factor cache period.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, hybrid::{AllowedLag, HybridRateLimiterProvider}};
+    /// # use trypema::hybrid::{AllowedLag, HybridRateLimiterProvider};
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let provider = HybridRateLimiterProvider::builder(connection_manager)
     ///     // Optional: only available with 'redis-tokio' or 'redis-smol'
@@ -105,63 +157,20 @@ impl HybridRateLimiterBuilder {
     /// # }
     /// ```
     pub fn allowed_lag_applies_to_rejections(mut self, value: bool) -> Self {
-        self.allowed_lag_applies_to_rejections = value;
+        self.backend.allowed_lag_applies_to_rejections = value;
         self
-    }
-}
+    } // end method allowed_lag_applies_to_rejections
+} // end impl
 
-impl RateLimiterBuilder for HybridRateLimiterBuilder {
-    type Provider = HybridRateLimiterProvider;
+impl sealed::Sealed for HybridRateLimiterProvider {}
 
-    fn window_size(mut self, value: WindowSize) -> Self {
-        self.provider.window_size = value;
-        self
-    }
+impl RateLimiterTarget for HybridRateLimiterProvider {
+    type Backend = HybridBackend;
 
-    fn bucket_size(mut self, value: BucketSize) -> Self {
-        self.provider.bucket_size = value;
-        self
-    }
+    fn build_from(builder: RateLimiterBuilder<HybridBackend>) -> Result<Arc<Self>, TrypemaError> {
+        let (backend, config, cleanup) = builder.validate()?;
 
-    fn hard_limit_factor(mut self, value: HardLimitFactor) -> Self {
-        self.provider.hard_limit_factor = value;
-        self
-    }
-
-    fn suppression_factor_cache_period(mut self, value: SuppressionFactorCachePeriod) -> Self {
-        self.provider.suppression_factor_cache_period = value;
-        self
-    }
-
-    fn stale_after(mut self, value: Duration) -> Self {
-        self.cleanup.stale_after = value;
-        self
-    }
-
-    fn cleanup_interval(mut self, value: Duration) -> Self {
-        self.cleanup.interval = value;
-        self
-    }
-
-    fn cleanup_enabled(mut self, enabled: bool) -> Self {
-        self.cleanup.enabled = enabled;
-        self
-    }
-
-    fn build(self) -> Result<Arc<Self::Provider>, TrypemaError> {
-        let provider_config = self.provider.validate()?;
-        let cleanup = self.cleanup.validate()?;
-
-        let config = HybridRateLimiterConfig {
-            connection_manager: self.connection_manager,
-            prefix: self.prefix,
-            provider: provider_config,
-            sync_interval: self.sync_interval,
-            allowed_lag: self.allowed_lag,
-            allowed_lag_applies_to_rejections: self.allowed_lag_applies_to_rejections,
-        };
-
-        let provider = Arc::new(HybridRateLimiterProvider::new(config, cleanup));
+        let provider = Arc::new(Self::new(backend.into_config(config), cleanup));
 
         if cleanup.enabled {
             provider.start_cleanup_loop();
@@ -169,7 +178,7 @@ impl RateLimiterBuilder for HybridRateLimiterBuilder {
 
         Ok(provider)
     }
-}
+} // end impl
 
 /// Provider for hybrid rate limiting (local fast-path + Redis sync).
 ///
@@ -199,70 +208,40 @@ impl RateLimiterBuilder for HybridRateLimiterBuilder {
 pub struct HybridRateLimiterProvider {
     absolute: Arc<AbsoluteHybridRateLimiter>,
     suppressed: Arc<SuppressedHybridRateLimiter>,
-    cleanup: CleanupConfig,
-    is_cleanup_loop_running: AtomicBool,
-    cleanup_generation: AtomicU64,
+    cleanup_loop: CleanupLoop,
 }
 
 impl HybridRateLimiterProvider {
-    /// Create builder using connection manager and default validated configuration.
-    pub fn builder(connection_manager: ConnectionManager) -> HybridRateLimiterBuilder {
-        HybridRateLimiterBuilder::new(connection_manager)
+    /// Create a builder whose `build()` returns this provider.
+    ///
+    /// Same as [`RateLimiterBuilder::hybrid`] with the target fixed to this type.
+    pub fn builder(
+        connection_manager: ConnectionManager,
+    ) -> RateLimiterBuilder<HybridBackend, Self> {
+        RateLimiterBuilder::hybrid(connection_manager).with_target()
     }
 
     pub(crate) fn new(options: HybridRateLimiterConfig, cleanup: CleanupConfig) -> Self {
         Self {
-            absolute: AbsoluteHybridRateLimiter::new(options.clone()),
-            suppressed: SuppressedHybridRateLimiter::new(options),
-            cleanup,
-            is_cleanup_loop_running: AtomicBool::new(false),
-            cleanup_generation: AtomicU64::new(0),
+            absolute: AbsoluteHybridRateLimiter::new(options.clone(), cleanup),
+            suppressed: SuppressedHybridRateLimiter::new(options, cleanup),
+            cleanup_loop: CleanupLoop::new(cleanup),
         }
     }
 
     /// Start stale-state cleanup. Calling while already running is no-op.
     pub fn start_cleanup_loop(self: &Arc<Self>) {
-        if self.is_cleanup_loop_running.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        let generation = self
-            .cleanup_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-
-        let provider = Arc::downgrade(self);
-        let cleanup_interval = self.cleanup.interval;
-
-        spawn_task(async move {
-            let mut interval = new_interval(cleanup_interval);
-            // Tokio intervals tick immediately; Smol intervals wait for the configured duration.
-            #[cfg(feature = "redis-tokio")]
-            tick(&mut interval).await;
-
-            loop {
-                tick(&mut interval).await;
-                let Some(provider) = provider.upgrade() else {
-                    break;
-                };
-
-                if !provider.is_cleanup_loop_running.load(Ordering::Acquire)
-                    || provider.cleanup_generation.load(Ordering::Acquire) != generation
-                {
-                    break;
-                }
-
-                if let Err(error) = provider.cleanup(provider.cleanup.stale_after_ms()).await {
-                    tracing::warn!(?error, "Hybrid cleanup failed, will retry");
-                }
-            }
-        });
+        CleanupLoop::start_task(
+            self,
+            |provider| &provider.cleanup_loop,
+            |provider, stale_after_ms| async move { provider.cleanup(stale_after_ms).await },
+            "Hybrid cleanup failed, will retry",
+        );
     }
 
     /// Stop stale-state cleanup. Calling while stopped is no-op.
     pub fn stop_cleanup_loop(&self) {
-        self.cleanup_generation.fetch_add(1, Ordering::AcqRel);
-        self.is_cleanup_loop_running.store(false, Ordering::Release);
+        self.cleanup_loop.stop();
     }
 
     /// Access the absolute allow/reject strategy.
@@ -272,7 +251,7 @@ impl HybridRateLimiterProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # use trypema::hybrid::HybridRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
@@ -297,7 +276,7 @@ impl HybridRateLimiterProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use trypema::{RateLimiterBuilder, hybrid::HybridRateLimiterProvider};
+    /// # use trypema::hybrid::HybridRateLimiterProvider;
     /// # async fn example(connection_manager: trypema::redis::ConnectionManager) {
     /// let rl = HybridRateLimiterProvider::builder(connection_manager).build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};

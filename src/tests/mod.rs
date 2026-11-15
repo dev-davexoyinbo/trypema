@@ -12,6 +12,7 @@ mod test_absolute_redis_rate_limiter;
 mod test_builder;
 mod test_cleanup_loop;
 mod test_common_validation;
+mod test_limiter_builder;
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 mod test_redis_script_scale;
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]

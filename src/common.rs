@@ -94,7 +94,7 @@ pub(crate) struct Bucket {
 /// # Examples
 ///
 /// ```
-/// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+/// # use trypema::local::LocalRateLimiterProvider;
 /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
 /// use trypema::{RateLimit, RateLimitDecision};
 ///

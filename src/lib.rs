@@ -7,7 +7,9 @@
 compile_error!("Features `redis-tokio` and `redis-smol` are mutually exclusive");
 
 mod builder;
-pub use builder::RateLimiterBuilder;
+pub use builder::{AnyTarget, RateLimiterBuilder, RateLimiterTarget};
+
+mod cleanup_loop;
 
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 pub(crate) mod runtime;

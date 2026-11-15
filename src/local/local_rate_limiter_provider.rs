@@ -1,70 +1,57 @@
-use std::{
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    thread,
-    time::Duration,
-};
+use std::sync::Arc;
 
 use crate::{
-    BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, TrypemaError,
-    WindowSize,
-    builder::{CleanupConfig, ProviderConfig},
+    RateLimiterBuilder, RateLimiterTarget, TrypemaError,
+    builder::{CleanupConfig, ProviderConfig, sealed},
+    cleanup_loop::CleanupLoop,
 };
 
 use super::{AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter};
 
-/// Builder for [`LocalRateLimiterProvider`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalRateLimiterBuilder {
-    provider: ProviderConfig,
-    cleanup: CleanupConfig,
-}
+/// Backend of a [`RateLimiterBuilder`] that builds in-process state.
+///
+/// It has no settings of its own. Create the builder with [`RateLimiterBuilder::local`].
+#[derive(Clone, Copy, Debug)]
+pub struct LocalBackend;
 
-impl RateLimiterBuilder for LocalRateLimiterBuilder {
-    type Provider = LocalRateLimiterProvider;
+impl RateLimiterBuilder<LocalBackend> {
+    /// Create a builder for the local provider or one of its two limiters.
+    ///
+    /// The type that the caller expects from `build()` selects the target:
+    /// [`LocalRateLimiterProvider`], [`AbsoluteLocalRateLimiter`], or
+    /// [`SuppressedLocalRateLimiter`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use trypema::{
+    ///     RateLimiterBuilder, WindowSize,
+    ///     local::{LocalRateLimiterProvider, SuppressedLocalRateLimiter},
+    /// };
+    ///
+    /// let provider: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local().build()?;
+    ///
+    /// let limiter: Arc<SuppressedLocalRateLimiter> = RateLimiterBuilder::local()
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(60))
+    ///     .build()?;
+    /// # Ok::<(), trypema::TrypemaError>(())
+    /// ```
+    pub fn local() -> Self {
+        Self::new(LocalBackend)
+    } // end constructor
+} // end impl
 
-    fn window_size(mut self, value: WindowSize) -> Self {
-        self.provider.window_size = value;
-        self
-    }
+impl sealed::Sealed for LocalRateLimiterProvider {}
 
-    fn bucket_size(mut self, value: BucketSize) -> Self {
-        self.provider.bucket_size = value;
-        self
-    }
+impl RateLimiterTarget for LocalRateLimiterProvider {
+    type Backend = LocalBackend;
 
-    fn hard_limit_factor(mut self, value: HardLimitFactor) -> Self {
-        self.provider.hard_limit_factor = value;
-        self
-    }
+    fn build_from(builder: RateLimiterBuilder<LocalBackend>) -> Result<Arc<Self>, TrypemaError> {
+        let (_, config, cleanup) = builder.validate()?;
 
-    fn suppression_factor_cache_period(mut self, value: SuppressionFactorCachePeriod) -> Self {
-        self.provider.suppression_factor_cache_period = value;
-        self
-    }
-
-    fn stale_after(mut self, value: Duration) -> Self {
-        self.cleanup.stale_after = value;
-        self
-    }
-
-    fn cleanup_interval(mut self, value: Duration) -> Self {
-        self.cleanup.interval = value;
-        self
-    }
-
-    fn cleanup_enabled(mut self, enabled: bool) -> Self {
-        self.cleanup.enabled = enabled;
-        self
-    }
-
-    fn build(self) -> Result<Arc<Self::Provider>, TrypemaError> {
-        let config = self.provider.validate()?;
-        let cleanup = self.cleanup.validate()?;
-
-        let provider = Arc::new(LocalRateLimiterProvider::new(config, cleanup));
+        let provider = Arc::new(Self::new(config, cleanup));
 
         if cleanup.enabled {
             provider.start_cleanup_loop();
@@ -72,7 +59,7 @@ impl RateLimiterBuilder for LocalRateLimiterBuilder {
 
         Ok(provider)
     }
-}
+} // end impl
 
 /// Provider for in-process rate limiting strategies.
 ///
@@ -91,7 +78,7 @@ impl RateLimiterBuilder for LocalRateLimiterBuilder {
 /// # Examples
 ///
 /// ```
-/// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+/// # use trypema::local::LocalRateLimiterProvider;
 /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
 /// use trypema::RateLimit;
 ///
@@ -103,66 +90,33 @@ impl RateLimiterBuilder for LocalRateLimiterBuilder {
 pub struct LocalRateLimiterProvider {
     absolute: AbsoluteLocalRateLimiter,
     suppressed: SuppressedLocalRateLimiter,
-    cleanup: CleanupConfig,
-    is_cleanup_loop_running: AtomicBool,
-    cleanup_generation: AtomicU64,
+    cleanup_loop: CleanupLoop,
 }
 
 impl LocalRateLimiterProvider {
-    /// Create builder using default validated configuration.
-    pub fn builder() -> LocalRateLimiterBuilder {
-        LocalRateLimiterBuilder::default()
+    /// Create a builder whose `build()` returns this provider.
+    ///
+    /// Same as [`RateLimiterBuilder::local`] with the target fixed to this type.
+    pub fn builder() -> RateLimiterBuilder<LocalBackend, Self> {
+        RateLimiterBuilder::local().with_target()
     }
 
     pub(crate) fn new(config: ProviderConfig, cleanup: CleanupConfig) -> Self {
         Self {
-            absolute: AbsoluteLocalRateLimiter::new(config),
-            suppressed: SuppressedLocalRateLimiter::new(config),
-            cleanup,
-            is_cleanup_loop_running: AtomicBool::new(false),
-            cleanup_generation: AtomicU64::new(0),
+            absolute: AbsoluteLocalRateLimiter::new(config, cleanup),
+            suppressed: SuppressedLocalRateLimiter::new(config, cleanup),
+            cleanup_loop: CleanupLoop::new(cleanup),
         }
     }
 
     /// Start stale-state cleanup. Calling while already running is no-op.
     pub fn start_cleanup_loop(self: &Arc<Self>) {
-        if self.is_cleanup_loop_running.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        let generation = self
-            .cleanup_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        let provider = Arc::downgrade(self);
-        thread::spawn(move || Self::run_cleanup_loop(provider, generation));
-    }
-
-    fn run_cleanup_loop(weak_provider: Weak<Self>, generation: u64) {
-        loop {
-            let Some(provider) = weak_provider.upgrade() else {
-                break;
-            };
-            let interval = provider.cleanup.interval;
-            drop(provider);
-            thread::sleep(interval);
-
-            let Some(provider) = weak_provider.upgrade() else {
-                break;
-            };
-            if !provider.is_cleanup_loop_running.load(Ordering::Acquire)
-                || provider.cleanup_generation.load(Ordering::Acquire) != generation
-            {
-                break;
-            }
-            provider.cleanup(provider.cleanup.stale_after_ms());
-        }
+        CleanupLoop::start_thread(self, |provider| &provider.cleanup_loop, Self::cleanup);
     }
 
     /// Stop stale-state cleanup. Calling while stopped is no-op.
     pub fn stop_cleanup_loop(&self) {
-        self.cleanup_generation.fetch_add(1, Ordering::AcqRel);
-        self.is_cleanup_loop_running.store(false, Ordering::Release);
+        self.cleanup_loop.stop();
     }
 
     /// Access the absolute strategy.
@@ -175,7 +129,7 @@ impl LocalRateLimiterProvider {
     /// # Examples
     ///
     /// ```
-    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # use trypema::local::LocalRateLimiterProvider;
     /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///
@@ -200,7 +154,7 @@ impl LocalRateLimiterProvider {
     /// # Examples
     ///
     /// ```
-    /// # use trypema::{RateLimiterBuilder, local::LocalRateLimiterProvider};
+    /// # use trypema::local::LocalRateLimiterProvider;
     /// # let rl = LocalRateLimiterProvider::builder().disable_cleanup().build().unwrap();
     /// use trypema::{RateLimit, RateLimitDecision};
     ///

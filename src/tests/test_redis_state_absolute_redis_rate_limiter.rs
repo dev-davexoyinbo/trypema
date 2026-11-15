@@ -24,8 +24,7 @@ use super::runtime;
 
 use crate::common::RateType;
 use crate::{
-    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
-    RateLimiterBuilder, WindowSize,
+    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, WindowSize,
     redis::{RedisKey, RedisRateLimiterProvider},
 };
 

@@ -15,7 +15,7 @@ use crate::common::RateType;
 use crate::redis::common::RedisKeyGenerator;
 use crate::{
     BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
-    RateLimiterBuilder, TrypemaError, WindowSize,
+    TrypemaError, WindowSize,
     hybrid::{HybridRateLimiterProvider, SyncInterval},
     redis::{RedisKey, RedisRateLimiterProvider},
 };

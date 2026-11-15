@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use trypema::{
-    BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, WindowSize,
+    BucketSize, HardLimitFactor, SuppressionFactorCachePeriod, WindowSize,
     local::LocalRateLimiterProvider,
 };
 
@@ -131,7 +131,6 @@ pub mod redis {
     use std::{env, sync::Arc};
 
     use trypema::{
-        RateLimiterBuilder,
         hybrid::{HybridRateLimiterProvider, SyncInterval},
         redis::{RedisKey, RedisRateLimiterProvider},
     };

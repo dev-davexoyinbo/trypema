@@ -556,17 +556,34 @@ feature-gated link that breaks no-feature Rustdoc.
 
 ### 14.4 Builder and feature documentation
 
-Explain the provider-specific builder forms explicitly:
+`RateLimiterBuilder<B, T>` is the one builder. `B` is the backend (`LocalBackend`,
+`RedisBackend`, `HybridBackend`) and holds the backend settings. `T` is the target: `AnyTarget`,
+which lets the caller's type select it, or the fixed type of a `builder()` shortcut. Explain the
+forms explicitly:
 
-- Local: `LocalRateLimiterProvider::builder()`.
-- Redis: `RedisRateLimiterProvider::builder(connection_manager)`.
-- Hybrid: `HybridRateLimiterProvider::builder(connection_manager)`.
+- Primary: `RateLimiterBuilder::local()`, `RateLimiterBuilder::redis(connection_manager)`, and
+  `RateLimiterBuilder::hybrid(connection_manager)`, with the target from an annotation such as
+  `let limiter: Arc<AbsoluteHybridRateLimiter> = ...build()?;` or a turbofish.
+- Shortcuts: `LocalRateLimiterProvider::builder()`,
+  `RedisRateLimiterProvider::builder(connection_manager)`,
+  `HybridRateLimiterProvider::builder(connection_manager)`, `<Limiter>::builder()` for the two
+  local limiters, and `<Limiter>::builder(connection_manager)` for the four Redis and hybrid
+  limiters. They return the same builder with the target fixed, so `build()` needs no annotation.
+- Each provider and limiter implements the sealed `RateLimiterTarget` trait for its backend. A
+  target of another backend must not compile; keep the `compile_fail` doctests that prove it.
+- Shared setters are on every `RateLimiterBuilder<B, T>`. Backend setters are on that backend
+  only: `prefix` on Redis and hybrid; `sync_interval`, `allowed_lag`, and
+  `allowed_lag_applies_to_rejections` on hybrid. Do not split setters by strategy; document the
+  settings a target does not use instead.
+- The Redis and hybrid backends, constructors, setters, and target impls live in the Redis and
+  hybrid modules, behind the Redis feature gates, with `doc(cfg)` on impl blocks of the shared
+  `RateLimiterBuilder` type.
 
 Document the cleanup lifecycle:
 
-- The shared `RateLimiterBuilder::build()` starts cleanup automatically.
+- `RateLimiterBuilder::build()` starts cleanup automatically.
 - `cleanup_enabled(false)` disables automatic cleanup startup.
-- Provider `start_cleanup_loop()` and `stop_cleanup_loop()` methods are idempotent.
+- Provider and limiter `start_cleanup_loop()` and `stop_cleanup_loop()` methods are idempotent.
 
 In builder examples, put a short comment before optional chained setters. Use `Optional: ...` for
 general setters and `Optional: only available with 'redis-tokio' or 'redis-smol'` for Redis-only

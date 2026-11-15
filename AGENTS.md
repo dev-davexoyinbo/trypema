@@ -736,6 +736,12 @@ Follow `CONVENTIONS.md`.
 - Do not describe `get` as never mutating internal storage. Say it returns live state and may
   perform lazy eviction. Keep the absolute `u64` and suppressed snapshot return contracts clear.
 - Re-export new public common types from `src/lib.rs`.
+- `RateLimiterBuilder<B, T>` (`src/builder.rs`) builds every provider and limiter. It validates
+  the same settings for every target (`InvalidBucketSize`, cleanup durations) and starts the
+  cleanup loop of the built value unless cleanup is disabled. A limiter built directly uses the
+  same Redis keys as that strategy of a provider with the same prefix, and a limiter that a
+  provider owns runs no cleanup loop of its own. A target of another backend must not compile.
+  With no Redis feature, only `RateLimiterBuilder::local()` and the local targets exist.
 - Keep sync local examples and async Redis/hybrid examples consistent with their APIs.
 
 Required Rustdoc checks when documentation or public APIs change:
