@@ -3,7 +3,7 @@ use std::sync::Arc;
 use redis::aio::ConnectionManager;
 
 use crate::{
-    RateLimiterBuilder, RateLimiterTarget, TrypemaError,
+    RateLimiterBuilder, RateLimiterTarget, TrypemaError, WindowSize,
     builder::{CleanupConfig, ProviderConfig, sealed},
     cleanup_loop::CleanupLoop,
 };
@@ -192,6 +192,30 @@ impl RedisRateLimiterProvider {
     pub fn stop_cleanup_loop(&self) {
         self.cleanup_loop.stop();
     }
+
+    /// Return the sliding-window duration that this provider was built with.
+    ///
+    /// This is the builder's `window_size`, or the default of 10 seconds when the builder did not
+    /// set one. The absolute and suppressed strategies of the provider use the same window.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use trypema::{WindowSize, redis::RedisRateLimiterProvider};
+    ///
+    /// let provider = RedisRateLimiterProvider::builder(connection_manager)
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(90))
+    ///     .build()?;
+    ///
+    /// assert_eq!(provider.window_size(), WindowSize::seconds_or_panic(90));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn window_size(&self) -> WindowSize {
+        self.absolute.window_size()
+    } // end method window_size
 
     /// Access the absolute allow/reject strategy.
     ///

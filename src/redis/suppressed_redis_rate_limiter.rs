@@ -170,6 +170,30 @@ impl SuppressedRedisRateLimiter {
         self.cleanup_loop.stop();
     } // end method stop_cleanup_loop
 
+    /// Return the sliding-window duration that this limiter was built with.
+    ///
+    /// This is the builder's `window_size`, or the default of 10 seconds when the builder did not
+    /// set one. A limiter that a provider owns returns the window of that provider.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use trypema::{WindowSize, redis::SuppressedRedisRateLimiter};
+    ///
+    /// let limiter = SuppressedRedisRateLimiter::builder(connection_manager)
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(90))
+    ///     .build()?;
+    ///
+    /// assert_eq!(limiter.window_size(), WindowSize::seconds_or_panic(90));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn window_size(&self) -> WindowSize {
+        self.window_size
+    } // end method window_size
+
     /// Check admission and increment counters for `key` using probabilistic suppression.
     ///
     /// Executes an atomic Lua script that:

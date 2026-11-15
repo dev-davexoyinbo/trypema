@@ -178,6 +178,28 @@ impl AbsoluteLocalRateLimiter {
         self.cleanup_loop.stop();
     } // end method stop_cleanup_loop
 
+    /// Return the sliding-window duration that this limiter was built with.
+    ///
+    /// This is the builder's `window_size`, or the default of 10 seconds when the builder did not
+    /// set one. A limiter that a provider owns returns the window of that provider.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trypema::{WindowSize, local::AbsoluteLocalRateLimiter};
+    ///
+    /// let limiter = AbsoluteLocalRateLimiter::builder()
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(90))
+    ///     .build()?;
+    ///
+    /// assert_eq!(limiter.window_size(), WindowSize::seconds_or_panic(90));
+    /// # Ok::<(), trypema::TrypemaError>(())
+    /// ```
+    pub fn window_size(&self) -> WindowSize {
+        self.window_size
+    } // end method window_size
+
     #[cfg(test)]
     pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries, RandomState> {
         &self.series

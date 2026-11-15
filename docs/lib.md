@@ -144,6 +144,7 @@ loop ends within one cleanup interval. The builder of a backend accepts every se
 backend for every target. The absolute limiters do not use
 `hard_limit_factor` and `suppression_factor_cache_period`, and the suppressed hybrid limiter does
 not use `allowed_lag_applies_to_rejections`.
+Each provider and limiter returns the window it was built with from `window_size()`.
 
 ```
 use std::{sync::Arc, time::Duration};

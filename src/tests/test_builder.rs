@@ -502,3 +502,315 @@ fn redis_and_hybrid_shortcuts_build_their_own_type_without_annotation() {
         assert_eq!(Arc::strong_count(&absolute_hybrid), 1);
     });
 }
+
+#[test]
+fn local_targets_return_default_window_size_when_none_is_set() {
+    let builder = RateLimiterBuilder::local().disable_cleanup();
+
+    let provider: Arc<LocalRateLimiterProvider> = builder.build().unwrap();
+    let absolute: Arc<AbsoluteLocalRateLimiter> = builder.build().unwrap();
+    let suppressed: Arc<SuppressedLocalRateLimiter> = builder.build().unwrap();
+
+    assert_eq!(provider.window_size(), WindowSize::default());
+    assert_eq!(absolute.window_size(), WindowSize::default());
+    assert_eq!(suppressed.window_size(), WindowSize::default());
+}
+
+#[test]
+fn local_targets_return_the_set_window_size() {
+    // 90 seconds is not a whole number of minutes, so a value rounded through a larger unit fails.
+    let window_size = WindowSize::seconds_or_panic(90);
+    let builder = RateLimiterBuilder::local()
+        .window_size(window_size)
+        .disable_cleanup();
+
+    let provider: Arc<LocalRateLimiterProvider> = builder.build().unwrap();
+    let absolute: Arc<AbsoluteLocalRateLimiter> = builder.build().unwrap();
+    let suppressed: Arc<SuppressedLocalRateLimiter> = builder.build().unwrap();
+
+    assert_eq!(provider.window_size(), window_size);
+    assert_eq!(absolute.window_size(), window_size);
+    assert_eq!(suppressed.window_size(), window_size);
+}
+
+#[test]
+fn local_provider_and_its_limiters_return_the_same_window_size() {
+    let provider = LocalRateLimiterProvider::builder()
+        .window_size(WindowSize::seconds_or_panic(90))
+        .disable_cleanup()
+        .build()
+        .unwrap();
+
+    assert_eq!(provider.absolute().window_size(), provider.window_size());
+    assert_eq!(provider.suppressed().window_size(), provider.window_size());
+}
+
+#[test]
+fn local_shortcut_and_annotation_limiters_return_the_same_window_size() {
+    let window_size = WindowSize::seconds_or_panic(90);
+
+    let absolute_shortcut = AbsoluteLocalRateLimiter::builder()
+        .window_size(window_size)
+        .disable_cleanup()
+        .build()
+        .unwrap();
+    let absolute_annotation: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
+        .window_size(window_size)
+        .disable_cleanup()
+        .build()
+        .unwrap();
+    let suppressed_shortcut = SuppressedLocalRateLimiter::builder()
+        .window_size(window_size)
+        .disable_cleanup()
+        .build()
+        .unwrap();
+    let suppressed_annotation: Arc<SuppressedLocalRateLimiter> = RateLimiterBuilder::local()
+        .window_size(window_size)
+        .disable_cleanup()
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        absolute_shortcut.window_size(),
+        absolute_annotation.window_size()
+    );
+    assert_eq!(
+        suppressed_shortcut.window_size(),
+        suppressed_annotation.window_size()
+    );
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn redis_targets_return_default_window_size_when_none_is_set() {
+    use crate::redis::{
+        AbsoluteRedisRateLimiter, RedisBackend, RedisRateLimiterProvider,
+        SuppressedRedisRateLimiter,
+    };
+
+    super::runtime::block_on(async {
+        let builder: RateLimiterBuilder<RedisBackend> =
+            RateLimiterBuilder::redis(super::common::connection_manager().await)
+                .prefix(super::common::unique_prefix())
+                .disable_cleanup();
+
+        let provider: Arc<RedisRateLimiterProvider> = builder.clone().build().unwrap();
+        let absolute: Arc<AbsoluteRedisRateLimiter> = builder.clone().build().unwrap();
+        let suppressed: Arc<SuppressedRedisRateLimiter> = builder.build().unwrap();
+
+        assert_eq!(provider.window_size(), WindowSize::default());
+        assert_eq!(absolute.window_size(), WindowSize::default());
+        assert_eq!(suppressed.window_size(), WindowSize::default());
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn redis_targets_return_the_set_window_size() {
+    use crate::redis::{
+        AbsoluteRedisRateLimiter, RedisBackend, RedisRateLimiterProvider,
+        SuppressedRedisRateLimiter,
+    };
+
+    super::runtime::block_on(async {
+        // 90 seconds is not a whole number of minutes, so a value rounded through a larger unit
+        // fails.
+        let window_size = WindowSize::seconds_or_panic(90);
+        let builder: RateLimiterBuilder<RedisBackend> =
+            RateLimiterBuilder::redis(super::common::connection_manager().await)
+                .prefix(super::common::unique_prefix())
+                .window_size(window_size)
+                .disable_cleanup();
+
+        let provider: Arc<RedisRateLimiterProvider> = builder.clone().build().unwrap();
+        let absolute: Arc<AbsoluteRedisRateLimiter> = builder.clone().build().unwrap();
+        let suppressed: Arc<SuppressedRedisRateLimiter> = builder.build().unwrap();
+
+        assert_eq!(provider.window_size(), window_size);
+        assert_eq!(absolute.window_size(), window_size);
+        assert_eq!(suppressed.window_size(), window_size);
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn redis_provider_and_its_limiters_return_the_same_window_size() {
+    use crate::redis::RedisRateLimiterProvider;
+
+    super::runtime::block_on(async {
+        let provider = RedisRateLimiterProvider::builder(super::common::connection_manager().await)
+            .prefix(super::common::unique_prefix())
+            .window_size(WindowSize::seconds_or_panic(90))
+            .disable_cleanup()
+            .build()
+            .unwrap();
+
+        assert_eq!(provider.absolute().window_size(), provider.window_size());
+        assert_eq!(provider.suppressed().window_size(), provider.window_size());
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn redis_shortcut_and_annotation_limiters_return_the_same_window_size() {
+    use crate::redis::{AbsoluteRedisRateLimiter, SuppressedRedisRateLimiter};
+
+    super::runtime::block_on(async {
+        let connection_manager = super::common::connection_manager().await;
+        let window_size = WindowSize::seconds_or_panic(90);
+
+        let absolute_shortcut = AbsoluteRedisRateLimiter::builder(connection_manager.clone())
+            .prefix(super::common::unique_prefix())
+            .window_size(window_size)
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        let absolute_annotation: Arc<AbsoluteRedisRateLimiter> =
+            RateLimiterBuilder::redis(connection_manager.clone())
+                .prefix(super::common::unique_prefix())
+                .window_size(window_size)
+                .disable_cleanup()
+                .build()
+                .unwrap();
+        let suppressed_shortcut = SuppressedRedisRateLimiter::builder(connection_manager.clone())
+            .prefix(super::common::unique_prefix())
+            .window_size(window_size)
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        let suppressed_annotation: Arc<SuppressedRedisRateLimiter> =
+            RateLimiterBuilder::redis(connection_manager)
+                .prefix(super::common::unique_prefix())
+                .window_size(window_size)
+                .disable_cleanup()
+                .build()
+                .unwrap();
+
+        assert_eq!(
+            absolute_shortcut.window_size(),
+            absolute_annotation.window_size()
+        );
+        assert_eq!(
+            suppressed_shortcut.window_size(),
+            suppressed_annotation.window_size()
+        );
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn hybrid_targets_return_default_window_size_when_none_is_set() {
+    use crate::hybrid::{
+        AbsoluteHybridRateLimiter, HybridBackend, HybridRateLimiterProvider,
+        SuppressedHybridRateLimiter,
+    };
+
+    super::runtime::block_on(async {
+        let builder: RateLimiterBuilder<HybridBackend> =
+            RateLimiterBuilder::hybrid(super::common::connection_manager().await)
+                .prefix(super::common::unique_prefix())
+                .disable_cleanup();
+
+        let provider: Arc<HybridRateLimiterProvider> = builder.clone().build().unwrap();
+        let absolute: Arc<AbsoluteHybridRateLimiter> = builder.clone().build().unwrap();
+        let suppressed: Arc<SuppressedHybridRateLimiter> = builder.build().unwrap();
+
+        assert_eq!(provider.window_size(), WindowSize::default());
+        assert_eq!(absolute.window_size(), WindowSize::default());
+        assert_eq!(suppressed.window_size(), WindowSize::default());
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn hybrid_targets_return_the_set_window_size() {
+    use crate::hybrid::{
+        AbsoluteHybridRateLimiter, HybridBackend, HybridRateLimiterProvider,
+        SuppressedHybridRateLimiter,
+    };
+
+    super::runtime::block_on(async {
+        // 90 seconds is not a whole number of minutes, so a value rounded through a larger unit
+        // fails.
+        let window_size = WindowSize::seconds_or_panic(90);
+        let builder: RateLimiterBuilder<HybridBackend> =
+            RateLimiterBuilder::hybrid(super::common::connection_manager().await)
+                .prefix(super::common::unique_prefix())
+                .window_size(window_size)
+                .disable_cleanup();
+
+        let provider: Arc<HybridRateLimiterProvider> = builder.clone().build().unwrap();
+        let absolute: Arc<AbsoluteHybridRateLimiter> = builder.clone().build().unwrap();
+        let suppressed: Arc<SuppressedHybridRateLimiter> = builder.build().unwrap();
+
+        assert_eq!(provider.window_size(), window_size);
+        assert_eq!(absolute.window_size(), window_size);
+        assert_eq!(suppressed.window_size(), window_size);
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn hybrid_provider_and_its_limiters_return_the_same_window_size() {
+    use crate::hybrid::HybridRateLimiterProvider;
+
+    super::runtime::block_on(async {
+        let provider =
+            HybridRateLimiterProvider::builder(super::common::connection_manager().await)
+                .prefix(super::common::unique_prefix())
+                .window_size(WindowSize::seconds_or_panic(90))
+                .disable_cleanup()
+                .build()
+                .unwrap();
+
+        assert_eq!(provider.absolute().window_size(), provider.window_size());
+        assert_eq!(provider.suppressed().window_size(), provider.window_size());
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn hybrid_shortcut_and_annotation_limiters_return_the_same_window_size() {
+    use crate::hybrid::{AbsoluteHybridRateLimiter, SuppressedHybridRateLimiter};
+
+    super::runtime::block_on(async {
+        let connection_manager = super::common::connection_manager().await;
+        let window_size = WindowSize::seconds_or_panic(90);
+
+        let absolute_shortcut = AbsoluteHybridRateLimiter::builder(connection_manager.clone())
+            .prefix(super::common::unique_prefix())
+            .window_size(window_size)
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        let absolute_annotation: Arc<AbsoluteHybridRateLimiter> =
+            RateLimiterBuilder::hybrid(connection_manager.clone())
+                .prefix(super::common::unique_prefix())
+                .window_size(window_size)
+                .disable_cleanup()
+                .build()
+                .unwrap();
+        let suppressed_shortcut = SuppressedHybridRateLimiter::builder(connection_manager.clone())
+            .prefix(super::common::unique_prefix())
+            .window_size(window_size)
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        let suppressed_annotation: Arc<SuppressedHybridRateLimiter> =
+            RateLimiterBuilder::hybrid(connection_manager)
+                .prefix(super::common::unique_prefix())
+                .window_size(window_size)
+                .disable_cleanup()
+                .build()
+                .unwrap();
+
+        assert_eq!(
+            absolute_shortcut.window_size(),
+            absolute_annotation.window_size()
+        );
+        assert_eq!(
+            suppressed_shortcut.window_size(),
+            suppressed_annotation.window_size()
+        );
+    });
+}
