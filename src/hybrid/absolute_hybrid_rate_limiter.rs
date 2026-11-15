@@ -8,6 +8,7 @@ use std::{
 };
 
 use dashmap::{DashMap, mapref::entry::Entry, mapref::one::Ref};
+use futures::FutureExt;
 use redis::aio::ConnectionManager;
 use tokio::sync::{RwLock, mpsc, watch};
 
@@ -351,10 +352,24 @@ impl AbsoluteHybridRateLimiter {
     fn epoch_change_task(self: &Arc<Self>) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         let limiter = Arc::downgrade(self);
+        // The limiter owns the sender, so this receiver reports its drop. The task then ends at
+        // once instead of at its next wake, up to one epoch interval later.
+        let mut limiter_drop = self.is_active_watch.subscribe();
 
         spawn_task(async move {
             loop {
-                runtime::sleep(EPOCH_CHANGE_INTERVAL).await;
+                let mut wake = Box::pin(runtime::sleep(EPOCH_CHANGE_INTERVAL).fuse());
+                loop {
+                    futures::select! {
+                        _ = wake => break,
+                        changed = limiter_drop.changed().fuse() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 let Some(limiter) = limiter.upgrade() else {
                     break;
                 };
