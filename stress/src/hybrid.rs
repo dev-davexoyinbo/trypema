@@ -5,8 +5,7 @@
 use std::sync::Arc;
 
 use trypema::{
-    BucketSize, HardLimitFactor, RateLimit, RateLimiterBuilder, SuppressionFactorCachePeriod,
-    WindowSize,
+    BucketSize, HardLimitFactor, RateLimit, SuppressionFactorCachePeriod, WindowSize,
     hybrid::{HybridRateLimiterProvider, SyncInterval},
     redis::RedisKey,
 };

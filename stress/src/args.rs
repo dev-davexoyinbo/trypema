@@ -6,7 +6,7 @@ use std::{
 use clap::{Parser, ValueEnum};
 
 use trypema::{
-    BucketSize, HardLimitFactor, RateLimiterBuilder, SuppressionFactorCachePeriod, WindowSize,
+    BucketSize, HardLimitFactor, SuppressionFactorCachePeriod, WindowSize,
     local::LocalRateLimiterProvider,
 };
 
