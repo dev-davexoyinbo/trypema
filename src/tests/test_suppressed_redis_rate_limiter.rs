@@ -10,7 +10,7 @@ use super::runtime;
 use crate::common::SuppressionFactorCachePeriod;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
-    RateLimitDecision, RateLimiterBuilder, SuppressedRateLimitSnapshot, WindowSize,
+    RateLimitDecision, SuppressedRateLimitSnapshot, WindowSize,
     redis::{RedisKey, RedisRateLimiterProvider},
 };
 

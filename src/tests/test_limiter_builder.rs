@@ -1,4 +1,4 @@
-//! Tests for the builders that build one limiter without a provider.
+//! Tests for `RateLimiterBuilder` when it builds one limiter without a provider.
 
 use std::{sync::Arc, time::Duration};
 
@@ -16,8 +16,7 @@ fn invalid_bucket_size() -> TrypemaError {
 
 #[test]
 fn absolute_local_builder_defaults_build() {
-    let limiter: Arc<AbsoluteLocalRateLimiter> =
-        AbsoluteLocalRateLimiter::builder().build().unwrap();
+    let limiter: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local().build().unwrap();
     let rate = RateLimit::per_second_or_panic(1.0);
 
     assert!(matches!(
@@ -30,7 +29,7 @@ fn absolute_local_builder_defaults_build() {
 
 #[test]
 fn absolute_local_builder_passes_window_and_bucket_size() {
-    let limiter = AbsoluteLocalRateLimiter::builder()
+    let limiter: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
         .window_size(WindowSize::seconds_or_panic(2))
         .bucket_size(BucketSize::seconds_or_panic(1))
         .hard_limit_factor(HardLimitFactor::new_or_panic(3.0))
@@ -61,8 +60,7 @@ fn absolute_local_builder_passes_window_and_bucket_size() {
 
 #[test]
 fn suppressed_local_builder_defaults_build() {
-    let limiter: Arc<SuppressedLocalRateLimiter> =
-        SuppressedLocalRateLimiter::builder().build().unwrap();
+    let limiter: Arc<SuppressedLocalRateLimiter> = RateLimiterBuilder::local().build().unwrap();
     let rate = RateLimit::per_second_or_panic(1.0);
 
     assert!(matches!(
@@ -74,7 +72,7 @@ fn suppressed_local_builder_defaults_build() {
 
 #[test]
 fn suppressed_local_builder_passes_window_bucket_and_hard_limit_factor() {
-    let limiter = SuppressedLocalRateLimiter::builder()
+    let limiter: Arc<SuppressedLocalRateLimiter> = RateLimiterBuilder::local()
         .window_size(WindowSize::seconds_or_panic(2))
         .bucket_size(BucketSize::seconds_or_panic(1))
         .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
@@ -101,10 +99,10 @@ fn suppressed_local_builder_passes_window_bucket_and_hard_limit_factor() {
 #[test]
 fn local_limiter_builders_reject_bucket_larger_than_window() {
     for result in [
-        AbsoluteLocalRateLimiter::builder()
+        RateLimiterBuilder::local()
             .bucket_size(BucketSize::milliseconds_or_panic(1_001))
             .window_size(WindowSize::seconds_or_panic(1))
-            .build()
+            .build::<AbsoluteLocalRateLimiter>()
             .map(|_| ()),
         SuppressedLocalRateLimiter::builder()
             .window_size(WindowSize::seconds_or_panic(1))
@@ -174,7 +172,7 @@ fn suppressed_local_builder_cleanup_enabled_and_disabled() {
 
 #[test]
 fn local_limiter_cleanup_can_be_started_stopped_and_restarted() {
-    let limiter = AbsoluteLocalRateLimiter::builder()
+    let limiter: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
         .stale_after(Duration::from_millis(40))
         .cleanup_interval(Duration::from_millis(20))
         .disable_cleanup()
@@ -229,7 +227,7 @@ fn provider_limiter_stop_does_not_stop_provider_cleanup() {
 
 #[test]
 fn dropping_last_local_limiter_arc_frees_limiter_with_cleanup_running() {
-    let limiter = AbsoluteLocalRateLimiter::builder()
+    let limiter: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
         .cleanup_interval(Duration::from_millis(20))
         .build()
         .unwrap();
@@ -310,7 +308,7 @@ mod redis_backed {
     fn absolute_redis_builder_defaults_build() {
         runtime::block_on(async {
             let limiter: Arc<AbsoluteRedisRateLimiter> =
-                AbsoluteRedisRateLimiter::builder(connection_manager().await)
+                RateLimiterBuilder::redis(connection_manager().await)
                     .build()
                     .unwrap();
 
@@ -323,13 +321,14 @@ mod redis_backed {
         runtime::block_on(async {
             let mut connection = connection_manager().await;
             let prefix = unique_prefix();
-            let limiter = AbsoluteRedisRateLimiter::builder(connection.clone())
-                .prefix(prefix.clone())
-                .window_size(WindowSize::seconds_or_panic(2))
-                .bucket_size(BucketSize::seconds_or_panic(1))
-                .disable_cleanup()
-                .build()
-                .unwrap();
+            let limiter: Arc<AbsoluteRedisRateLimiter> =
+                RateLimiterBuilder::redis(connection.clone())
+                    .prefix(prefix.clone())
+                    .window_size(WindowSize::seconds_or_panic(2))
+                    .bucket_size(BucketSize::seconds_or_panic(1))
+                    .disable_cleanup()
+                    .build()
+                    .unwrap();
             let k = key("settings");
             let rate = RateLimit::per_second_or_panic(10.0);
 
@@ -358,7 +357,7 @@ mod redis_backed {
     fn suppressed_redis_builder_defaults_build() {
         runtime::block_on(async {
             let limiter: Arc<SuppressedRedisRateLimiter> =
-                SuppressedRedisRateLimiter::builder(connection_manager().await)
+                RateLimiterBuilder::redis(connection_manager().await)
                     .build()
                     .unwrap();
 
@@ -371,14 +370,15 @@ mod redis_backed {
         runtime::block_on(async {
             let mut connection = connection_manager().await;
             let prefix = unique_prefix();
-            let limiter = SuppressedRedisRateLimiter::builder(connection.clone())
-                .prefix(prefix.clone())
-                .window_size(WindowSize::seconds_or_panic(2))
-                .bucket_size(BucketSize::seconds_or_panic(1))
-                .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
-                .disable_cleanup()
-                .build()
-                .unwrap();
+            let limiter: Arc<SuppressedRedisRateLimiter> =
+                RateLimiterBuilder::redis(connection.clone())
+                    .prefix(prefix.clone())
+                    .window_size(WindowSize::seconds_or_panic(2))
+                    .bucket_size(BucketSize::seconds_or_panic(1))
+                    .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
+                    .disable_cleanup()
+                    .build()
+                    .unwrap();
             let k = key("settings");
             let rate = RateLimit::per_second_or_panic(10.0);
 
@@ -411,20 +411,20 @@ mod redis_backed {
             let window = WindowSize::seconds_or_panic(1);
 
             for result in [
-                AbsoluteRedisRateLimiter::builder(connection.clone())
+                RateLimiterBuilder::redis(connection.clone())
                     .bucket_size(bucket)
                     .window_size(window)
-                    .build()
+                    .build::<AbsoluteRedisRateLimiter>()
                     .map(|_| ()),
                 SuppressedRedisRateLimiter::builder(connection.clone())
                     .bucket_size(bucket)
                     .window_size(window)
                     .build()
                     .map(|_| ()),
-                AbsoluteHybridRateLimiter::builder(connection.clone())
+                RateLimiterBuilder::hybrid(connection.clone())
                     .bucket_size(bucket)
                     .window_size(window)
-                    .build()
+                    .build::<AbsoluteHybridRateLimiter>()
                     .map(|_| ()),
                 SuppressedHybridRateLimiter::builder(connection)
                     .window_size(window)
@@ -447,22 +447,24 @@ mod redis_backed {
 
             for enabled in [true, false] {
                 let prefix = unique_prefix();
-                let absolute = AbsoluteRedisRateLimiter::builder(connection.clone())
-                    .prefix(prefix.clone())
-                    .window_size(WindowSize::seconds_or_panic(60))
-                    .stale_after(Duration::from_millis(100))
-                    .cleanup_interval(Duration::from_millis(40))
-                    .cleanup_enabled(enabled)
-                    .build()
-                    .unwrap();
-                let suppressed = SuppressedRedisRateLimiter::builder(connection.clone())
-                    .prefix(prefix.clone())
-                    .window_size(WindowSize::seconds_or_panic(60))
-                    .stale_after(Duration::from_millis(100))
-                    .cleanup_interval(Duration::from_millis(40))
-                    .cleanup_enabled(enabled)
-                    .build()
-                    .unwrap();
+                let absolute: Arc<AbsoluteRedisRateLimiter> =
+                    RateLimiterBuilder::redis(connection.clone())
+                        .prefix(prefix.clone())
+                        .window_size(WindowSize::seconds_or_panic(60))
+                        .stale_after(Duration::from_millis(100))
+                        .cleanup_interval(Duration::from_millis(40))
+                        .cleanup_enabled(enabled)
+                        .build()
+                        .unwrap();
+                let suppressed: Arc<SuppressedRedisRateLimiter> =
+                    RateLimiterBuilder::redis(connection.clone())
+                        .prefix(prefix.clone())
+                        .window_size(WindowSize::seconds_or_panic(60))
+                        .stale_after(Duration::from_millis(100))
+                        .cleanup_interval(Duration::from_millis(40))
+                        .cleanup_enabled(enabled)
+                        .build()
+                        .unwrap();
                 assert!(matches!(
                     absolute.inc(&k, &rate, 1).await.unwrap(),
                     RateLimitDecision::Allowed
@@ -493,14 +495,15 @@ mod redis_backed {
         runtime::block_on(async {
             let mut connection = connection_manager().await;
             let prefix = unique_prefix();
-            let limiter = AbsoluteRedisRateLimiter::builder(connection.clone())
-                .prefix(prefix.clone())
-                .window_size(WindowSize::seconds_or_panic(60))
-                .stale_after(Duration::from_millis(100))
-                .cleanup_interval(Duration::from_millis(40))
-                .disable_cleanup()
-                .build()
-                .unwrap();
+            let limiter: Arc<AbsoluteRedisRateLimiter> =
+                RateLimiterBuilder::redis(connection.clone())
+                    .prefix(prefix.clone())
+                    .window_size(WindowSize::seconds_or_panic(60))
+                    .stale_after(Duration::from_millis(100))
+                    .cleanup_interval(Duration::from_millis(40))
+                    .disable_cleanup()
+                    .build()
+                    .unwrap();
             let rate = RateLimit::per_second_or_panic(100.0);
             let started = key("started");
             let stopped = key("stopped");
@@ -524,11 +527,12 @@ mod redis_backed {
         runtime::block_on(async {
             let connection = connection_manager().await;
             let prefix = unique_prefix();
-            let limiter = AbsoluteRedisRateLimiter::builder(connection.clone())
-                .prefix(prefix.clone())
-                .disable_cleanup()
-                .build()
-                .unwrap();
+            let limiter: Arc<AbsoluteRedisRateLimiter> =
+                RateLimiterBuilder::redis(connection.clone())
+                    .prefix(prefix.clone())
+                    .disable_cleanup()
+                    .build()
+                    .unwrap();
             let provider = RedisRateLimiterProvider::builder(connection)
                 .prefix(prefix)
                 .disable_cleanup()
@@ -555,7 +559,7 @@ mod redis_backed {
     fn absolute_hybrid_builder_defaults_build() {
         runtime::block_on(async {
             let limiter: Arc<AbsoluteHybridRateLimiter> =
-                AbsoluteHybridRateLimiter::builder(connection_manager().await)
+                RateLimiterBuilder::hybrid(connection_manager().await)
                     .build()
                     .unwrap();
 
@@ -570,16 +574,17 @@ mod redis_backed {
         runtime::block_on(async {
             let mut connection = connection_manager().await;
             let prefix = unique_prefix();
-            let limiter = AbsoluteHybridRateLimiter::builder(connection.clone())
-                .prefix(prefix.clone())
-                .window_size(WindowSize::seconds_or_panic(2))
-                .bucket_size(BucketSize::seconds_or_panic(1))
-                .sync_interval(SyncInterval::milliseconds_or_panic(1_000))
-                .allowed_lag(AllowedLag::milliseconds_or_panic(250))
-                .allowed_lag_applies_to_rejections(true)
-                .disable_cleanup()
-                .build()
-                .unwrap();
+            let limiter: Arc<AbsoluteHybridRateLimiter> =
+                RateLimiterBuilder::hybrid(connection.clone())
+                    .prefix(prefix.clone())
+                    .window_size(WindowSize::seconds_or_panic(2))
+                    .bucket_size(BucketSize::seconds_or_panic(1))
+                    .sync_interval(SyncInterval::milliseconds_or_panic(1_000))
+                    .allowed_lag(AllowedLag::milliseconds_or_panic(250))
+                    .allowed_lag_applies_to_rejections(true)
+                    .disable_cleanup()
+                    .build()
+                    .unwrap();
             let k = key("settings");
             let rate = RateLimit::per_second_or_panic(10.0);
 
@@ -616,7 +621,7 @@ mod redis_backed {
     fn suppressed_hybrid_builder_defaults_build() {
         runtime::block_on(async {
             let limiter: Arc<SuppressedHybridRateLimiter> =
-                SuppressedHybridRateLimiter::builder(connection_manager().await)
+                RateLimiterBuilder::hybrid(connection_manager().await)
                     .build()
                     .unwrap();
 
@@ -630,16 +635,17 @@ mod redis_backed {
         runtime::block_on(async {
             let mut connection = connection_manager().await;
             let prefix = unique_prefix();
-            let limiter = SuppressedHybridRateLimiter::builder(connection.clone())
-                .prefix(prefix.clone())
-                .window_size(WindowSize::seconds_or_panic(2))
-                .bucket_size(BucketSize::seconds_or_panic(1))
-                .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
-                .sync_interval(SyncInterval::milliseconds_or_panic(1_000))
-                .allowed_lag(AllowedLag::milliseconds_or_panic(250))
-                .disable_cleanup()
-                .build()
-                .unwrap();
+            let limiter: Arc<SuppressedHybridRateLimiter> =
+                RateLimiterBuilder::hybrid(connection.clone())
+                    .prefix(prefix.clone())
+                    .window_size(WindowSize::seconds_or_panic(2))
+                    .bucket_size(BucketSize::seconds_or_panic(1))
+                    .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
+                    .sync_interval(SyncInterval::milliseconds_or_panic(1_000))
+                    .allowed_lag(AllowedLag::milliseconds_or_panic(250))
+                    .disable_cleanup()
+                    .build()
+                    .unwrap();
             let k = key("settings");
             let rate = RateLimit::per_second_or_panic(10.0);
 
@@ -681,26 +687,28 @@ mod redis_backed {
 
             for enabled in [true, false] {
                 let prefix = unique_prefix();
-                let absolute = AbsoluteHybridRateLimiter::builder(connection.clone())
-                    .prefix(prefix.clone())
-                    .window_size(WindowSize::seconds_or_panic(60))
-                    .bucket_size(BucketSize::milliseconds_or_panic(5))
-                    .sync_interval(SyncInterval::milliseconds_or_panic(5))
-                    .stale_after(Duration::from_millis(100))
-                    .cleanup_interval(Duration::from_millis(40))
-                    .cleanup_enabled(enabled)
-                    .build()
-                    .unwrap();
-                let suppressed = SuppressedHybridRateLimiter::builder(connection.clone())
-                    .prefix(prefix.clone())
-                    .window_size(WindowSize::seconds_or_panic(60))
-                    .bucket_size(BucketSize::milliseconds_or_panic(5))
-                    .sync_interval(SyncInterval::milliseconds_or_panic(5))
-                    .stale_after(Duration::from_millis(100))
-                    .cleanup_interval(Duration::from_millis(40))
-                    .cleanup_enabled(enabled)
-                    .build()
-                    .unwrap();
+                let absolute: Arc<AbsoluteHybridRateLimiter> =
+                    RateLimiterBuilder::hybrid(connection.clone())
+                        .prefix(prefix.clone())
+                        .window_size(WindowSize::seconds_or_panic(60))
+                        .bucket_size(BucketSize::milliseconds_or_panic(5))
+                        .sync_interval(SyncInterval::milliseconds_or_panic(5))
+                        .stale_after(Duration::from_millis(100))
+                        .cleanup_interval(Duration::from_millis(40))
+                        .cleanup_enabled(enabled)
+                        .build()
+                        .unwrap();
+                let suppressed: Arc<SuppressedHybridRateLimiter> =
+                    RateLimiterBuilder::hybrid(connection.clone())
+                        .prefix(prefix.clone())
+                        .window_size(WindowSize::seconds_or_panic(60))
+                        .bucket_size(BucketSize::milliseconds_or_panic(5))
+                        .sync_interval(SyncInterval::milliseconds_or_panic(5))
+                        .stale_after(Duration::from_millis(100))
+                        .cleanup_interval(Duration::from_millis(40))
+                        .cleanup_enabled(enabled)
+                        .build()
+                        .unwrap();
                 assert!(matches!(
                     absolute.inc(&k, &rate, 1).await.unwrap(),
                     RateLimitDecision::Allowed
@@ -734,12 +742,13 @@ mod redis_backed {
         runtime::block_on(async {
             let connection = connection_manager().await;
             let prefix = unique_prefix();
-            let limiter = AbsoluteHybridRateLimiter::builder(connection.clone())
-                .prefix(prefix.clone())
-                .sync_interval(SyncInterval::milliseconds_or_panic(5))
-                .disable_cleanup()
-                .build()
-                .unwrap();
+            let limiter: Arc<AbsoluteHybridRateLimiter> =
+                RateLimiterBuilder::hybrid(connection.clone())
+                    .prefix(prefix.clone())
+                    .sync_interval(SyncInterval::milliseconds_or_panic(5))
+                    .disable_cleanup()
+                    .build()
+                    .unwrap();
             let provider = HybridRateLimiterProvider::builder(connection)
                 .prefix(prefix)
                 .sync_interval(SyncInterval::milliseconds_or_panic(5))
@@ -770,12 +779,13 @@ mod redis_backed {
         runtime::block_on(async {
             let mut connection = connection_manager().await;
             let prefix = unique_prefix();
-            let limiter = AbsoluteHybridRateLimiter::builder(connection.clone())
-                .prefix(prefix.clone())
-                .sync_interval(SyncInterval::milliseconds_or_panic(5))
-                .disable_cleanup()
-                .build()
-                .unwrap();
+            let limiter: Arc<AbsoluteHybridRateLimiter> =
+                RateLimiterBuilder::hybrid(connection.clone())
+                    .prefix(prefix.clone())
+                    .sync_interval(SyncInterval::milliseconds_or_panic(5))
+                    .disable_cleanup()
+                    .build()
+                    .unwrap();
             let k = key("flush");
             let rate = RateLimit::per_second_or_panic(10.0);
 
@@ -800,15 +810,16 @@ mod redis_backed {
             let prefix = unique_prefix();
             let allowed_lag_ms = 500_u64;
             // The 30-second window keeps the retry TTL far beyond the allowed lag.
-            let reader = AbsoluteHybridRateLimiter::builder(connection.clone())
-                .prefix(prefix.clone())
-                .window_size(WindowSize::seconds_or_panic(30))
-                .bucket_size(BucketSize::seconds_or_panic(1))
-                .allowed_lag(AllowedLag::milliseconds_or_panic(allowed_lag_ms))
-                .allowed_lag_applies_to_rejections(true)
-                .disable_cleanup()
-                .build()
-                .unwrap();
+            let reader: Arc<AbsoluteHybridRateLimiter> =
+                RateLimiterBuilder::hybrid(connection.clone())
+                    .prefix(prefix.clone())
+                    .window_size(WindowSize::seconds_or_panic(30))
+                    .bucket_size(BucketSize::seconds_or_panic(1))
+                    .allowed_lag(AllowedLag::milliseconds_or_panic(allowed_lag_ms))
+                    .allowed_lag_applies_to_rejections(true)
+                    .disable_cleanup()
+                    .build()
+                    .unwrap();
             let writer = HybridRateLimiterProvider::builder(connection)
                 .prefix(prefix)
                 .window_size(WindowSize::seconds_or_panic(30))
@@ -854,12 +865,13 @@ mod redis_backed {
     #[test]
     fn dropping_last_hybrid_limiter_arc_frees_limiter_with_workers_running() {
         runtime::block_on(async {
-            let limiter = AbsoluteHybridRateLimiter::builder(connection_manager().await)
-                .prefix(unique_prefix())
-                .sync_interval(SyncInterval::milliseconds_or_panic(5))
-                .cleanup_interval(Duration::from_millis(20))
-                .build()
-                .unwrap();
+            let limiter: Arc<AbsoluteHybridRateLimiter> =
+                RateLimiterBuilder::hybrid(connection_manager().await)
+                    .prefix(unique_prefix())
+                    .sync_interval(SyncInterval::milliseconds_or_panic(5))
+                    .cleanup_interval(Duration::from_millis(20))
+                    .build()
+                    .unwrap();
             let rate = RateLimit::per_second_or_panic(10.0);
             assert!(matches!(
                 limiter.inc(&key("drop"), &rate, 1).await.unwrap(),
@@ -872,6 +884,231 @@ mod redis_backed {
             runtime::async_sleep(Duration::from_millis(100)).await;
 
             assert_eq!(weak.strong_count(), 0);
+        });
+    }
+
+    /// Watches the background work of one hybrid limiter or provider through the Redis
+    /// connection it gets and, on Tokio, through the number of tasks alive on the runtime.
+    struct WorkerProbe {
+        observer: ConnectionManager,
+        client_name: String,
+        #[cfg(feature = "redis-tokio")]
+        baseline_task_count: usize,
+    }
+
+    impl WorkerProbe {
+        /// Return the probe and the dedicated connection to build the limiter from.
+        async fn new() -> (Self, ConnectionManager) {
+            let observer = connection_manager().await;
+            #[cfg(feature = "redis-tokio")]
+            let baseline_task_count = tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks();
+
+            let mut connection = connection_manager().await;
+            let client_name = format!("trypema_worker_probe_{}", rand::random::<u64>());
+            let () = redis::cmd("CLIENT")
+                .arg("SETNAME")
+                .arg(&client_name)
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+
+            let probe = Self {
+                observer,
+                client_name,
+                #[cfg(feature = "redis-tokio")]
+                baseline_task_count,
+            };
+            assert!(probe.is_client_connected().await);
+            (probe, connection)
+        }
+
+        async fn is_client_connected(&self) -> bool {
+            let clients: String = redis::cmd("CLIENT")
+                .arg("LIST")
+                .query_async(&mut self.observer.clone())
+                .await
+                .unwrap();
+            clients.contains(&format!(" name={} ", self.client_name))
+        }
+
+        /// Fail unless every worker ends within the bound after the last `Arc` drops, and
+        /// nothing under `prefix` changes in Redis after that.
+        async fn assert_workers_end(&self, prefix: &RedisKey) {
+            let bound = Duration::from_secs(3);
+            let deadline = std::time::Instant::now() + bound;
+
+            // The connection closes only when no worker and no limiter part holds it.
+            while self.is_client_connected().await {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a worker still holds the Redis connection {bound:?} after the drop"
+                );
+                runtime::async_sleep(Duration::from_millis(10)).await;
+            }
+
+            #[cfg(feature = "redis-tokio")]
+            loop {
+                let alive = tokio::runtime::Handle::current()
+                    .metrics()
+                    .num_alive_tasks();
+                if alive <= self.baseline_task_count {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{} tasks are alive {bound:?} after the drop, {} before the build",
+                    alive,
+                    self.baseline_task_count
+                );
+                runtime::async_sleep(Duration::from_millis(10)).await;
+            }
+
+            let mut observer = self.observer.clone();
+            let pattern = format!("{}*", prefix.as_str());
+            let mut keys_at_end: Vec<String> = observer.keys(&pattern).await.unwrap();
+            keys_at_end.sort();
+            let mut values_at_end = Vec::new();
+            for redis_key in &keys_at_end {
+                let value: Vec<u8> = redis::cmd("DUMP")
+                    .arg(redis_key)
+                    .query_async(&mut observer)
+                    .await
+                    .unwrap();
+                values_at_end.push(value);
+            }
+
+            // Many sync and cleanup intervals of the dropped limiter.
+            runtime::async_sleep(Duration::from_millis(200)).await;
+
+            let mut keys_later: Vec<String> = observer.keys(&pattern).await.unwrap();
+            keys_later.sort();
+            assert_eq!(
+                keys_later, keys_at_end,
+                "Redis keys changed after the workers ended"
+            );
+            for (redis_key, value_at_end) in keys_at_end.iter().zip(&values_at_end) {
+                let value: Vec<u8> = redis::cmd("DUMP")
+                    .arg(redis_key)
+                    .query_async(&mut observer)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    &value, value_at_end,
+                    "{redis_key} changed after the workers ended"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_last_absolute_hybrid_limiter_arc_ends_every_worker() {
+        runtime::block_on(async {
+            let (probe, connection) = WorkerProbe::new().await;
+            let prefix = unique_prefix();
+            let limiter: Arc<AbsoluteHybridRateLimiter> = RateLimiterBuilder::hybrid(connection)
+                .prefix(prefix.clone())
+                .sync_interval(SyncInterval::milliseconds_or_panic(5))
+                .stale_after(Duration::from_millis(50))
+                .cleanup_interval(Duration::from_millis(20))
+                .build()
+                .unwrap();
+            let rate = RateLimit::per_second_or_panic(10.0);
+            assert!(matches!(
+                limiter.inc(&key("workers"), &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ));
+            wait_for_hybrid_sync(5).await;
+
+            drop(limiter);
+
+            probe.assert_workers_end(&prefix).await;
+        });
+    }
+
+    #[test]
+    fn dropping_last_suppressed_hybrid_limiter_arc_ends_every_worker() {
+        runtime::block_on(async {
+            let (probe, connection) = WorkerProbe::new().await;
+            let prefix = unique_prefix();
+            let limiter: Arc<SuppressedHybridRateLimiter> = RateLimiterBuilder::hybrid(connection)
+                .prefix(prefix.clone())
+                .sync_interval(SyncInterval::milliseconds_or_panic(5))
+                .stale_after(Duration::from_millis(50))
+                .cleanup_interval(Duration::from_millis(20))
+                .build()
+                .unwrap();
+            let rate = RateLimit::per_second_or_panic(10.0);
+            assert!(matches!(
+                limiter.inc(&key("workers"), &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ));
+            wait_for_hybrid_sync(5).await;
+
+            drop(limiter);
+
+            probe.assert_workers_end(&prefix).await;
+        });
+    }
+
+    #[test]
+    fn dropping_last_hybrid_provider_arc_ends_every_worker() {
+        runtime::block_on(async {
+            let (probe, connection) = WorkerProbe::new().await;
+            let prefix = unique_prefix();
+            let provider: Arc<HybridRateLimiterProvider> = RateLimiterBuilder::hybrid(connection)
+                .prefix(prefix.clone())
+                .sync_interval(SyncInterval::milliseconds_or_panic(5))
+                .stale_after(Duration::from_millis(50))
+                .cleanup_interval(Duration::from_millis(20))
+                .build()
+                .unwrap();
+            let rate = RateLimit::per_second_or_panic(10.0);
+            assert!(matches!(
+                provider
+                    .absolute()
+                    .inc(&key("workers"), &rate, 1)
+                    .await
+                    .unwrap(),
+                RateLimitDecision::Allowed
+            ));
+            assert!(matches!(
+                provider
+                    .suppressed()
+                    .inc(&key("workers"), &rate, 1)
+                    .await
+                    .unwrap(),
+                RateLimitDecision::Allowed
+            ));
+            wait_for_hybrid_sync(5).await;
+
+            drop(provider);
+
+            probe.assert_workers_end(&prefix).await;
+        });
+    }
+
+    #[test]
+    fn dropping_last_redis_limiter_arc_ends_its_cleanup_task() {
+        runtime::block_on(async {
+            let (probe, connection) = WorkerProbe::new().await;
+            let prefix = unique_prefix();
+            let limiter: Arc<AbsoluteRedisRateLimiter> = RateLimiterBuilder::redis(connection)
+                .prefix(prefix.clone())
+                .stale_after(Duration::from_millis(50))
+                .cleanup_interval(Duration::from_millis(20))
+                .build()
+                .unwrap();
+            let rate = RateLimit::per_second_or_panic(10.0);
+            assert!(matches!(
+                limiter.inc(&key("workers"), &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ));
+
+            drop(limiter);
+
+            probe.assert_workers_end(&prefix).await;
         });
     }
 }

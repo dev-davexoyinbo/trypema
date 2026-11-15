@@ -10,8 +10,7 @@ use super::{
 };
 
 use crate::{
-    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
-    RateLimiterBuilder, WindowSize,
+    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, WindowSize,
     hybrid::{HybridRateLimiterProvider, SyncInterval},
     redis::{RedisKey, RedisRateLimiterProvider},
 };

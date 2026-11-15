@@ -10,8 +10,7 @@ use super::runtime;
 
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
-    RateLimitDecision, RateLimiterBuilder, SuppressedRateLimitSnapshot,
-    SuppressionFactorCachePeriod, WindowSize,
+    RateLimitDecision, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, WindowSize,
     hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
     redis::{RedisKey, RedisRateLimiterProvider},
 };
@@ -605,7 +604,7 @@ async fn build_limiter_with_allowed_lag(
 }
 
 fn assert_in_01(v: f64) {
-    assert!(v >= 0.0 && v <= 1.0, "expected v in [0,1], got {v:?}");
+    assert!((0.0..=1.0).contains(&v), "expected v in [0,1], got {v:?}");
 }
 
 async fn wait_for_hybrid_sync(sync_interval: u64) {

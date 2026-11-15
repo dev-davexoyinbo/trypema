@@ -3,29 +3,22 @@ use std::{sync::Arc, time::Duration};
 use crate::{
     BucketSize, HardLimitFactor, RateLimit, RateLimitComparator, RateLimitDecision,
     RateLimiterBuilder, SuppressionFactorCachePeriod, TrypemaError, WindowSize,
-    local::LocalRateLimiterProvider,
+    local::{
+        AbsoluteLocalRateLimiter, LocalBackend, LocalRateLimiterProvider,
+        SuppressedLocalRateLimiter,
+    },
 };
 
-fn build_provider<B>(builder: B) -> Result<Arc<B::Provider>, TrypemaError>
-where
-    B: RateLimiterBuilder,
-{
-    builder.build()
-}
-
 #[test]
-fn local_builder_implements_shared_trait_and_returns_arc() {
-    let provider: Arc<LocalRateLimiterProvider> = build_provider(
-        LocalRateLimiterProvider::builder()
-            .window_size(WindowSize::seconds_or_panic(1))
-            .bucket_size(BucketSize::milliseconds_or_panic(10))
-            .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
-            .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(
-                25,
-            ))
-            .disable_cleanup(),
-    )
-    .unwrap();
+fn local_builder_builds_provider_by_annotation_and_returns_arc() {
+    let provider: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+        .window_size(WindowSize::seconds_or_panic(1))
+        .bucket_size(BucketSize::milliseconds_or_panic(10))
+        .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
+        .suppression_factor_cache_period(SuppressionFactorCachePeriod::milliseconds_or_panic(25))
+        .disable_cleanup()
+        .build()
+        .unwrap();
 
     let clone = Arc::clone(&provider);
     assert!(Arc::ptr_eq(&provider, &clone));
@@ -39,6 +32,84 @@ fn local_builder_implements_shared_trait_and_returns_arc() {
         provider.absolute().inc("key", &rate, 1),
         RateLimitDecision::Rejected { .. }
     ));
+}
+
+#[test]
+fn local_builder_builds_provider_and_both_limiters_from_one_chain() {
+    let builder: RateLimiterBuilder<LocalBackend> = RateLimiterBuilder::local()
+        .window_size(WindowSize::seconds_or_panic(2))
+        .hard_limit_factor(HardLimitFactor::new_or_panic(1.5))
+        .disable_cleanup();
+
+    // The local builder is `Copy`, so one chain builds every target.
+    let provider: Arc<LocalRateLimiterProvider> = builder.build().unwrap();
+    let absolute: Arc<AbsoluteLocalRateLimiter> = builder.build().unwrap();
+    let suppressed = builder.build::<SuppressedLocalRateLimiter>().unwrap();
+    let rate = RateLimit::per_second_or_panic(10.0);
+
+    assert!(matches!(
+        absolute.inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    assert!(matches!(
+        suppressed.inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    assert_eq!(absolute.series().get("key").unwrap().window_limit, 20.0);
+    assert_eq!(
+        suppressed.series().get("key").unwrap().hard_window_limit,
+        30.0
+    );
+
+    // Each build makes its own state.
+    assert_eq!(provider.absolute().get("key"), 0);
+    assert_eq!(provider.suppressed().get("key").total, 0);
+}
+
+#[test]
+fn shortcut_builders_build_their_own_type_without_annotation() {
+    let provider = LocalRateLimiterProvider::builder()
+        .disable_cleanup()
+        .build()
+        .unwrap();
+    let absolute = AbsoluteLocalRateLimiter::builder()
+        .disable_cleanup()
+        .build()
+        .unwrap();
+    let suppressed = SuppressedLocalRateLimiter::builder()
+        .disable_cleanup()
+        .build()
+        .unwrap();
+    let rate = RateLimit::per_second_or_panic(10.0);
+
+    let _: &Arc<LocalRateLimiterProvider> = &provider;
+    assert!(matches!(
+        provider.absolute().inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    assert!(matches!(
+        absolute.inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    assert!(matches!(
+        suppressed.inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+}
+
+#[test]
+fn shortcut_builder_keeps_settings_and_validation() {
+    let shortcut = LocalRateLimiterProvider::builder()
+        .window_size(WindowSize::seconds_or_panic(1))
+        .bucket_size(BucketSize::milliseconds_or_panic(1_001))
+        .disable_cleanup();
+
+    assert_eq!(
+        shortcut.build().unwrap_err(),
+        TrypemaError::InvalidBucketSize(
+            "bucket size must be less than or equal to window size".to_string()
+        )
+    );
 }
 
 #[test]
@@ -233,13 +304,13 @@ fn redis_and_hybrid_builders_support_shared_and_specific_methods() {
         ));
 
         let prefix = super::common::unique_prefix();
-        let redis = build_provider(
-            RedisRateLimiterProvider::builder(connection_manager.clone())
+        let redis: Arc<RedisRateLimiterProvider> =
+            RateLimiterBuilder::redis(connection_manager.clone())
                 .window_size(WindowSize::seconds_or_panic(1))
                 .prefix(prefix)
-                .disable_cleanup(),
-        )
-        .unwrap();
+                .disable_cleanup()
+                .build()
+                .unwrap();
         assert_eq!(Arc::strong_count(&redis), 1);
         let key = super::common::key("redis_builder_outcome");
         let rate = RateLimit::per_second_or_panic(100.0);
@@ -252,14 +323,13 @@ fn redis_and_hybrid_builders_support_shared_and_specific_methods() {
         assert_eq!((outcome.previous_total, outcome.current_total), (0, 0));
 
         let prefix = super::common::unique_prefix();
-        let hybrid = build_provider(
-            HybridRateLimiterProvider::builder(connection_manager)
-                .bucket_size(BucketSize::milliseconds_or_panic(10))
-                .prefix(prefix)
-                .sync_interval(SyncInterval::milliseconds_or_panic(5))
-                .disable_cleanup(),
-        )
-        .unwrap();
+        let hybrid: Arc<HybridRateLimiterProvider> = RateLimiterBuilder::hybrid(connection_manager)
+            .bucket_size(BucketSize::milliseconds_or_panic(10))
+            .prefix(prefix)
+            .sync_interval(SyncInterval::milliseconds_or_panic(5))
+            .disable_cleanup()
+            .build()
+            .unwrap();
         assert_eq!(Arc::strong_count(&hybrid), 1);
         let key = super::common::key("hybrid_builder_outcome");
         let outcome = hybrid
@@ -314,5 +384,121 @@ fn hybrid_builder_passes_allowed_lag_to_both_strategies() {
                 .build()
                 .unwrap();
         assert!(rejection_lag.absolute().allowed_lag_applies_to_rejections);
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn redis_builder_builds_provider_and_both_limiters_from_one_chain() {
+    use crate::redis::{
+        AbsoluteRedisRateLimiter, RedisBackend, RedisRateLimiterProvider,
+        SuppressedRedisRateLimiter,
+    };
+
+    super::runtime::block_on(async {
+        let builder: RateLimiterBuilder<RedisBackend> =
+            RateLimiterBuilder::redis(super::common::connection_manager().await)
+                .prefix(super::common::unique_prefix())
+                .disable_cleanup();
+
+        // The Redis builder is `Clone`; a clone keeps the prefix, so all three share keys.
+        let provider: Arc<RedisRateLimiterProvider> = builder.clone().build().unwrap();
+        let absolute: Arc<AbsoluteRedisRateLimiter> = builder.clone().build().unwrap();
+        let suppressed: Arc<SuppressedRedisRateLimiter> = builder.build().unwrap();
+        let key = super::common::key("one_chain");
+        let rate = RateLimit::per_second_or_panic(10.0);
+
+        assert!(matches!(
+            absolute.inc(&key, &rate, 2).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert!(matches!(
+            suppressed.inc(&key, &rate, 3).await.unwrap(),
+            RateLimitDecision::Allowed
+        ));
+        assert_eq!(provider.absolute().get(&key).await.unwrap(), 2);
+        assert_eq!(provider.suppressed().get(&key).await.unwrap().total, 3);
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn hybrid_builder_builds_provider_and_both_limiters_from_one_chain() {
+    use crate::hybrid::{
+        AbsoluteHybridRateLimiter, AllowedLag, HybridBackend, HybridRateLimiterProvider,
+        SuppressedHybridRateLimiter,
+    };
+
+    super::runtime::block_on(async {
+        let builder: RateLimiterBuilder<HybridBackend> =
+            RateLimiterBuilder::hybrid(super::common::connection_manager().await)
+                .prefix(super::common::unique_prefix())
+                .allowed_lag(AllowedLag::milliseconds_or_panic(250))
+                .allowed_lag_applies_to_rejections(true)
+                .disable_cleanup();
+
+        let provider: Arc<HybridRateLimiterProvider> = builder.clone().build().unwrap();
+        let absolute: Arc<AbsoluteHybridRateLimiter> = builder.clone().build().unwrap();
+        let suppressed: Arc<SuppressedHybridRateLimiter> = builder.build().unwrap();
+
+        for allowed_lag in [
+            provider.absolute().allowed_lag,
+            provider.suppressed().allowed_lag,
+            absolute.allowed_lag,
+            suppressed.allowed_lag,
+        ] {
+            assert_eq!(allowed_lag, Duration::from_millis(250));
+        }
+        assert!(provider.absolute().allowed_lag_applies_to_rejections);
+        assert!(absolute.allowed_lag_applies_to_rejections);
+    });
+}
+
+#[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
+#[test]
+fn redis_and_hybrid_shortcuts_build_their_own_type_without_annotation() {
+    use crate::{
+        hybrid::{
+            AbsoluteHybridRateLimiter, HybridRateLimiterProvider, SuppressedHybridRateLimiter,
+        },
+        redis::{AbsoluteRedisRateLimiter, RedisRateLimiterProvider, SuppressedRedisRateLimiter},
+    };
+
+    super::runtime::block_on(async {
+        let connection_manager = super::common::connection_manager().await;
+
+        let redis = RedisRateLimiterProvider::builder(connection_manager.clone())
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        let absolute_redis = AbsoluteRedisRateLimiter::builder(connection_manager.clone())
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        let suppressed_redis = SuppressedRedisRateLimiter::builder(connection_manager.clone())
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        let hybrid = HybridRateLimiterProvider::builder(connection_manager.clone())
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        let absolute_hybrid = AbsoluteHybridRateLimiter::builder(connection_manager.clone())
+            .disable_cleanup()
+            .build()
+            .unwrap();
+        let suppressed_hybrid = SuppressedHybridRateLimiter::builder(connection_manager)
+            .disable_cleanup()
+            .build()
+            .unwrap();
+
+        let _: &Arc<RedisRateLimiterProvider> = &redis;
+        let _: &Arc<AbsoluteRedisRateLimiter> = &absolute_redis;
+        let _: &Arc<SuppressedRedisRateLimiter> = &suppressed_redis;
+        let _: &Arc<HybridRateLimiterProvider> = &hybrid;
+        let _: &Arc<AbsoluteHybridRateLimiter> = &absolute_hybrid;
+        let _: &Arc<SuppressedHybridRateLimiter> = &suppressed_hybrid;
+        assert_eq!(Arc::strong_count(&redis), 1);
+        assert_eq!(Arc::strong_count(&absolute_hybrid), 1);
     });
 }

@@ -36,7 +36,7 @@ use super::runtime;
 use crate::common::RateType;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
-    RateLimitDecision, RateLimiterBuilder, SuppressionFactorCachePeriod, WindowSize,
+    RateLimitDecision, SuppressionFactorCachePeriod, WindowSize,
     hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
     redis::RedisKey,
 };

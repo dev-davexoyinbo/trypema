@@ -9,8 +9,7 @@ use super::common::{assert_inside_allowed_lag, sleep_past_allowed_lag};
 use super::runtime;
 
 use crate::{
-    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
-    RateLimiterBuilder, WindowSize,
+    BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, WindowSize,
     hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
     redis::RedisKey,
 };
@@ -676,7 +675,6 @@ fn hybrid_absolute_concurrent_smoke_does_not_panic() {
         for _ in 0..16 {
             let rl = rl.clone();
             let k = k.clone();
-            let rate_limit = rate_limit.clone();
             tasks.push(runtime::spawn(async move {
                 for _ in 0..50 {
                     let d = rl.absolute().inc(&k, &rate_limit, 1).await.unwrap();
@@ -1703,7 +1701,6 @@ fn concurrent_increments_remain_exact_across_background_refreshes() {
         for _ in 0..worker_count {
             let rl = rl.clone();
             let k = k.clone();
-            let rate = rate.clone();
             tasks.push(runtime::spawn(async move {
                 for index in 0..increments_per_worker {
                     let decision = rl.absolute().inc(&k, &rate, 1).await.unwrap();
