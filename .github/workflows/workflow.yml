@@ -15,6 +15,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    env:
+      # .cargo/config.toml builds with target-cpu=native, and proc macros get the flag too. A
+      # cached target directory then holds code for another runner's CPU, and rustc fails
+      # with SIGILL. An empty RUSTFLAGS takes the place of build.rustflags, and rust-cache
+      # puts RUSTFLAGS in its cache key.
+      RUSTFLAGS: ""
+
     services:
       redis:
         image: redis:7.2-alpine

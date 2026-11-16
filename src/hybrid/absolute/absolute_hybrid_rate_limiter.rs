@@ -16,12 +16,12 @@ use crate::{
     ConditionalSetOutcome, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision,
     RateLimiterBuilder, RateLimiterTarget, TrypemaError, WindowSize,
     builder::{CleanupConfig, sealed},
-    cleanup_loop::CleanupLoop,
+    cleanup_loop::{AsyncCleanup, CleanupLoop},
     common::{HistoryUpdateMode, RandomState, duration_from_milliseconds},
     hybrid::{
         AbsoluteHybridCommitterSignal, HybridBackend, RedisCommitter, RedisCommitterOptions,
         RedisProxyCommitter,
-        absolute_hybrid_redis_proxy::{
+        absolute::{
             AbsoluteHybridCommit, AbsoluteHybridRedisProxy, AbsoluteHybridRedisProxyOptions,
             AbsoluteHybridRedisProxyReadStateResult,
         },
@@ -35,7 +35,7 @@ use crate::{
 mod helpers;
 
 #[derive(Debug)]
-enum AbsoluteRedisLimitingState {
+pub(crate) enum AbsoluteRedisLimitingState {
     Accepting {
         window_limit: Mutex<f64>,
         accept_limit: Mutex<u64>,
@@ -141,11 +141,11 @@ pub struct AbsoluteHybridRateLimiter {
     pub(crate) allowed_lag_applies_to_rejections: bool,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
-    limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState, RandomState>,
+    pub(crate) limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState, RandomState>,
     /// Per-key async mutex that serializes the "Redis read + state update" operation.
     /// Only one tokio task at a time may perform the read+update for a given key;
     /// all other tasks wait on this lock and then re-check the (now-updated) state.
-    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>, RandomState>,
+    pub(crate) reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>, RandomState>,
     epoch: AtomicU64,
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
@@ -206,8 +206,8 @@ impl AbsoluteHybridRateLimiter {
     ///
     /// Same as [`RateLimiterBuilder::hybrid`] with the target fixed to this type. The limiter has
     /// no suppressed strategy. `build()` starts the synchronization worker, and also the
-    /// stale-state cleanup loop of the limiter unless cleanup is disabled. Both end after the last
-    /// `Arc` of the limiter drops.
+    /// stale-state cleanup loop of the limiter unless cleanup is disabled. Both end at once after
+    /// the last `Arc` of the limiter drops.
     ///
     /// The limiter does not use `hard_limit_factor` and `suppression_factor_cache_period`.
     ///
@@ -256,21 +256,44 @@ impl AbsoluteHybridRateLimiter {
     /// Start stale-state cleanup. Calling while already running is no-op.
     ///
     /// Only a limiter built directly, with [`builder`](Self::builder) or `RateLimiterBuilder`, is
-    /// held in an `Arc` that callers can use here. The cleanup loop of a provider cleans the
-    /// limiters that the provider owns.
+    /// held in an `Arc` that callers can use here.
+    /// [`HybridRateLimiterProvider::start_cleanup_loop`](crate::hybrid::HybridRateLimiterProvider::start_cleanup_loop)
+    /// starts the loops of the two limiters that the provider owns.
     pub fn start_cleanup_loop(self: &Arc<Self>) {
-        CleanupLoop::start_task(
-            self,
-            |limiter| &limiter.cleanup_loop,
-            |limiter, stale_after_ms| async move { limiter.cleanup(stale_after_ms).await },
-            "Hybrid absolute cleanup failed, will retry",
-        );
+        self.cleanup_loop.start_task(self);
     } // end method start_cleanup_loop
 
     /// Stop stale-state cleanup. Calling while stopped is no-op.
+    ///
+    /// The loop ends at once. On a limiter that a provider owns, this stops the cleanup of this
+    /// strategy only.
     pub fn stop_cleanup_loop(&self) {
         self.cleanup_loop.stop();
     } // end method stop_cleanup_loop
+
+    /// Return the sliding-window duration that this limiter was built with.
+    ///
+    /// This is the builder's `window_size`, or the default of 10 seconds when the builder did not
+    /// set one. A limiter that a provider owns returns the window of that provider.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use trypema::{WindowSize, hybrid::AbsoluteHybridRateLimiter};
+    ///
+    /// let limiter = AbsoluteHybridRateLimiter::builder(connection_manager)
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(90))
+    ///     .build()?;
+    ///
+    /// assert_eq!(limiter.window_size(), WindowSize::seconds_or_panic(90));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn window_size(&self) -> WindowSize {
+        self.window_size
+    } // end method window_size
 
     fn epoch_change_task(self: &Arc<Self>) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
@@ -336,7 +359,7 @@ impl AbsoluteHybridRateLimiter {
     }
 
     /// Acquire (or create) the per-key reset lock and return an `Arc` to it.
-    fn get_or_create_reset_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn get_or_create_reset_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
         if let Some(lock) = self.reset_locks.get(key) {
             return Arc::clone(&lock);
         }
@@ -968,11 +991,6 @@ impl AbsoluteHybridRateLimiter {
         })
     } // end method set_if_preserve_history
 
-    #[cfg(test)]
-    pub(crate) fn local_state_count(&self) -> usize {
-        self.limiting_state.len()
-    }
-
     fn should_cleanup_local_state(
         &self,
         state: &AbsoluteRedisLimitingState,
@@ -1093,42 +1111,6 @@ impl AbsoluteHybridRateLimiter {
         Ok((new_total, old_total))
     }
 
-    /// Remove stale Redis state and local state stale since its rejection TTL elapsed.
-    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        self.redis_proxy.cleanup(stale_after_ms).await?;
-
-        let candidates = self
-            .limiting_state
-            .iter()
-            .filter(|state| self.should_cleanup_local_state(state.value(), stale_after_ms))
-            .map(|state| state.key().clone())
-            .collect::<Vec<_>>();
-
-        for key in candidates {
-            let lock = self.get_or_create_reset_lock(&key);
-            let _guard = lock.lock().await;
-
-            let should_remove = self.limiting_state.get(&key).is_some_and(|state| {
-                self.should_cleanup_local_state(state.value(), stale_after_ms)
-            });
-
-            if !should_remove {
-                continue;
-            }
-
-            match self.limiting_state.entry(key) {
-                Entry::Occupied(entry)
-                    if self.should_cleanup_local_state(entry.get(), stale_after_ms) =>
-                {
-                    entry.remove();
-                }
-                Entry::Occupied(_) | Entry::Vacant(_) => {}
-            }
-        }
-
-        Ok(())
-    }
-
     async fn flush(&self) -> Result<(), TrypemaError> {
         let mut resets: Vec<RedisKey> = Vec::new();
         let mut stale: Vec<RedisKey> = Vec::new();
@@ -1232,3 +1214,48 @@ impl AbsoluteHybridRateLimiter {
         Ok(())
     } // end method flush
 }
+
+impl AsyncCleanup for AbsoluteHybridRateLimiter {
+    const FAILURE_MESSAGE: &'static str = "Hybrid absolute cleanup failed, will retry";
+
+    /// Remove stale Redis state and local state stale since its rejection TTL elapsed.
+    async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+        self.redis_proxy.cleanup(stale_after_ms).await?;
+
+        let candidates = self
+            .limiting_state
+            .iter()
+            .filter(|state| self.should_cleanup_local_state(state.value(), stale_after_ms))
+            .map(|state| state.key().clone())
+            .collect::<Vec<_>>();
+
+        for key in candidates {
+            let lock = self.get_or_create_reset_lock(&key);
+            let _guard = lock.lock().await;
+
+            let should_remove = self.limiting_state.get(&key).is_some_and(|state| {
+                self.should_cleanup_local_state(state.value(), stale_after_ms)
+            });
+
+            if !should_remove {
+                continue;
+            }
+
+            match self.limiting_state.entry(key) {
+                Entry::Occupied(entry)
+                    if self.should_cleanup_local_state(entry.get(), stale_after_ms) =>
+                {
+                    entry.remove();
+                }
+                Entry::Occupied(_) | Entry::Vacant(_) => {}
+            }
+        }
+
+        // Remove each lock that only this map holds. No call holds or waits on it, so the next
+        // call creates a new one. This also removes the locks of keys that `delete` removed.
+        self.reset_locks
+            .retain(|_, lock| Arc::strong_count(lock) > 1);
+
+        Ok(())
+    } // end fn cleanup
+} // end impl

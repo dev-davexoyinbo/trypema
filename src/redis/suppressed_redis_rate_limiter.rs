@@ -7,7 +7,7 @@ use crate::{
     RateLimitComparator, RateLimitDecision, RateLimiterBuilder, RateLimiterTarget,
     SuppressedRateLimitSnapshot, TrypemaError, WindowSize,
     builder::{CleanupConfig, sealed},
-    cleanup_loop::CleanupLoop,
+    cleanup_loop::{AsyncCleanup, CleanupLoop},
     common::{HistoryUpdateMode, RateType, SuppressionFactorCachePeriod},
     redis::{
         RedisBackend, RedisKey, RedisKeyGenerator,
@@ -112,7 +112,7 @@ impl SuppressedRedisRateLimiter {
     ///
     /// Same as [`RateLimiterBuilder::redis`] with the target fixed to this type. The limiter has no
     /// absolute strategy. `build()` starts the stale-state cleanup loop of the limiter unless
-    /// cleanup is disabled. The loop ends after the last `Arc` of the limiter drops.
+    /// cleanup is disabled. The loop ends at once after the last `Arc` of the limiter drops.
     ///
     /// A limiter built with prefix `P` reads and writes the same Redis keys as the suppressed
     /// strategy of a provider with prefix `P`, so both can share state.
@@ -154,21 +154,45 @@ impl SuppressedRedisRateLimiter {
     /// Start stale-state cleanup. Calling while already running is no-op.
     ///
     /// Only a limiter built directly, with [`builder`](Self::builder) or `RateLimiterBuilder`, is
-    /// held in an `Arc` that callers can use here. The cleanup loop of a provider cleans the
-    /// limiters that the provider owns. A clone of a limiter starts with its cleanup loop stopped.
+    /// held in an `Arc` that callers can use here.
+    /// [`RedisRateLimiterProvider::start_cleanup_loop`](crate::redis::RedisRateLimiterProvider::start_cleanup_loop)
+    /// starts the loops of the two limiters that the provider owns. A clone of a limiter starts
+    /// with its cleanup loop stopped.
     pub fn start_cleanup_loop(self: &Arc<Self>) {
-        CleanupLoop::start_task(
-            self,
-            |limiter| &limiter.cleanup_loop,
-            |limiter, stale_after_ms| async move { limiter.cleanup(stale_after_ms).await },
-            "Redis suppressed cleanup failed, will retry",
-        );
+        self.cleanup_loop.start_task(self);
     } // end method start_cleanup_loop
 
     /// Stop stale-state cleanup. Calling while stopped is no-op.
+    ///
+    /// The loop ends at once. On a limiter that a provider owns, this stops the cleanup of this
+    /// strategy only.
     pub fn stop_cleanup_loop(&self) {
         self.cleanup_loop.stop();
     } // end method stop_cleanup_loop
+
+    /// Return the sliding-window duration that this limiter was built with.
+    ///
+    /// This is the builder's `window_size`, or the default of 10 seconds when the builder did not
+    /// set one. A limiter that a provider owns returns the window of that provider.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use trypema::{WindowSize, redis::SuppressedRedisRateLimiter};
+    ///
+    /// let limiter = SuppressedRedisRateLimiter::builder(connection_manager)
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(90))
+    ///     .build()?;
+    ///
+    /// assert_eq!(limiter.window_size(), WindowSize::seconds_or_panic(90));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn window_size(&self) -> WindowSize {
+        self.window_size
+    } // end method window_size
 
     /// Check admission and increment counters for `key` using probabilistic suppression.
     ///
@@ -614,8 +638,12 @@ impl SuppressedRedisRateLimiter {
             current_total,
         })
     } // end method set_if_preserve_history
+} // end impl
 
-    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+impl AsyncCleanup for SuppressedRedisRateLimiter {
+    const FAILURE_MESSAGE: &'static str = "Redis suppressed cleanup failed, will retry";
+
+    async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
         let mut connection_manager = self.connection_manager.clone();
 
         // One script call removes a limited number of stale keys. The first call sets the
@@ -644,5 +672,5 @@ impl SuppressedRedisRateLimiter {
                 return Ok(());
             }
         }
-    }
-}
+    } // end fn cleanup
+} // end impl

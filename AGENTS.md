@@ -44,14 +44,14 @@ Trypema has two rate-limiting strategies across three providers:
 | --- | --- | --- | --- |
 | Local | `src/local/absolute_local_rate_limiter.rs` | `src/local/suppressed_local_rate_limiter.rs` | Always compiled |
 | Redis | `src/redis/absolute_redis_rate_limiter.rs` | `src/redis/suppressed_redis_rate_limiter.rs` | Requires one Redis runtime feature |
-| Hybrid | `src/hybrid/absolute_hybrid_rate_limiter.rs` | `src/hybrid/suppressed_hybrid_rate_limiter.rs` | Requires one Redis runtime feature |
+| Hybrid | `src/hybrid/absolute/absolute_hybrid_rate_limiter.rs` | `src/hybrid/suppressed/suppressed_hybrid_rate_limiter.rs` | Requires one Redis runtime feature |
 
 Supporting areas:
 
 - Shared public types and comparator/history enums: `src/common.rs`
 - Redis Lua scripts: `src/redis/scripts.rs`
 - Shared Redis types and Rust helpers: `src/redis/common.rs`
-- Hybrid Redis proxies and commit coordination: `src/hybrid/`
+- Hybrid Redis proxies and commit coordination: `src/hybrid/`. Each strategy's limiter and Redis proxy are in `src/hybrid/absolute/` and `src/hybrid/suppressed/`; the provider, the committer and the shared types are in `src/hybrid/`.
 - Unit/integration tests: `src/tests/`
 - Criterion benchmarks: `benches/`
 - Stress harness: `stress/`
@@ -97,8 +97,11 @@ feature configuration.
   the call until none remain. The first call sets the cutoff time of the pass. One cleanup pass,
   and thus the Redis `clear`, removes all entities that were stale at that time. Activity during
   the pass can keep or recreate a key.
-- A provider cleanup pass runs the absolute cleanup and the suppressed cleanup. A failure of one
-  does not stop the other. The pass returns the first error.
+- Each limiter runs its own cleanup loop. A provider has no cleanup loop and no cleanup pass of
+  its own: its `start_cleanup_loop` and `stop_cleanup_loop` start and stop the loops of its two
+  limiters. A failed pass of one strategy therefore does not stop the cleanup of the other.
+- A stop, or the drop of the last `Arc` of a limiter, ends its cleanup loop at once, not at the
+  next wake. A pass that runs at that time completes first.
 - A hybrid strategy removes stale local state only after its Redis cleanup succeeds. When Redis
   fails, local state stays.
 - Increments within `bucket_size` of the newest bucket are coalesced into that bucket.
@@ -591,13 +594,14 @@ Test-only accessors may be used narrowly to:
 
 They must not be used to bypass the public API when constructing initial state.
 
-Minimize test-only helpers in production impl blocks:
+Keep test-only code out of production files:
 
-- One or two test-only methods may stay beside the production type with individual `#[cfg(test)]`
-  attributes.
-- For three or more test-only methods, put an inherent impl block in the appropriate
-  `src/tests/test_<production_file_name>.rs` file.
-- Fields required by that test-area impl may be `pub(crate)`, but must not become public API.
+- Put test-only methods, types, and trait impls in `src/tests/accessors.rs`, in an inherent
+  `impl` block or a trait impl of the production type.
+- Use `#[cfg(test)]` in production files only for the `mod tests` declaration and for a test hook
+  that must run inside a production code path (the suppressed hybrid `set_if` pause hook).
+- Fields, types, and modules that `src/tests/accessors.rs` needs may be `pub(crate)`, but must not
+  become public API.
 
 ### 8.2 Make setup prove itself
 
@@ -738,9 +742,10 @@ Follow `CONVENTIONS.md`.
 - Re-export new public common types from `src/lib.rs`.
 - `RateLimiterBuilder<B, T>` (`src/builder.rs`) builds every provider and limiter. It validates
   the same settings for every target (`InvalidBucketSize`, cleanup durations) and starts the
-  cleanup loop of the built value unless cleanup is disabled. A limiter built directly uses the
-  same Redis keys as that strategy of a provider with the same prefix, and a limiter that a
-  provider owns runs no cleanup loop of its own. A target of another backend must not compile.
+  cleanup of the built value unless cleanup is disabled: the loop of a limiter, or the loops of
+  the two limiters of a provider. A limiter built directly uses the same Redis keys as that
+  strategy of a provider with the same prefix. `stop_cleanup_loop` on a limiter that a provider
+  owns stops the cleanup of that strategy only. A target of another backend must not compile.
   With no Redis feature, only `RateLimiterBuilder::local()` and the local targets exist.
 - Keep sync local examples and async Redis/hybrid examples consistent with their APIs.
 

@@ -31,8 +31,9 @@ use crate::{BucketSize, HardLimitFactor, SuppressionFactorCachePeriod, TrypemaEr
 ///   [`suppression_factor_cache_period`](Self::suppression_factor_cache_period).
 /// - The suppressed hybrid limiter does not use `allowed_lag_applies_to_rejections`.
 ///
-/// `build()` validates the settings and starts the stale-state cleanup loop unless cleanup is
-/// disabled. The loop ends after the last `Arc` of the built value drops.
+/// `build()` validates the settings and starts stale-state cleanup unless cleanup is disabled. A
+/// limiter has one cleanup loop, and a provider starts the loops of its two limiters. A loop ends
+/// at once after the last `Arc` of the built value drops.
 ///
 /// # Examples
 ///

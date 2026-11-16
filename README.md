@@ -68,7 +68,9 @@ target fixed to its type, so its `build()` needs no annotation.
 Shared methods configure windowing, suppression, and stale-state cleanup. `build()` returns an
 `Arc` and starts cleanup by default; use `disable_cleanup()` to opt out and `enable_cleanup()` to
 opt back in while configuring the builder. The idempotent `start_cleanup_loop()` and
-`stop_cleanup_loop()` methods of a provider or limiter control cleanup after construction.
+`stop_cleanup_loop()` methods of a provider or limiter control cleanup after construction. Each
+limiter has its own cleanup loop. A provider starts and stops the loops of its two limiters, and
+`provider.absolute().stop_cleanup_loop()` stops the cleanup of that strategy only.
 
 ## Redis and hybrid construction
 
@@ -129,11 +131,12 @@ other strategy.
 A limiter built with prefix `P` uses the same Redis keys as the provider with prefix `P`, so the
 two share state. `build()` starts the stale-state cleanup loop of the limiter unless cleanup is
 disabled. The limiter has idempotent `start_cleanup_loop()` and `stop_cleanup_loop()` methods.
-After the last `Arc` drops, the hybrid synchronization worker ends at once and the cleanup
-loop ends within one cleanup interval. The builder of a backend accepts every setting of that
-backend for every target. The absolute limiters do not use
+The cleanup loop ends at once after `stop_cleanup_loop()` or after the last `Arc` drops. The
+hybrid synchronization worker also ends at once after the last `Arc` drops. The builder of a
+backend accepts every setting of that backend for every target. The absolute limiters do not use
 `hard_limit_factor` and `suppression_factor_cache_period`, and the suppressed hybrid limiter does
 not use `allowed_lag_applies_to_rejections`.
+Each provider and limiter returns the window it was built with from `window_size()`.
 
 ```rust
 use std::{sync::Arc, time::Duration};

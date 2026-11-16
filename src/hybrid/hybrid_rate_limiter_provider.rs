@@ -3,9 +3,8 @@ use std::sync::Arc;
 use redis::aio::ConnectionManager;
 
 use crate::{
-    RateLimiterBuilder, RateLimiterTarget, TrypemaError,
+    RateLimiterBuilder, RateLimiterTarget, TrypemaError, WindowSize,
     builder::{CleanupConfig, ProviderConfig, sealed},
-    cleanup_loop::CleanupLoop,
     hybrid::{AbsoluteHybridRateLimiter, AllowedLag, SuppressedHybridRateLimiter, SyncInterval},
     redis::RedisKey,
 };
@@ -208,7 +207,6 @@ impl RateLimiterTarget for HybridRateLimiterProvider {
 pub struct HybridRateLimiterProvider {
     absolute: Arc<AbsoluteHybridRateLimiter>,
     suppressed: Arc<SuppressedHybridRateLimiter>,
-    cleanup_loop: CleanupLoop,
 }
 
 impl HybridRateLimiterProvider {
@@ -225,24 +223,50 @@ impl HybridRateLimiterProvider {
         Self {
             absolute: AbsoluteHybridRateLimiter::new(options.clone(), cleanup),
             suppressed: SuppressedHybridRateLimiter::new(options, cleanup),
-            cleanup_loop: CleanupLoop::new(cleanup),
         }
     }
 
-    /// Start stale-state cleanup. Calling while already running is no-op.
-    pub fn start_cleanup_loop(self: &Arc<Self>) {
-        CleanupLoop::start_task(
-            self,
-            |provider| &provider.cleanup_loop,
-            |provider, stale_after_ms| async move { provider.cleanup(stale_after_ms).await },
-            "Hybrid cleanup failed, will retry",
-        );
-    }
+    /// Start stale-state cleanup of both strategies. Calling while already running is no-op.
+    ///
+    /// Each strategy has its own cleanup loop. This starts the loops of the absolute and the
+    /// suppressed limiter. A failed pass of one strategy does not stop the loop of the other.
+    pub fn start_cleanup_loop(&self) {
+        self.absolute.start_cleanup_loop();
+        self.suppressed.start_cleanup_loop();
+    } // end method start_cleanup_loop
 
-    /// Stop stale-state cleanup. Calling while stopped is no-op.
+    /// Stop stale-state cleanup of both strategies. Calling while stopped is no-op.
+    ///
+    /// The two loops end at once. To stop the cleanup of one strategy only, call
+    /// `stop_cleanup_loop` on [`absolute`](Self::absolute) or [`suppressed`](Self::suppressed).
     pub fn stop_cleanup_loop(&self) {
-        self.cleanup_loop.stop();
-    }
+        self.absolute.stop_cleanup_loop();
+        self.suppressed.stop_cleanup_loop();
+    } // end method stop_cleanup_loop
+
+    /// Return the sliding-window duration that this provider was built with.
+    ///
+    /// This is the builder's `window_size`, or the default of 10 seconds when the builder did not
+    /// set one. The absolute and suppressed strategies of the provider use the same window.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(connection_manager: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
+    /// use trypema::{WindowSize, hybrid::HybridRateLimiterProvider};
+    ///
+    /// let provider = HybridRateLimiterProvider::builder(connection_manager)
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(90))
+    ///     .build()?;
+    ///
+    /// assert_eq!(provider.window_size(), WindowSize::seconds_or_panic(90));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn window_size(&self) -> WindowSize {
+        self.absolute.window_size()
+    } // end method window_size
 
     /// Access the absolute allow/reject strategy.
     ///
@@ -292,17 +316,5 @@ impl HybridRateLimiterProvider {
     /// ```
     pub fn suppressed(&self) -> &SuppressedHybridRateLimiter {
         &self.suppressed
-    }
-
-    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        // The two strategies are independent. A failure of one must not stop the other.
-        let absolute = self.absolute.cleanup(stale_after_ms).await;
-        let suppressed = self.suppressed.cleanup(stale_after_ms).await;
-
-        if let (Err(_), Err(error)) = (&absolute, &suppressed) {
-            tracing::warn!(?error, "Suppressed cleanup also failed");
-        }
-
-        absolute.and(suppressed)
     }
 }

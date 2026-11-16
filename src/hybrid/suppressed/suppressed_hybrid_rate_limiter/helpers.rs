@@ -885,21 +885,6 @@ impl SuppressedHybridRateLimiter {
         Ok(())
     } // end fn send_commit
 
-    #[cfg(test)]
-    pub(crate) fn local_state_count(&self) -> usize {
-        self.limiting_state.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_set_if_test_hook(
-        &self,
-    ) -> Result<Arc<SuppressedHybridSetIfTestHook>, TrypemaError> {
-        let hook = Arc::new(SuppressedHybridSetIfTestHook::default());
-        *mutex_lock(&self.set_if_test_hook, "set_if_test_hook")? = Some(Arc::clone(&hook));
-
-        Ok(hook)
-    }
-
     pub(super) fn should_cleanup_local_state(
         &self,
         state: &SuppressedRedisLimitingState,

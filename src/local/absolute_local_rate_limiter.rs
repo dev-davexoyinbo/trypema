@@ -13,7 +13,7 @@ use crate::{
     ConditionalSetOutcome, HistoryPreservation, RateLimitComparator, RateLimiterBuilder,
     RateLimiterTarget, TrypemaError,
     builder::{CleanupConfig, ProviderConfig, sealed},
-    cleanup_loop::CleanupLoop,
+    cleanup_loop::{Cleanup, CleanupLoop},
     common::{
         Bucket, BucketSize, HistoryUpdateMode, RandomState, RateLimit, RateLimitDecision,
         WindowSize, duration_from_milliseconds,
@@ -114,7 +114,7 @@ pub struct AbsoluteLocalRateLimiter {
     window_size_ms: u128,
     window_duration: Duration,
     bucket_size: BucketSize,
-    series: DashMap<String, RateLimitSeries, RandomState>,
+    pub(crate) series: DashMap<String, RateLimitSeries, RandomState>,
     cleanup_loop: CleanupLoop,
 }
 
@@ -134,7 +134,7 @@ impl AbsoluteLocalRateLimiter {
     ///
     /// Same as [`RateLimiterBuilder::local`] with the target fixed to this type. The limiter has no
     /// suppressed strategy. `build()` starts the stale-state cleanup loop of the limiter unless
-    /// cleanup is disabled. The loop ends after the last `Arc` of the limiter drops.
+    /// cleanup is disabled. The loop ends at once after the last `Arc` of the limiter drops.
     ///
     /// The limiter does not use `hard_limit_factor` and `suppression_factor_cache_period`.
     ///
@@ -167,21 +167,41 @@ impl AbsoluteLocalRateLimiter {
     /// Start stale-state cleanup. Calling while already running is no-op.
     ///
     /// Only a limiter built directly, with [`builder`](Self::builder) or `RateLimiterBuilder`, is
-    /// held in an `Arc` that callers can use here. The cleanup loop of a provider cleans the
-    /// limiters that the provider owns.
+    /// held in an `Arc` that callers can use here.
+    /// [`LocalRateLimiterProvider::start_cleanup_loop`](crate::local::LocalRateLimiterProvider::start_cleanup_loop)
+    /// starts the loops of the two limiters that the provider owns.
     pub fn start_cleanup_loop(self: &Arc<Self>) {
-        CleanupLoop::start_thread(self, |limiter| &limiter.cleanup_loop, Self::cleanup);
+        self.cleanup_loop.start_thread(self);
     } // end method start_cleanup_loop
-
     /// Stop stale-state cleanup. Calling while stopped is no-op.
+    ///
+    /// The loop ends at once. On a limiter that a provider owns, this stops the cleanup of this
+    /// strategy only.
     pub fn stop_cleanup_loop(&self) {
         self.cleanup_loop.stop();
     } // end method stop_cleanup_loop
 
-    #[cfg(test)]
-    pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries, RandomState> {
-        &self.series
-    }
+    /// Return the sliding-window duration that this limiter was built with.
+    ///
+    /// This is the builder's `window_size`, or the default of 10 seconds when the builder did not
+    /// set one. A limiter that a provider owns returns the window of that provider.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use trypema::{WindowSize, local::AbsoluteLocalRateLimiter};
+    ///
+    /// let limiter = AbsoluteLocalRateLimiter::builder()
+    ///     // Optional: sliding-window duration
+    ///     .window_size(WindowSize::seconds_or_panic(90))
+    ///     .build()?;
+    ///
+    /// assert_eq!(limiter.window_size(), WindowSize::seconds_or_panic(90));
+    /// # Ok::<(), trypema::TrypemaError>(())
+    /// ```
+    pub fn window_size(&self) -> WindowSize {
+        self.window_size
+    } // end method window_size
 
     /// Check admission and, if allowed, record the increment for `key`.
     ///
@@ -778,8 +798,10 @@ impl AbsoluteLocalRateLimiter {
             current_total,
         }
     } // end method set_if_preserve_history
+} // end impl
 
-    pub(crate) fn cleanup(&self, stale_after_ms: u64) {
+impl Cleanup for AbsoluteLocalRateLimiter {
+    fn cleanup(&self, stale_after_ms: u64) {
         self.series.retain(|_, series| match series.buckets.back() {
             None => false,
             Some(latest_bucket)
@@ -789,5 +811,5 @@ impl AbsoluteLocalRateLimiter {
             }
             Some(_) => true,
         });
-    } // end method cleanup
+    } // end fn cleanup
 } // end impl

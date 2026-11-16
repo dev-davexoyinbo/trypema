@@ -17,8 +17,9 @@
 //! | `P:K:hybrid_suppressed:sf`             | String      | Cached suppression factor (with PX TTL)          |
 //! | `P:hybrid_suppressed:active_entities`  | Sorted set  | All active user-keys (for cleanup)               |
 //!
-//! **Important:** because the hybrid limiter batches writes, tests must wait for the
-//! background committer to flush (`wait_for_hybrid_sync`) before inspecting Redis state.
+//! **Important:** because the hybrid limiter batches writes, tests wait until the background
+//! flush has committed the expected total (`wait_for_committed_total`) before inspecting Redis
+//! state.
 
 use std::{
     collections::HashMap,
@@ -29,10 +30,11 @@ use redis::AsyncCommands;
 
 use super::common::{
     assert_inside_allowed_lag, key, key_gen, redis_url, sleep_past_allowed_lag, unique_prefix,
-    wait_for_hybrid_sync,
 };
 use super::runtime;
+use super::wait::wait_until_async;
 
+use crate::cleanup_loop::AsyncCleanup;
 use crate::common::RateType;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
@@ -88,6 +90,29 @@ fn redis_key(prefix: &RedisKey, user_key: &RedisKey, suffix: &str) -> String {
 
 fn active_entities_key(prefix: &RedisKey) -> String {
     key_gen(prefix, RateType::HybridSuppressed).get_active_entities_key()
+}
+
+/// Wait until the background flush has committed a Redis total of `expected` for `user_key`.
+///
+/// A plain `GET` has no side effects, so the wait does not refresh active membership or the
+/// suppression factor cache.
+async fn wait_for_committed_total(prefix: &RedisKey, user_key: &RedisKey, expected: u64) {
+    let total_key = redis_key(prefix, user_key, "t");
+    let conn = redis::Client::open(redis_url())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+
+    wait_until_async(
+        async || {
+            let mut conn = conn.clone();
+            let total: Option<u64> = conn.get(&total_key).await.unwrap();
+            total == Some(expected)
+        },
+        &format!("the background flush must commit a total of {expected}"),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +271,8 @@ fn redis_state_hybrid_suppressed_no_redis_keys_before_soft_limit_overflow() {
         let prefix = unique_prefix();
         let window_size = 1_u64;
         let hard_limit_factor = 2.0_f64;
-        let sync_interval = 2000_u64; // very slow tick
+        // No background flush runs during the test, so it cannot write the accepting state.
+        let sync_interval = 60_000_u64;
 
         let rl = build_limiter(
             &url,
@@ -297,7 +323,8 @@ fn redis_state_hybrid_suppressed_commit_writes_total_count_after_overflow() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size = 1_u64;
+        // Parallel load cannot expire the committed history inside a long window.
+        let window_size = 10_u64;
         let hard_limit_factor = 1.0_f64; // soft == hard
         let sync_interval = 25_u64;
         let cache_ms = 5_u64;
@@ -314,7 +341,7 @@ fn redis_state_hybrid_suppressed_commit_writes_total_count_after_overflow() {
         .await;
 
         let k = key("k");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
         let soft_cap = (window_size as f64 * rate_limit.as_per_second()) as u64; // 5
 
         // Fill local budget.
@@ -339,8 +366,7 @@ fn redis_state_hybrid_suppressed_commit_writes_total_count_after_overflow() {
             "overflow: {overflow:?}"
         );
 
-        // Wait for committer flush.
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, soft_cap + 1).await;
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -401,7 +427,7 @@ fn redis_state_hybrid_suppressed_exact_hard_commit_caches_one_and_next_call_decl
             matches!(reaches_hard, RateLimitDecision::Allowed),
             "reaches_hard: {reaches_hard:?}"
         );
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, hard_cap).await;
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -449,7 +475,7 @@ fn redis_state_hybrid_suppressed_exact_hard_commit_caches_one_and_next_call_decl
             "next: {next:?}"
         );
 
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, hard_cap + 1).await;
 
         let total_after: u64 = conn.get(redis_key(&prefix, &k, "t")).await.unwrap();
         assert_eq!(total_after, hard_cap + 1);
@@ -474,7 +500,8 @@ fn redis_state_hybrid_suppressed_sf_cache_key_has_ttl() {
         let window_size = 10_u64;
         let hard_limit_factor = 2.0_f64;
         let sync_interval = 25_u64;
-        let cache_ms = 500_u64;
+        // The TTL check below runs well inside this period.
+        let cache_ms = 5_000_u64;
 
         let k = key("k");
         let rate_limit = RateLimit::per_second(1f64).unwrap();
@@ -584,7 +611,7 @@ fn redis_state_hybrid_suppressed_hash_sums_match_counters_after_commit_with_deni
                 "denied_after={denied_after}, decision={decision:?}"
             );
         }
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, hard_cap + 5).await;
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -863,7 +890,7 @@ fn redis_state_hybrid_suppressed_cleanup_removes_all_redis_keys_for_stale_entity
             ),
             "declined: {declined:?}"
         );
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, hard_cap + 1).await;
 
         // Read from a fresh instance to prove the committed factor is independently visible.
         let rl2 = build_limiter(
@@ -878,8 +905,6 @@ fn redis_state_hybrid_suppressed_cleanup_removes_all_redis_keys_for_stale_entity
         .await;
         let factor = rl2.suppressed().get_suppression_factor(&k).await.unwrap();
         assert!((factor - 1.0).abs() < 1e-12, "factor: {factor}");
-
-        wait_for_hybrid_sync(sync_interval * 3).await;
 
         let kg = key_gen(&prefix, RateType::HybridSuppressed);
         let active_entities_key = kg.get_active_entities_key();
@@ -964,7 +989,7 @@ fn redis_state_hybrid_suppressed_cleanup_does_not_remove_active_entity() {
             ),
             "overflow: {overflow:?}"
         );
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, soft_cap + 1).await;
 
         // Immediately cleanup with a long threshold — nothing should be removed.
         rl.suppressed().cleanup(stale_after_ms).await.unwrap();
@@ -1037,7 +1062,7 @@ fn redis_state_hybrid_suppressed_cleanup_allows_fresh_requests_after_cleanup() {
             ),
             "above_soft: {above_soft:?}"
         );
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, soft_cap + 1).await;
 
         // Wait until the cache TTL and its following stale horizon have elapsed.
         runtime::async_sleep(Duration::from_millis(cache_ms + stale_after_ms + 50)).await;
@@ -1112,7 +1137,7 @@ fn redis_state_hybrid_suppressed_sf_key_deleted_by_cleanup() {
             ),
             "declined: {declined:?}"
         );
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, hard_cap + 1).await;
 
         let rl2 = build_limiter(
             &url,
@@ -1193,7 +1218,7 @@ fn redis_state_hybrid_suppressed_window_limit_key_equals_hard_limit_after_commit
             matches!(reaches_hard, RateLimitDecision::Allowed),
             "reaches_hard: {reaches_hard:?}"
         );
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, expected_hard_capacity).await;
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()

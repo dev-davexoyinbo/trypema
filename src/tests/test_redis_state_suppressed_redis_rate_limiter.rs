@@ -23,6 +23,7 @@ use redis::AsyncCommands;
 use super::common::{key, key_gen, redis_url, unique_prefix};
 use super::runtime;
 
+use crate::cleanup_loop::AsyncCleanup;
 use crate::common::{RateType, SuppressionFactorCachePeriod};
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
@@ -126,7 +127,9 @@ fn redis_state_rate_update_delete_and_clear_cover_every_suppressed_key() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let (rl, prefix) = build_limiter(&url, 10, 1_000, 2.0, 1_000).await;
+        // The cached factor must outlive the raw reads, so its removal below proves that
+        // `set_rate_limit` dropped it.
+        let (rl, prefix) = build_limiter(&url, 10, 1_000, 2.0, 10_000).await;
         let first = key("first");
         let second = key("second");
         let initial_rate = RateLimit::per_second_or_panic(1.0);
@@ -399,6 +402,13 @@ fn redis_state_suppressed_sf_cache_key_is_set_in_suppression_zone() {
             "above_soft: {above_soft:?}"
         );
 
+        // Connect now, so only one round trip runs inside the cache period below.
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
         // Wait for the `sf` key written by the inc loop to expire, so that the
         // subsequent `get_suppression_factor` call is guaranteed to recompute and
         // re-write the `sf` key with a fresh cache_ms TTL.
@@ -419,12 +429,6 @@ fn redis_state_suppressed_sf_cache_key_is_set_in_suppression_zone() {
 
         // Also verify the `sf` key was physically written to Redis.  The key now has
         // a full cache_ms TTL so there is no race with the assertion below.
-        let mut conn = redis::Client::open(url.as_str())
-            .unwrap()
-            .get_multiplexed_async_connection()
-            .await
-            .unwrap();
-
         let sf_raw: Option<String> = conn.get(redis_key(&prefix, &k, "sf")).await.unwrap();
         assert!(
             sf_raw.is_some(),
@@ -445,7 +449,8 @@ fn redis_state_suppressed_sf_cache_key_has_ttl() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let cache_ms = 500_u64;
+        // The cached factor must outlive the connect and the PTTL read below.
+        let cache_ms = 10_000_u64;
         let (rl, prefix) = build_limiter(&url, 10, 100, 2.0, cache_ms).await;
         let k = key("k");
         let rate_limit = RateLimit::per_second(1f64).unwrap();
@@ -501,6 +506,16 @@ fn redis_state_suppressed_invalid_cached_factors_are_recomputed() {
         let k = key("k");
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
+        let factor_key = redis_key(&prefix, &k, "sf");
+        let expected = 1.0_f64 - (1.0_f64 / 11.0_f64);
+        // Connect first: the expected factor counts the seeded bucket in the last-second peak,
+        // so the reads below must run within one second of the seed.
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
         assert_eq!(
             rl.suppressed()
                 .set_if(&k, &rate_limit, RateLimitComparator::Always, 11)
@@ -508,14 +523,6 @@ fn redis_state_suppressed_invalid_cached_factors_are_recomputed() {
                 .unwrap(),
             (11, 0)
         );
-
-        let factor_key = redis_key(&prefix, &k, "sf");
-        let expected = 1.0_f64 - (1.0_f64 / 11.0_f64);
-        let mut conn = redis::Client::open(url.as_str())
-            .unwrap()
-            .get_multiplexed_async_connection()
-            .await
-            .unwrap();
 
         for invalid in [-0.25_f64, 1.25_f64] {
             let _: () = conn.set(&factor_key, invalid).await.unwrap();
@@ -573,9 +580,10 @@ fn redis_state_suppressed_inc_retains_first_hard_window_limit() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let (rl, prefix) = build_limiter(&url, 1, 1000, 1.0, 60_000).await;
+        // hard = 10s * 0.2/s * 1.0 = 2. The 10 s window keeps the stored limit alive for the read.
+        let (rl, prefix) = build_limiter(&url, 10, 1000, 1.0, 60_000).await;
         let k = key("k");
-        let initial_rate = RateLimit::per_second(2f64).unwrap();
+        let initial_rate = RateLimit::per_second(0.2f64).unwrap();
         let later_rate = RateLimit::per_second(10f64).unwrap();
 
         let decision = rl.suppressed().inc(&k, &initial_rate, 2).await.unwrap();
@@ -692,9 +700,8 @@ fn redis_state_suppressed_evicts_expired_buckets_from_both_hashes() {
             "declined: {declined:?}"
         );
 
-        // Wait for the window to expire.
-        thread::sleep(Duration::from_millis(window_size * 1000 + 50));
-        runtime::async_sleep(Duration::from_millis(10)).await;
+        // Wait for the window to expire, with a margin for a Redis clock that lags the host clock.
+        thread::sleep(Duration::from_millis(window_size * 1000 + 100));
 
         // A fresh inc triggers eviction inside the Lua script.
         let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
@@ -970,7 +977,7 @@ fn redis_state_suppressed_set_if_no_match_is_true_noop() {
             "the public factor read should have cached a factor"
         );
 
-        runtime::async_sleep(Duration::from_millis(50)).await;
+        runtime::async_sleep(Duration::from_millis(100)).await;
 
         let rate_new = RateLimit::per_second(20f64).unwrap();
         let outcome = rl
@@ -1047,7 +1054,11 @@ fn redis_state_suppressed_set_if_handles_expired_history_only_after_a_match() {
                 "creating an oldest bucket: {decision:?}"
             );
         }
-        runtime::async_sleep(Duration::from_millis(900)).await;
+        // The suppressed `inc` and factor read evict expired buckets, so the oldest buckets must be
+        // inside the 2 s window during the fresh calls: they are 1.1 s old then. After both sleeps
+        // they are 2.1 s old, and the fresh buckets and limit TTLs have about 1 s left for the
+        // checks below.
+        runtime::async_sleep(Duration::from_millis(1_100)).await;
         for k in [&miss_key, &match_key] {
             let decision = rl.suppressed().inc(k, &rate, 6).await.unwrap();
             assert!(
@@ -1059,7 +1070,7 @@ fn redis_state_suppressed_set_if_handles_expired_history_only_after_a_match() {
                 0.0
             );
         }
-        runtime::async_sleep(Duration::from_millis(1_200)).await;
+        runtime::async_sleep(Duration::from_millis(1_000)).await;
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()
@@ -1193,10 +1204,13 @@ fn redis_state_suppressed_set_if_handles_expired_history_only_after_a_match() {
 fn redis_state_suppressed_preserve_history_scales_declines() {
     let url = redis_url();
     runtime::block_on(async {
-        let (rl, prefix) = build_limiter(&url, 1, 100, 1.0, 1).await;
-        let low_rate = RateLimit::per_second(4f64).unwrap();
-        let medium_rate = RateLimit::per_second(12f64).unwrap();
-        let high_rate = RateLimit::per_second(100f64).unwrap();
+        // Hard limits are 4, 12 and 100. A call that must join the newest bucket runs within
+        // 500 ms of it, and a 600 ms pause starts a new bucket; every case ends well inside the
+        // 4 s window.
+        let (rl, prefix) = build_limiter(&url, 4, 500, 1.0, 1).await;
+        let low_rate = RateLimit::per_second(1f64).unwrap();
+        let medium_rate = RateLimit::per_second(3f64).unwrap();
+        let high_rate = RateLimit::per_second(25f64).unwrap();
 
         for (
             name,
@@ -1265,12 +1279,12 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
                             .unwrap(),
                         (6, 6)
                     );
-                    runtime::async_sleep(Duration::from_millis(120)).await;
+                    runtime::async_sleep(Duration::from_millis(600)).await;
                     assert!(matches!(
                         rl.suppressed().inc(&k, &high_rate, 5).await.unwrap(),
                         RateLimitDecision::Allowed
                     ));
-                    runtime::async_sleep(Duration::from_millis(120)).await;
+                    runtime::async_sleep(Duration::from_millis(600)).await;
                     assert!(matches!(
                         rl.suppressed().inc(&k, &high_rate, 6).await.unwrap(),
                         RateLimitDecision::Allowed
@@ -1284,7 +1298,7 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
                             .unwrap(),
                         (4, 0)
                     );
-                    runtime::async_sleep(Duration::from_millis(120)).await;
+                    runtime::async_sleep(Duration::from_millis(600)).await;
                     assert!(matches!(
                         rl.suppressed().inc(&k, &high_rate, 5).await.unwrap(),
                         RateLimitDecision::Allowed
@@ -1302,7 +1316,7 @@ fn redis_state_suppressed_preserve_history_scales_declines() {
                             .unwrap(),
                         (9, 9)
                     );
-                    runtime::async_sleep(Duration::from_millis(120)).await;
+                    runtime::async_sleep(Duration::from_millis(600)).await;
                     assert!(matches!(
                         rl.suppressed().inc(&k, &medium_rate, 3).await.unwrap(),
                         RateLimitDecision::Allowed
@@ -1614,7 +1628,9 @@ fn redis_state_suppressed_get_eviction_invalidates_cached_factor() {
         let cached: bool = conn.exists(redis_key(&prefix, &k, "sf")).await.unwrap();
         assert!(cached, "setup must create a long-lived suppression cache");
 
-        runtime::async_sleep(Duration::from_millis(1_050)).await;
+        // Redis reads its own clock, which can lag the host clock, so expiry waits keep a margin of
+        // at least 100 ms.
+        runtime::async_sleep(Duration::from_millis(1_200)).await;
 
         assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 0);
         let cached: bool = conn.exists(redis_key(&prefix, &k, "sf")).await.unwrap();
@@ -1661,11 +1677,13 @@ fn redis_state_suppressed_cleanup_removes_only_stale_entities() {
             );
         }
 
-        runtime::async_sleep(Duration::from_millis(250)).await;
+        // The stale entity is 600 ms old at cleanup; the active one is one round trip old, and
+        // the 500 ms threshold leaves it a wide margin.
+        runtime::async_sleep(Duration::from_millis(600)).await;
         let snapshot = rl.suppressed().get(&active_key).await.unwrap();
         assert_eq!((snapshot.total, snapshot.total_declined), (11, 1));
 
-        rl.suppressed().cleanup(100).await.unwrap();
+        rl.suppressed().cleanup(500).await.unwrap();
 
         let mut conn = redis::Client::open(url.as_str())
             .unwrap()

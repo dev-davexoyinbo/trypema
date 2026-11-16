@@ -115,7 +115,9 @@ fn delete_returns_zero_for_expired_suppressed_redis_state() {
             rl.suppressed().inc(&key, &rate_limit, 1).await.unwrap(),
             RateLimitDecision::Allowed
         ));
-        runtime::async_sleep(Duration::from_millis(1_050)).await;
+        // Redis reads its own clock, which can lag the host clock, so expiry waits keep a margin of
+        // at least 100 ms.
+        runtime::async_sleep(Duration::from_millis(1_200)).await;
 
         assert_eq!(rl.suppressed().delete(&key).await.unwrap(), Some(0));
     });
@@ -590,7 +592,7 @@ fn verify_suppression_factor_calculation_spread_redis() {
             (20, 0)
         );
 
-        // wait for 1.5 seconds
+        // Move the bucket out of the last-second peak interval; the 10 s window keeps it live.
         runtime::async_sleep(Duration::from_millis(1200)).await;
 
         let expected_suppression_factor = 1f64 - (1f64 / 2f64);
@@ -626,8 +628,9 @@ fn verify_suppression_factor_calculation_last_second_redis() {
             "first: {first:?}"
         );
 
-        // wait for 1s to pass
-        runtime::async_sleep(Duration::from_millis(1001)).await;
+        // Move the first bucket out of the last-second peak interval. Redis reads its own clock,
+        // which can lag the host clock, so the wait keeps a 200 ms margin.
+        runtime::async_sleep(Duration::from_millis(1_200)).await;
 
         let second = rl.suppressed().inc(&k, &rate_limit, 20).await.unwrap();
         assert!(
@@ -641,8 +644,9 @@ fn verify_suppression_factor_calculation_last_second_redis() {
             "second: {second:?}"
         );
 
-        // Allow time for the suppression_factor to expire
-        runtime::async_sleep(Duration::from_millis(101)).await;
+        // Let the factor cached by the second call expire (100 ms default cache period). The
+        // second bucket stays inside the last second with a wide margin.
+        runtime::async_sleep(Duration::from_millis(200)).await;
 
         let expected_suppression_factor = 1f64 - (1f64 / 20f64);
 

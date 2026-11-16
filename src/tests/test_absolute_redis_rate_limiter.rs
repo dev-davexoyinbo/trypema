@@ -186,12 +186,13 @@ fn rate_grouping_merges_within_group_affects_remaining_after_waiting() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let rl = build_limiter(&url, 6, 300).await;
+        let rl = build_limiter(&url, 6, 1_000).await;
 
         let k = key("k");
         let rate_limit = RateLimit::per_second(1f64).unwrap();
 
-        // Create a single bucket by staying within the rate-group coalescing window.
+        // Create a single bucket by staying within the rate-group coalescing window. The 1 s
+        // group leaves a wide margin over the 50 ms pause and the round trips.
         assert_allowed(
             rl.absolute().inc(&k, &rate_limit, 2).await.unwrap(),
             "creating the oldest grouped usage",
@@ -560,11 +561,12 @@ fn volume_unit_increments_accepts_exact_capacity_then_rejects_rest() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size = 1_u64;
+        // A 10 s window keeps all 80 sequential round trips inside one window.
+        let window_size = 10_u64;
         let rl = build_limiter(&url, window_size, 1000).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::per_second(50f64).unwrap();
+        let rate_limit = RateLimit::per_second(5f64).unwrap();
         let capacity = window_capacity(window_size, &rate_limit);
         assert_eq!(capacity, 50);
 
@@ -1255,7 +1257,9 @@ fn delete_returns_zero_for_expired_redis_state() {
             rl.absolute().inc(&key, &rate_limit, 1).await.unwrap(),
             "seed expiring state",
         );
-        runtime::async_sleep(Duration::from_millis(1_050)).await;
+        // Redis reads its own clock, which can lag the host clock, so expiry waits keep a margin of
+        // at least 100 ms.
+        runtime::async_sleep(Duration::from_millis(1_200)).await;
 
         assert_eq!(rl.absolute().delete(&key).await.unwrap(), Some(0));
     });

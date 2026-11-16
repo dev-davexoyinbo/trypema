@@ -1,13 +1,20 @@
 use std::{
     env,
-    sync::{Arc, Barrier, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
-use super::common::{assert_inside_allowed_lag, sleep_past_allowed_lag};
-use super::runtime;
+use redis::AsyncCommands;
 
+use super::common::{
+    assert_inside_allowed_lag, connection_manager, key_gen, sleep_past_allowed_lag,
+};
+use super::runtime;
+use super::wait::{WAIT_BOUND, wait_until_async};
+
+use crate::cleanup_loop::AsyncCleanup;
+use crate::common::RateType;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, WindowSize,
@@ -25,9 +32,11 @@ fn rate_and_key_lifecycle_handles_pending_state_and_remote_revisions() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
+        // No background flush runs during the test, so pending counts reach Redis only through
+        // the lifecycle calls that the assertions are about.
         let rl_a =
-            build_limiter_with_prefix(&url, 6, 1_000, 2.0, 1_000, 2_000, prefix.clone()).await;
-        let rl_b = build_limiter_with_prefix(&url, 6, 1_000, 2.0, 1_000, 2_000, prefix).await;
+            build_limiter_with_prefix(&url, 6, 1_000, 2.0, 1_000, 60_000, prefix.clone()).await;
+        let rl_b = build_limiter_with_prefix(&url, 6, 1_000, 2.0, 1_000, 60_000, prefix).await;
         let first = key("first");
         let second = key("second");
         let missing = key("missing");
@@ -164,7 +173,9 @@ fn multi_instance_threaded_lifecycle_cutovers_fence_stale_snapshot() {
     const RECREATED_INCREMENTS: u64 = 4;
     const CLEAR_PENDING_INCREMENTS: u64 = 2;
     const CLEAR_AFTER_INCREMENTS: u64 = 2;
-    const SYNC_INTERVAL: u64 = 2_000;
+    // No background flush runs during the test: the administrator's checks of pending counts on
+    // other instances need them to reach Redis only through the lifecycle calls.
+    const SYNC_INTERVAL: u64 = 60_000;
 
     let url = redis_url();
 
@@ -179,7 +190,7 @@ fn multi_instance_threaded_lifecycle_cutovers_fence_stale_snapshot() {
         let clear_even = key("threaded_clear_even");
         let clear_odd = key("threaded_clear_odd");
         let caller_pending = key("threaded_caller_pending");
-        let barrier = Arc::new(Barrier::new(INSTANCES + 1));
+        let barrier = Arc::new(PhaseBarrier::new(INSTANCES + 1));
         let (deleted_tx, deleted_rx) = mpsc::channel();
         let mut workers = Vec::with_capacity(INSTANCES);
 
@@ -234,6 +245,9 @@ fn multi_instance_threaded_lifecycle_cutovers_fence_stale_snapshot() {
                             suppression_factor: 1.0,
                         }
                     );
+                    // Every worker reads before any worker commits its decline below.
+                    barrier.wait();
+
                     let decision = limiter
                         .suppressed()
                         .inc(&lifecycle_key, &high_rate, 1)
@@ -361,6 +375,7 @@ fn multi_instance_threaded_lifecycle_cutovers_fence_stale_snapshot() {
             Some(high_rate)
         );
 
+        barrier.wait();
         barrier.wait();
         barrier.wait();
         let declined_total = INSTANCES as u64;
@@ -537,6 +552,47 @@ fn multi_instance_threaded_lifecycle_cutovers_fence_stale_snapshot() {
     });
 }
 
+/// A barrier that fails when a party does not arrive within `WAIT_BOUND`, so a worker that
+/// panics fails the test instead of hanging it.
+struct PhaseBarrier {
+    parties: usize,
+    state: Mutex<(usize, u64)>,
+    released: Condvar,
+}
+
+impl PhaseBarrier {
+    fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            state: Mutex::new((0, 0)),
+            released: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        let generation = state.1;
+        state.0 += 1;
+
+        if state.0 == self.parties {
+            *state = (0, generation + 1);
+            self.released.notify_all();
+            return;
+        }
+
+        let (state, timeout) = self
+            .released
+            .wait_timeout_while(state, WAIT_BOUND, |state| state.1 == generation)
+            .unwrap();
+        drop(state);
+
+        assert!(
+            !timeout.timed_out(),
+            "every party must reach the barrier within {WAIT_BOUND:?}"
+        );
+    }
+}
+
 fn redis_url() -> String {
     env::var("REDIS_URL").unwrap_or_else(|_| {
         panic!(
@@ -607,13 +663,20 @@ fn assert_in_01(v: f64) {
     assert!((0.0..=1.0).contains(&v), "expected v in [0,1], got {v:?}");
 }
 
-async fn wait_for_hybrid_sync(sync_interval: u64) {
-    // Hybrid commit flow is tick-based:
-    // - tick N: committer flushes queued commits, then signals limiter.flush()
-    // - limiter.flush() can enqueue additional commits
-    // - tick N+1: those follow-up commits are flushed
-    // Waiting ~2 ticks makes committed state observable from another instance.
-    runtime::async_sleep(Duration::from_millis(sync_interval * 2 + 50)).await;
+/// Wait until the background flush has committed a Redis total of `expected` for `key`.
+async fn wait_for_committed_total(prefix: &RedisKey, key: &RedisKey, expected: u64) {
+    let total_key = key_gen(prefix, RateType::HybridSuppressed).get_total_count_key(key);
+    let connection = connection_manager().await;
+
+    wait_until_async(
+        async || {
+            let mut connection = connection.clone();
+            let total: Option<u64> = connection.get(&total_key).await.unwrap();
+            total == Some(expected)
+        },
+        &format!("the background flush must commit a total of {expected}"),
+    )
+    .await;
 }
 
 fn record_suppressed_decision(
@@ -751,7 +814,8 @@ fn hybrid_suppressed_shared_soft_hard_boundary_is_allowed_then_fully_suppressed(
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size = 1_u64;
+        // Parallel load cannot expire the history this test reads inside a long window.
+        let window_size = 10_u64;
         let bucket_size = 1_000_u64;
         let sync_interval = 25_u64;
         let hard_limit_factor = 1.0_f64;
@@ -769,7 +833,7 @@ fn hybrid_suppressed_shared_soft_hard_boundary_is_allowed_then_fully_suppressed(
         .await;
 
         let k = key("k");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
         let cap = window_capacity(window_size, &rate_limit);
 
         // Every request through the exact shared soft/hard boundary is allowed. The boundary
@@ -983,14 +1047,15 @@ fn hybrid_suppressed_denies_100_percent_after_hard_limit() {
 
     runtime::block_on(async {
         // Use small limits to keep this integration test fast.
-        let window_size = 1_u64;
+        // Parallel load cannot expire the history this test reads inside a long window.
+        let window_size = 10_u64;
         let bucket_size = 1_000_u64;
         let sync_interval = 2_000_u64;
         let hard_limit_factor = 2.0_f64;
         let cache_ms = 60_000_u64;
 
         let k = key("k_hard");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
         let soft_window_limit = window_capacity(window_size, &rate_limit);
 
         let hard_window_limit = (soft_window_limit as f64 * hard_limit_factor) as u64;
@@ -1068,7 +1133,8 @@ fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_one() {
     runtime::block_on(async {
         // This test exercises the Suppressing fast path after the shared soft/hard boundary
         // establishes suppression_factor == 1.0.
-        let window_size = 1_u64;
+        // Parallel load cannot expire the history this test reads inside a long window.
+        let window_size = 10_u64;
         let bucket_size = 1_000_u64;
         let sync_interval = 25_u64;
         let hard_limit_factor = 1.0_f64;
@@ -1086,7 +1152,7 @@ fn hybrid_suppressed_suppressing_ttl_fast_path_skips_rng_when_sf_is_one() {
         .await;
 
         let k = key("k");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
         let cap = window_capacity(window_size, &rate_limit);
 
         // Fill through the exact boundary. Every request must be an exact Allowed variant.
@@ -1147,7 +1213,8 @@ fn hybrid_suppressed_per_key_state_is_independent() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size = 1_u64;
+        // Parallel load cannot expire the history this test reads inside a long window.
+        let window_size = 10_u64;
         let bucket_size = 1_000_u64;
         let sync_interval = 1_000_u64;
         let hard_limit_factor = 1.0_f64;
@@ -1166,7 +1233,7 @@ fn hybrid_suppressed_per_key_state_is_independent() {
 
         let a = key("a");
         let b = key("b");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
         let cap = window_capacity(window_size, &rate_limit);
 
         // Drive key `a` to the exact shared soft/hard boundary.
@@ -1216,7 +1283,8 @@ fn hybrid_suppressed_batch_increment_respects_soft_limit_boundary() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size = 1_u64;
+        // Parallel load cannot expire the history this test reads inside a long window.
+        let window_size = 10_u64;
         let bucket_size = 1_000_u64;
         let sync_interval = 10_u64;
         let hard_limit_factor = 1.0_f64;
@@ -1234,7 +1302,7 @@ fn hybrid_suppressed_batch_increment_respects_soft_limit_boundary() {
         .await;
 
         let k = key("k_batch");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
         let cap = window_capacity(window_size, &rate_limit);
         assert_eq!(cap, 5);
 
@@ -1282,10 +1350,11 @@ fn hybrid_suppressed_does_not_commit_before_soft_limit_overflow() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size = 1_u64;
+        // Parallel load cannot expire the history this test reads inside a long window.
+        let window_size = 10_u64;
         let bucket_size = 1_000_u64;
-        // Keep ticks infrequent to avoid a background flush committing accepting state.
-        let sync_interval = 2_000_u64;
+        // No background flush runs during the test, so it cannot commit the accepting state.
+        let sync_interval = 60_000_u64;
         let hard_limit_factor = 1.0_f64;
         let cache_ms = 250_u64;
 
@@ -1312,7 +1381,7 @@ fn hybrid_suppressed_does_not_commit_before_soft_limit_overflow() {
         .await;
 
         let k = key("k");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
         let cap = window_capacity(window_size, &rate_limit);
 
         // Fill to the soft limit exactly (no overflow, no queued commit).
@@ -1335,7 +1404,8 @@ fn hybrid_suppressed_suppressing_hard_cap_guard_forces_full_denial_without_rng()
     let url = redis_url();
 
     runtime::block_on(async {
-        let window_size = 1_u64;
+        // Parallel load cannot expire the history this test reads inside a long window.
+        let window_size = 10_u64;
         let bucket_size = 1_000_u64;
         let sync_interval = 2_000_u64;
         let hard_limit_factor = 1.0_f64;
@@ -1353,7 +1423,7 @@ fn hybrid_suppressed_suppressing_hard_cap_guard_forces_full_denial_without_rng()
         .await;
 
         let k = key("k");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
         let cap = window_capacity(window_size, &rate_limit);
 
         for accepted_after in 1..=cap {
@@ -1571,14 +1641,15 @@ fn hybrid_suppressed_full_denial_seeded_from_hybrid_redis_keyspace_does_not_call
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let window_size = 1_u64;
+        // Parallel load cannot expire the history this test reads inside a long window.
+        let window_size = 10_u64;
         let bucket_size = 1_000_u64;
         let sync_interval = 25_u64;
 
         let cache_ms = 5_u64;
         // With hard_limit_factor=1.0, hard_window_limit == base capacity.
         let k = key("k");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
         let cap = (window_size as f64 * rate_limit.as_per_second()) as u64;
 
         let rl_hybrid = build_limiter_with_prefix(
@@ -1637,7 +1708,8 @@ fn hybrid_suppressed_refresh_commit_is_visible_to_other_instances() {
         // this test polls another instance. Fractional rate keeps setup capacity small.
         let window_size = 60_u64;
         let bucket_size = 1_000_u64;
-        let sync_interval = 25_u64;
+        // No background flush runs during the test, so only the hard-boundary refresh commits.
+        let sync_interval = 60_000_u64;
         let cache_ms = 5_u64;
 
         let rl_a = build_limiter_with_prefix(
@@ -1808,10 +1880,11 @@ fn hybrid_suppressed_public_decisions_never_return_absolute_rejection_metadata()
     let url = redis_url();
 
     runtime::block_on(async {
-        let rl = build_limiter_with_prefix(&url, 1, 1_000, 1.0, 50, 25, unique_prefix()).await;
+        // Parallel load cannot expire the history this test reads inside a long window.
+        let rl = build_limiter_with_prefix(&url, 10, 1_000, 1.0, 50, 25, unique_prefix()).await;
 
         let k = key("k");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
 
         for observed_after in 1..=25_u64 {
             let decision = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
@@ -1888,6 +1961,7 @@ fn hybrid_suppressed_window_eviction_allows_fresh_burst_after_expiry() {
         )
         .await;
 
+        let history_started = Instant::now();
         let reaches_hard = rl
             .suppressed()
             .inc(&k, &rate_limit, hard_window_limit)
@@ -1909,8 +1983,7 @@ fn hybrid_suppressed_window_eviction_allows_fresh_burst_after_expiry() {
             ),
             "declined: {declined:?}"
         );
-        // Wait for the committer to flush all queued counts to Redis (two ticks).
-        wait_for_hybrid_sync(sync_interval).await;
+        wait_for_committed_total(&prefix, &k, hard_window_limit + 1).await;
         // Let the suppression_factor Redis cache expire so the next read recomputes.
         runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
 
@@ -1930,6 +2003,11 @@ fn hybrid_suppressed_window_eviction_allows_fresh_burst_after_expiry() {
             .get_suppression_factor(&k)
             .await
             .unwrap();
+        let elapsed = history_started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(window_size * 1_000),
+            "test setup took {elapsed:?}, longer than the window; the check before expiry cannot be made"
+        );
         assert!(
             (sf_before - 1.0).abs() < 1e-12,
             "expected sf=1.0 before window expiry, got {sf_before}"
@@ -2006,7 +2084,7 @@ fn hybrid_suppressed_throughput_over_multiple_windows_stays_at_rate_limit() {
             hard_limit_factor,
             cache_ms,
             sync_interval,
-            prefix,
+            prefix.clone(),
         )
         .await;
 
@@ -2016,6 +2094,7 @@ fn hybrid_suppressed_throughput_over_multiple_windows_stays_at_rate_limit() {
             // Within each window, hammer at 10× the rate limit to ensure we hit the ceiling.
             // The limiter should admit ≈ soft_window_limit requests and suppress the rest.
             let burst = soft_window_limit * 10;
+            let burst_started = Instant::now();
             for _ in 0..burst {
                 let d = rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap();
                 match d {
@@ -2031,9 +2110,17 @@ fn hybrid_suppressed_throughput_over_multiple_windows_stays_at_rate_limit() {
                 }
             }
 
-            // Flush committed state and wait for the window to fully expire before next window.
-            wait_for_hybrid_sync(sync_interval).await;
-            runtime::async_sleep(Duration::from_millis(window_size * 1_000 + 50)).await;
+            // A burst near the window length lets its first buckets expire before the flush.
+            let burst_elapsed = burst_started.elapsed();
+            assert!(
+                burst_elapsed < Duration::from_millis(window_size * 1_000 / 2),
+                "the burst took {burst_elapsed:?}; its committed total cannot be checked"
+            );
+
+            // Every observation, declined ones too, is committed. Then the window expires, and a
+            // flush tick has time to drop the local state that is older than the window.
+            wait_for_committed_total(&prefix, &k, burst).await;
+            runtime::async_sleep(Duration::from_millis(window_size * 1_000 + 250)).await;
             runtime::async_sleep(Duration::from_millis(cache_ms + 50)).await;
         }
 
@@ -2071,8 +2158,9 @@ fn cleanup_keeps_suppressing_state_while_cache_ttl_is_live() {
     runtime::block_on(async {
         let cache_ttl_ms = 500_u64;
         let stale_after_ms = 50_u64;
+        // No background flush runs during the test; a flush would renew the suppressing state.
         let rl =
-            build_limiter_with_prefix(&url, 6, 1_000, 1.0, cache_ttl_ms, 2_000, unique_prefix())
+            build_limiter_with_prefix(&url, 6, 1_000, 1.0, cache_ttl_ms, 60_000, unique_prefix())
                 .await;
         let k = key("k");
         let rate = RateLimit::per_second(5f64).unwrap();
@@ -2108,14 +2196,91 @@ fn cleanup_keeps_suppressing_state_while_cache_ttl_is_live() {
 }
 
 #[test]
+fn cleanup_removes_reset_locks_that_no_call_holds() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        // No background flush runs during the test; a flush holds the locks of its keys.
+        let rl = build_limiter_with_prefix(&url, 6, 1_000, 1.0, 100, 60_000, unique_prefix()).await;
+        let rate = RateLimit::per_second(100f64).unwrap();
+        let kept = key("kept");
+        let deleted = key("deleted");
+
+        assert!(
+            matches!(
+                rl.suppressed().inc(&kept, &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ),
+            "first inc of the kept key"
+        );
+        assert!(
+            matches!(
+                rl.suppressed().inc(&deleted, &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ),
+            "first inc of the deleted key"
+        );
+        rl.suppressed().delete(&deleted).await.unwrap();
+        assert_eq!(rl.suppressed().local_state_count(), 1);
+        assert_eq!(
+            rl.suppressed().reset_lock_count(),
+            2,
+            "delete removes the state of its key but not the lock"
+        );
+
+        rl.suppressed().cleanup(0).await.unwrap();
+        assert_eq!(rl.suppressed().local_state_count(), 0);
+        assert_eq!(
+            rl.suppressed().reset_lock_count(),
+            0,
+            "cleanup must remove the locks that no call holds"
+        );
+
+        assert!(
+            matches!(
+                rl.suppressed().inc(&kept, &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ),
+            "inc after cleanup"
+        );
+        assert_eq!(rl.suppressed().reset_lock_count(), 1);
+    });
+}
+
+#[test]
+fn cleanup_keeps_a_reset_lock_that_a_call_holds() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1_000, 1.0, 100, 60_000, unique_prefix()).await;
+        let k = key("k");
+        let lock = rl.suppressed().get_or_create_reset_lock(&k);
+        let guard = lock.lock().await;
+
+        rl.suppressed().cleanup(0).await.unwrap();
+        assert_eq!(rl.suppressed().reset_lock_count(), 1);
+        assert!(
+            std::sync::Arc::ptr_eq(&lock, &rl.suppressed().get_or_create_reset_lock(&k)),
+            "the next call must wait on the lock that is held"
+        );
+
+        drop(guard);
+        drop(lock);
+        rl.suppressed().cleanup(0).await.unwrap();
+        assert_eq!(rl.suppressed().reset_lock_count(), 0);
+    });
+}
+
+#[test]
 fn cleanup_keeps_suppressing_state_until_stale_horizon_after_cache_expiry() {
     let url = redis_url();
 
     runtime::block_on(async {
         let cache_ttl_ms = 500_u64;
-        let stale_after_ms = 300_u64;
+        let stale_after_ms = 400_u64;
+        // No background flush runs during the test; a flush would renew the suppressing state.
         let rl =
-            build_limiter_with_prefix(&url, 6, 1_000, 1.0, cache_ttl_ms, 2_000, unique_prefix())
+            build_limiter_with_prefix(&url, 6, 1_000, 1.0, cache_ttl_ms, 60_000, unique_prefix())
                 .await;
         let k = key("k");
         let rate = RateLimit::per_second(5f64).unwrap();
@@ -2159,6 +2324,7 @@ fn get_does_not_resurrect_an_expired_local_baseline() {
         let k = key("k");
         let rate = RateLimit::per_second(10f64).unwrap();
 
+        let history_started = Instant::now();
         assert_eq!(
             rl.suppressed()
                 .set_if(&k, &rate, RateLimitComparator::Always, 5)
@@ -2166,7 +2332,13 @@ fn get_does_not_resurrect_an_expired_local_baseline() {
                 .unwrap(),
             (5, 0)
         );
-        assert_eq!(rl.suppressed().get(&k).await.unwrap().total, 5);
+        let total = rl.suppressed().get(&k).await.unwrap().total;
+        let elapsed = history_started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "test setup took {elapsed:?}, longer than the window; the check before expiry cannot be made"
+        );
+        assert_eq!(total, 5);
 
         runtime::async_sleep(Duration::from_millis(1_100)).await;
 
@@ -2234,9 +2406,9 @@ fn get_does_not_hide_newer_redis_suppression_with_local_accepting_state() {
 
     runtime::block_on(async {
         let prefix = unique_prefix();
-        let writer =
-            build_limiter_with_prefix(&url, 6, 1_000, 1.0, 100, 2_000, prefix.clone()).await;
-        let reader = build_limiter_with_prefix(&url, 6, 1_000, 1.0, 100, 2_000, prefix).await;
+        let allowed_lag_ms = 3_000_u64;
+        let writer = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix.clone()).await;
+        let reader = build_limiter_with_allowed_lag(&url, 6, allowed_lag_ms, prefix).await;
         let k = key("k");
         let rate = RateLimit::per_second(1f64).unwrap();
 
@@ -2248,6 +2420,7 @@ fn get_does_not_hide_newer_redis_suppression_with_local_accepting_state() {
                 .unwrap(),
             (5, 0)
         );
+        let synced_before = Instant::now();
         assert_eq!(reader.suppressed().get_estimate(&k).await.unwrap().total, 5);
 
         assert_eq!(
@@ -2259,8 +2432,10 @@ fn get_does_not_hide_newer_redis_suppression_with_local_accepting_state() {
             (6, 5)
         );
 
+        let estimate = reader.suppressed().get_estimate(&k).await.unwrap();
+        assert_inside_allowed_lag(synced_before, allowed_lag_ms);
         assert_eq!(
-            reader.suppressed().get_estimate(&k).await.unwrap(),
+            estimate,
             SuppressedRateLimitSnapshot {
                 total: 5,
                 total_declined: 0,
@@ -2313,10 +2488,8 @@ fn get_methods_keep_the_exact_snapshot_during_background_sync() {
     let url = redis_url();
 
     runtime::block_on(async {
-        let sync_interval = 500_u64;
-        let rl =
-            build_limiter_with_prefix(&url, 60, 1_000, 1.5, 100, sync_interval, unique_prefix())
-                .await;
+        let prefix = unique_prefix();
+        let rl = build_limiter_with_prefix(&url, 60, 1_000, 1.5, 100, 500, prefix.clone()).await;
         let k = key("k");
         let rate = RateLimit::per_second(100f64).unwrap();
 
@@ -2325,7 +2498,7 @@ fn get_methods_keep_the_exact_snapshot_during_background_sync() {
             RateLimitDecision::Allowed
         ));
 
-        runtime::async_sleep(Duration::from_millis(sync_interval + 100)).await;
+        wait_for_committed_total(&prefix, &k, 3).await;
 
         let expected = SuppressedRateLimitSnapshot {
             total: 3,
@@ -2796,19 +2969,21 @@ fn hybrid_suppressed_try_inc_needs_redis_after_delete_clear_and_suppression_expi
 
     runtime::block_on(async {
         let suppression_factor_cache_period = 100_u64;
+        // No background flush runs during the test; a flush would renew the suppression state
+        // whose expiry the last check needs.
         let rl = build_limiter_with_prefix(
             &url,
-            1,
+            10,
             1_000,
             2.0,
             suppression_factor_cache_period,
-            1_000,
+            60_000,
             unique_prefix(),
         )
         .await;
         let k = key("k");
-        let rate_limit = RateLimit::per_second(5f64).unwrap();
-        let soft_window_limit = window_capacity(1, &rate_limit);
+        let rate_limit = RateLimit::per_second(0.5).unwrap();
+        let soft_window_limit = window_capacity(10, &rate_limit);
 
         assert!(matches!(
             rl.suppressed().inc(&k, &rate_limit, 1).await.unwrap(),
