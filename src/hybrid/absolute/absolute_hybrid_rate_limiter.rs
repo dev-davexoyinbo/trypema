@@ -145,7 +145,7 @@ pub struct AbsoluteHybridRateLimiter {
     /// Per-key async mutex that serializes the "Redis read + state update" operation.
     /// Only one tokio task at a time may perform the read+update for a given key;
     /// all other tasks wait on this lock and then re-check the (now-updated) state.
-    reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>, RandomState>,
+    pub(crate) reset_locks: DashMap<RedisKey, Arc<tokio::sync::Mutex<()>>, RandomState>,
     epoch: AtomicU64,
     last_commited_epoch: AtomicU64,
     is_active_watch: watch::Sender<u64>,
@@ -359,7 +359,7 @@ impl AbsoluteHybridRateLimiter {
     }
 
     /// Acquire (or create) the per-key reset lock and return an `Arc` to it.
-    fn get_or_create_reset_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn get_or_create_reset_lock(&self, key: &RedisKey) -> Arc<tokio::sync::Mutex<()>> {
         if let Some(lock) = self.reset_locks.get(key) {
             return Arc::clone(&lock);
         }
@@ -1255,6 +1255,11 @@ impl AsyncCleanup for AbsoluteHybridRateLimiter {
                 Entry::Occupied(_) | Entry::Vacant(_) => {}
             }
         }
+
+        // Remove each lock that only this map holds. No call holds or waits on it, so the next
+        // call creates a new one. This also removes the locks of keys that `delete` removed.
+        self.reset_locks
+            .retain(|_, lock| Arc::strong_count(lock) > 1);
 
         Ok(())
     } // end fn cleanup

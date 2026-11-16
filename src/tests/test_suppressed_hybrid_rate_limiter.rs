@@ -18,7 +18,7 @@ use crate::common::RateType;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, WindowSize,
-    hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
+    hybrid::{AllowedLag, HybridRateLimiterProvider, SuppressedHybridRateLimiter, SyncInterval},
     redis::{RedisKey, RedisRateLimiterProvider},
 };
 
@@ -2192,6 +2192,88 @@ fn cleanup_keeps_suppressing_state_while_cache_ttl_is_live() {
         runtime::async_sleep(Duration::from_millis(cache_ttl_ms)).await;
         rl.suppressed().cleanup(stale_after_ms).await.unwrap();
         assert_eq!(rl.suppressed().local_state_count(), 0);
+    });
+}
+
+impl SuppressedHybridRateLimiter {
+    fn reset_lock_count(&self) -> usize {
+        self.reset_locks.len()
+    }
+} // end impl
+
+#[test]
+fn cleanup_removes_reset_locks_that_no_call_holds() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        // No background flush runs during the test; a flush holds the locks of its keys.
+        let rl = build_limiter_with_prefix(&url, 6, 1_000, 1.0, 100, 60_000, unique_prefix()).await;
+        let rate = RateLimit::per_second(100f64).unwrap();
+        let kept = key("kept");
+        let deleted = key("deleted");
+
+        assert!(
+            matches!(
+                rl.suppressed().inc(&kept, &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ),
+            "first inc of the kept key"
+        );
+        assert!(
+            matches!(
+                rl.suppressed().inc(&deleted, &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ),
+            "first inc of the deleted key"
+        );
+        rl.suppressed().delete(&deleted).await.unwrap();
+        assert_eq!(rl.suppressed().local_state_count(), 1);
+        assert_eq!(
+            rl.suppressed().reset_lock_count(),
+            2,
+            "delete removes the state of its key but not the lock"
+        );
+
+        rl.suppressed().cleanup(0).await.unwrap();
+        assert_eq!(rl.suppressed().local_state_count(), 0);
+        assert_eq!(
+            rl.suppressed().reset_lock_count(),
+            0,
+            "cleanup must remove the locks that no call holds"
+        );
+
+        assert!(
+            matches!(
+                rl.suppressed().inc(&kept, &rate, 1).await.unwrap(),
+                RateLimitDecision::Allowed
+            ),
+            "inc after cleanup"
+        );
+        assert_eq!(rl.suppressed().reset_lock_count(), 1);
+    });
+}
+
+#[test]
+fn cleanup_keeps_a_reset_lock_that_a_call_holds() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_prefix(&url, 6, 1_000, 1.0, 100, 60_000, unique_prefix()).await;
+        let k = key("k");
+        let lock = rl.suppressed().get_or_create_reset_lock(&k);
+        let guard = lock.lock().await;
+
+        rl.suppressed().cleanup(0).await.unwrap();
+        assert_eq!(rl.suppressed().reset_lock_count(), 1);
+        assert!(
+            std::sync::Arc::ptr_eq(&lock, &rl.suppressed().get_or_create_reset_lock(&k)),
+            "the next call must wait on the lock that is held"
+        );
+
+        drop(guard);
+        drop(lock);
+        rl.suppressed().cleanup(0).await.unwrap();
+        assert_eq!(rl.suppressed().reset_lock_count(), 0);
     });
 }
 

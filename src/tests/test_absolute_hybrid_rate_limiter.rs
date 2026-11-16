@@ -12,7 +12,7 @@ use super::wait::wait_until_async;
 use crate::cleanup_loop::AsyncCleanup;
 use crate::{
     BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, WindowSize,
-    hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
+    hybrid::{AbsoluteHybridRateLimiter, AllowedLag, HybridRateLimiterProvider, SyncInterval},
     redis::RedisKey,
 };
 
@@ -2469,6 +2469,79 @@ fn checked_only_key_is_removed_by_cleanup_after_stale_after() {
             0,
             "checks and their Redis refreshes must not count as activity"
         );
+    });
+}
+
+impl AbsoluteHybridRateLimiter {
+    fn reset_lock_count(&self) -> usize {
+        self.reset_locks.len()
+    }
+} // end impl
+
+#[test]
+fn cleanup_removes_reset_locks_that_no_call_holds() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        // No background flush runs during the test; a flush holds the locks of its keys.
+        let rl = build_limiter_with_allowed_lag(&url, 6, 60_000, 200, unique_prefix()).await;
+        let rate = RateLimit::per_second(100f64).unwrap();
+        let kept = key("kept");
+        let deleted = key("deleted");
+
+        assert_allowed(
+            rl.absolute().inc(&kept, &rate, 1).await.unwrap(),
+            "first inc of the kept key",
+        );
+        assert_allowed(
+            rl.absolute().inc(&deleted, &rate, 1).await.unwrap(),
+            "first inc of the deleted key",
+        );
+        rl.absolute().delete(&deleted).await.unwrap();
+        assert_eq!(rl.absolute().local_state_count(), 1);
+        assert_eq!(
+            rl.absolute().reset_lock_count(),
+            2,
+            "delete removes the state of its key but not the lock"
+        );
+
+        rl.absolute().cleanup(0).await.unwrap();
+        assert_eq!(rl.absolute().local_state_count(), 0);
+        assert_eq!(
+            rl.absolute().reset_lock_count(),
+            0,
+            "cleanup must remove the locks that no call holds"
+        );
+
+        assert_allowed(
+            rl.absolute().inc(&kept, &rate, 1).await.unwrap(),
+            "inc after cleanup",
+        );
+        assert_eq!(rl.absolute().reset_lock_count(), 1);
+    });
+}
+
+#[test]
+fn cleanup_keeps_a_reset_lock_that_a_call_holds() {
+    let url = redis_url();
+
+    runtime::block_on(async {
+        let rl = build_limiter_with_allowed_lag(&url, 6, 60_000, 200, unique_prefix()).await;
+        let k = key("k");
+        let lock = rl.absolute().get_or_create_reset_lock(&k);
+        let guard = lock.lock().await;
+
+        rl.absolute().cleanup(0).await.unwrap();
+        assert_eq!(rl.absolute().reset_lock_count(), 1);
+        assert!(
+            std::sync::Arc::ptr_eq(&lock, &rl.absolute().get_or_create_reset_lock(&k)),
+            "the next call must wait on the lock that is held"
+        );
+
+        drop(guard);
+        drop(lock);
+        rl.absolute().cleanup(0).await.unwrap();
+        assert_eq!(rl.absolute().reset_lock_count(), 0);
     });
 }
 
