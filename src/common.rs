@@ -214,13 +214,6 @@ pub struct ConditionalSetOutcome {
     pub current_total: u64,
 }
 
-#[cfg(test)]
-impl PartialEq<(u64, u64)> for ConditionalSetOutcome {
-    fn eq(&self, other: &(u64, u64)) -> bool {
-        (self.current_total, self.previous_total) == *other
-    }
-}
-
 /// Per-second rate limit for a key.
 ///
 /// Wraps a positive `f64` so Trypema can express non-integer limits such as `0.5` or `5.5`

@@ -114,7 +114,7 @@ pub struct AbsoluteLocalRateLimiter {
     window_size_ms: u128,
     window_duration: Duration,
     bucket_size: BucketSize,
-    series: DashMap<String, RateLimitSeries, RandomState>,
+    pub(crate) series: DashMap<String, RateLimitSeries, RandomState>,
     cleanup_loop: CleanupLoop,
 }
 
@@ -202,11 +202,6 @@ impl AbsoluteLocalRateLimiter {
     pub fn window_size(&self) -> WindowSize {
         self.window_size
     } // end method window_size
-
-    #[cfg(test)]
-    pub(crate) fn series(&self) -> &DashMap<String, RateLimitSeries, RandomState> {
-        &self.series
-    }
 
     /// Check admission and, if allowed, record the increment for `key`.
     ///

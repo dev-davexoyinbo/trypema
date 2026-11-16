@@ -25,7 +25,7 @@
 //! let decision = rl.suppressed().inc("api_endpoint", &rate, 1);
 //! ```
 
-mod absolute_local_rate_limiter;
+pub(crate) mod absolute_local_rate_limiter;
 pub use absolute_local_rate_limiter::AbsoluteLocalRateLimiter;
 
 mod local_rate_limiter_provider;

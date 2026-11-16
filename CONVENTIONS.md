@@ -64,7 +64,7 @@ Keep responsibilities in their existing layers:
 | `src/redis/scripts.rs` | Canonical home of all rate-limiter Lua bodies and Lua helpers |
 | `src/hybrid/` | Local pending state, Redis proxies, flushing, and coordination |
 | `src/runtime.rs` | Runtime abstraction shared by Tokio and Smol builds |
-| `src/tests/` | Unit, behavioral, concurrency, and raw Redis-state regression tests |
+| `src/tests/` | Unit, behavioral, concurrency, and raw Redis-state regression tests; test-only accessors in `accessors.rs` |
 | `benches/` | Criterion benchmarks and benchmark-only helpers |
 | `stress/` | Long-running or comparative load generation |
 | `docs/lib.md` | Canonical docs.rs crate documentation |
@@ -424,12 +424,13 @@ pass.
 - A regression test should fail under the bug it is intended to catch.
 - Prefer exact assertions for deterministic values.
 - Assert setup operations when later assertions depend on them.
-- Minimize production-code `#[cfg(test)]` helpers. One or two test-only methods may remain in the
-  production type's impl with individual `#[cfg(test)]` attributes. When a type needs three or
-  more test-only methods, place one inherent impl block in the appropriate `src/tests/` file,
-  named `test_<production_file_name>.rs`.
-- Fields needed by an impl in `src/tests/` may be `pub(crate)`; do not make them public. Test-only
-  helpers must not bypass the public API to construct limiter state.
+- Production files contain no test-only methods, types, or trait impls. Put them in
+  `src/tests/accessors.rs`, in an inherent `impl` block or a trait impl of the production type.
+- Use `#[cfg(test)]` in production files only for the `mod tests` declaration and for a test hook
+  that must run inside a production code path, such as the pause hook of the suppressed hybrid
+  `set_if`. The hook type and its install method go in `src/tests/accessors.rs`.
+- Fields, types, and modules that `src/tests/accessors.rs` needs may be `pub(crate)`; do not make
+  them public. Test-only helpers must not bypass the public API to construct limiter state.
 
 ### 12.2 State construction
 

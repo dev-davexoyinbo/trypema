@@ -1,3 +1,5 @@
+pub(crate) mod accessors;
+
 #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
 mod runtime;
 

@@ -594,13 +594,14 @@ Test-only accessors may be used narrowly to:
 
 They must not be used to bypass the public API when constructing initial state.
 
-Minimize test-only helpers in production impl blocks:
+Keep test-only code out of production files:
 
-- One or two test-only methods may stay beside the production type with individual `#[cfg(test)]`
-  attributes.
-- For three or more test-only methods, put an inherent impl block in the appropriate
-  `src/tests/test_<production_file_name>.rs` file.
-- Fields required by that test-area impl may be `pub(crate)`, but must not become public API.
+- Put test-only methods, types, and trait impls in `src/tests/accessors.rs`, in an inherent
+  `impl` block or a trait impl of the production type.
+- Use `#[cfg(test)]` in production files only for the `mod tests` declaration and for a test hook
+  that must run inside a production code path (the suppressed hybrid `set_if` pause hook).
+- Fields, types, and modules that `src/tests/accessors.rs` needs may be `pub(crate)`, but must not
+  become public API.
 
 ### 8.2 Make setup prove itself
 

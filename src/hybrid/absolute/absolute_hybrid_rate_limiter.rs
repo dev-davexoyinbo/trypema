@@ -35,7 +35,7 @@ use crate::{
 mod helpers;
 
 #[derive(Debug)]
-enum AbsoluteRedisLimitingState {
+pub(crate) enum AbsoluteRedisLimitingState {
     Accepting {
         window_limit: Mutex<f64>,
         accept_limit: Mutex<u64>,
@@ -141,7 +141,7 @@ pub struct AbsoluteHybridRateLimiter {
     pub(crate) allowed_lag_applies_to_rejections: bool,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<AbsoluteHybridCommit>>,
     redis_proxy: AbsoluteHybridRedisProxy,
-    limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState, RandomState>,
+    pub(crate) limiting_state: DashMap<RedisKey, AbsoluteRedisLimitingState, RandomState>,
     /// Per-key async mutex that serializes the "Redis read + state update" operation.
     /// Only one tokio task at a time may perform the read+update for a given key;
     /// all other tasks wait on this lock and then re-check the (now-updated) state.
@@ -990,11 +990,6 @@ impl AbsoluteHybridRateLimiter {
             current_total,
         })
     } // end method set_if_preserve_history
-
-    #[cfg(test)]
-    pub(crate) fn local_state_count(&self) -> usize {
-        self.limiting_state.len()
-    }
 
     fn should_cleanup_local_state(
         &self,

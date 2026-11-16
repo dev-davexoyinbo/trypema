@@ -18,7 +18,7 @@ use crate::common::RateType;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, WindowSize,
-    hybrid::{AllowedLag, HybridRateLimiterProvider, SuppressedHybridRateLimiter, SyncInterval},
+    hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
     redis::{RedisKey, RedisRateLimiterProvider},
 };
 
@@ -2194,12 +2194,6 @@ fn cleanup_keeps_suppressing_state_while_cache_ttl_is_live() {
         assert_eq!(rl.suppressed().local_state_count(), 0);
     });
 }
-
-impl SuppressedHybridRateLimiter {
-    fn reset_lock_count(&self) -> usize {
-        self.reset_locks.len()
-    }
-} // end impl
 
 #[test]
 fn cleanup_removes_reset_locks_that_no_call_holds() {

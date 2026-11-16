@@ -12,7 +12,7 @@ use super::wait::wait_until_async;
 use crate::cleanup_loop::AsyncCleanup;
 use crate::{
     BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, WindowSize,
-    hybrid::{AbsoluteHybridRateLimiter, AllowedLag, HybridRateLimiterProvider, SyncInterval},
+    hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},
     redis::RedisKey,
 };
 
@@ -2471,12 +2471,6 @@ fn checked_only_key_is_removed_by_cleanup_after_stale_after() {
         );
     });
 }
-
-impl AbsoluteHybridRateLimiter {
-    fn reset_lock_count(&self) -> usize {
-        self.reset_locks.len()
-    }
-} // end impl
 
 #[test]
 fn cleanup_removes_reset_locks_that_no_call_holds() {

@@ -34,7 +34,7 @@ use crate::{
 mod helpers;
 
 #[derive(Debug)]
-enum SuppressedRedisLimitingState {
+pub(crate) enum SuppressedRedisLimitingState {
     Accepting {
         hard_window_limit: Mutex<f64>,
         starting_count: Mutex<u64>,
@@ -59,13 +59,6 @@ enum SuppressedRedisLimitingState {
         declined_count: AtomicU64,
         state_revision: Mutex<StateRevision>,
     },
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct SuppressedHybridSetIfTestHook {
-    pub snapshot_taken: tokio::sync::Notify,
-    pub resume: tokio::sync::Notify,
 }
 
 impl sealed::Sealed for SuppressedHybridRateLimiter {}
@@ -130,7 +123,7 @@ pub struct SuppressedHybridRateLimiter {
     pub(crate) allowed_lag: Duration,
     commiter_sender: mpsc::Sender<AbsoluteHybridCommitterSignal<SuppressedHybridCommit>>,
     redis_proxy: SuppressedHybridRedisProxy,
-    limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState, RandomState>,
+    pub(crate) limiting_state: DashMap<RedisKey, SuppressedRedisLimitingState, RandomState>,
     hard_limit_factor: HardLimitFactor,
     suppression_factor_cache_period: SuppressionFactorCachePeriod,
     epoch: AtomicU64,
@@ -140,7 +133,8 @@ pub struct SuppressedHybridRateLimiter {
     maintenance_lock: Arc<RwLock<()>>,
     cleanup_loop: CleanupLoop,
     #[cfg(test)]
-    set_if_test_hook: Mutex<Option<Arc<SuppressedHybridSetIfTestHook>>>,
+    pub(crate) set_if_test_hook:
+        Mutex<Option<Arc<crate::tests::accessors::SuppressedHybridSetIfTestHook>>>,
 }
 
 impl SuppressedHybridRateLimiter {
