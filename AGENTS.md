@@ -97,8 +97,11 @@ feature configuration.
   the call until none remain. The first call sets the cutoff time of the pass. One cleanup pass,
   and thus the Redis `clear`, removes all entities that were stale at that time. Activity during
   the pass can keep or recreate a key.
-- A provider cleanup pass runs the absolute cleanup and the suppressed cleanup. A failure of one
-  does not stop the other. The pass returns the first error.
+- Each limiter runs its own cleanup loop. A provider has no cleanup loop and no cleanup pass of
+  its own: its `start_cleanup_loop` and `stop_cleanup_loop` start and stop the loops of its two
+  limiters. A failed pass of one strategy therefore does not stop the cleanup of the other.
+- A stop, or the drop of the last `Arc` of a limiter, ends its cleanup loop at once, not at the
+  next wake. A pass that runs at that time completes first.
 - A hybrid strategy removes stale local state only after its Redis cleanup succeeds. When Redis
   fails, local state stays.
 - Increments within `bucket_size` of the newest bucket are coalesced into that bucket.
@@ -738,9 +741,10 @@ Follow `CONVENTIONS.md`.
 - Re-export new public common types from `src/lib.rs`.
 - `RateLimiterBuilder<B, T>` (`src/builder.rs`) builds every provider and limiter. It validates
   the same settings for every target (`InvalidBucketSize`, cleanup durations) and starts the
-  cleanup loop of the built value unless cleanup is disabled. A limiter built directly uses the
-  same Redis keys as that strategy of a provider with the same prefix, and a limiter that a
-  provider owns runs no cleanup loop of its own. A target of another backend must not compile.
+  cleanup of the built value unless cleanup is disabled: the loop of a limiter, or the loops of
+  the two limiters of a provider. A limiter built directly uses the same Redis keys as that
+  strategy of a provider with the same prefix. `stop_cleanup_loop` on a limiter that a provider
+  owns stops the cleanup of that strategy only. A target of another backend must not compile.
   With no Redis feature, only `RateLimiterBuilder::local()` and the local targets exist.
 - Keep sync local examples and async Redis/hybrid examples consistent with their APIs.
 

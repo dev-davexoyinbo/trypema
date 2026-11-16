@@ -6,6 +6,7 @@ use std::{
 
 use dashmap::DashMap;
 
+use crate::cleanup_loop::Cleanup;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, SuppressedRateLimitSnapshot, SuppressionFactorCachePeriod, WindowSize,

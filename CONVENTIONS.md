@@ -584,6 +584,8 @@ Document the cleanup lifecycle:
 - `RateLimiterBuilder::build()` starts cleanup automatically.
 - `cleanup_enabled(false)` disables automatic cleanup startup.
 - Provider and limiter `start_cleanup_loop()` and `stop_cleanup_loop()` methods are idempotent.
+- Each limiter owns its cleanup loop. A provider has no loop of its own; its methods start and
+  stop the loops of its two limiters.
 
 In builder examples, put a short comment before optional chained setters. Use `Optional: ...` for
 general setters and `Optional: only available with 'redis-tokio' or 'redis-smol'` for Redis-only

@@ -224,7 +224,34 @@ fn local_limiter_cleanup_can_be_started_stopped_and_restarted() {
 }
 
 #[test]
-fn provider_limiter_stop_does_not_stop_provider_cleanup() {
+fn provider_start_removes_stale_state_of_both_strategies() {
+    let provider = LocalRateLimiterProvider::builder()
+        .stale_after(Duration::from_millis(40))
+        .cleanup_interval(Duration::from_millis(20))
+        .disable_cleanup()
+        .build()
+        .unwrap();
+    let rate = RateLimit::per_second_or_panic(100.0);
+
+    assert!(matches!(
+        provider.absolute().inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    assert!(matches!(
+        provider.suppressed().inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    provider.start_cleanup_loop();
+    provider.start_cleanup_loop();
+
+    wait_until(
+        || provider.absolute().series().is_empty() && provider.suppressed().series().is_empty(),
+        "the provider start must start the cleanup of both strategies",
+    );
+}
+
+#[test]
+fn provider_limiter_stop_stops_only_the_cleanup_of_that_strategy() {
     let provider = LocalRateLimiterProvider::builder()
         .stale_after(Duration::from_millis(40))
         .cleanup_interval(Duration::from_millis(20))
@@ -232,16 +259,52 @@ fn provider_limiter_stop_does_not_stop_provider_cleanup() {
         .unwrap();
     let rate = RateLimit::per_second_or_panic(100.0);
 
-    // The limiter of a provider has no running loop of its own; the provider loop cleans it.
     provider.absolute().stop_cleanup_loop();
+    // The absolute key is older than the suppressed key, so it is stale first.
     assert!(matches!(
         provider.absolute().inc("key", &rate, 1),
         RateLimitDecision::Allowed
     ));
+    assert!(matches!(
+        provider.suppressed().inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
     wait_until(
-        || provider.absolute().series().is_empty(),
-        "the provider loop must remove the stale key of its limiter",
+        || provider.suppressed().series().is_empty(),
+        "the suppressed loop must keep running",
     );
+    // A loop still running at the 20 ms interval would remove the stale absolute key in this
+    // window of five intervals.
+    std::thread::sleep(Duration::from_millis(100));
+
+    assert_eq!(provider.absolute().series().len(), 1);
+}
+
+#[test]
+fn provider_stop_stops_the_cleanup_of_both_strategies() {
+    let provider = LocalRateLimiterProvider::builder()
+        .stale_after(Duration::from_millis(40))
+        .cleanup_interval(Duration::from_millis(20))
+        .build()
+        .unwrap();
+    let rate = RateLimit::per_second_or_panic(100.0);
+
+    provider.stop_cleanup_loop();
+    provider.stop_cleanup_loop();
+    assert!(matches!(
+        provider.absolute().inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    assert!(matches!(
+        provider.suppressed().inc("key", &rate, 1),
+        RateLimitDecision::Allowed
+    ));
+    // The keys turn stale after 40 ms. Loops still running at the 20 ms interval would remove
+    // them in this window.
+    std::thread::sleep(Duration::from_millis(100));
+
+    assert_eq!(provider.absolute().series().len(), 1);
+    assert_eq!(provider.suppressed().series().len(), 1);
 }
 
 #[test]

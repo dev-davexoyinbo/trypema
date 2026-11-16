@@ -9,6 +9,7 @@ use super::common::{assert_inside_allowed_lag, sleep_past_allowed_lag};
 use super::runtime;
 use super::wait::wait_until_async;
 
+use crate::cleanup_loop::AsyncCleanup;
 use crate::{
     BucketSize, HistoryPreservation, RateLimit, RateLimitComparator, RateLimitDecision, WindowSize,
     hybrid::{AllowedLag, HybridRateLimiterProvider, SyncInterval},

@@ -12,6 +12,7 @@ use super::common::{connection_manager, key, key_gen, unique_prefix};
 use super::runtime;
 use super::wait::wait_until_async;
 
+use crate::cleanup_loop::AsyncCleanup;
 use crate::common::RateType;
 use crate::redis::common::RedisKeyGenerator;
 use crate::{
@@ -40,7 +41,8 @@ fn assert_allowed(decision: RateLimitDecision, context: &str) {
     );
 }
 
-/// A Redis provider and a hybrid provider that share one prefix.
+/// A Redis provider and a hybrid provider that share one prefix. Their cleanup loops do not
+/// start at build; the short cleanup settings are for the tests that start them.
 struct Providers {
     redis: Arc<RedisRateLimiterProvider>,
     hybrid: Arc<HybridRateLimiterProvider>,
@@ -53,6 +55,8 @@ impl Providers {
         let redis = RedisRateLimiterProvider::builder(connection_manager().await)
             .prefix(prefix.clone())
             .window_size(WindowSize::seconds_or_panic(60))
+            .stale_after(Duration::from_millis(100))
+            .cleanup_interval(Duration::from_millis(20))
             .cleanup_enabled(false)
             .build()
             .unwrap();
@@ -60,6 +64,8 @@ impl Providers {
             .prefix(prefix.clone())
             .window_size(WindowSize::seconds_or_panic(60))
             .sync_interval(SyncInterval::milliseconds_or_panic(5))
+            .stale_after(Duration::from_millis(100))
+            .cleanup_interval(Duration::from_millis(20))
             .cleanup_enabled(false)
             .build()
             .unwrap();
@@ -244,7 +250,8 @@ fn redis_suppressed_clear_removes_many_entities() {
 // A failed cleanup step
 // ---------------------------------------------------------------------------
 
-/// The cleanup of one strategy fails. The cleanup of the other strategy must run.
+/// The cleanup of the absolute strategy fails at each pass. The cleanup loop of the suppressed
+/// strategy of the same provider must still remove its stale state.
 async fn cleanup_of_suppressed_runs_when_absolute_fails(
     absolute_type: RateType,
     suppressed_type: RateType,
@@ -263,35 +270,47 @@ async fn cleanup_of_suppressed_runs_when_absolute_fails(
         "the setup must register the stale entity",
     )
     .await;
-    // The entity is 600 ms old at cleanup, 500 ms past the threshold, which leaves time for the
-    // refresh that follows a hybrid flush.
-    runtime::async_sleep(Duration::from_millis(600)).await;
 
     // A string where the script expects a sorted set makes the absolute cleanup fail.
     let broken_key = providers
         .key_generator(absolute_type)
         .get_active_entities_key();
     let _: () = conn.set(&broken_key, "not a sorted set").await.unwrap();
-
-    let result = match absolute_type {
-        RateType::Absolute => providers.redis.cleanup(100).await,
-        _ => providers.hybrid.cleanup(100).await,
+    let absolute_result = match absolute_type {
+        RateType::Absolute => providers.redis.absolute().cleanup(100).await,
+        _ => providers.hybrid.absolute().cleanup(100).await,
     };
-
     assert!(
-        result.is_err(),
-        "the absolute cleanup must report its error"
+        absolute_result.is_err(),
+        "the broken key must make the absolute cleanup fail"
     );
+
+    match absolute_type {
+        RateType::Absolute => providers.redis.start_cleanup_loop(),
+        _ => providers.hybrid.start_cleanup_loop(),
+    }
+
+    wait_until_async(
+        async || {
+            count_entity_keys(
+                &mut conn.clone(),
+                &suppressed_generator,
+                std::slice::from_ref(&stale),
+            )
+            .await
+                == 0
+        },
+        "the suppressed cleanup loop must remove the stale entity while the absolute one fails",
+    )
+    .await;
+    let broken_value: String = conn.get(&broken_key).await.unwrap();
     assert_eq!(
-        count_entity_keys(
-            &mut conn,
-            &suppressed_generator,
-            std::slice::from_ref(&stale)
-        )
-        .await,
-        0,
-        "the suppressed cleanup did not run"
+        broken_value, "not a sorted set",
+        "the failed absolute cleanup must not change the broken key"
     );
+
+    providers.redis.stop_cleanup_loop();
+    providers.hybrid.stop_cleanup_loop();
     let _: () = conn.del(&broken_key).await.unwrap();
 }
 

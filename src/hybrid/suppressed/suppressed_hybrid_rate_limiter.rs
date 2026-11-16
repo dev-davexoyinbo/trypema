@@ -17,7 +17,7 @@ use crate::{
     RateLimitDecision, RateLimiterBuilder, RateLimiterTarget, SuppressedRateLimitSnapshot,
     SuppressionFactorCachePeriod, TrypemaError, WindowSize,
     builder::{CleanupConfig, sealed},
-    cleanup_loop::CleanupLoop,
+    cleanup_loop::{AsyncCleanup, CleanupLoop},
     common::{HistoryUpdateMode, RandomState},
     hybrid::{
         AbsoluteHybridCommitterSignal, HybridBackend, RedisCommitter, RedisCommitterOptions,
@@ -207,8 +207,8 @@ impl SuppressedHybridRateLimiter {
     ///
     /// Same as [`RateLimiterBuilder::hybrid`] with the target fixed to this type. The limiter has
     /// no absolute strategy. `build()` starts the synchronization worker, and also the stale-state
-    /// cleanup loop of the limiter unless cleanup is disabled. Both end after the last `Arc` of the
-    /// limiter drops.
+    /// cleanup loop of the limiter unless cleanup is disabled. Both end at once after the last
+    /// `Arc` of the limiter drops.
     ///
     /// The limiter does not use `allowed_lag_applies_to_rejections`.
     ///
@@ -255,18 +255,17 @@ impl SuppressedHybridRateLimiter {
     /// Start stale-state cleanup. Calling while already running is no-op.
     ///
     /// Only a limiter built directly, with [`builder`](Self::builder) or `RateLimiterBuilder`, is
-    /// held in an `Arc` that callers can use here. The cleanup loop of a provider cleans the
-    /// limiters that the provider owns.
+    /// held in an `Arc` that callers can use here.
+    /// [`HybridRateLimiterProvider::start_cleanup_loop`](crate::hybrid::HybridRateLimiterProvider::start_cleanup_loop)
+    /// starts the loops of the two limiters that the provider owns.
     pub fn start_cleanup_loop(self: &Arc<Self>) {
-        CleanupLoop::start_task(
-            self,
-            |limiter| &limiter.cleanup_loop,
-            |limiter, stale_after_ms| async move { limiter.cleanup(stale_after_ms).await },
-            "Hybrid suppressed cleanup failed, will retry",
-        );
+        self.cleanup_loop.start_task(self);
     } // end method start_cleanup_loop
 
     /// Stop stale-state cleanup. Calling while stopped is no-op.
+    ///
+    /// The loop ends at once. On a limiter that a provider owns, this stops the cleanup of this
+    /// strategy only.
     pub fn stop_cleanup_loop(&self) {
         self.cleanup_loop.stop();
     } // end method stop_cleanup_loop
@@ -1035,42 +1034,6 @@ impl SuppressedHybridRateLimiter {
         self.try_inc_with_rng(key.as_str(), count, &mut rng)
     } // end method try_inc
 
-    /// Remove stale Redis state and local state stale since its suppression cache expired.
-    pub(crate) async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
-        self.redis_proxy.cleanup(stale_after_ms).await?;
-
-        let candidates = self
-            .limiting_state
-            .iter()
-            .filter(|state| self.should_cleanup_local_state(state.value(), stale_after_ms))
-            .map(|state| state.key().clone())
-            .collect::<Vec<_>>();
-
-        for key in candidates {
-            let lock = self.get_or_create_reset_lock(&key);
-            let _guard = lock.lock().await;
-
-            let should_remove = self.limiting_state.get(&key).is_some_and(|state| {
-                self.should_cleanup_local_state(state.value(), stale_after_ms)
-            });
-
-            if !should_remove {
-                continue;
-            }
-
-            match self.limiting_state.entry(key) {
-                Entry::Occupied(entry)
-                    if self.should_cleanup_local_state(entry.get(), stale_after_ms) =>
-                {
-                    entry.remove();
-                }
-                Entry::Occupied(_) | Entry::Vacant(_) => {}
-            }
-        }
-
-        Ok(())
-    } // end fn cleanup
-
     async fn flush(&self) -> Result<(), TrypemaError> {
         let (mut resets, stale) = self.collect_flush_candidates();
 
@@ -1116,4 +1079,44 @@ impl SuppressedHybridRateLimiter {
 
         Ok(())
     } // end fn flush
+} // end impl
+
+impl AsyncCleanup for SuppressedHybridRateLimiter {
+    const FAILURE_MESSAGE: &'static str = "Hybrid suppressed cleanup failed, will retry";
+
+    /// Remove stale Redis state and local state stale since its suppression cache expired.
+    async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+        self.redis_proxy.cleanup(stale_after_ms).await?;
+
+        let candidates = self
+            .limiting_state
+            .iter()
+            .filter(|state| self.should_cleanup_local_state(state.value(), stale_after_ms))
+            .map(|state| state.key().clone())
+            .collect::<Vec<_>>();
+
+        for key in candidates {
+            let lock = self.get_or_create_reset_lock(&key);
+            let _guard = lock.lock().await;
+
+            let should_remove = self.limiting_state.get(&key).is_some_and(|state| {
+                self.should_cleanup_local_state(state.value(), stale_after_ms)
+            });
+
+            if !should_remove {
+                continue;
+            }
+
+            match self.limiting_state.entry(key) {
+                Entry::Occupied(entry)
+                    if self.should_cleanup_local_state(entry.get(), stale_after_ms) =>
+                {
+                    entry.remove();
+                }
+                Entry::Occupied(_) | Entry::Vacant(_) => {}
+            }
+        }
+
+        Ok(())
+    } // end fn cleanup
 } // end impl

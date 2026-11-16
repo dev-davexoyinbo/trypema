@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::{
     RateLimiterBuilder, RateLimiterTarget, TrypemaError, WindowSize,
     builder::{CleanupConfig, ProviderConfig, sealed},
-    cleanup_loop::CleanupLoop,
 };
 
 use super::{AbsoluteLocalRateLimiter, SuppressedLocalRateLimiter};
@@ -88,9 +87,8 @@ impl RateLimiterTarget for LocalRateLimiterProvider {
 /// ```
 #[derive(Debug)]
 pub struct LocalRateLimiterProvider {
-    absolute: AbsoluteLocalRateLimiter,
-    suppressed: SuppressedLocalRateLimiter,
-    cleanup_loop: CleanupLoop,
+    absolute: Arc<AbsoluteLocalRateLimiter>,
+    suppressed: Arc<SuppressedLocalRateLimiter>,
 }
 
 impl LocalRateLimiterProvider {
@@ -103,21 +101,28 @@ impl LocalRateLimiterProvider {
 
     pub(crate) fn new(config: ProviderConfig, cleanup: CleanupConfig) -> Self {
         Self {
-            absolute: AbsoluteLocalRateLimiter::new(config, cleanup),
-            suppressed: SuppressedLocalRateLimiter::new(config, cleanup),
-            cleanup_loop: CleanupLoop::new(cleanup),
+            absolute: Arc::new(AbsoluteLocalRateLimiter::new(config, cleanup)),
+            suppressed: Arc::new(SuppressedLocalRateLimiter::new(config, cleanup)),
         }
     }
 
-    /// Start stale-state cleanup. Calling while already running is no-op.
-    pub fn start_cleanup_loop(self: &Arc<Self>) {
-        CleanupLoop::start_thread(self, |provider| &provider.cleanup_loop, Self::cleanup);
-    }
+    /// Start stale-state cleanup of both strategies. Calling while already running is no-op.
+    ///
+    /// Each strategy has its own cleanup loop. This starts the loops of the absolute and the
+    /// suppressed limiter.
+    pub fn start_cleanup_loop(&self) {
+        self.absolute.start_cleanup_loop();
+        self.suppressed.start_cleanup_loop();
+    } // end method start_cleanup_loop
 
-    /// Stop stale-state cleanup. Calling while stopped is no-op.
+    /// Stop stale-state cleanup of both strategies. Calling while stopped is no-op.
+    ///
+    /// The two loops end at once. To stop the cleanup of one strategy only, call
+    /// `stop_cleanup_loop` on [`absolute`](Self::absolute) or [`suppressed`](Self::suppressed).
     pub fn stop_cleanup_loop(&self) {
-        self.cleanup_loop.stop();
-    }
+        self.absolute.stop_cleanup_loop();
+        self.suppressed.stop_cleanup_loop();
+    } // end method stop_cleanup_loop
 
     /// Return the sliding-window duration that this provider was built with.
     ///
@@ -191,10 +196,5 @@ impl LocalRateLimiterProvider {
     /// ```
     pub fn suppressed(&self) -> &SuppressedLocalRateLimiter {
         &self.suppressed
-    }
-
-    pub(crate) fn cleanup(&self, stale_after_ms: u64) {
-        self.absolute.cleanup(stale_after_ms);
-        self.suppressed.cleanup(stale_after_ms);
     }
 }

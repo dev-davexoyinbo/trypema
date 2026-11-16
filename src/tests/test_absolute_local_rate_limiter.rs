@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::cleanup_loop::Cleanup;
 use crate::common::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
     RateLimitDecision, SuppressionFactorCachePeriod, WindowSize,

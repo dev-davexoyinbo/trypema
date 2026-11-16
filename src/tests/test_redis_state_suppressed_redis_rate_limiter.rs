@@ -23,6 +23,7 @@ use redis::AsyncCommands;
 use super::common::{key, key_gen, redis_url, unique_prefix};
 use super::runtime;
 
+use crate::cleanup_loop::AsyncCleanup;
 use crate::common::{RateType, SuppressionFactorCachePeriod};
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,

@@ -251,160 +251,144 @@ fn redis_and_hybrid_cleanup_support_opt_out_stop_and_restart() {
     });
 }
 
-/// Tests of `CleanupLoop` itself. Each test owns the cleanup function that the loop runs: a
-/// counter of its calls and a `LoopEnd` that the loop drops when it ends.
+/// Tests of `CleanupLoop` itself. A loop holds a `Weak` of the `Arc` that it was started for, so
+/// `Arc::weak_count` of that `Arc` is the number of loops that run for it. A limiter holds its
+/// `CleanupLoop`, so the drop of its last `Arc` drops the `CleanupLoop`. These tests hold the
+/// `CleanupLoop` beside the `Arc`, so that they can see the weak count after that drop.
 mod loop_lifecycle {
     use std::{
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
-            mpsc,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use crate::{builder::CleanupConfig, cleanup_loop::CleanupLoop, tests::wait::wait_until};
+    use crate::{
+        builder::CleanupConfig,
+        cleanup_loop::{Cleanup, CleanupLoop},
+        tests::wait::wait_until,
+    };
 
-    pub(super) const INTERVAL: Duration = Duration::from_millis(20);
-    /// Interval for the restart tests: long enough that a stop and a start run before the first
-    /// loop wakes.
-    pub(super) const LONG_INTERVAL: Duration = Duration::from_millis(200);
+    /// Longer than each test, so that a loop that ends in a test did not end at a wake.
+    pub(super) const LONG_INTERVAL: Duration = Duration::from_secs(60);
+    pub(super) const SHORT_INTERVAL: Duration = Duration::from_millis(20);
+    /// A stopped or dropped loop must end within this bound.
+    pub(super) const END_BOUND: Duration = Duration::from_secs(1);
+    pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(5);
+    pub(super) const STALE_AFTER: Duration = Duration::from_millis(7);
 
+    /// An owner that counts its passes and keeps the stale-after value of the last pass.
+    #[derive(Default)]
     pub(super) struct Owner {
-        pub(super) cleanup_loop: CleanupLoop,
+        pub(super) passes: AtomicUsize,
+        pub(super) stale_after_ms: AtomicU64,
     }
 
-    pub(super) fn owner(interval: Duration) -> Arc<Owner> {
-        Arc::new(Owner {
-            cleanup_loop: CleanupLoop::new(CleanupConfig {
-                enabled: false,
-                stale_after: Duration::from_millis(1),
-                interval,
-            }),
+    impl Owner {
+        pub(super) fn passes(&self) -> usize {
+            self.passes.load(Ordering::Acquire)
+        }
+
+        pub(super) fn record_pass(&self, stale_after_ms: u64) {
+            self.stale_after_ms.store(stale_after_ms, Ordering::Release);
+            self.passes.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl Cleanup for Owner {
+        fn cleanup(&self, stale_after_ms: u64) {
+            self.record_pass(stale_after_ms);
+        }
+    }
+
+    pub(super) fn cleanup_loop(interval: Duration) -> CleanupLoop {
+        CleanupLoop::new(CleanupConfig {
+            enabled: false,
+            stale_after: STALE_AFTER,
+            interval,
         })
     }
 
-    /// Sends one message when the loop that owns it drops it.
-    pub(super) struct LoopEnd(mpsc::Sender<()>);
-
-    impl Drop for LoopEnd {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
+    /// Wait until no loop holds `owner`, or fail with `message` after `END_BOUND`.
+    fn assert_loop_ends_at_once<T>(owner: &Arc<T>, message: &str) {
+        let deadline = Instant::now() + END_BOUND;
+        while Arc::weak_count(owner) > 0 {
+            assert!(Instant::now() < deadline, "{message} within {END_BOUND:?}");
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 
-    /// The call counter and drop signal of one loop.
-    pub(super) struct Probe {
-        pub(super) calls: Arc<AtomicUsize>,
-        ended: mpsc::Receiver<()>,
-    }
+    #[test]
+    fn thread_loop_runs_one_pass_per_interval() {
+        let owner = Arc::new(Owner::default());
+        let cleanup_loop = cleanup_loop(SHORT_INTERVAL);
+        cleanup_loop.start_thread(&owner);
 
-    impl Probe {
-        pub(super) fn new() -> (Self, Arc<AtomicUsize>, LoopEnd) {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let (sender, ended) = mpsc::channel();
-            (
-                Self {
-                    calls: Arc::clone(&calls),
-                    ended,
-                },
-                calls,
-                LoopEnd(sender),
-            )
-        }
-
-        pub(super) fn calls(&self) -> usize {
-            self.calls.load(Ordering::Acquire)
-        }
-
-        pub(super) fn has_ended(&self) -> bool {
-            self.ended.try_recv().is_ok()
-        }
-    }
-
-    pub(super) fn thread_cleanup(
-        calls: Arc<AtomicUsize>,
-        loop_end: LoopEnd,
-    ) -> impl Fn(&Owner, u64) + Send + 'static {
-        move |_, _| {
-            let _ = &loop_end;
-            calls.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-
-    pub(super) fn start_thread(owner: &Arc<Owner>, probe: (Arc<AtomicUsize>, LoopEnd)) {
-        CleanupLoop::start_thread(
-            owner,
-            |owner| &owner.cleanup_loop,
-            thread_cleanup(probe.0, probe.1),
+        wait_until(|| owner.passes() >= 3, "the started loop must run passes");
+        assert_eq!(
+            owner.stale_after_ms.load(Ordering::Acquire),
+            STALE_AFTER.as_millis() as u64
         );
+
+        cleanup_loop.stop();
+        assert_loop_ends_at_once(&owner, "the loop must end after stop");
     }
 
     #[test]
-    fn thread_loop_ends_after_last_owner_arc_drops() {
-        let owner = owner(INTERVAL);
-        let (probe, calls, loop_end) = Probe::new();
-        start_thread(&owner, (calls, loop_end));
-        wait_until(|| probe.calls() >= 1, "the started loop must run");
+    fn thread_loop_ends_at_once_when_its_cleanup_loop_drops() {
+        let owner = Arc::new(Owner::default());
+        let cleanup_loop = cleanup_loop(LONG_INTERVAL);
+        cleanup_loop.start_thread(&owner);
+        assert_eq!(Arc::weak_count(&owner), 1, "the started loop must run");
 
-        drop(owner);
+        drop(cleanup_loop);
 
-        wait_until(
-            || probe.has_ended(),
-            "the loop must end after the owner drops",
-        );
-        let calls_at_end = probe.calls();
-        std::thread::sleep(INTERVAL * 5);
-        assert_eq!(probe.calls(), calls_at_end);
+        assert_loop_ends_at_once(&owner, "the loop must end after the drop");
+        assert_eq!(owner.passes(), 0);
     }
 
     #[test]
-    fn thread_loop_ends_after_stop() {
-        let owner = owner(INTERVAL);
-        let (probe, calls, loop_end) = Probe::new();
-        start_thread(&owner, (calls, loop_end));
-        wait_until(|| probe.calls() >= 1, "the started loop must run");
+    fn thread_loop_ends_at_once_after_stop() {
+        let owner = Arc::new(Owner::default());
+        let cleanup_loop = cleanup_loop(LONG_INTERVAL);
+        cleanup_loop.start_thread(&owner);
+        assert_eq!(Arc::weak_count(&owner), 1, "the started loop must run");
 
-        owner.cleanup_loop.stop();
+        cleanup_loop.stop();
+        cleanup_loop.stop();
 
-        wait_until(|| probe.has_ended(), "the loop must end after stop");
-        let calls_at_end = probe.calls();
-        std::thread::sleep(INTERVAL * 5);
-        assert_eq!(probe.calls(), calls_at_end);
-        drop(owner);
+        assert_loop_ends_at_once(&owner, "the loop must end after stop");
+        assert_eq!(owner.passes(), 0);
     }
 
     #[test]
-    fn thread_loop_stop_then_start_before_wake_leaves_one_loop() {
-        let owner = owner(LONG_INTERVAL);
-        let (first, calls, loop_end) = Probe::new();
-        start_thread(&owner, (calls, loop_end));
-        // The first loop sleeps for one 200 ms interval before it runs, so this restart is
-        // before it wakes.
-        owner.cleanup_loop.stop();
-        let (second, calls, loop_end) = Probe::new();
-        start_thread(&owner, (calls, loop_end));
-        let (third, calls, loop_end) = Probe::new();
-        start_thread(&owner, (calls, loop_end));
+    fn thread_loop_stop_then_start_leaves_one_loop() {
+        let cleanup_loop = cleanup_loop(LONG_INTERVAL);
+        let first = Arc::new(Owner::default());
+        let second = Arc::new(Owner::default());
+        let third = Arc::new(Owner::default());
 
-        assert!(
-            third.has_ended(),
+        cleanup_loop.start_thread(&first);
+        cleanup_loop.stop();
+        cleanup_loop.start_thread(&second);
+        cleanup_loop.start_thread(&third);
+
+        assert_eq!(
+            Arc::weak_count(&third),
+            0,
             "a start while a loop runs must not start a second loop"
         );
-        wait_until(
-            || first.has_ended(),
-            "the stopped loop must end at its wake",
+        assert_loop_ends_at_once(&first, "the stopped loop must end");
+        assert_eq!(first.passes(), 0, "the stopped loop must not run a pass");
+        assert_eq!(
+            Arc::weak_count(&second),
+            1,
+            "the restarted loop must keep running"
         );
-        wait_until(|| second.calls() >= 3, "the restarted loop must run");
-        assert_eq!(first.calls(), 0, "the stopped loop must not run a pass");
-        assert_eq!(third.calls(), 0);
-        assert!(!second.has_ended(), "the restarted loop must keep running");
 
-        drop(owner);
-        wait_until(
-            || second.has_ended(),
-            "the loop must end after the owner drops",
-        );
+        cleanup_loop.stop();
+        assert_loop_ends_at_once(&second, "the restarted loop must end after stop");
     }
 
     #[cfg(any(feature = "redis-tokio", feature = "redis-smol"))]
@@ -415,34 +399,49 @@ mod loop_lifecycle {
                 Arc,
                 atomic::{AtomicUsize, Ordering},
             },
+            time::Instant,
         };
 
-        use super::{INTERVAL, LONG_INTERVAL, LoopEnd, Owner, Probe, owner};
+        use super::{
+            END_BOUND, LONG_INTERVAL, Owner, POLL_INTERVAL, SHORT_INTERVAL, STALE_AFTER,
+            cleanup_loop,
+        };
         use crate::{
             TrypemaError,
-            cleanup_loop::CleanupLoop,
+            cleanup_loop::AsyncCleanup,
             tests::{runtime, wait::wait_until_async},
         };
 
-        fn task_cleanup(
-            calls: Arc<AtomicUsize>,
-            loop_end: LoopEnd,
-        ) -> impl Fn(Arc<Owner>, u64) -> std::future::Ready<Result<(), TrypemaError>> + Send + 'static
-        {
-            move |_, _| {
-                let _ = &loop_end;
-                calls.fetch_add(1, Ordering::AcqRel);
-                std::future::ready(Ok(()))
+        impl AsyncCleanup for Owner {
+            const FAILURE_MESSAGE: &'static str = "test cleanup failed";
+
+            async fn cleanup(&self, stale_after_ms: u64) -> Result<(), TrypemaError> {
+                self.record_pass(stale_after_ms);
+                Ok(())
             }
         }
 
-        fn start_task(owner: &Arc<Owner>, probe: (Arc<AtomicUsize>, LoopEnd)) {
-            CleanupLoop::start_task(
-                owner,
-                |owner| &owner.cleanup_loop,
-                task_cleanup(probe.0, probe.1),
-                "test cleanup failed",
-            );
+        /// An owner whose passes all fail.
+        #[derive(Default)]
+        struct FailingOwner {
+            passes: AtomicUsize,
+        }
+
+        impl AsyncCleanup for FailingOwner {
+            const FAILURE_MESSAGE: &'static str = "test cleanup failed";
+
+            async fn cleanup(&self, _stale_after_ms: u64) -> Result<(), TrypemaError> {
+                self.passes.fetch_add(1, Ordering::AcqRel);
+                Err(TrypemaError::CustomError("test pass failed".to_string()))
+            }
+        }
+
+        async fn assert_loop_ends_at_once<T>(owner: &Arc<T>, message: &str) {
+            let deadline = Instant::now() + END_BOUND;
+            while Arc::weak_count(owner) > 0 {
+                assert!(Instant::now() < deadline, "{message} within {END_BOUND:?}");
+                runtime::async_sleep(POLL_INTERVAL).await;
+            }
         }
 
         fn on_runtime(test: impl Future<Output = ()>) {
@@ -450,77 +449,104 @@ mod loop_lifecycle {
         }
 
         #[test]
-        fn task_loop_ends_after_last_owner_arc_drops() {
+        fn task_loop_runs_one_pass_per_interval() {
             on_runtime(async {
-                let owner = owner(INTERVAL);
-                let (probe, calls, loop_end) = Probe::new();
-                start_task(&owner, (calls, loop_end));
-                wait_until_async(async || probe.calls() >= 1, "the started loop must run").await;
-
-                drop(owner);
+                let owner = Arc::new(Owner::default());
+                let cleanup_loop = cleanup_loop(SHORT_INTERVAL);
+                cleanup_loop.start_task(&owner);
 
                 wait_until_async(
-                    async || probe.has_ended(),
-                    "the loop must end after the owner drops",
+                    async || owner.passes() >= 3,
+                    "the started loop must run passes",
                 )
                 .await;
-                let calls_at_end = probe.calls();
-                runtime::async_sleep(INTERVAL * 5).await;
-                assert_eq!(probe.calls(), calls_at_end);
+                assert_eq!(
+                    owner.stale_after_ms.load(Ordering::Acquire),
+                    STALE_AFTER.as_millis() as u64
+                );
+
+                cleanup_loop.stop();
+                assert_loop_ends_at_once(&owner, "the loop must end after stop").await;
             });
         }
 
         #[test]
-        fn task_loop_ends_after_stop() {
+        fn task_loop_keeps_running_after_failed_passes() {
             on_runtime(async {
-                let owner = owner(INTERVAL);
-                let (probe, calls, loop_end) = Probe::new();
-                start_task(&owner, (calls, loop_end));
-                wait_until_async(async || probe.calls() >= 1, "the started loop must run").await;
+                let owner = Arc::new(FailingOwner::default());
+                let cleanup_loop = cleanup_loop(SHORT_INTERVAL);
+                cleanup_loop.start_task(&owner);
 
-                owner.cleanup_loop.stop();
+                wait_until_async(
+                    async || owner.passes.load(Ordering::Acquire) >= 3,
+                    "the loop must try again after a failed pass",
+                )
+                .await;
 
-                wait_until_async(async || probe.has_ended(), "the loop must end after stop").await;
-                let calls_at_end = probe.calls();
-                runtime::async_sleep(INTERVAL * 5).await;
-                assert_eq!(probe.calls(), calls_at_end);
-                drop(owner);
+                cleanup_loop.stop();
+                assert_loop_ends_at_once(&owner, "the loop must end after stop").await;
             });
         }
 
         #[test]
-        fn task_loop_stop_then_start_before_wake_leaves_one_loop() {
+        fn task_loop_ends_at_once_when_its_cleanup_loop_drops() {
             on_runtime(async {
-                let owner = owner(LONG_INTERVAL);
-                let (first, calls, loop_end) = Probe::new();
-                start_task(&owner, (calls, loop_end));
-                // No await runs between these calls, so the first task has not run yet.
-                owner.cleanup_loop.stop();
-                let (second, calls, loop_end) = Probe::new();
-                start_task(&owner, (calls, loop_end));
-                let (third, calls, loop_end) = Probe::new();
-                start_task(&owner, (calls, loop_end));
+                let owner = Arc::new(Owner::default());
+                let cleanup_loop = cleanup_loop(LONG_INTERVAL);
+                cleanup_loop.start_task(&owner);
+                assert_eq!(Arc::weak_count(&owner), 1, "the started loop must run");
 
-                assert!(
-                    third.has_ended(),
+                drop(cleanup_loop);
+
+                assert_loop_ends_at_once(&owner, "the loop must end after the drop").await;
+                assert_eq!(owner.passes(), 0);
+            });
+        }
+
+        #[test]
+        fn task_loop_ends_at_once_after_stop() {
+            on_runtime(async {
+                let owner = Arc::new(Owner::default());
+                let cleanup_loop = cleanup_loop(LONG_INTERVAL);
+                cleanup_loop.start_task(&owner);
+                assert_eq!(Arc::weak_count(&owner), 1, "the started loop must run");
+
+                cleanup_loop.stop();
+                cleanup_loop.stop();
+
+                assert_loop_ends_at_once(&owner, "the loop must end after stop").await;
+                assert_eq!(owner.passes(), 0);
+            });
+        }
+
+        #[test]
+        fn task_loop_stop_then_start_leaves_one_loop() {
+            on_runtime(async {
+                let cleanup_loop = cleanup_loop(LONG_INTERVAL);
+                let first = Arc::new(Owner::default());
+                let second = Arc::new(Owner::default());
+                let third = Arc::new(Owner::default());
+
+                cleanup_loop.start_task(&first);
+                cleanup_loop.stop();
+                cleanup_loop.start_task(&second);
+                cleanup_loop.start_task(&third);
+
+                assert_eq!(
+                    Arc::weak_count(&third),
+                    0,
                     "a start while a loop runs must not start a second loop"
                 );
-                wait_until_async(
-                    async || first.has_ended(),
-                    "the stopped loop must end at its wake",
-                )
-                .await;
-                wait_until_async(async || second.calls() >= 3, "the restarted loop must run").await;
-                assert_eq!(first.calls(), 0, "the stopped loop must not run a pass");
-                assert_eq!(third.calls(), 0);
-                assert!(!second.has_ended(), "the restarted loop must keep running");
+                assert_loop_ends_at_once(&first, "the stopped loop must end").await;
+                assert_eq!(first.passes(), 0, "the stopped loop must not run a pass");
+                assert_eq!(
+                    Arc::weak_count(&second),
+                    1,
+                    "the restarted loop must keep running"
+                );
 
-                drop(owner);
-                wait_until_async(
-                    async || second.has_ended(),
-                    "the loop must end after the owner drops",
-                )
-                .await;
+                cleanup_loop.stop();
+                assert_loop_ends_at_once(&second, "the restarted loop must end after stop").await;
             });
         }
     }

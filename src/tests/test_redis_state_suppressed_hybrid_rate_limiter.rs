@@ -34,6 +34,7 @@ use super::common::{
 use super::runtime;
 use super::wait::wait_until_async;
 
+use crate::cleanup_loop::AsyncCleanup;
 use crate::common::RateType;
 use crate::{
     BucketSize, HardLimitFactor, HistoryPreservation, RateLimit, RateLimitComparator,
